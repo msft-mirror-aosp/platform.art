@@ -22,6 +22,9 @@
 #include "space.h"
 #include "thread.h"
 
+#include <functional>
+#include <map>
+
 namespace art {
 namespace gc {
 
@@ -115,7 +118,7 @@ class RegionSpace FINAL : public ContinuousMemMapAllocSpace {
   void DumpNonFreeRegions(std::ostream& os) REQUIRES(!region_lock_);
 
   size_t RevokeThreadLocalBuffers(Thread* thread) REQUIRES(!region_lock_);
-  void RevokeThreadLocalBuffersLocked(Thread* thread) REQUIRES(region_lock_);
+  size_t RevokeThreadLocalBuffers(Thread* thread, const bool reuse) REQUIRES(!region_lock_);
   size_t RevokeAllThreadLocalBuffers()
       REQUIRES(!Locks::runtime_shutdown_lock_, !Locks::thread_list_lock_, !region_lock_);
   void AssertThreadLocalBuffersAreRevoked(Thread* thread) REQUIRES(!region_lock_);
@@ -162,6 +165,9 @@ class RegionSpace FINAL : public ContinuousMemMapAllocSpace {
   }
   size_t GetNumRegions() const {
     return num_regions_;
+  }
+  size_t GetNumNonFreeRegions() const NO_THREAD_SAFETY_ANALYSIS {
+    return num_non_free_regions_;
   }
 
   bool CanMoveObjects() const OVERRIDE {
@@ -276,7 +282,9 @@ class RegionSpace FINAL : public ContinuousMemMapAllocSpace {
   }
 
   void RecordAlloc(mirror::Object* ref) REQUIRES(!region_lock_);
-  bool AllocNewTlab(Thread* self, size_t min_bytes) REQUIRES(!region_lock_);
+
+  bool AllocNewTlab(Thread* self, const size_t tlab_size, size_t* bytes_tl_bulk_allocated)
+      REQUIRES(!region_lock_);
 
   uint32_t Time() {
     return time_;
@@ -480,10 +488,9 @@ class RegionSpace FINAL : public ContinuousMemMapAllocSpace {
 
     void RecordThreadLocalAllocations(size_t num_objects, size_t num_bytes) {
       DCHECK(IsAllocated());
-      DCHECK_EQ(objects_allocated_.LoadRelaxed(), 0U);
       DCHECK_EQ(Top(), end_);
-      objects_allocated_.StoreRelaxed(num_objects);
-      top_.StoreRelaxed(begin_ + num_bytes);
+      objects_allocated_.fetch_add(num_objects, std::memory_order_relaxed);
+      top_.store(begin_ + num_bytes, std::memory_order_relaxed);
       DCHECK_LE(Top(), end_);
     }
 
@@ -570,6 +577,7 @@ class RegionSpace FINAL : public ContinuousMemMapAllocSpace {
   }
 
   Region* AllocateRegion(bool for_evac) REQUIRES(region_lock_);
+  void RevokeThreadLocalBuffersLocked(Thread* thread, bool reuse) REQUIRES(region_lock_);
 
   Mutex region_lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
 
@@ -589,6 +597,9 @@ class RegionSpace FINAL : public ContinuousMemMapAllocSpace {
   // The pointer to the region array.
   std::unique_ptr<Region[]> regions_ GUARDED_BY(region_lock_);
 
+  // To hold partially used TLABs which can be reassigned to threads later for
+  // utilizing the un-used portion.
+  std::multimap<size_t, Region*, std::greater<size_t>> partial_tlabs_ GUARDED_BY(region_lock_);
   // The upper-bound index of the non-free regions. Used to avoid scanning all regions in
   // RegionSpace::SetFromSpace and RegionSpace::ClearFromSpace.
   //
