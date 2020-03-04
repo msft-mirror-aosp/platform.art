@@ -4136,7 +4136,7 @@ class Heap::TriggerPostForkCCGcTask : public HeapTask {
 void Heap::PostForkChildAction(Thread* self) {
   // Temporarily increase max_allowed_footprint_ and concurrent_start_bytes_ to
   // max values to avoid GC during app launch.
-  if (collector_type_ == kCollectorTypeCC && !IsLowMemoryMode()) {
+  if (collector_type_ == kCollectorTypeCC) {
     // Set max_allowed_footprint_ to the largest allowed value.
     SetIdealFootprint(growth_limit_);
     // Set concurrent_start_bytes_ to half of the heap size.
