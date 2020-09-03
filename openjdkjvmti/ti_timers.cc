@@ -51,7 +51,7 @@ jvmtiError TimerUtil::GetAvailableProcessors(jvmtiEnv* env ATTRIBUTE_UNUSED,
     return ERR(NULL_POINTER);
   }
 
-  *processor_count_ptr = static_cast<jint>(sysconf(_SC_NPROCESSORS_CONF));
+  *processor_count_ptr = static_cast<jint>(sysconf(_SC_NPROCESSORS_ONLN));
 
   return ERR(NONE);
 }
