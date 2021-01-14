@@ -59,6 +59,7 @@
   V(MemoryPeekByteArray, "void libcore.io.Memory.peekByteArray(long, byte[], int, int)") \
   V(MethodInvoke, "java.lang.Object java.lang.reflect.Method.invoke(java.lang.Object, java.lang.Object[])") \
   V(ReferenceGetReferent, "java.lang.Object java.lang.ref.Reference.getReferent()") \
+  V(ReferenceRefersTo, "boolean java.lang.ref.Reference.refersTo(java.lang.Object)") \
   V(RuntimeAvailableProcessors, "int java.lang.Runtime.availableProcessors()") \
   V(StringGetCharsNoCheck, "void java.lang.String.getCharsNoCheck(int, int, char[], int)") \
   V(StringCharAt, "char java.lang.String.charAt(int)") \
