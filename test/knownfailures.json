@@ -1373,5 +1373,55 @@
         "variant": "gcstress & debuggable & debug & host",
         "bug": "b/149708943",
         "description": ["Timeouts."]
+    },
+    {
+        "tests": ["003-omnibus-opcodes",
+                  "051-thread",
+                  "427-bounds",
+                  "570-checker-osr-locals",
+                  "597-app-images-same-classloader",
+                  "724-invoke-super-npe",
+                  "725-imt-conflict-object",
+                  "952-invoke-custom",
+                  "960-default-smali",
+                  "966-default-conflict",
+                  "990-field-trace",
+                  "2034-spaces-in-SimpleName"],
+        "variant": "jvm",
+        "bug": "b/154802847",
+        "description": ["Failing on RI. Needs further investigating."]
+    },
+    {
+        "tests": ["122-npe", "160-read-barrier-stress"],
+        "variant": "jvm",
+        "description": ["Reference.refersTo() not supported on old version of RI."]
+    },
+    {
+        "tests": ["2232-write-metrics-to-log"],
+        "variant": "jvm",
+        "description": ["RI does not support ART metrics."]
+    },
+    {
+        "tests": ["2232-write-metrics-to-log"],
+        "variant": "target",
+        "description": ["Checks LOG_STREAM output, which cannot be captured on target."]
+    },
+    {
+        "tests": ["053-wait-some"],
+        "env_vars": {"ART_TEST_DEBUG_GC": "true"},
+        "bug": "b/175435088",
+        "description": ["Test is time-sensitive and fails on debug-gc configuration."]
+    },
+    {
+        "tests": ["053-wait-some"],
+        "variant": "gcstress | interp-ac",
+        "bug": "b/175435088",
+        "description": ["Test is time-sensitive and fails on gcstress and",
+                        "interpreter-access-checks configurations."]
+    },
+    {
+        "tests": ["821-madvise-willneed"],
+        "variant": "jvm",
+        "description": ["Adding custom madvise flags. Not to be tested on default jvm"]
     }
 ]
