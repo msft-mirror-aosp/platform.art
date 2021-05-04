@@ -326,6 +326,9 @@ LOCAL_REQUIRED_MODULES += art_apex_boot_integrity
 # Clear locally used variable.
 art_target_include_debug_build :=
 
+LOCAL_LICENSE_KINDS := SPDX-license-identifier-Apache-2.0 SPDX-license-identifier-BSD SPDX-license-identifier-GPL-2.0
+LOCAL_LICENSE_CONDITIONS := notice restricted
+LOCAL_NOTICE_FILE := $(LOCAL_PATH)/NOTICE
 include $(BUILD_PHONY_PACKAGE)
 
 include $(CLEAR_VARS)
@@ -334,6 +337,9 @@ LOCAL_IS_HOST_MODULE := true
 ifneq ($(HOST_OS),darwin)
   LOCAL_REQUIRED_MODULES += $(APEX_TEST_MODULE)
 endif
+LOCAL_LICENSE_KINDS := SPDX-license-identifier-Apache-2.0 SPDX-license-identifier-BSD SPDX-license-identifier-GPL-2.0
+LOCAL_LICENSE_CONDITIONS := notice restricted
+LOCAL_NOTICE_FILE := $(LOCAL_PATH)/NOTICE
 include $(BUILD_PHONY_PACKAGE)
 
 # Create canonical name -> file name symlink in the symbol directory
@@ -410,6 +416,9 @@ LOCAL_REQUIRED_MODULES += \
 endif
 endif
 
+LOCAL_LICENSE_KINDS := SPDX-license-identifier-Apache-2.0 SPDX-license-identifier-BSD SPDX-license-identifier-GPL-2.0
+LOCAL_LICENSE_CONDITIONS := notice restricted
+LOCAL_NOTICE_FILE := $(LOCAL_PATH)/NOTICE
 include $(BUILD_PHONY_PACKAGE)
 
 # The art-tools package depends on helpers and tools that are useful for developers. Similar
@@ -434,6 +443,9 @@ LOCAL_REQUIRED_MODULES += \
 
 endif
 
+LOCAL_LICENSE_KINDS := SPDX-license-identifier-Apache-2.0 SPDX-license-identifier-BSD SPDX-license-identifier-GPL-2.0
+LOCAL_LICENSE_CONDITIONS := notice restricted
+LOCAL_NOTICE_FILE := $(LOCAL_PATH)/NOTICE
 include $(BUILD_PHONY_PACKAGE)
 
 ####################################################################################################
@@ -453,6 +465,9 @@ LOCAL_MODULE := art-libartd-libopenjdkd-host-dependency
 LOCAL_MULTILIB := both
 LOCAL_REQUIRED_MODULES := libopenjdkd
 LOCAL_IS_HOST_MODULE := true
+LOCAL_LICENSE_KINDS := SPDX-license-identifier-Apache-2.0 SPDX-license-identifier-BSD SPDX-license-identifier-GPL-2.0
+LOCAL_LICENSE_CONDITIONS := notice restricted
+LOCAL_NOTICE_FILE := $(LOCAL_PATH)/NOTICE
 include $(BUILD_PHONY_PACKAGE)
 endif
 
@@ -462,6 +477,9 @@ include $(CLEAR_VARS)
 LOCAL_MODULE := art-libartd-libopenjdkd-target-dependency
 LOCAL_MULTILIB := both
 LOCAL_REQUIRED_MODULES := libopenjdkd
+LOCAL_LICENSE_KINDS := SPDX-license-identifier-Apache-2.0 SPDX-license-identifier-BSD SPDX-license-identifier-GPL-2.0
+LOCAL_LICENSE_CONDITIONS := notice restricted
+LOCAL_NOTICE_FILE := $(LOCAL_PATH)/NOTICE
 include $(BUILD_PHONY_PACKAGE)
 endif
 
