@@ -46,6 +46,8 @@ enum class StringCompressionFlag : uint32_t {
 // C++ mirror of java.lang.String
 class MANAGED String final : public Object {
  public:
+  MIRROR_CLASS("Ljava/lang/String;");
+
   // Size of java.lang.String.class.
   static uint32_t ClassSize(PointerSize pointer_size);
 
@@ -148,9 +150,7 @@ class MANAGED String final : public Object {
                                                        gc::AllocatorType allocator_type)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
 
-  static ObjPtr<String> AllocFromStrings(Thread* self,
-                                         Handle<String> string,
-                                         Handle<String> string2)
+  static ObjPtr<String> DoConcat(Thread* self, Handle<String> h_this, Handle<String> h_arg)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
 
   static ObjPtr<String> AllocFromUtf16(Thread* self,
