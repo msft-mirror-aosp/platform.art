@@ -27,8 +27,6 @@ class MyClassNatives {
     // Normal native
     native void throwException();
     // Normal native
-    synchronized native void synchronizedThrowException();
-    // Normal native
     native void foo();
     // Normal native
     native int bar(int count);

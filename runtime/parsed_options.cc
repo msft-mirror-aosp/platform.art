@@ -112,18 +112,6 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
       .Define("-Xbootclasspath:_")
           .WithType<ParseStringList<':'>>()  // std::vector<std::string>, split by :
           .IntoKey(M::BootClassPath)
-      .Define("-Xbootclasspathfds:_")
-          .WithType<ParseIntList<':'>>()
-          .IntoKey(M::BootClassPathFds)
-      .Define("-Xbootclasspathimagefds:_")
-          .WithType<ParseIntList<':'>>()
-          .IntoKey(M::BootClassPathImageFds)
-      .Define("-Xbootclasspathvdexfds:_")
-          .WithType<ParseIntList<':'>>()
-          .IntoKey(M::BootClassPathVdexFds)
-      .Define("-Xbootclasspathoatfds:_")
-          .WithType<ParseIntList<':'>>()
-          .IntoKey(M::BootClassPathOatFds)
       .Define("-Xcheck:jni")
           .IntoKey(M::CheckJni)
       .Define("-Xms_")
@@ -176,13 +164,11 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
           .IntoKey(M::ProfileClock)
       .Define("-Xjitthreshold:_")
           .WithType<unsigned int>()
-          .IntoKey(M::JITOptimizeThreshold)
+          .IntoKey(M::JITCompileThreshold)
       .SetCategory("ART")
       .Define("-Ximage:_")
-          .WithType<ParseStringList<':'>>()
+          .WithType<std::string>()
           .IntoKey(M::Image)
-      .Define("-Xforcejitzygote")
-          .IntoKey(M::ForceJitZygote)
       .Define("-Xprimaryzygote")
           .IntoKey(M::PrimaryZygote)
       .Define("-Xbootclasspath-locations:_")
@@ -274,6 +260,9 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
       .Define("-Xjitwarmupthreshold:_")
           .WithType<unsigned int>()
           .IntoKey(M::JITWarmupThreshold)
+      .Define("-Xjitosrthreshold:_")
+          .WithType<unsigned int>()
+          .IntoKey(M::JITOsrThreshold)
       .Define("-Xjitprithreadweight:_")
           .WithType<unsigned int>()
           .IntoKey(M::JITPriorityThreadWeight)
@@ -474,7 +463,7 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
           "-Xverifyopt:_", "-Xcheckdexsum", "-Xincludeselectedop", "-Xjitop:_",
           "-Xincludeselectedmethod",
           "-Xjitblocking", "-Xjitmethod:_", "-Xjitclass:_", "-Xjitoffset:_",
-          "-Xjitosrthreshold:_", "-Xjitconfig:_", "-Xjitcheckcg", "-Xjitverbose", "-Xjitprofile",
+          "-Xjitconfig:_", "-Xjitcheckcg", "-Xjitverbose", "-Xjitprofile",
           "-Xjitdisableopt", "-Xjitsuspendpoll", "-XX:mainThreadStackSize=_"})
       .IgnoreUnrecognized(ignore_unrecognized)
       .OrderCategories({"standard", "extended", "Dalvik", "ART"});
@@ -698,8 +687,17 @@ bool ParsedOptions::DoParse(const RuntimeOptions& options,
     // If not set, background collector type defaults to homogeneous compaction.
     // If not low memory mode, semispace otherwise.
 
-    gc::CollectorType background_collector_type_ = args.GetOrDefault(M::BackgroundGc);
+    gc::CollectorType background_collector_type_;
+    gc::CollectorType collector_type_ = (XGcOption{}).collector_type_;
     bool low_memory_mode_ = args.Exists(M::LowMemoryMode);
+
+    background_collector_type_ = args.GetOrDefault(M::BackgroundGc);
+    {
+      XGcOption* xgc = args.Get(M::GcOption);
+      if (xgc != nullptr && xgc->collector_type_ != gc::kCollectorTypeNone) {
+        collector_type_ = xgc->collector_type_;
+      }
+    }
 
     if (background_collector_type_ == gc::kCollectorTypeNone) {
       background_collector_type_ = low_memory_mode_ ?
@@ -726,35 +724,17 @@ bool ParsedOptions::DoParse(const RuntimeOptions& options,
     }
   }
 
-  if (args.Exists(M::ForceJitZygote)) {
-    if (args.Exists(M::Image)) {
-      Usage("-Ximage and -Xforcejitzygote cannot be specified together\n");
-      Exit(0);
-    }
-    // If `boot.art` exists in the ART APEX, it will be used. Otherwise, Everything will be JITed.
-    args.Set(M::Image,
-             ParseStringList<':'>{{"boot.art!/apex/com.android.art/etc/boot-image.prof",
-                                   "/nonx/boot-framework.art!/system/etc/boot-image.prof"}});
-  }
-
   if (!args.Exists(M::CompilerCallbacksPtr) && !args.Exists(M::Image)) {
     const bool deny_art_apex_data_files = args.Exists(M::DenyArtApexDataFiles);
-    std::string image_locations =
+    std::string image =
         GetDefaultBootImageLocation(GetAndroidRoot(), deny_art_apex_data_files);
-    args.Set(M::Image, ParseStringList<':'>::Split(image_locations));
+    args.Set(M::Image, image);
   }
 
   // 0 means no growth limit, and growth limit should be always <= heap size
   if (args.GetOrDefault(M::HeapGrowthLimit) <= 0u ||
       args.GetOrDefault(M::HeapGrowthLimit) > args.GetOrDefault(M::MemoryMaximumSize)) {
     args.Set(M::HeapGrowthLimit, args.GetOrDefault(M::MemoryMaximumSize));
-  }
-
-  // Increase log thresholds for GC stress mode to avoid excessive log spam.
-  if (args.GetOrDefault(M::GcOption).gcstress_) {
-    args.SetIfMissing(M::AlwaysLogExplicitGcs, false);
-    args.SetIfMissing(M::LongPauseLogThreshold, gc::Heap::kDefaultLongPauseLogThresholdGcStress);
-    args.SetIfMissing(M::LongGCLogThreshold, gc::Heap::kDefaultLongGCLogThresholdGcStress);
   }
 
   *runtime_options = std::move(args);

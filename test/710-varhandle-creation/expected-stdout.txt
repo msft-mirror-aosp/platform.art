@@ -4,5 +4,3 @@ LookupCheckA...PASS
 LookupCheckB...PASS
 UnreflectCheck...PASS
 LookupCheckC...PASS
-Initial value of UnloadTest.i: 42
-Final value of UnloadTest.i: 42

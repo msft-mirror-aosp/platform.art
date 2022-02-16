@@ -109,40 +109,38 @@ static constexpr uint8_t ToJdwpThreadStatus(ThreadState state) {
     TS_WAIT     = 4,  // (in Object.wait())
   };
   switch (state) {
-    case ThreadState::kBlocked:
+    case kBlocked:
       return TS_MONITOR;
-    case ThreadState::kNative:
-    case ThreadState::kRunnable:
-    case ThreadState::kSuspended:
+    case kNative:
+    case kRunnable:
+    case kSuspended:
       return TS_RUNNING;
-    case ThreadState::kObsoleteRunnable:
-      break;  // Obsolete value.
-    case ThreadState::kSleeping:
+    case kSleeping:
       return TS_SLEEPING;
-    case ThreadState::kStarting:
-    case ThreadState::kTerminated:
+    case kStarting:
+    case kTerminated:
       return TS_ZOMBIE;
-    case ThreadState::kTimedWaiting:
-    case ThreadState::kWaitingForTaskProcessor:
-    case ThreadState::kWaitingForLockInflation:
-    case ThreadState::kWaitingForCheckPointsToRun:
-    case ThreadState::kWaitingForDebuggerSend:
-    case ThreadState::kWaitingForDebuggerSuspension:
-    case ThreadState::kWaitingForDebuggerToAttach:
-    case ThreadState::kWaitingForDeoptimization:
-    case ThreadState::kWaitingForGcToComplete:
-    case ThreadState::kWaitingForGetObjectsAllocated:
-    case ThreadState::kWaitingForJniOnLoad:
-    case ThreadState::kWaitingForMethodTracingStart:
-    case ThreadState::kWaitingForSignalCatcherOutput:
-    case ThreadState::kWaitingForVisitObjects:
-    case ThreadState::kWaitingInMainDebuggerLoop:
-    case ThreadState::kWaitingInMainSignalCatcherLoop:
-    case ThreadState::kWaitingPerformingGc:
-    case ThreadState::kWaitingWeakGcRootRead:
-    case ThreadState::kWaitingForGcThreadFlip:
-    case ThreadState::kNativeForAbort:
-    case ThreadState::kWaiting:
+    case kTimedWaiting:
+    case kWaitingForTaskProcessor:
+    case kWaitingForLockInflation:
+    case kWaitingForCheckPointsToRun:
+    case kWaitingForDebuggerSend:
+    case kWaitingForDebuggerSuspension:
+    case kWaitingForDebuggerToAttach:
+    case kWaitingForDeoptimization:
+    case kWaitingForGcToComplete:
+    case kWaitingForGetObjectsAllocated:
+    case kWaitingForJniOnLoad:
+    case kWaitingForMethodTracingStart:
+    case kWaitingForSignalCatcherOutput:
+    case kWaitingForVisitObjects:
+    case kWaitingInMainDebuggerLoop:
+    case kWaitingInMainSignalCatcherLoop:
+    case kWaitingPerformingGc:
+    case kWaitingWeakGcRootRead:
+    case kWaitingForGcThreadFlip:
+    case kNativeForAbort:
+    case kWaiting:
       return TS_WAIT;
       // Don't add a 'default' here so the compiler can spot incompatible enum changes.
   }

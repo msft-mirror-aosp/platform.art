@@ -25,11 +25,8 @@
 namespace art {
 namespace x86 {
 
-static constexpr ManagedRegister kManagedCoreArgumentRegisters[] = {
-    X86ManagedRegister::FromCpuRegister(EAX),
-    X86ManagedRegister::FromCpuRegister(ECX),
-    X86ManagedRegister::FromCpuRegister(EDX),
-    X86ManagedRegister::FromCpuRegister(EBX),
+static constexpr Register kManagedCoreArgumentRegisters[] = {
+    EAX, ECX, EDX, EBX
 };
 static constexpr size_t kManagedCoreArgumentRegistersCount =
     arraysize(kManagedCoreArgumentRegisters);
@@ -74,39 +71,15 @@ static constexpr uint32_t kNativeFpCalleeSpillMask = 0u;
 
 // Calling convention
 
-ArrayRef<const ManagedRegister> X86JniCallingConvention::CalleeSaveScratchRegisters() const {
-  DCHECK(!IsCriticalNative());
-  // All managed callee-save registers are available.
-  static_assert((kCoreCalleeSpillMask & ~kNativeCoreCalleeSpillMask) == 0u);
-  static_assert(kFpCalleeSpillMask == 0u);
-  return ArrayRef<const ManagedRegister>(kCalleeSaveRegisters);
+ManagedRegister X86JniCallingConvention::SavedLocalReferenceCookieRegister() const {
+  // The EBP is callee-save register in both managed and native ABIs.
+  // It is saved in the stack frame and it has no special purpose like `tr` on arm/arm64.
+  static_assert((kCoreCalleeSpillMask & (1u << EBP)) != 0u);  // Managed callee save register.
+  return X86ManagedRegister::FromCpuRegister(EBP);
 }
 
-ArrayRef<const ManagedRegister> X86JniCallingConvention::ArgumentScratchRegisters() const {
-  DCHECK(!IsCriticalNative());
-  // Exclude EAX or EAX/EDX if they are used as return registers.
-  // Due to the odd ordering of argument registers, use a re-ordered array (pull EDX forward).
-  static constexpr ManagedRegister kArgumentRegisters[] = {
-      X86ManagedRegister::FromCpuRegister(EAX),
-      X86ManagedRegister::FromCpuRegister(EDX),
-      X86ManagedRegister::FromCpuRegister(ECX),
-      X86ManagedRegister::FromCpuRegister(EBX),
-  };
-  static_assert(arraysize(kArgumentRegisters) == kManagedCoreArgumentRegistersCount);
-  static_assert(kManagedCoreArgumentRegisters[0].Equals(kArgumentRegisters[0]));
-  static_assert(kManagedCoreArgumentRegisters[1].Equals(kArgumentRegisters[2]));
-  static_assert(kManagedCoreArgumentRegisters[2].Equals(kArgumentRegisters[1]));
-  static_assert(kManagedCoreArgumentRegisters[3].Equals(kArgumentRegisters[3]));
-  ArrayRef<const ManagedRegister> scratch_regs(kArgumentRegisters);
-  X86ManagedRegister return_reg = ReturnRegister().AsX86();
-  auto return_reg_overlaps = [return_reg](ManagedRegister reg) {
-    return return_reg.Overlaps(reg.AsX86());
-  };
-  if (return_reg_overlaps(scratch_regs[0])) {
-    scratch_regs = scratch_regs.SubArray(/*pos=*/ return_reg_overlaps(scratch_regs[1]) ? 2u : 1u);
-  }
-  DCHECK(std::none_of(scratch_regs.begin(), scratch_regs.end(), return_reg_overlaps));
-  return scratch_regs;
+ManagedRegister X86JniCallingConvention::ReturnScratchRegister() const {
+  return ManagedRegister::NoRegister();  // No free regs, so assembler uses push/pop
 }
 
 static ManagedRegister ReturnRegisterForShorty(const char* shorty, bool jni) {
@@ -125,15 +98,15 @@ static ManagedRegister ReturnRegisterForShorty(const char* shorty, bool jni) {
   }
 }
 
-ManagedRegister X86ManagedRuntimeCallingConvention::ReturnRegister() const {
+ManagedRegister X86ManagedRuntimeCallingConvention::ReturnRegister() {
   return ReturnRegisterForShorty(GetShorty(), false);
 }
 
-ManagedRegister X86JniCallingConvention::ReturnRegister() const {
+ManagedRegister X86JniCallingConvention::ReturnRegister() {
   return ReturnRegisterForShorty(GetShorty(), true);
 }
 
-ManagedRegister X86JniCallingConvention::IntReturnRegister() const {
+ManagedRegister X86JniCallingConvention::IntReturnRegister() {
   return X86ManagedRegister::FromCpuRegister(EAX);
 }
 
@@ -179,19 +152,20 @@ ManagedRegister X86ManagedRuntimeCallingConvention::CurrentParamRegister() {
     if (IsCurrentParamALong()) {
       switch (gpr_arg_count_) {
         case 1:
-          static_assert(kManagedCoreArgumentRegisters[1].AsX86().AsCpuRegister() == ECX);
-          static_assert(kManagedCoreArgumentRegisters[2].AsX86().AsCpuRegister() == EDX);
+          static_assert(kManagedCoreArgumentRegisters[1] == ECX);
+          static_assert(kManagedCoreArgumentRegisters[2] == EDX);
           return X86ManagedRegister::FromRegisterPair(ECX_EDX);
         case 2:
-          static_assert(kManagedCoreArgumentRegisters[2].AsX86().AsCpuRegister() == EDX);
-          static_assert(kManagedCoreArgumentRegisters[3].AsX86().AsCpuRegister() == EBX);
+          static_assert(kManagedCoreArgumentRegisters[2] == EDX);
+          static_assert(kManagedCoreArgumentRegisters[3] == EBX);
           return X86ManagedRegister::FromRegisterPair(EDX_EBX);
         default:
           LOG(FATAL) << "UNREACHABLE";
           UNREACHABLE();
       }
     } else {
-      return kManagedCoreArgumentRegisters[gpr_arg_count_];
+      Register core_reg = kManagedCoreArgumentRegisters[gpr_arg_count_];
+      return X86ManagedRegister::FromCpuRegister(core_reg);
     }
   }
 }
@@ -206,12 +180,10 @@ FrameOffset X86ManagedRuntimeCallingConvention::CurrentParamStackOffset() {
 
 X86JniCallingConvention::X86JniCallingConvention(bool is_static,
                                                  bool is_synchronized,
-                                                 bool is_fast_native,
                                                  bool is_critical_native,
                                                  const char* shorty)
     : JniCallingConvention(is_static,
                            is_synchronized,
-                           is_fast_native,
                            is_critical_native,
                            shorty,
                            kX86PointerSize) {
@@ -229,6 +201,7 @@ size_t X86JniCallingConvention::FrameSize() const {
   if (is_critical_native_) {
     CHECK(!SpillsMethod());
     CHECK(!HasLocalReferenceSegmentState());
+    CHECK(!SpillsReturnValue());
     return 0u;  // There is no managed frame for @CriticalNative.
   }
 
@@ -241,6 +214,19 @@ size_t X86JniCallingConvention::FrameSize() const {
 
   DCHECK(HasLocalReferenceSegmentState());
   // Cookie is saved in one of the spilled registers.
+
+  // Plus return value spill area size
+  if (SpillsReturnValue()) {
+    // For 64-bit return values there shall be a 4B alignment gap between
+    // the method pointer and the saved return value.
+    size_t padding = ReturnValueSaveLocation().SizeValue() - method_ptr_size;
+    DCHECK_EQ(padding,
+              (GetReturnType() == Primitive::kPrimLong || GetReturnType() == Primitive::kPrimDouble)
+                  ? 4u
+                  : 0u);
+    total_size += padding;
+    total_size += SizeOfReturnValue();
+  }
 
   return RoundUp(total_size, kStackAlignment);
 }
@@ -307,15 +293,6 @@ ManagedRegister X86JniCallingConvention::CurrentParamRegister() {
 FrameOffset X86JniCallingConvention::CurrentParamStackOffset() {
   return
       FrameOffset(displacement_.Int32Value() - OutFrameSize() + (itr_slots_ * kFramePointerSize));
-}
-
-ManagedRegister X86JniCallingConvention::LockingArgumentRegister() const {
-  DCHECK(!IsFastNative());
-  DCHECK(!IsCriticalNative());
-  DCHECK(IsSynchronized());
-  // The callee-save register is EBP is suitable as a locking argument.
-  static_assert(kCalleeSaveRegisters[0].Equals(X86ManagedRegister::FromCpuRegister(EBP)));
-  return X86ManagedRegister::FromCpuRegister(EBP);
 }
 
 ManagedRegister X86JniCallingConvention::HiddenArgumentRegister() const {

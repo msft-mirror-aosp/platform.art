@@ -72,7 +72,6 @@
 #include "mirror/object_array-alloc-inl.h"
 #include "mirror/object_array-inl.h"
 #include "mirror/string-inl.h"
-#include "mirror/var_handle.h"
 #include "nterp_helpers.h"
 #include "oat.h"
 #include "oat_file.h"
@@ -956,7 +955,7 @@ bool ImageWriter::PruneImageClassInternal(
     result = true;
   } else {
     ObjPtr<mirror::ClassExt> ext(klass->GetExtData());
-    CHECK(ext.IsNull() || ext->GetErroneousStateError() == nullptr) << klass->PrettyClass();
+    CHECK(ext.IsNull() || ext->GetVerifyError() == nullptr) << klass->PrettyClass();
   }
   if (!result) {
     // Check interfaces since these wont be visited through VisitReferences.)
@@ -1114,6 +1113,49 @@ void ImageWriter::VisitClassLoaders(ClassLoaderVisitor* visitor) {
   Runtime::Current()->GetClassLinker()->VisitClassLoaders(visitor);
 }
 
+void ImageWriter::ClearDexCache(ObjPtr<mirror::DexCache> dex_cache) {
+  // Clear methods.
+  mirror::MethodDexCacheType* resolved_methods = dex_cache->GetResolvedMethods();
+  for (size_t slot_idx = 0, num = dex_cache->NumResolvedMethods(); slot_idx != num; ++slot_idx) {
+    mirror::MethodDexCachePair invalid(nullptr,
+                                       mirror::MethodDexCachePair::InvalidIndexForSlot(slot_idx));
+    mirror::DexCache::SetNativePair(resolved_methods, slot_idx, invalid);
+  }
+  // Clear fields.
+  mirror::FieldDexCacheType* resolved_fields = dex_cache->GetResolvedFields();
+  for (size_t slot_idx = 0, num = dex_cache->NumResolvedFields(); slot_idx != num; ++slot_idx) {
+    mirror::FieldDexCachePair invalid(nullptr,
+                                      mirror::FieldDexCachePair::InvalidIndexForSlot(slot_idx));
+    mirror::DexCache::SetNativePair(resolved_fields, slot_idx, invalid);
+  }
+  // Clear types.
+  mirror::TypeDexCacheType* resolved_types = dex_cache->GetResolvedTypes();
+  for (size_t slot_idx = 0, num = dex_cache->NumResolvedTypes(); slot_idx != num; ++slot_idx) {
+    mirror::TypeDexCachePair invalid(nullptr,
+                                     mirror::TypeDexCachePair::InvalidIndexForSlot(slot_idx));
+    resolved_types[slot_idx].store(invalid, std::memory_order_relaxed);
+  }
+  // Clear strings.
+  mirror::StringDexCacheType* resolved_strings = dex_cache->GetStrings();
+  for (size_t slot_idx = 0, num = dex_cache->NumStrings(); slot_idx != num; ++slot_idx) {
+    mirror::StringDexCachePair invalid(nullptr,
+                                       mirror::StringDexCachePair::InvalidIndexForSlot(slot_idx));
+    resolved_strings[slot_idx].store(invalid, std::memory_order_relaxed);
+  }
+  // Clear method types.
+  mirror::MethodTypeDexCacheType* resolved_method_types = dex_cache->GetResolvedMethodTypes();
+  size_t num_resolved_method_types = dex_cache->NumResolvedMethodTypes();
+  for (size_t slot_idx = 0; slot_idx != num_resolved_method_types; ++slot_idx) {
+    mirror::MethodTypeDexCachePair invalid(
+        nullptr, mirror::MethodTypeDexCachePair::InvalidIndexForSlot(slot_idx));
+    resolved_method_types[slot_idx].store(invalid, std::memory_order_relaxed);
+  }
+  // Clear call sites.
+  std::fill_n(dex_cache->GetResolvedCallSites(),
+              dex_cache->NumResolvedCallSites(),
+              GcRoot<mirror::CallSite>(nullptr));
+}
+
 void ImageWriter::PruneNonImageClasses() {
   Runtime* runtime = Runtime::Current();
   ClassLinker* class_linker = runtime->GetClassLinker();
@@ -1147,7 +1189,7 @@ void ImageWriter::PruneNonImageClasses() {
   // Completely clear DexCaches.
   std::vector<ObjPtr<mirror::DexCache>> dex_caches = FindDexCaches(self);
   for (ObjPtr<mirror::DexCache> dex_cache : dex_caches) {
-    dex_cache->ResetNativeArrays();
+    ClearDexCache(dex_cache);
   }
 
   // Drop the array class cache in the ClassLinker, as these are roots holding those classes live.
@@ -1162,8 +1204,7 @@ std::vector<ObjPtr<mirror::DexCache>> ImageWriter::FindDexCaches(Thread* self) {
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
   ReaderMutexLock mu2(self, *Locks::dex_lock_);
   dex_caches.reserve(class_linker->GetDexCachesData().size());
-  for (const auto& entry : class_linker->GetDexCachesData()) {
-    const ClassLinker::DexCacheData& data = entry.second;
+  for (const ClassLinker::DexCacheData& data : class_linker->GetDexCachesData()) {
     if (self->IsJWeakCleared(data.weak_root)) {
       continue;
     }
@@ -1214,8 +1255,7 @@ ObjPtr<mirror::ObjectArray<mirror::Object>> ImageWriter::CollectDexCaches(Thread
   {
     ReaderMutexLock mu(self, *Locks::dex_lock_);
     // Count number of dex caches not in the boot image.
-    for (const auto& entry : class_linker->GetDexCachesData()) {
-      const ClassLinker::DexCacheData& data = entry.second;
+    for (const ClassLinker::DexCacheData& data : class_linker->GetDexCachesData()) {
       ObjPtr<mirror::DexCache> dex_cache =
           ObjPtr<mirror::DexCache>::DownCast(self->DecodeJObject(data.weak_root));
       if (dex_cache == nullptr) {
@@ -1232,10 +1272,23 @@ ObjPtr<mirror::ObjectArray<mirror::Object>> ImageWriter::CollectDexCaches(Thread
   CHECK(dex_caches != nullptr) << "Failed to allocate a dex cache array.";
   {
     ReaderMutexLock mu(self, *Locks::dex_lock_);
-    // Collect all dex caches (and sort them by registration index to make output deterministic).
-    std::map<uint64_t, ObjPtr<mirror::DexCache>> non_image_dex_caches;
-    for (const auto& entry : class_linker->GetDexCachesData()) {
-      const ClassLinker::DexCacheData& data = entry.second;
+    size_t non_image_dex_caches = 0;
+    // Re-count number of non image dex caches.
+    for (const ClassLinker::DexCacheData& data : class_linker->GetDexCachesData()) {
+      ObjPtr<mirror::DexCache> dex_cache =
+          ObjPtr<mirror::DexCache>::DownCast(self->DecodeJObject(data.weak_root));
+      if (dex_cache == nullptr) {
+        continue;
+      }
+      const DexFile* dex_file = dex_cache->GetDexFile();
+      if (IsImageDexCache(dex_cache)) {
+        non_image_dex_caches += image_dex_files.find(dex_file) != image_dex_files.end() ? 1u : 0u;
+      }
+    }
+    CHECK_EQ(dex_cache_count, non_image_dex_caches)
+        << "The number of non-image dex caches changed.";
+    size_t i = 0;
+    for (const ClassLinker::DexCacheData& data : class_linker->GetDexCachesData()) {
       ObjPtr<mirror::DexCache> dex_cache =
           ObjPtr<mirror::DexCache>::DownCast(self->DecodeJObject(data.weak_root));
       if (dex_cache == nullptr) {
@@ -1244,16 +1297,9 @@ ObjPtr<mirror::ObjectArray<mirror::Object>> ImageWriter::CollectDexCaches(Thread
       const DexFile* dex_file = dex_cache->GetDexFile();
       if (IsImageDexCache(dex_cache) &&
           image_dex_files.find(dex_file) != image_dex_files.end()) {
-        bool inserted = non_image_dex_caches.emplace(data.registration_index, dex_cache).second;
-        CHECK(inserted);
+        dex_caches->Set<false>(i, dex_cache.Ptr());
+        ++i;
       }
-    }
-    CHECK_EQ(dex_cache_count, non_image_dex_caches.size())
-        << "The number of non-image dex caches changed.";
-    // Write the dex caches to the output array (in registration order).
-    size_t i = 0;
-    for (const auto& entry : non_image_dex_caches) {
-      dex_caches->Set<false>(i++, entry.second.Ptr());
     }
   }
   return dex_caches;
@@ -2055,8 +2101,7 @@ void ImageWriter::LayoutHelper::VerifyImageBinSlotsAssigned() {
     ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
     Thread* self = Thread::Current();
     ReaderMutexLock mu(self, *Locks::dex_lock_);
-    for (const auto& entry : class_linker->GetDexCachesData()) {
-      const ClassLinker::DexCacheData& data = entry.second;
+    for (const ClassLinker::DexCacheData& data : class_linker->GetDexCachesData()) {
       ObjPtr<mirror::DexCache> dex_cache =
           ObjPtr<mirror::DexCache>::DownCast(self->DecodeJObject(data.weak_root));
       if (dex_cache == nullptr ||
@@ -3032,19 +3077,6 @@ T* ImageWriter::NativeLocationInImage(T* obj) {
   }
 }
 
-ArtField* ImageWriter::NativeLocationInImage(ArtField* src_field) {
-  // Fields are not individually stored in the native relocation map. Use the field array.
-  ObjPtr<mirror::Class> declaring_class = src_field->GetDeclaringClass();
-  LengthPrefixedArray<ArtField>* src_fields =
-      src_field->IsStatic() ? declaring_class->GetSFieldsPtr() : declaring_class->GetIFieldsPtr();
-  DCHECK(src_fields != nullptr);
-  LengthPrefixedArray<ArtField>* dst_fields = NativeLocationInImage(src_fields);
-  DCHECK(dst_fields != nullptr);
-  size_t field_offset =
-      reinterpret_cast<uint8_t*>(src_field) - reinterpret_cast<uint8_t*>(src_fields);
-  return reinterpret_cast<ArtField*>(reinterpret_cast<uint8_t*>(dst_fields) + field_offset);
-}
-
 class ImageWriter::NativeLocationVisitor {
  public:
   explicit NativeLocationVisitor(ImageWriter* image_writer)
@@ -3115,25 +3147,17 @@ void ImageWriter::FixupObject(Object* orig, Object* copy) {
     ObjPtr<mirror::Class> klass = orig->GetClass();
     if (klass == GetClassRoot<mirror::Method>(class_roots) ||
         klass == GetClassRoot<mirror::Constructor>(class_roots)) {
-      // Need to update the ArtMethod.
+      // Need to go update the ArtMethod.
       auto* dest = down_cast<mirror::Executable*>(copy);
       auto* src = down_cast<mirror::Executable*>(orig);
       ArtMethod* src_method = src->GetArtMethod();
       CopyAndFixupPointer(dest, mirror::Executable::ArtMethodOffset(), src_method);
-    } else if (klass == GetClassRoot<mirror::FieldVarHandle>(class_roots) ||
-               klass == GetClassRoot<mirror::StaticFieldVarHandle>(class_roots)) {
-      // Need to update the ArtField.
-      auto* dest = down_cast<mirror::FieldVarHandle*>(copy);
-      auto* src = down_cast<mirror::FieldVarHandle*>(orig);
-      ArtField* src_field = src->GetArtField();
-      CopyAndFixupPointer(dest, mirror::FieldVarHandle::ArtFieldOffset(), src_field);
     } else if (klass == GetClassRoot<mirror::DexCache>(class_roots)) {
-      down_cast<mirror::DexCache*>(copy)->SetDexFile(nullptr);
-      down_cast<mirror::DexCache*>(copy)->ResetNativeArrays();
+      down_cast<mirror::DexCache*>(copy)->ResetNativeFields();
     } else if (klass->IsClassLoaderClass()) {
       mirror::ClassLoader* copy_loader = down_cast<mirror::ClassLoader*>(copy);
       // If src is a ClassLoader, set the class table to null so that it gets recreated by the
-      // ClassLinker.
+      // ClassLoader.
       copy_loader->SetClassTable(nullptr);
       // Also set allocator to null to be safe. The allocator is created when we create the class
       // table. We also never expect to unload things in the image since they are held live as
@@ -3501,36 +3525,30 @@ void ImageWriter::CopyAndFixupReference(DestType* dest, ObjPtr<mirror::Object> s
   dest->Assign(GetImageAddress(src.Ptr()));
 }
 
-template <typename ValueType>
-void ImageWriter::CopyAndFixupPointer(
-    void** target, ValueType src_value, PointerSize pointer_size) {
-  DCHECK(src_value != nullptr);
-  void* new_value = NativeLocationInImage(src_value);
-  DCHECK(new_value != nullptr);
+void ImageWriter::CopyAndFixupPointer(void** target, void* value, PointerSize pointer_size) {
+  void* new_value = NativeLocationInImage(value);
   if (pointer_size == PointerSize::k32) {
     *reinterpret_cast<uint32_t*>(target) = reinterpret_cast32<uint32_t>(new_value);
   } else {
     *reinterpret_cast<uint64_t*>(target) = reinterpret_cast64<uint64_t>(new_value);
   }
+  DCHECK(value != nullptr);
 }
 
-template <typename ValueType>
-void ImageWriter::CopyAndFixupPointer(void** target, ValueType src_value)
+void ImageWriter::CopyAndFixupPointer(void** target, void* value)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  CopyAndFixupPointer(target, src_value, target_ptr_size_);
+  CopyAndFixupPointer(target, value, target_ptr_size_);
 }
 
-template <typename ValueType>
 void ImageWriter::CopyAndFixupPointer(
-    void* object, MemberOffset offset, ValueType src_value, PointerSize pointer_size) {
+    void* object, MemberOffset offset, void* value, PointerSize pointer_size) {
   void** target =
       reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(object) + offset.Uint32Value());
-  return CopyAndFixupPointer(target, src_value, pointer_size);
+  return CopyAndFixupPointer(target, value, pointer_size);
 }
 
-template <typename ValueType>
-void ImageWriter::CopyAndFixupPointer(void* object, MemberOffset offset, ValueType src_value) {
-  return CopyAndFixupPointer(object, offset, src_value, target_ptr_size_);
+void ImageWriter::CopyAndFixupPointer(void* object, MemberOffset offset, void* value) {
+  return CopyAndFixupPointer(object, offset, value, target_ptr_size_);
 }
 
 }  // namespace linker

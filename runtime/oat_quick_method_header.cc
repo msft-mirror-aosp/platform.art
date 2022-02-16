@@ -19,6 +19,7 @@
 #include "arch/instruction_set.h"
 #include "art_method.h"
 #include "dex/dex_file_types.h"
+#include "interpreter/interpreter_mterp_impl.h"
 #include "interpreter/mterp/nterp.h"
 #include "nterp_helpers.h"
 #include "scoped_thread_state_change-inl.h"
@@ -92,9 +93,11 @@ static inline OatQuickMethodHeader* GetNterpMethodHeader() {
   if (!interpreter::IsNterpSupported()) {
     return nullptr;
   }
-  const void* nterp_entrypoint = interpreter::GetNterpEntryPoint();
-  uintptr_t nterp_code_pointer =
-      reinterpret_cast<uintptr_t>(EntryPointToCodePointer(nterp_entrypoint));
+  uintptr_t nterp_entrypoint = reinterpret_cast<uintptr_t>(interpreter::GetNterpEntryPoint());
+  uintptr_t nterp_code_pointer = (kRuntimeISA == InstructionSet::kArm)
+      // Remove the Thumb mode bit if present on ARM.
+      ? nterp_entrypoint & ~static_cast<uintptr_t>(1)
+      : nterp_entrypoint;
   return reinterpret_cast<OatQuickMethodHeader*>(nterp_code_pointer - sizeof(OatQuickMethodHeader));
 }
 

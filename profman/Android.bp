@@ -76,6 +76,7 @@ art_cc_library_static {
     host_supported: true,
     defaults: [
         "art_debug_defaults",
+        "art_defaults",
         "libartbased_static_defaults",
         "libdexfiled_static_defaults",
         "libprofiled_static_defaults",
@@ -193,7 +194,6 @@ art_cc_test {
         "art_standalone_gtest_defaults",
         "art_profman_tests_defaults",
     ],
-    data: [":generate-boot-image"],
     shared_libs: [
         "libprofile",
     ],

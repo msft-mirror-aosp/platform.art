@@ -425,11 +425,11 @@ class Location : public ValueObject {
     return PayloadField::Decode(value_);
   }
 
-  using KindField = BitField<Kind, 0, kBitsForKind>;
-  using PayloadField = BitField<uintptr_t, kBitsForKind, kBitsForPayload>;
+  typedef BitField<Kind, 0, kBitsForKind> KindField;
+  typedef BitField<uintptr_t, kBitsForKind, kBitsForPayload> PayloadField;
 
   // Layout for kUnallocated locations payload.
-  using PolicyField = BitField<Policy, 0, 3>;
+  typedef BitField<Policy, 0, 3> PolicyField;
 
   // Layout for stack slots.
   static const intptr_t kStackIndexBias =
@@ -605,17 +605,11 @@ class LocationSummary : public ArenaObject<kArenaAllocLocationSummary> {
   }
 
   bool CallsOnSlowPath() const {
-    return OnlyCallsOnSlowPath() || CallsOnMainAndSlowPath();
+    return call_kind_ == kCallOnSlowPath || call_kind_ == kCallOnMainAndSlowPath;
   }
 
   bool OnlyCallsOnSlowPath() const {
     return call_kind_ == kCallOnSlowPath;
-  }
-
-  bool NeedsSuspendCheckEntry() const {
-    // Slow path calls do not need a SuspendCheck at method entry since they go into the runtime,
-    // which we expect to either do a suspend check or return quickly.
-    return WillCall();
   }
 
   bool CallsOnMainAndSlowPath() const {

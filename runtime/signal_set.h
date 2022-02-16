@@ -21,7 +21,7 @@
 
 #include <android-base/logging.h>
 
-#if defined(__GLIBC__) || defined(ANDROID_HOST_MUSL)
+#if defined(__GLIBC__)
 #define sigset64_t sigset_t
 #define sigemptyset64 sigemptyset
 #define sigaddset64 sigaddset

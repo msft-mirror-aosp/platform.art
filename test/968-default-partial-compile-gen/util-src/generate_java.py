@@ -67,7 +67,8 @@ class Compiler:
     """
     args = args.split()
     files = list(map(str, files))
-    cmd = ['sh', '-a', '-e', '--', str(self.javac)] + args + sorted(files)
+    cmd = ['sh', '-a', '-e', '--', str(self.javac)] + args + files
+    print("Running compile command: {}".format(cmd))
     subprocess.check_call(cmd)
     print("Compiled {} files".format(len(files)))
 

@@ -399,9 +399,6 @@ class JitCodeCache {
     return shared_region_.IsInExecSpace(ptr);
   }
 
-  ProfilingInfo* GetProfilingInfo(ArtMethod* method, Thread* self);
-  void ResetHotnessCounter(ArtMethod* method, Thread* self);
-
  private:
   JitCodeCache();
 

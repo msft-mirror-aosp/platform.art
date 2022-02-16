@@ -27,6 +27,10 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.TimeoutException;
 
 public class Main {
+
+  // Workaround for b/18051191.
+  class InnerClass {}
+
   private static class HashCodeQuery implements Callable<Integer> {
     public HashCodeQuery(Object obj) {
       m_obj = obj;

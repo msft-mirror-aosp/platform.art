@@ -58,7 +58,6 @@ constexpr bool IsMirroredDescriptor(std::string_view desc) {
     vis("Ljava/lang/invoke/ByteBufferViewVarHandle;") \
     vis("Ljava/lang/invoke/CallSite;")                \
     vis("Ljava/lang/invoke/FieldVarHandle;")          \
-    vis("Ljava/lang/invoke/StaticFieldVarHandle;")    \
     vis("Ljava/lang/invoke/MethodHandle;")            \
     vis("Ljava/lang/invoke/MethodHandleImpl;")        \
     vis("Ljava/lang/invoke/MethodHandles$Lookup;")    \

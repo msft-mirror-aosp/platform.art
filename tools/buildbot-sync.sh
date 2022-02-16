@@ -18,25 +18,31 @@
 
 set -e
 
-. "$(dirname $0)/buildbot-utils.sh"
+if [ -t 1 ]; then
+  # Color sequences if terminal is a tty.
+  red='\033[0;31m'
+  green='\033[0;32m'
+  yellow='\033[0;33m'
+  magenta='\033[0;35m'
+  nc='\033[0m'
+fi
 
 # Setup as root, as some actions performed here require it.
 adb root
 adb wait-for-device
 
 if [[ -z "$ANDROID_BUILD_TOP" ]]; then
-  msgerror 'ANDROID_BUILD_TOP environment variable is empty; did you forget to run `lunch`?'
+  echo 'ANDROID_BUILD_TOP environment variable is empty; did you forget to run `lunch`?'
   exit 1
 fi
 
 if [[ -z "$ANDROID_PRODUCT_OUT" ]]; then
-  msgerror 'ANDROID_PRODUCT_OUT environment variable is empty; did you forget to run `lunch`?'
+  echo 'ANDROID_PRODUCT_OUT environment variable is empty; did you forget to run `lunch`?'
   exit 1
 fi
 
 if [[ -z "$ART_TEST_CHROOT" ]]; then
-  msgerror 'ART_TEST_CHROOT environment variable is empty; ' \
-      'please set it before running this script.'
+  echo 'ART_TEST_CHROOT environment variable is empty; please set it before running this script.'
   exit 1
 fi
 
@@ -52,7 +58,7 @@ fi
       # We sync the APEXes later.
       continue
     fi
-    msginfo "Syncing $dir directory..."
+    echo -e "${green}Syncing $dir directory...${nc}"
     adb shell mkdir -p "$ART_TEST_CHROOT/$dir"
     adb push $dir "$ART_TEST_CHROOT/$(dirname $dir)"
   done
@@ -77,28 +83,18 @@ activate_apex() {
   local src_apex=${1}
   local dst_apex=${2:-${src_apex}}
 
-  # Unpack the .apex or .capex file in the product directory, but if we already
-  # see a directory we assume buildbot-build.sh has already done it for us and
-  # just use it.
+  # Unpack the .apex file in the product directory, but if we already see a
+  # directory we assume buildbot-build.sh has already done it for us and just
+  # use it.
   src_apex_path=$ANDROID_PRODUCT_OUT/system/apex/${src_apex}
   if [ ! -d $src_apex_path ]; then
-    unset src_apex_file
-    if [ -f "${src_apex_path}.apex" ]; then
-      src_apex_file="${src_apex_path}.apex"
-    elif [ -f "${src_apex_path}.capex" ]; then
-      src_apex_file="${src_apex_path}.capex"
-    fi
-    if [ -z "${src_apex_file}" ]; then
-      msgerror "Failed to find .apex or .capex file to extract for ${src_apex_path}"
-      exit 1
-    fi
-    msginfo "Extracting APEX ${src_apex_file}..."
+    echo -e "${green}Extracting APEX ${src_apex}.apex...${nc}"
     mkdir -p $src_apex_path
     $ANDROID_HOST_OUT/bin/deapexer --debugfs_path $ANDROID_HOST_OUT/bin/debugfs_static \
-      extract ${src_apex_file} $src_apex_path
+      extract ${src_apex_path}.apex $src_apex_path
   fi
 
-  msginfo "Activating APEX ${src_apex} as ${dst_apex}..."
+  echo -e "${green}Activating APEX ${src_apex} as ${dst_apex}...${nc}"
   adb shell rm -rf "$ART_TEST_CHROOT/apex/${dst_apex}"
   adb push $src_apex_path "$ART_TEST_CHROOT/apex/${dst_apex}"
 }
@@ -110,20 +106,3 @@ activate_apex com.android.runtime
 activate_apex com.android.tzdata
 activate_apex com.android.conscrypt
 activate_apex com.android.os.statsd
-
-# Generate primary boot images on device for testing.
-for b in {32,64}; do
-  basename="generate-boot-image$b"
-  bin_on_host="$ANDROID_PRODUCT_OUT/system/bin/$basename"
-  bin_on_device="/data/local/tmp/$basename"
-  output_dir="/data/local/tmp/art_boot_images"
-  if [ -f $bin_on_host ]; then
-    msginfo "Generating the primary boot image ($b-bit)..."
-    adb push "$bin_on_host" "$ART_TEST_CHROOT$bin_on_device"
-    adb shell mkdir -p "$ART_TEST_CHROOT$output_dir"
-    # `compiler-filter=speed-profile` is required because OatDumpTest checks the compiled code in
-    # the boot image.
-    adb shell chroot "$ART_TEST_CHROOT" \
-      "$bin_on_device" --output-dir=$output_dir --compiler-filter=speed-profile
-  fi
-done

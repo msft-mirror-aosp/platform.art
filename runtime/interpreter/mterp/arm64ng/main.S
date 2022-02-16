@@ -61,7 +61,6 @@
  *   reg nick      purpose
  *   x19  xSELF     self (Thread) pointer
  *   x20  wMR       marking register
- *   x21  xSUSPEND  suspend check register
  *   x29  xFP       interpreted frame pointer, used for accessing locals and args
  *   x22  xPC       interpreted program counter, used for fetching instructions
  *   x23  xINST     first 16-bit code unit of current instruction
@@ -75,6 +74,7 @@
 */
 
 /* single-purpose registers, given names for clarity */
+#define xSELF    x19
 #define CFI_DEX  22 // DWARF register number of the register holding dex-pc (xPC).
 #define CFI_TMP  0  // DWARF register number of the first argument register (r0).
 #define xPC      x22
@@ -290,27 +290,25 @@ END \name
 .endm
 
 .macro BRANCH
-    add     xPC, xPC, wINST, sxtw #1    // update xPC
     // Update method counter and do a suspend check if the branch is negative or zero.
     cmp wINST, #0
     b.le 2f
 1:
+    add     xPC, xPC, wINST, sxtw #1    // update xPC
     FETCH wINST, 0                      // load wINST
     GET_INST_OPCODE ip                  // extract opcode from wINST
     GOTO_OPCODE ip                      // jump to next instruction
 2:
     ldr x0, [sp]
     ldrh w2, [x0, #ART_METHOD_HOTNESS_COUNT_OFFSET]
-#if (NTERP_HOTNESS_VALUE != 0)
-#error Expected 0 for hotness value
-#endif
-    // If the counter is at zero, handle this in the runtime.
-    cbz w2, NterpHandleHotnessOverflow
-    add x2, x2, #-1
+    add x2, x2, #1
+    and w2, w2, #NTERP_HOTNESS_MASK
     strh w2, [x0, #ART_METHOD_HOTNESS_COUNT_OFFSET]
+    // If the counter overflows, handle this in the runtime.
+    cbz w2, NterpHandleHotnessOverflow
     // Otherwise, do a suspend check.
-    ldr w0, [xSELF, #THREAD_FLAGS_OFFSET]
-    tst w0, #THREAD_SUSPEND_OR_CHECKPOINT_REQUEST
+    ldr x0, [xSELF, #THREAD_FLAGS_OFFSET]
+    ands x0, x0, #THREAD_SUSPEND_OR_CHECKPOINT_REQUEST
     b.eq 1b
     EXPORT_PC
     bl    art_quick_test_suspend
@@ -370,10 +368,6 @@ END \name
 5:
 .endm
 
-.macro TEST_IF_MARKING label
-    cbnz wMR, \label
-.endm
-
 // Setup the stack to start executing the method. Expects:
 // - x0 to contain the ArtMethod
 //
@@ -428,15 +422,13 @@ END \name
 .macro START_EXECUTING_INSTRUCTIONS
     ldr x0, [sp]
     ldrh w2, [x0, #ART_METHOD_HOTNESS_COUNT_OFFSET]
-#if (NTERP_HOTNESS_VALUE != 0)
-#error Expected 0 for hotness value
-#endif
-    // If the counter is at zero, handle this in the runtime.
-    cbz w2, 2f
-    add x2, x2, #-1
+    add x2, x2, #1
+    and w2, w2, #NTERP_HOTNESS_MASK
     strh w2, [x0, #ART_METHOD_HOTNESS_COUNT_OFFSET]
-    ldr w0, [xSELF, #THREAD_FLAGS_OFFSET]
-    tst w0, #THREAD_SUSPEND_OR_CHECKPOINT_REQUEST
+    // If the counter overflows, handle this in the runtime.
+    cbz w2, 2f
+    ldr x0, [xSELF, #THREAD_FLAGS_OFFSET]
+    tst x0, #THREAD_SUSPEND_OR_CHECKPOINT_REQUEST
     b.ne 3f
 1:
     FETCH_INST
@@ -470,9 +462,8 @@ END \name
 
     // GP callee-saves.
     // No need to restore x19 (it's always the thread), and
-    // don't restore x20 (the marking register) as it may have been updated,
-    // don't restore x21 (the suspend check register) as it may have been updated.
-    RESTORE_REG      x22, 88
+    // don't restore x20 (the marking register) as it may have been updated.
+    RESTORE_TWO_REGS x21, x22, 80
     RESTORE_TWO_REGS x23, x24, 96
     RESTORE_TWO_REGS x25, x26, 112
     RESTORE_TWO_REGS x27, x28, 128
@@ -1420,6 +1411,17 @@ END \name
    .endif
 .endm
 
+// Fetch some information from the thread cache.
+// Uses ip and ip2 as temporaries.
+.macro FETCH_FROM_THREAD_CACHE dest_reg, slow_path
+   add      ip, xSELF, #THREAD_INTERPRETER_CACHE_OFFSET       // cache address
+   ubfx     ip2, xPC, #2, #THREAD_INTERPRETER_CACHE_SIZE_LOG2  // entry index
+   add      ip, ip, ip2, lsl #4            // entry address within the cache
+   ldp      ip, \dest_reg, [ip]           // entry key (pc) and value (offset)
+   cmp      ip, xPC
+   b.ne \slow_path
+.endm
+
 // Puts the next int/long/object parameter passed in physical register
 // in the expected dex register array entry, and in case of object in the
 // expected reference array entry.
@@ -1596,12 +1598,12 @@ OAT_ENTRY ExecuteNterpImpl, EndExecuteNterpImpl
 
     sub ip2, ip, x15
     ldr w26, [x0, #ART_METHOD_ACCESS_FLAGS_OFFSET]
-    lsl x27, ip2, #2 // x27 is now the offset for inputs into the registers array.
+    lsl x21, ip2, #2 // x21 is now the offset for inputs into the registers array.
 
     tbz w26, #ART_METHOD_NTERP_ENTRY_POINT_FAST_PATH_FLAG_BIT, .Lsetup_slow_path
     // Setup pointer to inputs in FP and pointer to inputs in REFS
-    add x10, xFP, x27
-    add x11, xREFS, x27
+    add x10, xFP, x21
+    add x11, xREFS, x21
     mov x12, #0
     SETUP_REFERENCE_PARAMETER_IN_GPR w1, x10, x11, w15, x12, .Lxmm_setup_finished
     SETUP_REFERENCE_PARAMETER_IN_GPR w2, x10, x11, w15, x12, .Lxmm_setup_finished
@@ -1618,8 +1620,8 @@ OAT_ENTRY ExecuteNterpImpl, EndExecuteNterpImpl
     // If the method is not static and there is one argument ('this'), we don't need to fetch the
     // shorty.
     tbnz w26, #ART_METHOD_IS_STATIC_FLAG_BIT, .Lsetup_with_shorty
-    str w1, [xFP, x27]
-    str w1, [xREFS, x27]
+    str w1, [xFP, x21]
+    str w1, [xREFS, x21]
     cmp w15, #1
     b.eq .Lxmm_setup_finished
 
@@ -1632,8 +1634,8 @@ OAT_ENTRY ExecuteNterpImpl, EndExecuteNterpImpl
     RESTORE_ALL_ARGUMENTS
 
     // Setup pointer to inputs in FP and pointer to inputs in REFS
-    add x10, xFP, x27
-    add x11, xREFS, x27
+    add x10, xFP, x21
+    add x11, xREFS, x21
     mov x12, #0
 
     add x9, xIBASE, #1  // shorty + 1  ; ie skip return arg character
@@ -1678,16 +1680,6 @@ OAT_ENTRY ExecuteNterpImpl, EndExecuteNterpImpl
 %def opcode_pre():
 
 %def helpers():
-
-%def fetch_from_thread_cache(dest_reg, miss_label):
-   // Fetch some information from the thread cache.
-   // Uses ip and ip2 as temporaries.
-   add      ip, xSELF, #THREAD_INTERPRETER_CACHE_OFFSET       // cache address
-   ubfx     ip2, xPC, #2, #THREAD_INTERPRETER_CACHE_SIZE_LOG2  // entry index
-   add      ip, ip, ip2, lsl #4            // entry address within the cache
-   ldp      ip, ${dest_reg}, [ip]          // entry key (pc) and value (offset)
-   cmp      ip, xPC
-   b.ne     ${miss_label}
 
 %def footer():
 /*
@@ -1759,8 +1751,8 @@ NterpNewArray:
    /* new-array vA, vB, class@CCCC */
    EXPORT_PC
    // Fast-path which gets the class from thread-local cache.
-%  fetch_from_thread_cache("x0", miss_label="2f")
-   TEST_IF_MARKING 3f
+   FETCH_FROM_THREAD_CACHE x0, 2f
+   cbnz wMR, 3f
 1:
    lsr     w1, wINST, #12              // w1<- B
    GET_VREG w1, w1                     // w1<- vB (array length)
@@ -1782,10 +1774,11 @@ NterpNewArray:
    b 1b
 
 NterpHandleHotnessOverflow:
-    mov x1, xPC
+    add x1, xPC, xINST, lsl #1
     mov x2, xFP
     bl nterp_hot_method
     cbnz x0, 1f
+    add     xPC, xPC, wINST, sxtw #1    // update xPC
     FETCH wINST, 0                      // load wINST
     GET_INST_OPCODE ip                  // extract opcode from wINST
     GOTO_OPCODE ip                      // jump to next instruction
@@ -1925,13 +1918,14 @@ artNterpAsmInstructionEnd:
 artNterpAsmInstructionStart = .L_op_nop
     .text
 
-%def opcode_name_prefix():
-%   return "nterp_"
+%def default_helper_prefix():
+%  return "nterp_"
+
 %def opcode_start():
     NAME_START nterp_${opcode}
 %def opcode_end():
     NAME_END nterp_${opcode}
-%def opcode_slow_path_start(name):
+%def helper_start(name):
     NAME_START ${name}
-%def opcode_slow_path_end(name):
+%def helper_end(name):
     NAME_END ${name}

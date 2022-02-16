@@ -33,7 +33,8 @@ class QuickCompilerCallbacks final : public CompilerCallbacks {
 
   ~QuickCompilerCallbacks() { }
 
-  void AddUncompilableMethod(MethodReference ref) override;
+  void MethodVerified(verifier::MethodVerifier* verifier)
+      REQUIRES_SHARED(Locks::mutator_lock_) override;
 
   void ClassRejected(ClassReference ref) override;
 

@@ -52,6 +52,16 @@ static inline LayoutType MergeLayoutType(LayoutType a, LayoutType b) {
   return std::min(a, b);
 }
 
+enum class MadviseState : uint8_t {
+  // Madvise based on a file that was just loaded.
+  kMadviseStateAtLoad,
+  // Madvise based after launch is finished.
+  kMadviseStateFinishedLaunch,
+  // Trim by madvising code that is unlikely to be too important in the future.
+  kMadviseStateFinishedTrim,
+};
+std::ostream& operator<<(std::ostream& os, MadviseState collector_type);
+
 // A dex layout section such as code items or strings. Each section is composed of subsections
 // that are laid out adjacently to each other such as (hot, unused, startup, etc...).
 class DexLayoutSection {
@@ -101,9 +111,9 @@ class DexLayoutSections {
     kSectionCount,
   };
 
-  // Advise load access about the dex file based on layout. The caller is expected to have already
+  // Advise access about the dex file based on layout. The caller is expected to have already
   // madvised to MADV_RANDOM.
-  void MadviseAtLoad(const DexFile* dex_file) const;
+  void Madvise(const DexFile* dex_file, MadviseState state) const;
 
   DexLayoutSection sections_[static_cast<size_t>(SectionType::kSectionCount)];
 };

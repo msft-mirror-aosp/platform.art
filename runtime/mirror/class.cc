@@ -38,7 +38,6 @@
 #include "dex/dex_file_annotations.h"
 #include "dex/signature-inl.h"
 #include "dex_cache-inl.h"
-#include "field.h"
 #include "gc/accounting/card_table-inl.h"
 #include "gc/heap-inl.h"
 #include "handle_scope-inl.h"
@@ -48,7 +47,6 @@
 #include "method.h"
 #include "object-inl.h"
 #include "object-refvisitor-inl.h"
-#include "object_array-alloc-inl.h"
 #include "object_array-inl.h"
 #include "object_lock.h"
 #include "string-inl.h"
@@ -234,7 +232,7 @@ void Class::SetStatus(Handle<Class> h_this, ClassStatus new_status, Thread* self
     ObjPtr<ClassExt> ext(EnsureExtDataPresent(h_this, self));
     if (!ext.IsNull()) {
       self->AssertPendingException();
-      ext->SetErroneousStateError(self->GetException());
+      ext->SetVerifyError(self->GetException());
     } else {
       self->AssertPendingOOMException();
     }
@@ -252,6 +250,10 @@ void Class::SetStatus(Handle<Class> h_this, ClassStatus new_status, Thread* self
     if (!h_this->IsFinalizable()) {
       h_this->SetObjectSizeAllocFastPath(RoundUp(h_this->GetObjectSize(), kObjectAlignment));
     }
+  }
+
+  if (kIsDebugBuild && new_status >= ClassStatus::kInitialized) {
+    CHECK(h_this->WasVerificationAttempted()) << h_this->PrettyClassAndClassLoader();
   }
 
   if (!class_linker_initialized) {
@@ -304,6 +306,10 @@ void Class::SetStatusForPrimitiveOrArray(ClassStatus new_status) {
 
   // Do not update `object_alloc_fast_path_`. Arrays are variable size and
   // instances of primitive classes cannot be created at all.
+
+  if (kIsDebugBuild && new_status >= ClassStatus::kInitialized) {
+    CHECK(WasVerificationAttempted()) << PrettyClassAndClassLoader();
+  }
 
   // There can be no waiters to notify as these classes are initialized
   // before another thread can see them.
@@ -624,7 +630,7 @@ static inline ArtMethod* FindClassMethodWithSignature(ObjPtr<Class> this_klass,
   // Search declared methods first.
   for (ArtMethod& method : this_klass->GetDeclaredMethodsSlice(pointer_size)) {
     ArtMethod* np_method = method.GetInterfaceMethodIfProxy(pointer_size);
-    if (np_method->GetNameView() == name && np_method->GetSignature() == signature) {
+    if (np_method->GetName() == name && np_method->GetSignature() == signature) {
       return &method;
     }
   }
@@ -637,7 +643,7 @@ static inline ArtMethod* FindClassMethodWithSignature(ObjPtr<Class> this_klass,
   for (; klass != nullptr; klass = klass->GetSuperClass()) {
     DCHECK(!klass->IsProxyClass());
     for (ArtMethod& method : klass->GetDeclaredMethodsSlice(pointer_size)) {
-      if (method.GetNameView() == name && method.GetSignature() == signature) {
+      if (method.GetName() == name && method.GetSignature() == signature) {
         if (IsInheritedMethod(this_klass, klass, method)) {
           return &method;
         }
@@ -662,7 +668,7 @@ static inline ArtMethod* FindClassMethodWithSignature(ObjPtr<Class> this_klass,
   for (; klass != end_klass; klass = klass->GetSuperClass()) {
     DCHECK(!klass->IsProxyClass());
     for (ArtMethod& method : klass->GetCopiedMethodsSlice(pointer_size)) {
-      if (method.GetNameView() == name && method.GetSignature() == signature) {
+      if (method.GetName() == name && method.GetSignature() == signature) {
         return &method;  // No further check needed, copied methods are inherited by definition.
       }
     }
@@ -683,153 +689,6 @@ ArtMethod* Class::FindClassMethod(std::string_view name,
   return FindClassMethodWithSignature(this, name, signature, pointer_size);
 }
 
-// Binary search a range with a three-way compare function.
-//
-// Return a tuple consisting of a `success` value, the index of the match (`mid`) and
-// the remaining range when we found the match (`begin` and `end`). This is useful for
-// subsequent binary search with a secondary comparator, see `ClassMemberBinarySearch()`.
-template <typename Compare>
-ALWAYS_INLINE
-std::tuple<bool, uint32_t, uint32_t, uint32_t> BinarySearch(uint32_t begin,
-                                                            uint32_t end,
-                                                            Compare&& cmp)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  while (begin != end) {
-    uint32_t mid = (begin + end) >> 1;
-    auto cmp_result = cmp(mid);
-    if (cmp_result == 0) {
-      return {true, mid, begin, end};
-    }
-    if (cmp_result > 0) {
-      begin = mid + 1u;
-    } else {
-      end = mid;
-    }
-  }
-  return {false, 0u, 0u, 0u};
-}
-
-// Binary search for class members. The range passed to this search must be sorted, so
-// declared methods or fields cannot be searched directly but declared direct methods,
-// declared virtual methods, declared static fields or declared instance fields can.
-template <typename NameCompare, typename SecondCompare, typename NameIndexGetter>
-ALWAYS_INLINE
-std::tuple<bool, uint32_t> ClassMemberBinarySearch(uint32_t begin,
-                                                   uint32_t end,
-                                                   NameCompare&& name_cmp,
-                                                   SecondCompare&& second_cmp,
-                                                   NameIndexGetter&& get_name_idx)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  // First search for the item with the given name.
-  bool success;
-  uint32_t mid;
-  std::tie(success, mid, begin, end) = BinarySearch(begin, end, name_cmp);
-  if (!success) {
-    return {false, 0u};
-  }
-  // If found, do the secondary comparison.
-  auto second_cmp_result = second_cmp(mid);
-  if (second_cmp_result == 0) {
-    return {true, mid};
-  }
-  // We have matched the name but not the secondary comparison. We no longer need to
-  // search for the name as string as we know the matching name string index.
-  // Repeat the above binary searches and secondary comparisons with a simpler name
-  // index compare until the search range contains only matching name.
-  auto name_idx = get_name_idx(mid);
-  if (second_cmp_result > 0) {
-    do {
-      begin = mid + 1u;
-      auto name_index_cmp = [&](uint32_t mid2) REQUIRES_SHARED(Locks::mutator_lock_) {
-        DCHECK_LE(name_idx, get_name_idx(mid2));
-        return (name_idx != get_name_idx(mid2)) ? -1 : 0;
-      };
-      std::tie(success, mid, begin, end) = BinarySearch(begin, end, name_index_cmp);
-      if (!success) {
-        return {false, 0u};
-      }
-      second_cmp_result = second_cmp(mid);
-    } while (second_cmp_result > 0);
-    end = mid;
-  } else {
-    do {
-      end = mid;
-      auto name_index_cmp = [&](uint32_t mid2) REQUIRES_SHARED(Locks::mutator_lock_) {
-        DCHECK_GE(name_idx, get_name_idx(mid2));
-        return (name_idx != get_name_idx(mid2)) ? 1 : 0;
-      };
-      std::tie(success, mid, begin, end) = BinarySearch(begin, end, name_index_cmp);
-      if (!success) {
-        return {false, 0u};
-      }
-      second_cmp_result = second_cmp(mid);
-    } while (second_cmp_result < 0);
-    begin = mid + 1u;
-  }
-  if (second_cmp_result == 0) {
-    return {true, mid};
-  }
-  // All items in the remaining range have a matching name, so search with secondary comparison.
-  std::tie(success, mid, std::ignore, std::ignore) = BinarySearch(begin, end, second_cmp);
-  return {success, mid};
-}
-
-static std::tuple<bool, ArtMethod*> FindDeclaredClassMethod(ObjPtr<mirror::Class> klass,
-                                                            const DexFile& dex_file,
-                                                            std::string_view name,
-                                                            Signature signature,
-                                                            PointerSize pointer_size)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  DCHECK(&klass->GetDexFile() == &dex_file);
-  DCHECK(!name.empty());
-
-  ArraySlice<ArtMethod> declared_methods = klass->GetDeclaredMethodsSlice(pointer_size);
-  DCHECK(!declared_methods.empty());
-  auto get_method_id = [&](uint32_t mid) REQUIRES_SHARED(Locks::mutator_lock_) ALWAYS_INLINE
-      -> const dex::MethodId& {
-    ArtMethod& method = declared_methods[mid];
-    DCHECK(method.GetDexFile() == &dex_file);
-    DCHECK_NE(method.GetDexMethodIndex(), dex::kDexNoIndex);
-    return dex_file.GetMethodId(method.GetDexMethodIndex());
-  };
-  auto name_cmp = [&](uint32_t mid) REQUIRES_SHARED(Locks::mutator_lock_) ALWAYS_INLINE {
-    // Do not use ArtMethod::GetNameView() to avoid reloading dex file through the same
-    // declaring class from different methods and also avoid the runtime method check.
-    const dex::MethodId& method_id = get_method_id(mid);
-    return name.compare(dex_file.GetMethodNameView(method_id));
-  };
-  auto signature_cmp = [&](uint32_t mid) REQUIRES_SHARED(Locks::mutator_lock_) ALWAYS_INLINE {
-    // Do not use ArtMethod::GetSignature() to avoid reloading dex file through the same
-    // declaring class from different methods and also avoid the runtime method check.
-    const dex::MethodId& method_id = get_method_id(mid);
-    return signature.Compare(dex_file.GetMethodSignature(method_id));
-  };
-  auto get_name_idx = [&](uint32_t mid) REQUIRES_SHARED(Locks::mutator_lock_) ALWAYS_INLINE {
-    const dex::MethodId& method_id = get_method_id(mid);
-    return method_id.name_idx_;
-  };
-
-  // Use binary search in the sorted direct methods, then in the sorted virtual methods.
-  uint32_t num_direct_methods = klass->NumDirectMethods();
-  uint32_t num_declared_methods = dchecked_integral_cast<uint32_t>(declared_methods.size());
-  DCHECK_LE(num_direct_methods, num_declared_methods);
-  const uint32_t ranges[2][2] = {
-     {0u, num_direct_methods},                   // Declared direct methods.
-     {num_direct_methods, num_declared_methods}  // Declared virtual methods.
-  };
-  for (const uint32_t (&range)[2] : ranges) {
-    auto [success, mid] =
-        ClassMemberBinarySearch(range[0], range[1], name_cmp, signature_cmp, get_name_idx);
-    if (success) {
-      return {true, &declared_methods[mid]};
-    }
-  }
-
-  // Did not find a declared method in either slice.
-  return {false, nullptr};
-}
-
-FLATTEN
 ArtMethod* Class::FindClassMethod(ObjPtr<DexCache> dex_cache,
                                   uint32_t dex_method_idx,
                                   PointerSize pointer_size) {
@@ -847,22 +706,24 @@ ArtMethod* Class::FindClassMethod(ObjPtr<DexCache> dex_cache,
       }
     }
   }
-
   // If not found, we need to search by name and signature.
   const DexFile& dex_file = *dex_cache->GetDexFile();
   const dex::MethodId& method_id = dex_file.GetMethodId(dex_method_idx);
   const Signature signature = dex_file.GetMethodSignature(method_id);
-  std::string_view name;  // Do not touch the dex file string data until actually needed.
-
+  std::string_view name;  // Delay strlen() until actually needed.
   // If we do not have a dex_cache match, try to find the declared method in this class now.
   if (this_dex_cache != dex_cache && !GetDeclaredMethodsSlice(pointer_size).empty()) {
     DCHECK(name.empty());
-    name = dex_file.GetMethodNameView(method_id);
-    auto [success, method] = FindDeclaredClassMethod(
-        this, *this_dex_cache->GetDexFile(), name, signature, pointer_size);
-    DCHECK_EQ(success, method != nullptr);
-    if (success) {
-      return method;
+    // Avoid string comparisons by comparing the respective unicode lengths first.
+    uint32_t length, other_length;  // UTF16 length.
+    name = dex_file.GetMethodName(method_id, &length);
+    for (ArtMethod& method : GetDeclaredMethodsSlice(pointer_size)) {
+      DCHECK_NE(method.GetDexMethodIndex(), dex::kDexNoIndex);
+      const char* other_name = method.GetDexFile()->GetMethodName(
+          method.GetDexMethodIndex(), &other_length);
+      if (length == other_length && name == other_name && signature == method.GetSignature()) {
+        return &method;
+      }
     }
   }
 
@@ -874,8 +735,7 @@ ArtMethod* Class::FindClassMethod(ObjPtr<DexCache> dex_cache,
   for (; klass != nullptr; klass = klass->GetSuperClass()) {
     ArtMethod* candidate_method = nullptr;
     ArraySlice<ArtMethod> declared_methods = klass->GetDeclaredMethodsSlice(pointer_size);
-    ObjPtr<DexCache> klass_dex_cache = klass->GetDexCache();
-    if (klass_dex_cache == dex_cache) {
+    if (klass->GetDexCache() == dex_cache) {
       // Matching dex_cache. We cannot compare the `dex_method_idx` anymore because
       // the type index differs, so compare the name index and proto index.
       for (ArtMethod& method : declared_methods) {
@@ -886,15 +746,15 @@ ArtMethod* Class::FindClassMethod(ObjPtr<DexCache> dex_cache,
           break;
         }
       }
-    } else if (!declared_methods.empty()) {
-      if (name.empty()) {
-        name = dex_file.GetMethodNameView(method_id);
+    } else {
+      if (!declared_methods.empty() && name.empty()) {
+        name = dex_file.StringDataByIdx(method_id.name_idx_);
       }
-      auto [success, method] = FindDeclaredClassMethod(
-          klass, *klass_dex_cache->GetDexFile(), name, signature, pointer_size);
-      DCHECK_EQ(success, method != nullptr);
-      if (success) {
-        candidate_method = method;
+      for (ArtMethod& method : declared_methods) {
+        if (method.GetName() == name && method.GetSignature() == signature) {
+          candidate_method = &method;
+          break;
+        }
       }
     }
     if (candidate_method != nullptr) {
@@ -919,7 +779,7 @@ ArtMethod* Class::FindClassMethod(ObjPtr<DexCache> dex_cache,
       name = dex_file.StringDataByIdx(method_id.name_idx_);
     }
     for (ArtMethod& method : copied_methods) {
-      if (method.GetNameView() == name && method.GetSignature() == signature) {
+      if (method.GetName() == name && method.GetSignature() == signature) {
         return &method;  // No further check needed, copied methods are inherited by definition.
       }
     }
@@ -1035,43 +895,39 @@ ArtMethod* Class::FindClassInitializer(PointerSize pointer_size) {
   return nullptr;
 }
 
-static std::tuple<bool, ArtField*> FindFieldByNameAndType(const DexFile& dex_file,
-                                                          LengthPrefixedArray<ArtField>* fields,
-                                                          std::string_view name,
-                                                          std::string_view type)
+// Custom binary search to avoid double comparisons from std::binary_search.
+static ArtField* FindFieldByNameAndType(const DexFile& dex_file,
+                                        LengthPrefixedArray<ArtField>* fields,
+                                        std::string_view name,
+                                        std::string_view type)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   DCHECK(fields != nullptr);
-  DCHECK(!name.empty());
-  DCHECK(!type.empty());
-
-  // Fields are sorted by class, then name, then type descriptor. This is verified in dex file
-  // verifier. There can be multiple fields with the same name in the same class due to proguard.
-  // Note: std::string_view::compare() uses lexicographical comparison and treats the `char` as
-  // unsigned; for Modified-UTF-8 without embedded nulls this is consistent with the
-  // CompareModifiedUtf8ToModifiedUtf8AsUtf16CodePointValues() ordering.
-  auto get_field_id = [&](uint32_t mid) REQUIRES_SHARED(Locks::mutator_lock_) ALWAYS_INLINE
-      -> const dex::FieldId& {
+  size_t low = 0;
+  size_t high = fields->size();
+  ArtField* ret = nullptr;
+  while (low < high) {
+    size_t mid = (low + high) / 2;
     ArtField& field = fields->At(mid);
     DCHECK(field.GetDexFile() == &dex_file);
-    return dex_file.GetFieldId(field.GetDexFieldIndex());
-  };
-  auto name_cmp = [&](uint32_t mid) REQUIRES_SHARED(Locks::mutator_lock_) ALWAYS_INLINE {
-    const dex::FieldId& field_id = get_field_id(mid);
-    return name.compare(dex_file.GetFieldNameView(field_id));
-  };
-  auto type_cmp = [&](uint32_t mid) REQUIRES_SHARED(Locks::mutator_lock_) ALWAYS_INLINE {
-    const dex::FieldId& field_id = get_field_id(mid);
-    return type.compare(dex_file.GetTypeDescriptorView(dex_file.GetTypeId(field_id.type_idx_)));
-  };
-  auto get_name_idx = [&](uint32_t mid) REQUIRES_SHARED(Locks::mutator_lock_) ALWAYS_INLINE {
-    const dex::FieldId& field_id = get_field_id(mid);
-    return field_id.name_idx_;
-  };
-
-  // Use binary search in the sorted fields.
-  auto [success, mid] =
-      ClassMemberBinarySearch(/*begin=*/ 0u, fields->size(), name_cmp, type_cmp, get_name_idx);
-
+    const dex::FieldId& field_id = dex_file.GetFieldId(field.GetDexFieldIndex());
+    // Fields are sorted by class, then name, then type descriptor. This is verified in dex file
+    // verifier. There can be multiple fields with the same in the same class name due to proguard.
+    // Note: std::string_view::compare() uses lexicographical comparison and treats the `char` as
+    // unsigned; for modified-UTF-8 without embedded nulls this is consistent with the
+    // CompareModifiedUtf8ToModifiedUtf8AsUtf16CodePointValues() ordering.
+    int result = dex_file.GetFieldNameView(field_id).compare(name);
+    if (result == 0) {
+      result = dex_file.GetFieldTypeDescriptorView(field_id).compare(type);
+    }
+    if (result < 0) {
+      low = mid + 1;
+    } else if (result > 0) {
+      high = mid;
+    } else {
+      ret = &field;
+      break;
+    }
+  }
   if (kIsDebugBuild) {
     ArtField* found = nullptr;
     for (ArtField& field : MakeIterationRangeFromLengthPrefixedArray(fields)) {
@@ -1080,17 +936,9 @@ static std::tuple<bool, ArtField*> FindFieldByNameAndType(const DexFile& dex_fil
         break;
       }
     }
-
-    ArtField* ret = success ? &fields->At(mid) : nullptr;
-    CHECK_EQ(found, ret)
-        << "Found " << ArtField::PrettyField(found) << " vs " << ArtField::PrettyField(ret);
+    CHECK_EQ(found, ret) << "Found " << found->PrettyField() << " vs  " << ret->PrettyField();
   }
-
-  if (success) {
-    return {true, &fields->At(mid)};
-  }
-
-  return {false, nullptr};
+  return ret;
 }
 
 ArtField* Class::FindDeclaredInstanceField(std::string_view name, std::string_view type) {
@@ -1100,9 +948,7 @@ ArtField* Class::FindDeclaredInstanceField(std::string_view name, std::string_vi
     return nullptr;
   }
   DCHECK(!IsProxyClass());
-  auto [success, field] = FindFieldByNameAndType(GetDexFile(), ifields, name, type);
-  DCHECK_EQ(success, field != nullptr);
-  return field;
+  return FindFieldByNameAndType(GetDexFile(), ifields, name, type);
 }
 
 ArtField* Class::FindDeclaredInstanceField(ObjPtr<DexCache> dex_cache, uint32_t dex_field_idx) {
@@ -1151,9 +997,7 @@ ArtField* Class::FindDeclaredStaticField(std::string_view name, std::string_view
       return nullptr;
     }
   }
-  auto [success, field] = FindFieldByNameAndType(GetDexFile(), sfields, name, type);
-  DCHECK_EQ(success, field != nullptr);
-  return field;
+  return FindFieldByNameAndType(GetDexFile(), sfields, name, type);
 }
 
 ArtField* Class::FindDeclaredStaticField(ObjPtr<DexCache> dex_cache, uint32_t dex_field_idx) {
@@ -1165,75 +1009,6 @@ ArtField* Class::FindDeclaredStaticField(ObjPtr<DexCache> dex_cache, uint32_t de
     }
   }
   return nullptr;
-}
-
-ObjPtr<mirror::ObjectArray<mirror::Field>> Class::GetDeclaredFields(
-    Thread* self,
-    bool public_only,
-    bool force_resolve) REQUIRES_SHARED(Locks::mutator_lock_) {
-  if (UNLIKELY(IsObsoleteObject())) {
-    ThrowRuntimeException("Obsolete Object!");
-    return nullptr;
-  }
-  StackHandleScope<1> hs(self);
-  IterationRange<StrideIterator<ArtField>> ifields = GetIFields();
-  IterationRange<StrideIterator<ArtField>> sfields = GetSFields();
-  size_t array_size = NumInstanceFields() + NumStaticFields();
-  auto hiddenapi_context = hiddenapi::GetReflectionCallerAccessContext(self);
-  // Lets go subtract all the non discoverable fields.
-  for (ArtField& field : ifields) {
-    if (!IsDiscoverable(public_only, hiddenapi_context, &field)) {
-      --array_size;
-    }
-  }
-  for (ArtField& field : sfields) {
-    if (!IsDiscoverable(public_only, hiddenapi_context, &field)) {
-      --array_size;
-    }
-  }
-  size_t array_idx = 0;
-  auto object_array = hs.NewHandle(mirror::ObjectArray<mirror::Field>::Alloc(
-      self, GetClassRoot<mirror::ObjectArray<mirror::Field>>(), array_size));
-  if (object_array == nullptr) {
-    return nullptr;
-  }
-  for (ArtField& field : ifields) {
-    if (IsDiscoverable(public_only, hiddenapi_context, &field)) {
-      ObjPtr<mirror::Field> reflect_field =
-          mirror::Field::CreateFromArtField(self, &field, force_resolve);
-      if (reflect_field == nullptr) {
-        if (kIsDebugBuild) {
-          self->AssertPendingException();
-        }
-        // Maybe null due to OOME or type resolving exception.
-        return nullptr;
-      }
-      // We're initializing a newly allocated object, so we do not need to record that under
-      // a transaction. If the transaction is aborted, the whole object shall be unreachable.
-      object_array->SetWithoutChecks</*kTransactionActive=*/ false,
-                                     /*kCheckTransaction=*/ false>(
-                                         array_idx++, reflect_field);
-    }
-  }
-  for (ArtField& field : sfields) {
-    if (IsDiscoverable(public_only, hiddenapi_context, &field)) {
-      ObjPtr<mirror::Field> reflect_field =
-          mirror::Field::CreateFromArtField(self, &field, force_resolve);
-      if (reflect_field == nullptr) {
-        if (kIsDebugBuild) {
-          self->AssertPendingException();
-        }
-        return nullptr;
-      }
-      // We're initializing a newly allocated object, so we do not need to record that under
-      // a transaction. If the transaction is aborted, the whole object shall be unreachable.
-      object_array->SetWithoutChecks</*kTransactionActive=*/ false,
-                                     /*kCheckTransaction=*/ false>(
-                                         array_idx++, reflect_field);
-    }
-  }
-  DCHECK_EQ(array_idx, array_size);
-  return object_array.Get();
 }
 
 ArtField* Class::FindStaticField(std::string_view name, std::string_view type) {
@@ -1330,37 +1105,17 @@ ArtField* FindFieldImpl(ObjPtr<mirror::Class> klass,
     return static_cast<ArtField*>(nullptr);
   };
 
-  auto find_field_by_name_and_type = [&](ObjPtr<mirror::Class> k, ObjPtr<DexCache> k_dex_cache)
-      REQUIRES_SHARED(Locks::mutator_lock_) -> std::tuple<bool, ArtField*> {
-    if ((!kSearchInstanceFields || k->GetIFieldsPtr() == nullptr) &&
-        (!kSearchStaticFields || k->GetSFieldsPtr() == nullptr)) {
-      return {false, nullptr};
-    }
-    ensure_name_and_type_initialized();
-    const DexFile& k_dex_file = *k_dex_cache->GetDexFile();
-    if (kSearchInstanceFields && k->GetIFieldsPtr() != nullptr) {
-      auto [success, field] = FindFieldByNameAndType(k_dex_file, k->GetIFieldsPtr(), name, type);
-      DCHECK_EQ(success, field != nullptr);
-      if (success) {
-        return {true, field};
-      }
-    }
-    if (kSearchStaticFields && k->GetSFieldsPtr() != nullptr) {
-      auto [success, field] = FindFieldByNameAndType(k_dex_file, k->GetSFieldsPtr(), name, type);
-      DCHECK_EQ(success, field != nullptr);
-      if (success) {
-        return {true, field};
-      }
-    }
-    return {false, nullptr};
-  };
-
   // If we had a dex cache mismatch, search declared fields by name and type.
-  if (klass_dex_cache != dex_cache) {
-    auto [success, field] = find_field_by_name_and_type(klass, klass_dex_cache);
-    DCHECK_EQ(success, field != nullptr);
-    if (success) {
-      return field;
+  if (klass_dex_cache != dex_cache &&
+      ((kSearchInstanceFields && klass->GetIFieldsPtr() != nullptr) ||
+       (kSearchStaticFields && klass->GetSFieldsPtr() != nullptr))) {
+    ensure_name_and_type_initialized();
+    ArtField* f = kSearchInstanceFields ? klass->FindDeclaredInstanceField(name, type) : nullptr;
+    if (kSearchStaticFields && f == nullptr) {
+      f = klass->FindDeclaredStaticField(name, type);
+    }
+    if (f != nullptr) {
+      return f;
     }
   }
 
@@ -1397,11 +1152,15 @@ ArtField* FindFieldImpl(ObjPtr<mirror::Class> klass,
           }
         }
       }
-    } else {
-      auto [success, field] = find_field_by_name_and_type(k, k_dex_cache);
-      DCHECK_EQ(success, field != nullptr);
-      if (success) {
-        return field;
+    } else if ((kSearchInstanceFields && k->GetIFieldsPtr() != nullptr) ||
+               (kSearchStaticFields && k->GetSFieldsPtr() != nullptr)) {
+      ensure_name_and_type_initialized();
+      ArtField* f = kSearchInstanceFields ? k->FindDeclaredInstanceField(name, type) : nullptr;
+      if (kSearchStaticFields && f == nullptr) {
+        f = k->FindDeclaredStaticField(name, type);
+      }
+      if (f != nullptr) {
+        return f;
       }
     }
     if (kSearchStaticFields) {
@@ -1794,12 +1553,10 @@ ObjPtr<Method> Class::GetDeclaredMethodInternal(
     if (m.IsMiranda()) {
       continue;
     }
-    ArtMethod* np_method = m.GetInterfaceMethodIfProxy(kPointerSize);
-    if (!np_method->NameEquals(h_method_name.Get())) {
-      continue;
-    }
-    // `ArtMethod::EqualParameters()` may throw when resolving types.
-    if (!np_method->EqualParameters(h_args)) {
+    auto* np_method = m.GetInterfaceMethodIfProxy(kPointerSize);
+    // May cause thread suspension.
+    ObjPtr<String> np_name = np_method->ResolveNameString();
+    if (!np_name->Equals(h_method_name.Get()) || !np_method->EqualParameters(h_args)) {
       if (UNLIKELY(self->IsExceptionPending())) {
         return nullptr;
       }
@@ -1828,12 +1585,14 @@ ObjPtr<Method> Class::GetDeclaredMethodInternal(
       if ((modifiers & kAccConstructor) != 0) {
         continue;
       }
-      ArtMethod* np_method = m.GetInterfaceMethodIfProxy(kPointerSize);
-      if (!np_method->NameEquals(h_method_name.Get())) {
-        continue;
+      auto* np_method = m.GetInterfaceMethodIfProxy(kPointerSize);
+      // May cause thread suspension.
+      ObjPtr<String> np_name = np_method->ResolveNameString();
+      if (np_name == nullptr) {
+        self->AssertPendingException();
+        return nullptr;
       }
-      // `ArtMethod::EqualParameters()` may throw when resolving types.
-      if (!np_method->EqualParameters(h_args)) {
+      if (!np_name->Equals(h_method_name.Get()) || !np_method->EqualParameters(h_args)) {
         if (UNLIKELY(self->IsExceptionPending())) {
           return nullptr;
         }
@@ -1989,6 +1748,13 @@ template void Class::GetAccessFlagsDCheck<kVerifyThis>();
 template void Class::GetAccessFlagsDCheck<kVerifyReads>();
 template void Class::GetAccessFlagsDCheck<kVerifyWrites>();
 template void Class::GetAccessFlagsDCheck<kVerifyAll>();
+
+void Class::SetAccessFlagsDCheck(uint32_t new_access_flags) {
+  uint32_t old_access_flags = GetField32<kVerifyNone>(AccessFlagsOffset());
+  // kAccVerificationAttempted is retained.
+  CHECK((old_access_flags & kAccVerificationAttempted) == 0 ||
+        (new_access_flags & kAccVerificationAttempted) != 0);
+}
 
 ObjPtr<Object> Class::GetMethodIds() {
   ObjPtr<ClassExt> ext(GetExtData());

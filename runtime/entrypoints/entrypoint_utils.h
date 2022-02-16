@@ -128,13 +128,6 @@ enum FindFieldType {
   StaticPrimitiveWrite = StaticBit | PrimitiveBit | WriteBit,
 };
 
-template<bool access_check>
-inline ArtMethod* FindSuperMethodToCall(uint32_t method_idx,
-                                        ArtMethod* resolved_method,
-                                        ArtMethod* referrer,
-                                        Thread* self)
-    REQUIRES_SHARED(Locks::mutator_lock_);
-
 template<FindFieldType type, bool access_check>
 inline ArtField* FindFieldFromCode(uint32_t field_idx,
                                    ArtMethod* referrer,
@@ -150,6 +143,20 @@ inline ArtMethod* FindMethodFromCode(uint32_t method_idx,
                                      Thread* self)
     REQUIRES_SHARED(Locks::mutator_lock_)
     REQUIRES(!Roles::uninterruptible_);
+
+// Fast path field resolution that can't initialize classes or throw exceptions.
+inline ArtField* FindFieldFast(uint32_t field_idx,
+                               ArtMethod* referrer,
+                               FindFieldType type,
+                               size_t expected_size)
+    REQUIRES_SHARED(Locks::mutator_lock_);
+
+// Fast path method resolution that can't throw exceptions.
+template <InvokeType type, bool access_check>
+inline ArtMethod* FindMethodFast(uint32_t method_idx,
+                                 ObjPtr<mirror::Object> this_object,
+                                 ArtMethod* referrer)
+    REQUIRES_SHARED(Locks::mutator_lock_);
 
 inline ObjPtr<mirror::Class> ResolveVerifyAndClinit(dex::TypeIndex type_idx,
                                                     ArtMethod* referrer,
@@ -210,7 +217,7 @@ bool NeedsClinitCheckBeforeCall(ArtMethod* method) REQUIRES_SHARED(Locks::mutato
 // Returns the synchronization object for a native method for a GenericJni frame
 // we have just created or are about to exit. The synchronization object is
 // the class object for static methods and the `this` object otherwise.
-ObjPtr<mirror::Object> GetGenericJniSynchronizationObject(Thread* self, ArtMethod* called)
+jobject GetGenericJniSynchronizationObject(Thread* self, ArtMethod* called)
     REQUIRES_SHARED(Locks::mutator_lock_);
 
 // Update .bss method entrypoint if the `callee_reference` has an associated oat file

@@ -17,9 +17,11 @@
 .super Ljava/lang/Object;
 
 #
+# Ensure foo() does not analyze unverified bad() always-throws property.
+#
 ## CHECK-START: void TestCase.foo(java.lang.Object) inliner (after)
 ## CHECK-DAG: InvokeStaticOrDirect method_name:TestCase.bar always_throws:true
-## CHECK-NOT: InvokeStaticOrDirect method_name:TestCase.bad
+## CHECK-DAG: InvokeStaticOrDirect method_name:TestCase.bad always_throws:false
 .method public static foo(Ljava/lang/Object;)V
   .registers 1
   if-nez v0, :Skip1
@@ -48,6 +50,6 @@
   .registers 1
   invoke-static {}, LTestCase;->bar()Lwont/be/Resolvable;
   move-result-object v0
-  return-object v0
+  throw v0
 .end method
 

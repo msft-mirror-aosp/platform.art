@@ -14,11 +14,9 @@
  * limitations under the License.
  */
 
-import static java.lang.invoke.MethodHandles.lookup;
-import static java.lang.invoke.MethodType.methodType;
-
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
+import java.lang.invoke.MethodType;
 import java.lang.invoke.VarHandle;
 import java.lang.invoke.WrongMethodTypeException;
 
@@ -48,19 +46,7 @@ public final class Main {
         failAssertion(sb.toString());
     }
 
-    private static void assertEquals(boolean expected, boolean actual) {
-        if (expected != actual) {
-            failAssertEquals(expected, actual);
-        }
-    }
-
     private static void assertEquals(int expected, int actual) {
-        if (expected != actual) {
-            failAssertEquals(expected, actual);
-        }
-    }
-
-    private static void assertEquals(long expected, long actual) {
         if (expected != actual) {
             failAssertEquals(expected, actual);
         }
@@ -72,27 +58,35 @@ public final class Main {
         }
     }
 
-    static class FieldVarHandleExactInvokerTest {
-        private static final Class<?> THIS_CLASS = FieldVarHandleExactInvokerTest.class;
-        private static final VarHandle fieldVarHandle;
+    private static void assertEquals(double expected, double actual) {
+        if (expected != actual) {
+            failAssertEquals(expected, actual);
+        }
+    }
 
+    static class FieldVarHandleExactInvokerTest {
+        private static final VarHandle fieldVarHandle;
         int field;
 
         static {
             try {
-                fieldVarHandle = lookup().findVarHandle(THIS_CLASS, "field", int.class);
+                fieldVarHandle =
+                        MethodHandles.lookup()
+                                .findVarHandle(
+                                        FieldVarHandleExactInvokerTest.class, "field", int.class);
             } catch (Exception e) {
                 throw new TestSetupError("Failed to lookup of field", e);
             }
         }
 
         void run() throws Throwable {
-            System.out.println(THIS_CLASS.getName());
+            System.out.println("fieldVarHandleExactInvokerTest");
 
             MethodHandle invokerMethodHandle =
                     MethodHandles.varHandleExactInvoker(
                             VarHandle.AccessMode.GET_AND_SET,
-                            methodType(int.class, THIS_CLASS, int.class));
+                            MethodType.methodType(
+                                    int.class, FieldVarHandleExactInvokerTest.class, int.class));
 
             field = 3;
             assertEquals(3, (int) invokerMethodHandle.invokeExact(fieldVarHandle, this, 4));
@@ -176,55 +170,15 @@ public final class Main {
         }
     }
 
-    static class LongFieldVarHandleExactInvokerTest {
-        private static final Class<?> THIS_CLASS = LongFieldVarHandleExactInvokerTest.class;
-
-        private static final VarHandle fieldVarHandle;
-
-        private static final long CANARY = 0x0123456789abcdefL;
-
-        long field = 0L;
-
-        static {
-            try {
-                fieldVarHandle = lookup().findVarHandle(THIS_CLASS, "field", long.class);
-            } catch (Exception e) {
-                throw new TestSetupError("Failed to lookup of field", e);
-            }
-        }
-
-        void run() throws Throwable {
-            System.out.println(THIS_CLASS.getName());
-
-            MethodHandle invokerMethodHandle =
-                    MethodHandles.varHandleExactInvoker(
-                            VarHandle.AccessMode.COMPARE_AND_SET,
-                            methodType(boolean.class, THIS_CLASS, long.class, long.class));
-            checkCompareAndSet(invokerMethodHandle, 0L, CANARY);
-            checkCompareAndSet(invokerMethodHandle, 1L, 1L);
-            checkCompareAndSet(invokerMethodHandle, CANARY, ~CANARY);
-            checkCompareAndSet(invokerMethodHandle, ~CANARY, 0L);
-        }
-
-        private void checkCompareAndSet(MethodHandle compareAndSet, long oldValue, long newValue)
-                throws Throwable {
-            final boolean expectSuccess = (oldValue == field);
-            final long oldFieldValue = field;
-            assertEquals(
-                    expectSuccess,
-                    (boolean) compareAndSet.invoke(fieldVarHandle, this, oldValue, newValue));
-            assertEquals(expectSuccess ? newValue : oldFieldValue, field);
-        }
-    }
-
     static class FieldVarHandleInvokerTest {
-        private static final Class<?> THIS_CLASS = FieldVarHandleInvokerTest.class;
         private static final VarHandle fieldVarHandle;
         int field;
 
         static {
             try {
-                fieldVarHandle = lookup().findVarHandle(THIS_CLASS, "field", int.class);
+                fieldVarHandle =
+                        MethodHandles.lookup()
+                                .findVarHandle(FieldVarHandleInvokerTest.class, "field", int.class);
             } catch (Exception e) {
                 throw new TestSetupError("Failed to lookup of field", e);
             }
@@ -235,7 +189,8 @@ public final class Main {
             MethodHandle invokerMethodHandle =
                     MethodHandles.varHandleInvoker(
                             VarHandle.AccessMode.GET_AND_SET,
-                            methodType(int.class, THIS_CLASS, int.class));
+                            MethodType.methodType(
+                                    int.class, FieldVarHandleInvokerTest.class, int.class));
 
             field = 3;
             int oldField = (int) invokerMethodHandle.invoke(fieldVarHandle, this, 4);
@@ -360,7 +315,7 @@ public final class Main {
             MethodHandle exactInvoker =
                     MethodHandles.varHandleExactInvoker(
                             VarHandle.AccessMode.COMPARE_AND_EXCHANGE,
-                            methodType(
+                            MethodType.methodType(
                                     float.class,
                                     float[].class,
                                     int.class,
@@ -434,7 +389,7 @@ public final class Main {
             MethodHandle invoker =
                     MethodHandles.varHandleInvoker(
                             VarHandle.AccessMode.COMPARE_AND_EXCHANGE,
-                            methodType(
+                            MethodType.methodType(
                                     float.class,
                                     float[].class,
                                     int.class,
@@ -473,25 +428,11 @@ public final class Main {
             } catch (WrongMethodTypeException expected) {
                 assertEquals(16.0f, floatsArray[2]);
             }
-
-            try {
-                MethodHandle unsupportedInvoker =
-                        MethodHandles.varHandleInvoker(
-                                VarHandle.AccessMode.GET_AND_BITWISE_OR,
-                                methodType(float.class, float[].class, int.class, float.class));
-                old =
-                        (float)
-                                unsupportedInvoker.invoke(
-                                        floatsArrayVarHandle, floatsArray, 0, 2.71f);
-                assertUnreachable();
-            } catch (UnsupportedOperationException expected) {
-            }
         }
     }
 
     public static void main(String[] args) throws Throwable {
         new FieldVarHandleExactInvokerTest().run();
-        new LongFieldVarHandleExactInvokerTest().run();
         new FieldVarHandleInvokerTest().run();
         new DivergenceExactInvokerTest().run();
         new DivergenceInvokerTest().run();

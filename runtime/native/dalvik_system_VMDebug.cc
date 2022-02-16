@@ -315,7 +315,6 @@ enum class VMDebugRuntimeStatId {
   kArtGcBlockingGcCountRateHistogram,
   kArtGcObjectsAllocated,
   kArtGcTotalTimeWaitingForGc,
-  kArtGcPreOomeGcCount,
   kNumRuntimeStats,
 };
 
@@ -362,10 +361,6 @@ static jstring VMDebug_getRuntimeStatInternal(JNIEnv* env, jclass, jint statId) 
     }
     case VMDebugRuntimeStatId::kArtGcTotalTimeWaitingForGc: {
       std::string output = std::to_string(heap->GetTotalTimeWaitingForGC());
-      return env->NewStringUTF(output.c_str());
-    }
-    case VMDebugRuntimeStatId::kArtGcPreOomeGcCount: {
-      std::string output = std::to_string(heap->GetPreOomeGcCount());
       return env->NewStringUTF(output.c_str());
     }
     default:

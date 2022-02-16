@@ -865,6 +865,7 @@ class OatDumper {
     os << StringPrintf("location: %s\n", oat_dex_file.GetDexFileLocation().c_str());
     os << StringPrintf("checksum: 0x%08x\n", oat_dex_file.GetDexFileLocationChecksum());
 
+    const uint8_t* const oat_file_begin = oat_dex_file.GetOatFile()->Begin();
     if (oat_dex_file.GetOatFile()->ContainsDexCode()) {
       const uint8_t* const vdex_file_begin = oat_dex_file.GetOatFile()->DexBegin();
 
@@ -891,13 +892,11 @@ class OatDumper {
     // Print lookup table, if it exists.
     if (oat_dex_file.GetLookupTableData() != nullptr) {
       uint32_t table_offset = dchecked_integral_cast<uint32_t>(
-          oat_dex_file.GetLookupTableData() - oat_dex_file.GetOatFile()->DexBegin());
+          oat_dex_file.GetLookupTableData() - oat_file_begin);
       uint32_t table_size = TypeLookupTable::RawDataLength(dex_file->NumClassDefs());
       os << StringPrintf("type-table: 0x%08x..0x%08x\n",
                          table_offset,
                          table_offset + table_size - 1);
-      const TypeLookupTable& lookup = oat_dex_file.GetTypeLookupTable();
-      lookup.Dump(os);
     }
 
     VariableIndentationOutputStream vios(&os);
@@ -1495,16 +1494,8 @@ class OatDumper {
         return nullptr;
       }
       return verifier::MethodVerifier::VerifyMethodAndDump(
-          soa.Self(),
-          vios,
-          dex_method_idx,
-          dex_file,
-          dex_cache,
-          *options_.class_loader_,
-          class_def,
-          code_item,
-          method_access_flags,
-          /* api_level= */ 0);
+          soa.Self(), vios, dex_method_idx, dex_file, dex_cache, *options_.class_loader_,
+          class_def, code_item, method, method_access_flags, /* api_level= */ 0);
     }
 
     return nullptr;
@@ -1832,7 +1823,7 @@ class ImageDumper {
       // Since FlushAllocStack() above resets the (active) allocation
       // stack. Need to revoke the thread-local allocation stacks that
       // point into it.
-      ScopedThreadSuspension sts(self, ThreadState::kNative);
+      ScopedThreadSuspension sts(self, kNative);
       ScopedSuspendAll ssa(__FUNCTION__);
       heap->RevokeAllThreadLocalAllocationStacks(self);
     }
@@ -2559,7 +2550,6 @@ static int DumpOat(Runtime* runtime,
                                                   /*executable=*/ false,
                                                   /*low_4gb=*/ false,
                                                   dex_filenames,
-                                                  /*dex_fds=*/ ArrayRef<const int>(),
                                                   /*reservation=*/ nullptr,
                                                   &error_msg));
   if (oat_file == nullptr) {
@@ -2588,7 +2578,6 @@ static int SymbolizeOat(const char* oat_filename,
                                                   /*executable=*/ false,
                                                   /*low_4gb=*/ false,
                                                   dex_filenames,
-                                                  /*dex_fds=*/ ArrayRef<const int>(),
                                                   /*reservation=*/ nullptr,
                                                   &error_msg));
   if (oat_file == nullptr) {
@@ -2639,7 +2628,6 @@ class IMTDumper {
                                                       /*executable=*/ false,
                                                       /*low_4gb=*/false,
                                                       dex_filenames,
-                                                      /*dex_fds=*/ArrayRef<const int>(),
                                                       /*reservation=*/ nullptr,
                                                       &error_msg));
       if (oat_file == nullptr) {

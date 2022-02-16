@@ -57,7 +57,6 @@
 #include "scoped_thread_state_change-inl.h"
 #include "stack.h"
 #include "thread-current-inl.h"
-#include "thread-inl.h"
 #include "thread_list.h"
 
 namespace art {
@@ -569,7 +568,7 @@ void JitCodeCache::WaitUntilInlineCacheAccessible(Thread* self) {
   if (IsWeakAccessEnabled(self)) {
     return;
   }
-  ScopedThreadSuspension sts(self, ThreadState::kWaitingWeakGcRootRead);
+  ScopedThreadSuspension sts(self, kWaitingWeakGcRootRead);
   MutexLock mu(self, *Locks::jit_lock_);
   while (!IsWeakAccessEnabled(self)) {
     inline_cache_cond_.Wait(self);
@@ -616,17 +615,19 @@ static void ClearMethodCounter(ArtMethod* method, bool was_warm)
   if (was_warm) {
     method->SetPreviouslyWarm();
   }
-  method->ResetCounter(Runtime::Current()->GetJITOptions()->GetWarmupThreshold());
-  // We add one sample so that the profile knows that the method was executed at least once.
+  // We reset the counter to 1 so that the profile knows that the method was executed at least once.
   // This is required for layout purposes.
-  method->UpdateCounter(/* new_samples= */ 1);
+  // We also need to make sure we'll pass the warmup threshold again, so we set to 0 if
+  // the warmup threshold is 1.
+  uint16_t jit_warmup_threshold = Runtime::Current()->GetJITOptions()->GetWarmupThreshold();
+  method->SetCounter(std::min(jit_warmup_threshold - 1, 1));
 }
 
 void JitCodeCache::WaitForPotentialCollectionToCompleteRunnable(Thread* self) {
   while (collection_in_progress_) {
     Locks::jit_lock_->Unlock(self);
     {
-      ScopedThreadSuspension sts(self, ThreadState::kSuspended);
+      ScopedThreadSuspension sts(self, kSuspended);
       MutexLock mu(self, *Locks::jit_lock_);
       WaitForPotentialCollectionToComplete(self);
     }
@@ -793,8 +794,9 @@ bool JitCodeCache::RemoveMethod(ArtMethod* method, bool release_memory) {
     return false;
   }
 
-  ClearMethodCounter(method, /* was_warm= */ false);
-  Runtime::Current()->GetInstrumentation()->InitializeMethodsCode(method, /*aot_code=*/ nullptr);
+  method->SetCounter(0);
+  Runtime::Current()->GetInstrumentation()->UpdateMethodsCode(
+      method, GetQuickToInterpreterBridge());
   VLOG(jit)
       << "JIT removed (osr=" << std::boolalpha << osr << std::noboolalpha << ") "
       << ArtMethod::PrettyMethod(method) << "@" << method
@@ -943,7 +945,7 @@ bool JitCodeCache::Reserve(Thread* self,
   while (true) {
     bool at_max_capacity = false;
     {
-      ScopedThreadSuspension sts(self, ThreadState::kSuspended);
+      ScopedThreadSuspension sts(self, kSuspended);
       MutexLock mu(self, *Locks::jit_lock_);
       WaitForPotentialCollectionToComplete(self);
       ScopedCodeCacheWrite ccw(*region);
@@ -1069,7 +1071,7 @@ void JitCodeCache::MarkCompiledCodeOnThreadStacks(Thread* self) {
   threads_running_checkpoint = Runtime::Current()->GetThreadList()->RunCheckpoint(&closure);
   // Now that we have run our checkpoint, move to a suspended state and wait
   // for other threads to run the checkpoint.
-  ScopedThreadSuspension sts(self, ThreadState::kSuspended);
+  ScopedThreadSuspension sts(self, kSuspended);
   if (threads_running_checkpoint != 0) {
     barrier.Increment(self, threads_running_checkpoint);
   }
@@ -1100,7 +1102,7 @@ void JitCodeCache::GarbageCollectCache(Thread* self) {
   ScopedTrace trace(__FUNCTION__);
   // Wait for an existing collection, or let everyone know we are starting one.
   {
-    ScopedThreadSuspension sts(self, ThreadState::kSuspended);
+    ScopedThreadSuspension sts(self, kSuspended);
     MutexLock mu(self, *Locks::jit_lock_);
     if (!garbage_collect_code_) {
       private_region_.IncreaseCodeCacheCapacity();
@@ -1157,7 +1159,7 @@ void JitCodeCache::GarbageCollectCache(Thread* self) {
       // Start polling the liveness of compiled code to prepare for the next full collection.
       if (next_collection_will_be_full) {
         for (auto it : profiling_infos_) {
-          it.second->ResetCounter();
+          it.second->SetBaselineHotnessCount(0);
         }
 
         // Change entry points of native methods back to the GenericJNI entrypoint.
@@ -1166,13 +1168,14 @@ void JitCodeCache::GarbageCollectCache(Thread* self) {
           if (!data.IsCompiled() || IsInZygoteExecSpace(data.GetCode())) {
             continue;
           }
+          // Make sure a single invocation of the GenericJNI trampoline tries to recompile.
+          uint16_t new_counter = Runtime::Current()->GetJit()->HotMethodThreshold() - 1u;
           const OatQuickMethodHeader* method_header =
               OatQuickMethodHeader::FromCodePointer(data.GetCode());
           for (ArtMethod* method : data.GetMethods()) {
             if (method->GetEntryPointFromQuickCompiledCode() == method_header->GetEntryPoint()) {
               // Don't call Instrumentation::UpdateMethodsCode(), same as for normal methods above.
-              // Make sure a single invocation of the GenericJNI trampoline tries to recompile.
-              method->SetHotCounter();
+              method->SetCounter(new_counter);
               method->SetEntryPointFromQuickCompiledCode(GetQuickGenericJniStub());
             }
           }
@@ -1280,46 +1283,24 @@ bool JitCodeCache::IsMethodBeingCompiled(ArtMethod* method) {
       ContainsElement(current_baseline_compilations_, method);
 }
 
-ProfilingInfo* JitCodeCache::GetProfilingInfo(ArtMethod* method, Thread* self) {
-  MutexLock mu(self, *Locks::jit_lock_);
-  DCHECK(IsMethodBeingCompiled(method))
-      << "GetProfilingInfo should only be called when the method is being compiled";
-  auto it = profiling_infos_.find(method);
-  if (it == profiling_infos_.end()) {
-    return nullptr;
-  }
-  return it->second;
-}
-
-void JitCodeCache::ResetHotnessCounter(ArtMethod* method, Thread* self) {
-  MutexLock mu(self, *Locks::jit_lock_);
-  auto it = profiling_infos_.find(method);
-  DCHECK(it != profiling_infos_.end());
-  it->second->ResetCounter();
-}
-
-
 void JitCodeCache::DoCollection(Thread* self, bool collect_profiling_info) {
   ScopedTrace trace(__FUNCTION__);
   {
     MutexLock mu(self, *Locks::jit_lock_);
 
     // Update to interpreter the methods that have baseline entrypoints and whose baseline
-    // hotness count hasn't changed.
+    // hotness count is zero.
     // Note that these methods may be in thread stack or concurrently revived
     // between. That's OK, as the thread executing it will mark it.
-    uint16_t warmup_threshold = Runtime::Current()->GetJITOptions()->GetWarmupThreshold();
     for (auto it : profiling_infos_) {
       ProfilingInfo* info = it.second;
-      if (!info->CounterHasChanged()) {
+      if (info->GetBaselineHotnessCount() == 0) {
         const void* entry_point = info->GetMethod()->GetEntryPointFromQuickCompiledCode();
         if (ContainsPc(entry_point)) {
           OatQuickMethodHeader* method_header =
               OatQuickMethodHeader::FromEntryPoint(entry_point);
           if (CodeInfo::IsBaseline(method_header->GetOptimizedCodeInfoPtr())) {
-            info->GetMethod()->ResetCounter(warmup_threshold);
-            Runtime::Current()->GetInstrumentation()->InitializeMethodsCode(
-                info->GetMethod(), /*aot_code=*/ nullptr);
+            info->GetMethod()->SetEntryPointFromQuickCompiledCode(GetQuickToInterpreterBridge());
           }
         }
       }
@@ -1508,6 +1489,7 @@ void JitCodeCache::GetProfiledMethods(const std::set<std::string>& dex_base_loca
   WaitUntilInlineCacheAccessible(self);
   MutexLock mu(self, *Locks::jit_lock_);
   ScopedTrace trace(__FUNCTION__);
+  uint16_t jit_compile_threshold = Runtime::Current()->GetJITOptions()->GetCompileThreshold();
   for (auto it : profiling_infos_) {
     ProfilingInfo* info = it.second;
     ArtMethod* method = info->GetMethod();
@@ -1519,13 +1501,10 @@ void JitCodeCache::GetProfiledMethods(const std::set<std::string>& dex_base_loca
     }
     std::vector<ProfileMethodInfo::ProfileInlineCache> inline_caches;
 
-    // If the method is still baseline compiled, don't save the inline caches.
+    // If the method didn't reach the compilation threshold don't save the inline caches.
     // They might be incomplete and cause unnecessary deoptimizations.
     // If the inline cache is empty the compiler will generate a regular invoke virtual/interface.
-    const void* entry_point = method->GetEntryPointFromQuickCompiledCode();
-    if (ContainsPc(entry_point) &&
-        CodeInfo::IsBaseline(
-            OatQuickMethodHeader::FromEntryPoint(entry_point)->GetOptimizedCodeInfoPtr())) {
+    if (method->GetCounter() < jit_compile_threshold) {
       methods.emplace_back(/*ProfileMethodInfo*/
           MethodReference(dex_file, method->GetDexMethodIndex()), inline_caches);
       continue;
@@ -1671,8 +1650,7 @@ bool JitCodeCache::NotifyCompilationOf(ArtMethod* method,
     }
     return new_compilation;
   } else {
-    if (compilation_kind == CompilationKind::kBaseline) {
-      DCHECK(CanAllocateProfilingInfo());
+    if (CanAllocateProfilingInfo() && (compilation_kind == CompilationKind::kBaseline)) {
       bool has_profiling_info = false;
       {
         MutexLock mu(self, *Locks::jit_lock_);
@@ -1745,7 +1723,7 @@ void JitCodeCache::InvalidateAllCompiledCode() {
     if (meth->IsObsolete()) {
       linker->SetEntryPointsForObsoleteMethod(meth);
     } else {
-      Runtime::Current()->GetInstrumentation()->InitializeMethodsCode(meth, /*aot_code=*/ nullptr);
+      linker->SetEntryPointsToInterpreter(meth);
     }
   }
   saved_compiled_methods_map_.clear();
@@ -1762,7 +1740,8 @@ void JitCodeCache::InvalidateCompiledCodeFor(ArtMethod* method,
   if (method_entrypoint == header->GetEntryPoint()) {
     // The entrypoint is the one to invalidate, so we just update it to the interpreter entry point
     // and clear the counter to get the method Jitted again.
-    Runtime::Current()->GetInstrumentation()->InitializeMethodsCode(method, /*aot_code=*/ nullptr);
+    Runtime::Current()->GetInstrumentation()->UpdateMethodsCode(
+        method, GetQuickToInterpreterBridge());
     ClearMethodCounter(method, /*was_warm=*/ true);
   } else {
     MutexLock mu(Thread::Current(), *Locks::jit_lock_);

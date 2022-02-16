@@ -225,8 +225,6 @@ class ClassLoaderContext {
     ClassLoaderType type;
     // Shared libraries this context has.
     std::vector<std::unique_ptr<ClassLoaderInfo>> shared_libraries;
-    // Shared libraries that will be loaded after apks code that this context has.
-    std::vector<std::unique_ptr<ClassLoaderInfo>> shared_libraries_after;
     // The list of class path elements that this loader loads.
     // Note that this list may contain relative paths.
     std::vector<std::string> classpath;
@@ -299,8 +297,7 @@ class ClassLoaderContext {
                                  Handle<mirror::ClassLoader> class_loader,
                                  Handle<mirror::ObjectArray<mirror::Object>> dex_elements,
                                  ClassLoaderInfo* child_info,
-                                 bool is_shared_library,
-                                 bool is_after)
+                                 bool is_shared_library)
     REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Encodes the context as a string suitable to be passed to dex2oat or to be added to the

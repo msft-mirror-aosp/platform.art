@@ -17,17 +17,13 @@
 #ifndef ART_ODREFRESH_ODR_CONFIG_H_
 #define ART_ODREFRESH_ODR_CONFIG_H_
 
-#include <optional>
 #include <string>
 #include <vector>
 
 #include "android-base/file.h"
 #include "arch/instruction_set.h"
-#include "base/file_utils.h"
 #include "base/globals.h"
 #include "log/log.h"
-#include "odr_common.h"
-#include "odrefresh/odrefresh.h"
 
 namespace art {
 namespace odrefresh {
@@ -53,34 +49,22 @@ class OdrConfig final {
   std::string dex2oat_;
   std::string dex2oat_boot_classpath_;
   bool dry_run_;
-  std::optional<bool> refresh_;
-  std::optional<bool> partial_compilation_;
   InstructionSet isa_;
   std::string program_name_;
   std::string system_server_classpath_;
-  std::string system_server_compiler_filter_;
+  std::string updatable_bcp_packages_file_;
   ZygoteKind zygote_kind_;
-  std::string boot_classpath_;
-  std::string artifact_dir_;
-  std::string standalone_system_server_jars_;
-  bool compilation_os_mode_ = false;
-  bool minimal_ = false;
-
-  // Staging directory for artifacts. The directory must exist and will be automatically removed
-  // after compilation. If empty, use the default directory.
-  std::string staging_dir_;
 
  public:
   explicit OdrConfig(const char* program_name)
     : dry_run_(false),
       isa_(InstructionSet::kNone),
-      program_name_(android::base::Basename(program_name)),
-      artifact_dir_(GetApexDataDalvikCacheDirectory(InstructionSet::kNone)) {
+      program_name_(android::base::Basename(program_name)) {
   }
 
   const std::string& GetApexInfoListFile() const { return apex_info_list_file_; }
 
-  std::vector<InstructionSet> GetBootClasspathIsas() const {
+  std::vector<InstructionSet> GetBootExtensionIsas() const {
     const auto [isa32, isa64] = GetPotentialInstructionSets();
     switch (zygote_kind_) {
       case ZygoteKind::kZygote32:
@@ -107,8 +91,6 @@ class OdrConfig final {
 
   const std::string& GetDex2oatBootClasspath() const { return dex2oat_boot_classpath_; }
 
-  const std::string& GetArtifactDirectory() const { return artifact_dir_; }
-
   std::string GetDex2Oat() const {
     const char* prefix = UseDebugBinaries() ? "dex2oatd" : "dex2oat";
     const char* suffix = "";
@@ -127,24 +109,14 @@ class OdrConfig final {
     return art_bin_dir_ + '/' + prefix + suffix;
   }
 
+  std::string GetDexOptAnalyzer() const {
+    const char* dexoptanalyzer{UseDebugBinaries() ? "dexoptanalyzerd" : "dexoptanalyzer"};
+    return art_bin_dir_ + '/' + dexoptanalyzer;
+  }
+
   bool GetDryRun() const { return dry_run_; }
-  bool GetPartialCompilation() const {
-    return partial_compilation_.value_or(true);
-  }
-  bool GetRefresh() const {
-    return refresh_.value_or(true);
-  }
-  const std::string& GetSystemServerClasspath() const {
-    return system_server_classpath_;
-  }
-  const std::string& GetSystemServerCompilerFilter() const {
-    return system_server_compiler_filter_;
-  }
-  const std::string& GetStagingDir() const {
-    return staging_dir_;
-  }
-  bool GetCompilationOsMode() const { return compilation_os_mode_; }
-  bool GetMinimal() const { return minimal_; }
+  const std::string& GetSystemServerClasspath() const { return system_server_classpath_; }
+  const std::string& GetUpdatableBcpPackagesFile() const { return updatable_bcp_packages_file_; }
 
   void SetApexInfoListFile(const std::string& file_path) { apex_info_list_file_ = file_path; }
   void SetArtBinDir(const std::string& art_bin_dir) { art_bin_dir_ = art_bin_dir; }
@@ -153,48 +125,15 @@ class OdrConfig final {
     dex2oat_boot_classpath_ = classpath;
   }
 
-  void SetArtifactDirectory(const std::string& artifact_dir) {
-    artifact_dir_ = artifact_dir;
-  }
-
   void SetDryRun() { dry_run_ = true; }
-  void SetPartialCompilation(bool value) {
-    partial_compilation_ = value;
-  }
-  void SetRefresh(bool value) {
-    refresh_ = value;
-  }
   void SetIsa(const InstructionSet isa) { isa_ = isa; }
 
   void SetSystemServerClasspath(const std::string& classpath) {
     system_server_classpath_ = classpath;
   }
 
-  void SetSystemServerCompilerFilter(const std::string& filter) {
-    system_server_compiler_filter_ = filter;
-  }
-
+  void SetUpdatableBcpPackagesFile(const std::string& file) { updatable_bcp_packages_file_ = file; }
   void SetZygoteKind(ZygoteKind zygote_kind) { zygote_kind_ = zygote_kind; }
-
-  const std::string& GetBootClasspath() const { return boot_classpath_; }
-
-  void SetBootClasspath(const std::string& classpath) { boot_classpath_ = classpath; }
-
-  void SetStagingDir(const std::string& staging_dir) {
-    staging_dir_ = staging_dir;
-  }
-
-  const std::string& GetStandaloneSystemServerJars() const {
-    return standalone_system_server_jars_;
-  }
-
-  void SetStandaloneSystemServerJars(const std::string& jars) {
-    standalone_system_server_jars_ = jars;
-  }
-
-  void SetCompilationOsMode(bool value) { compilation_os_mode_ = value; }
-
-  void SetMinimal(bool value) { minimal_ = value; }
 
  private:
   // Returns a pair for the possible instruction sets for the configured instruction set

@@ -301,33 +301,30 @@ END \name
 .endm
 
 .macro BRANCH
-    add rPC, rPC, rINST, lsl #1
     // Update method counter and do a suspend check if the branch is negative or zero.
     cmp rINST, #0
     ble 2f
 1:
-    FETCH_INST                          // load rINST
+    add r2, rINST, rINST                // r2<- byte offset
+    FETCH_ADVANCE_INST_RB r2            // update xPC, load rINST
     GET_INST_OPCODE ip                  // extract opcode from rINST
     GOTO_OPCODE ip                      // jump to next instruction
 2:
     ldr r0, [sp]
     ldrh r2, [r0, #ART_METHOD_HOTNESS_COUNT_OFFSET]
-    cmp r2, #NTERP_HOTNESS_VALUE
-    beq NterpHandleHotnessOverflow
-    add r2, r2, #-1
+    add r2, r2, #1
+    ubfx r2, r2, #0, #NTERP_HOTNESS_BITS
     strh r2, [r0, #ART_METHOD_HOTNESS_COUNT_OFFSET]
+    // If the counter overflows, handle this in the runtime.
+    cmp r2, #0
+    beq NterpHandleHotnessOverflow
     // Otherwise, do a suspend check.
     ldr r0, [rSELF, #THREAD_FLAGS_OFFSET]
-    tst r0, #THREAD_SUSPEND_OR_CHECKPOINT_REQUEST
+    ands r0, r0, #THREAD_SUSPEND_OR_CHECKPOINT_REQUEST
     beq 1b
     EXPORT_PC
     bl    art_quick_test_suspend
     b 1b
-.endm
-
-.macro TEST_IF_MARKING label
-    cmp rMR, #0
-    bne \label
 .endm
 
 // Expects:
@@ -454,10 +451,12 @@ END \name
 .macro START_EXECUTING_INSTRUCTIONS
     ldr r0, [sp]
     ldrh r2, [r0, #ART_METHOD_HOTNESS_COUNT_OFFSET]
-    cmp r2, #NTERP_HOTNESS_VALUE
-    beq 2f
-    add r2, r2, #-1
+    add r2, r2, #1
+    ubfx r2, r2, #0, #NTERP_HOTNESS_BITS
     strh r2, [r0, #ART_METHOD_HOTNESS_COUNT_OFFSET]
+    // If the counter overflows, handle this in the runtime.
+    cmp r2, #0
+    beq 2f
     ldr r0, [rSELF, #THREAD_FLAGS_OFFSET]
     tst r0, #THREAD_SUSPEND_OR_CHECKPOINT_REQUEST
     bne 3f
@@ -1483,6 +1482,19 @@ END \name
    LDREXD_STREXD_LOOP \addr, \tmp1, \tmp2, \store1, \store2, \tmp1, \label
 .endm
 
+// Fetch some information from the thread cache.
+// Uses ip and lr as temporaries.
+.macro FETCH_FROM_THREAD_CACHE dest_reg, slow_path
+   add      ip, rSELF, #THREAD_INTERPRETER_CACHE_OFFSET       // cache address
+   ubfx     lr, rPC, #2, #THREAD_INTERPRETER_CACHE_SIZE_LOG2  // entry index
+   add      ip, ip, lr, lsl #3             // entry address within the cache
+   // In T32, we would use `ldrd ip, \dest_reg, [ip]`
+   ldr      \dest_reg, [ip, #4]            // value (offset)
+   ldr      ip, [ip]                       // entry key (pc)
+   cmp      ip, rPC
+   bne \slow_path
+.endm
+
 // Puts the next int/long/object parameter passed in physical register
 // in the expected dex register array entry, and in case of object in the
 // expected reference array entry.
@@ -1692,18 +1704,6 @@ OAT_ENTRY ExecuteNterpImpl, EndExecuteNterpImpl
 
 %def helpers():
 
-%def fetch_from_thread_cache(dest_reg, miss_label):
-   // Fetch some information from the thread cache.
-   // Uses ip and lr as temporaries.
-   add      ip, rSELF, #THREAD_INTERPRETER_CACHE_OFFSET       // cache address
-   ubfx     lr, rPC, #2, #THREAD_INTERPRETER_CACHE_SIZE_LOG2  // entry index
-   add      ip, ip, lr, lsl #3             // entry address within the cache
-   // In T32, we would use `ldrd ip, \dest_reg, [ip]`
-   ldr      ${dest_reg}, [ip, #4]          // value (offset)
-   ldr      ip, [ip]                       // entry key (pc)
-   cmp      ip, rPC
-   bne      ${miss_label}
-
 %def footer():
 /*
  * ===========================================================================
@@ -1774,8 +1774,9 @@ NterpNewArray:
    /* new-array vA, vB, class@CCCC */
    EXPORT_PC
    // Fast-path which gets the class from thread-local cache.
-%  fetch_from_thread_cache("r0", miss_label="2f")
-   TEST_IF_MARKING 3f
+   FETCH_FROM_THREAD_CACHE r0, 2f
+   cmp rMR, #0
+   bne 3f
 1:
    lsr     r1, rINST, #12              // r1<- B
    GET_VREG r1, r1                     // r1<- vB (array length)
@@ -1798,12 +1799,13 @@ NterpNewArray:
 
 
 NterpHandleHotnessOverflow:
-    mov r1, rPC
+    add r1, rPC, rINST, lsl #1
     mov r2, rFP
     bl nterp_hot_method
     cmp r0, #0
     bne 1f
-    FETCH_INST                          // load rINST
+    add r2, rINST, rINST                // w2<- byte offset
+    FETCH_ADVANCE_INST_RB r2            // update rPC, load rINST
     GET_INST_OPCODE ip                  // extract opcode from rINST
     GOTO_OPCODE ip                      // jump to next instruction
 1:
@@ -1999,13 +2001,14 @@ artNterpAsmInstructionEnd:
 artNterpAsmInstructionStart = .L_op_nop
     .text
 
-%def opcode_name_prefix():
-%   return "nterp_"
+%def default_helper_prefix():
+%  return "nterp_"
+
 %def opcode_start():
     NAME_START nterp_${opcode}
 %def opcode_end():
     NAME_END nterp_${opcode}
-%def opcode_slow_path_start(name):
+%def helper_start(name):
     NAME_START ${name}
-%def opcode_slow_path_end(name):
+%def helper_end(name):
     NAME_END ${name}

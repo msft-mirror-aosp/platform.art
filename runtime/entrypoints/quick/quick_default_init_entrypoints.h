@@ -20,15 +20,14 @@
 #include "base/logging.h"  // FOR VLOG_IS_ON.
 #include "entrypoints/jni/jni_entrypoints.h"
 #include "entrypoints/runtime_asm_entrypoints.h"
+#include "palette/palette.h"
 #include "quick_alloc_entrypoints.h"
 #include "quick_default_externs.h"
 #include "quick_entrypoints.h"
 
 namespace art {
 
-static void DefaultInitEntryPoints(JniEntryPoints* jpoints,
-                                   QuickEntryPoints* qpoints,
-                                   bool monitor_jni_entry_exit) {
+static void DefaultInitEntryPoints(JniEntryPoints* jpoints, QuickEntryPoints* qpoints) {
   // JNI
   jpoints->pDlsymLookup = art_jni_dlsym_lookup_stub;
   jpoints->pDlsymLookupCritical = art_jni_dlsym_lookup_critical_stub;
@@ -74,21 +73,22 @@ static void DefaultInitEntryPoints(JniEntryPoints* jpoints,
   qpoints->pAputObject = art_quick_aput_obj;
 
   // JNI
-  qpoints->pJniMethodStart = art_jni_method_start;
-  qpoints->pJniMethodEnd = art_jni_method_end;
+  qpoints->pJniMethodStart = JniMethodStart;
+  qpoints->pJniMethodFastStart = JniMethodFastStart;
+  qpoints->pJniMethodStartSynchronized = JniMethodStartSynchronized;
+  qpoints->pJniMethodEnd = JniMethodEnd;
+  qpoints->pJniMethodEndSynchronized = JniMethodEndSynchronized;
+  qpoints->pJniMethodEndWithReference = JniMethodEndWithReference;
+  qpoints->pJniMethodFastEndWithReference = JniMethodFastEndWithReference;
+  qpoints->pJniMethodEndWithReferenceSynchronized = JniMethodEndWithReferenceSynchronized;
+  qpoints->pJniMethodFastEnd = JniMethodFastEnd;
   qpoints->pQuickGenericJniTrampoline = art_quick_generic_jni_trampoline;
-  qpoints->pJniDecodeReferenceResult = JniDecodeReferenceResult;
-  qpoints->pJniReadBarrier = art_jni_read_barrier;
 
   // Locks
   if (UNLIKELY(VLOG_IS_ON(systrace_lock_logging))) {
-    qpoints->pJniLockObject = art_jni_lock_object_no_inline;
-    qpoints->pJniUnlockObject = art_jni_unlock_object_no_inline;
     qpoints->pLockObject = art_quick_lock_object_no_inline;
     qpoints->pUnlockObject = art_quick_unlock_object_no_inline;
   } else {
-    qpoints->pJniLockObject = art_jni_lock_object;
-    qpoints->pJniUnlockObject = art_jni_unlock_object;
     qpoints->pLockObject = art_quick_lock_object;
     qpoints->pUnlockObject = art_quick_unlock_object;
   }
@@ -131,13 +131,16 @@ static void DefaultInitEntryPoints(JniEntryPoints* jpoints,
   qpoints->pUpdateInlineCache = art_quick_update_inline_cache;
   qpoints->pCompileOptimized = art_quick_compile_optimized;
 
-  // Tracing hooks
-  qpoints->pMethodEntryHook = art_quick_method_entry_hook;
-  qpoints->pMethodExitHook = art_quick_method_exit_hook;
-
-  if (monitor_jni_entry_exit) {
-    qpoints->pJniMethodStart = art_jni_monitored_method_start;
-    qpoints->pJniMethodEnd = art_jni_monitored_method_end;
+  bool should_report = false;
+  PaletteShouldReportJniInvocations(&should_report);
+  if (should_report) {
+    qpoints->pJniMethodStart = JniMonitoredMethodStart;
+    qpoints->pJniMethodStartSynchronized = JniMonitoredMethodStartSynchronized;
+    qpoints->pJniMethodEnd = JniMonitoredMethodEnd;
+    qpoints->pJniMethodEndSynchronized = JniMonitoredMethodEndSynchronized;
+    qpoints->pJniMethodEndWithReference = JniMonitoredMethodEndWithReference;
+    qpoints->pJniMethodEndWithReferenceSynchronized =
+        JniMonitoredMethodEndWithReferenceSynchronized;
   }
 }
 

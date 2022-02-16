@@ -17,7 +17,11 @@
 # This script undoes (most of) the work done by tools/buildbot-setup-device.sh.
 # Make sure to keep these files in sync.
 
-. "$(dirname $0)/buildbot-utils.sh"
+if [ -t 1 ]; then
+  # Color sequences if terminal is a tty.
+  green='\033[0;32m'
+  nc='\033[0m'
+fi
 
 # Setup as root, as some actions performed here require it.
 adb root
@@ -30,7 +34,7 @@ if [[ -n "$ART_TEST_CHROOT" ]]; then
   if adb shell test -d "$ART_TEST_CHROOT"; then
     # Display users of the chroot dir.
 
-    msginfo "List open files under chroot dir $ART_TEST_CHROOT"
+    echo -e "${green}List open files under chroot dir $ART_TEST_CHROOT${nc}"
     adb shell lsof | grep "$ART_TEST_CHROOT"
 
     # for_all_chroot_process ACTION
@@ -60,12 +64,12 @@ if [[ -n "$ART_TEST_CHROOT" ]]; then
       echo "$cmdline (PID: $pid)"
     }
 
-    msginfo "List processes running from binaries under chroot dir $ART_TEST_CHROOT"
+    echo -e "${green}List processes running from binaries under chroot dir $ART_TEST_CHROOT${nc}"
     for_all_chroot_process display_process
 
     # Tear down the chroot dir.
 
-    msginfo "Tear down the chroot set up in $ART_TEST_CHROOT"
+    echo -e "${green}Tear down the chroot set up in $ART_TEST_CHROOT${nc}"
 
     # remove_filesystem_from_chroot DIR-IN-CHROOT FSTYPE REMOVE-DIR-IN-CHROOT
     # -----------------------------------------------------------------------
@@ -139,8 +143,8 @@ if [[ -n "$ART_TEST_CHROOT" ]]; then
       adb shell kill -9 "$pid"
     }
 
-    msginfo "Kill processes" \
-      "still running from binaries under chroot dir $ART_TEST_CHROOT (if any)"
+    echo -e "${green}Kill processes still running from binaries under" \
+      "chroot dir $ART_TEST_CHROOT (if any)${nc} "
     for_all_chroot_process kill_process
   fi
 fi

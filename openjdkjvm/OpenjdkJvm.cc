@@ -367,8 +367,7 @@ JNIEXPORT void JVM_Sleep(JNIEnv* env, jclass threadClass ATTRIBUTE_UNUSED,
                          jobject java_lock, jlong millis) {
   art::ScopedFastNativeObjectAccess soa(env);
   art::ObjPtr<art::mirror::Object> lock = soa.Decode<art::mirror::Object>(java_lock);
-  art::Monitor::Wait(
-      art::Thread::Current(), lock.Ptr(), millis, 0, true, art::ThreadState::kSleeping);
+  art::Monitor::Wait(art::Thread::Current(), lock.Ptr(), millis, 0, true, art::kSleeping);
 }
 
 JNIEXPORT jobject JVM_CurrentThread(JNIEnv* env, jclass unused ATTRIBUTE_UNUSED) {
@@ -406,12 +405,38 @@ JNIEXPORT jboolean JVM_HoldsLock(JNIEnv* env, jclass unused ATTRIBUTE_UNUSED, jo
   return soa.Self()->HoldsLock(object);
 }
 
-JNIEXPORT __attribute__((noreturn)) void JVM_SetNativeThreadName(
-    JNIEnv* env ATTRIBUTE_UNUSED,
-    jobject jthread ATTRIBUTE_UNUSED,
-    jstring java_name ATTRIBUTE_UNUSED) {
-  UNIMPLEMENTED(FATAL) << "JVM_SetNativeThreadName is not implemented";
-  UNREACHABLE();
+JNIEXPORT void JVM_SetNativeThreadName(JNIEnv* env, jobject jthread, jstring java_name) {
+  ScopedUtfChars name(env, java_name);
+  {
+    art::ScopedObjectAccess soa(env);
+    if (soa.Decode<art::mirror::Object>(jthread) == soa.Self()->GetPeer()) {
+      soa.Self()->SetThreadName(name.c_str());
+      return;
+    }
+  }
+  // Suspend thread to avoid it from killing itself while we set its name. We don't just hold the
+  // thread list lock to avoid this, as setting the thread name causes mutator to lock/unlock
+  // in the DDMS send code.
+  art::ThreadList* thread_list = art::Runtime::Current()->GetThreadList();
+  bool timed_out;
+  // Take suspend thread lock to avoid races with threads trying to suspend this one.
+  art::Thread* thread;
+  {
+    thread = thread_list->SuspendThreadByPeer(jthread,
+                                              art::SuspendReason::kInternal,
+                                              &timed_out);
+  }
+  if (thread != nullptr) {
+    {
+      art::ScopedObjectAccess soa(env);
+      thread->SetThreadName(name.c_str());
+    }
+    bool resumed = thread_list->Resume(thread, art::SuspendReason::kInternal);
+    DCHECK(resumed);
+  } else if (timed_out) {
+    LOG(ERROR) << "Trying to set thread name to '" << name.c_str() << "' failed as the thread "
+        "failed to suspend within a generous timeout.";
+  }
 }
 
 JNIEXPORT __attribute__((noreturn)) jint JVM_IHashCode(JNIEnv* env ATTRIBUTE_UNUSED,

@@ -122,10 +122,7 @@ art_cc_library {
 art_cc_defaults {
     name: "art_libartpalette_tests_defaults",
     srcs: ["apex/palette_test.cc"],
-    shared_libs: [
-        "libartpalette",
-        "libnativehelper",
-    ],
+    shared_libs: ["libartpalette"],
 }
 
 // Version of ART gtest `art_libartpalette_tests` bundled with the ART APEX on target.
@@ -147,6 +144,4 @@ art_cc_test {
         "art_standalone_gtest_defaults",
         "art_libartpalette_tests_defaults",
     ],
-    test_config_template: ":art-gtests-target-standalone-cts-template",
-    test_suites: ["cts"],
 }

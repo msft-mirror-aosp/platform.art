@@ -77,7 +77,7 @@ class AllocRecordStackTrace {
 
   AllocRecordStackTrace() = default;
 
-  AllocRecordStackTrace(AllocRecordStackTrace&& r) noexcept
+  AllocRecordStackTrace(AllocRecordStackTrace&& r)
       : tid_(r.tid_),
         stack_(std::move(r.stack_)) {}
 
@@ -211,7 +211,7 @@ class AllocRecordObjectMap {
   // recent allocation tracking, but GcRoot<mirror::Object> pointers in these pairs can become null.
   // Both types of pointers need read barriers, do not directly access them.
   using EntryPair = std::pair<GcRoot<mirror::Object>, AllocRecord>;
-  using EntryList = std::list<EntryPair>;
+  typedef std::list<EntryPair> EntryList;
 
   // Caller needs to check that it is enabled before calling since we read the stack trace before
   // checking the enabled boolean.

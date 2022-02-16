@@ -53,7 +53,7 @@ namespace art {
 namespace gc {
 namespace accounting {
 template <size_t kAlignment> class SpaceBitmap;
-using ContinuousSpaceBitmap = SpaceBitmap<kObjectAlignment>;
+typedef SpaceBitmap<kObjectAlignment> ContinuousSpaceBitmap;
 }  // namespace accounting
 namespace space {
 class ImageSpace;
@@ -446,6 +446,10 @@ class ImageWriter final {
   // Remove unwanted classes from various roots.
   void PruneNonImageClasses() REQUIRES_SHARED(Locks::mutator_lock_);
 
+  // Remove everything from the DexCache.
+  void ClearDexCache(ObjPtr<mirror::DexCache> dex_cache)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
   // Find dex caches for pruning or preloading.
   std::vector<ObjPtr<mirror::DexCache>> FindDexCaches(Thread* self)
       REQUIRES_SHARED(Locks::mutator_lock_)
@@ -562,7 +566,6 @@ class ImageWriter final {
   // Location of where the object will be when the image is loaded at runtime.
   template <typename T>
   T* NativeLocationInImage(T* obj) REQUIRES_SHARED(Locks::mutator_lock_);
-  ArtField* NativeLocationInImage(ArtField* src_field) REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Return true if `dex_cache` belongs to the image we're writing.
   // For a boot image, this is true for all dex caches.
@@ -600,19 +603,15 @@ class ImageWriter final {
   void CopyAndFixupReference(DestType* dest, ObjPtr<mirror::Object> src)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  // Translate a native pointer to the destination value and store in the target location.
-  template <typename ValueType>
-  void CopyAndFixupPointer(void** target, ValueType src_value, PointerSize pointer_size)
+  // Copy a native pointer and record image relocation.
+  void CopyAndFixupPointer(void** target, void* value, PointerSize pointer_size)
       REQUIRES_SHARED(Locks::mutator_lock_);
-  template <typename ValueType>
-  void CopyAndFixupPointer(void** target, ValueType src_value)
+  void CopyAndFixupPointer(void** target, void* value)
       REQUIRES_SHARED(Locks::mutator_lock_);
-  template <typename ValueType>
   void CopyAndFixupPointer(
-      void* object, MemberOffset offset, ValueType src_value, PointerSize pointer_size)
+      void* object, MemberOffset offset, void* value, PointerSize pointer_size)
       REQUIRES_SHARED(Locks::mutator_lock_);
-  template <typename ValueType>
-  void CopyAndFixupPointer(void* object, MemberOffset offset, ValueType src_value)
+  void CopyAndFixupPointer(void* object, MemberOffset offset, void* value)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   /*

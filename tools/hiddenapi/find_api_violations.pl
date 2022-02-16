@@ -36,17 +36,17 @@ get all packages names, you should process the logcat from device boot time.
 
 =over
 
-=item --[no]unsupported
+=item --[no]lightgrey
 
-(Don't) show unsupported API accesses (default true)
+(Don't) show light grey list accesses (default true)
 
-=item --[no]max-target
+=item --[no]darkgrey
 
-(Don't) show APIs blocked by apps target SDK (default true)
+(Don't) show dark grey list accesses (default true)
 
-=item --[no]blocked
+=item --[no]black
 
-(Don't) show blocked list accesses (default true)
+(Don't) show black list accesses (default true)
 
 =item --bugreport|-b
 
@@ -62,19 +62,19 @@ Output API signatures only, don't include CSV header/package names/list name.
 
 =cut
 
-my $unsupported = 1;
-my $maxtarget = 1;
-my $blocked = 1;
+my $lightgrey = 1;
+my $darkgrey = 1;
+my $black = 1;
 my $bugreport = 0;
 my $short = 0;
 my $help = 0;
 
-GetOptions("unsupported!" => \$unsupported,
-           "max-target!"  => \$maxtarget,
-           "blocked!"     => \$blocked,
-           "bugreport|b"  => \$bugreport,
-           "short|s"      => \$short,
-           "help"         => \$help)
+GetOptions("lightgrey!"  => \$lightgrey,
+           "darkgrey!"   => \$darkgrey,
+           "black!"      => \$black,
+           "bugreport|b" => \$bugreport,
+           "short|s"     => \$short,
+           "help"        => \$help)
   or pod2usage(q(-verbose) => 1);
 
 pod2usage(q(-verbose) => 2) if ($help);
@@ -119,9 +119,9 @@ while (my $line = <>) {
   if ($msg =~ m/Accessing hidden (\w+) (L.*?) \((.*list), (.*?)\)/) {
     my ($member_type, $symbol, $list, $access_type) = ($1, $2, $3, $4);
     my $package = $procmap->{$pid} || "unknown($pid)";
-    if (($list =~ m/unsupported/ && $unsupported)
-      || ($list =~ m/max-target/ && $maxtarget)
-      || ($list =~ m/blocked/ && $blocked)) {
+    if (($list =~ m/light/ && $lightgrey)
+      || ($list =~ m/dark/ && $darkgrey)
+      || ($list =~ m/black/ && $black)) {
       if ($short) {
         print "$symbol\n";
       } else {

@@ -26,7 +26,6 @@
 
 namespace art {
 
-[[noreturn]]
 static void SimpleAborter(const char* msg) {
   LOG(FATAL_WITHOUT_ABORT) << msg;
   _exit(1);

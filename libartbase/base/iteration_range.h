@@ -27,11 +27,11 @@ namespace art {
 template <typename Iter>
 class IterationRange {
  public:
-  using iterator        = Iter;
-  using difference_type = typename std::iterator_traits<Iter>::difference_type;
-  using value_type      = typename std::iterator_traits<Iter>::value_type;
-  using pointer         = typename std::iterator_traits<Iter>::pointer;
-  using reference       = typename std::iterator_traits<Iter>::reference;
+  typedef Iter iterator;
+  typedef typename std::iterator_traits<Iter>::difference_type difference_type;
+  typedef typename std::iterator_traits<Iter>::value_type value_type;
+  typedef typename std::iterator_traits<Iter>::pointer pointer;
+  typedef typename std::iterator_traits<Iter>::reference reference;
 
   IterationRange(iterator first, iterator last) : first_(first), last_(last) { }
 
@@ -64,7 +64,7 @@ inline IterationRange<Iter> MakeEmptyIterationRange(const Iter& it) {
 
 template <typename Container>
 inline auto ReverseRange(Container&& c) {
-  using riter = typename std::reverse_iterator<decltype(c.begin())>;
+  typedef typename std::reverse_iterator<decltype(c.begin())> riter;
   return MakeIterationRange(riter(c.end()), riter(c.begin()));
 }
 

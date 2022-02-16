@@ -17,6 +17,7 @@ soong_config_module_type_import {
     module_types: [
         "art_module_apex_defaults",
         "art_module_cc_defaults",
+        "art_module_genrule_defaults",
     ],
 }
 
@@ -46,7 +47,7 @@ art_runtime_base_binaries_first_on_device_first_on_host = [
 // `art/Android.mk`.
 // TODO(b/121117762): Remove this note when both the ART Buildbot and Golem use
 // the ART APEX.
-art_runtime_base_native_shared_libs_minus_libart = [
+art_runtime_base_native_shared_libs = [
     // External API (having APEX stubs).
     "libdexfile",
     "libnativebridge",
@@ -58,24 +59,15 @@ art_runtime_base_native_shared_libs_minus_libart = [
     "libadbconnection",
     // TODO(b/124476339): Clean up the following libraries once "required"
     // dependencies work with APEX libraries.
+    "libart",
     "libart-compiler",
-    "libartservice",
     "libdt_fd_forward",
     "libdt_socket",
     "libjdwp",
     "libnpt",
     "libopenjdkjvm",
     "libopenjdkjvmti",
-    // TODO(chriswailes): Make libarttools a dependency for another target
-    // when such a target exists
-    "libarttools",
 ]
-// Actual version of ART runtime base libs, used in non-test ART APEXes.
-art_runtime_base_native_shared_libs = ["libart"] +
-    art_runtime_base_native_shared_libs_minus_libart
-// "Broken" version of ART runtime base libs, used for testing purposes.
-art_runtime_base_broken_native_shared_libs = ["libart-broken"] +
-    art_runtime_base_native_shared_libs_minus_libart
 
 art_runtime_base_native_device_only_shared_libs = [
     "libperfetto_hprof",
@@ -175,18 +167,6 @@ libcore_java_libs = [
     "apache-xml",
 ]
 
-// Create combined library which is used for compiling run-tests.
-// This is much easier than trying to make the test depend on them directly,
-// or than trying to make the test compilation depend on the apex module.
-// Some of the components are only visible here (but not in test Android.bp).
-java_library {
-    name: "art-run-test-bootclasspath",
-    sdk_version: "core_platform",
-    static_libs: libcore_java_libs + [
-        "framework-annotations-lib",
-    ],
-}
-
 // Native libraries that support the core Java libraries.
 //
 // Note: ART on-device chroot-based testing and benchmarking is not yet using
@@ -258,15 +238,11 @@ apex_defaults {
     compile_multilib: "both",
     manifest: "manifest-art.json",
     bootclasspath_fragments: ["art-bootclasspath-fragment"],
-    systemserverclasspath_fragments: ["art-systemserverclasspath-fragment"],
     compat_configs: ["libcore-platform-compat-config"],
     java_libs: libcore_java_libs,
     native_shared_libs: art_runtime_base_native_shared_libs +
         art_runtime_base_native_device_only_shared_libs +
         libcore_native_shared_libs,
-    binaries: [
-        "artd",
-    ],
     multilib: {
         both: {
             binaries: art_runtime_base_binaries_both +
@@ -284,7 +260,6 @@ apex_defaults {
     ],
     prebuilts: [
         "art-linker-config",
-        "com.android.art.artd.init.rc",
         "current_sdkinfo",
     ],
     // ART APEXes depend on bouncycastle which is disabled for PDK builds.
@@ -341,28 +316,6 @@ apex_test {
     installable: false,
 }
 
-// "Broken" test APEX, only used for testing, including module
-// `libart-broken` instead of `libart`.
-apex_test {
-    name: "test_broken_com.android.art",
-    defaults: ["com.android.art-defaults"],
-
-    // Only include native libraries in this test APEX. Don't include
-    // binaries (and maybe other artifacts) for now, as they pull
-    // the "non-broken" `libart` module into this test APEX and
-    // overwrite `libart-broken`. Maybe consider creating "broken"
-    // variants of binaries (and other artifacts)?
-    native_shared_libs: art_runtime_base_broken_native_shared_libs,
-    compile_multilib: "both",
-
-    key: "com.android.art.key",
-    manifest: "test_apex_manifest.json",
-    file_contexts: ":com.android.art-file_contexts",
-    certificate: ":com.android.art.certificate",
-    installable: false,
-    min_sdk_version: "31",
-}
-
 apex_test {
     name: "test_jitzygote_com.android.art",
     defaults: ["com.android.art-device-defaults-minus-odrefresh"],
@@ -411,8 +364,6 @@ art_gtests = [
     "art_imgdiag_tests",
     "art_libartbase_tests",
     "art_libartpalette_tests",
-    "art_libartservice_tests",
-    "art_libarttools_tests",
     "art_libdexfile_tests",
     "art_libdexfile_support_tests",
     "art_libprofile_tests",
@@ -513,9 +464,17 @@ art_check_apex_gen_stem = "$(location art-apex-tester)" +
 
 // The non-flattened APEXes are always checked, as they are always generated
 // (even when APEX flattening is enabled).
-genrule_defaults {
+art_module_genrule_defaults {
     name: "art-check-apex-gen-defaults",
-    defaults: ["art_module_source_build_genrule_defaults"],
+
+    // Enable if SOONG_CONFIG_art_module_source_build is true.
+    enabled: false,
+    soong_config_variables: {
+        source_build: {
+            enabled: true,
+        },
+    },
+
     tools: [
         "art-apex-tester",
         "deapexer",

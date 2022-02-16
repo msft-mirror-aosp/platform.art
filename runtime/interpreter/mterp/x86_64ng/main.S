@@ -251,25 +251,19 @@ END_FUNCTION \name
 
 
 .macro BRANCH
-    leaq    (rPC, rINSTq, 2), rPC
     // Update method counter and do a suspend check if the branch is negative or zero.
     testq rINSTq, rINSTq
     jle 3f
 2:
+    leaq    (rPC, rINSTq, 2), rPC
     FETCH_INST
     GOTO_NEXT
 3:
     movq (%rsp), %rdi
-    movzwl ART_METHOD_HOTNESS_COUNT_OFFSET(%rdi), %esi
-#if (NTERP_HOTNESS_VALUE != 0)
-#error Expected 0 for hotness value
-#endif
-    // If the counter is at zero, handle this in the runtime.
-    testw %si, %si
-    je NterpHandleHotnessOverflow
-    // Update counter.
-    addl $$-1, %esi
-    movw %si, ART_METHOD_HOTNESS_COUNT_OFFSET(%rdi)
+    addw $$1, ART_METHOD_HOTNESS_COUNT_OFFSET(%rdi)
+    andw $$(NTERP_HOTNESS_MASK), ART_METHOD_HOTNESS_COUNT_OFFSET(%rdi)
+    // If the counter overflows, handle this in the runtime.
+    jz NterpHandleHotnessOverflow
     // Otherwise, do a suspend check.
     testl   $$(THREAD_SUSPEND_OR_CHECKPOINT_REQUEST), rSELF:THREAD_FLAGS_OFFSET
     jz      2b
@@ -826,16 +820,9 @@ END_FUNCTION \name
 // Increase method hotness and do suspend check before starting executing the method.
 .macro START_EXECUTING_INSTRUCTIONS
    movq (%rsp), %rdi
-   movzwl ART_METHOD_HOTNESS_COUNT_OFFSET(%rdi), %esi
-#if (NTERP_HOTNESS_VALUE != 0)
-#error Expected 0 for hotness value
-#endif
-   // If the counter is at zero, handle this in the runtime.
-   testw %si, %si
-   je 2f
-   // Update counter.
-   addl $$-1, %esi
-   movw %si, ART_METHOD_HOTNESS_COUNT_OFFSET(%rdi)
+   addw $$1, ART_METHOD_HOTNESS_COUNT_OFFSET(%rdi)
+   andw $$(NTERP_HOTNESS_MASK), ART_METHOD_HOTNESS_COUNT_OFFSET(%rdi)
+   jz 2f
    testl $$(THREAD_SUSPEND_OR_CHECKPOINT_REQUEST), rSELF:THREAD_FLAGS_OFFSET
    jz 1f
    EXPORT_PC
@@ -1498,10 +1485,22 @@ END_FUNCTION \name
     jmp .Ldone_return_range_\suffix
 .endm
 
+// Fetch some information from the thread cache.
+// Uses rax, rdx, rcx as temporaries.
+.macro FETCH_FROM_THREAD_CACHE dest_reg, slow_path
+   movq rSELF:THREAD_SELF_OFFSET, %rax
+   movq rPC, %rdx
+   salq MACRO_LITERAL(THREAD_INTERPRETER_CACHE_SIZE_SHIFT), %rdx
+   andq MACRO_LITERAL(THREAD_INTERPRETER_CACHE_SIZE_MASK), %rdx
+   cmpq THREAD_INTERPRETER_CACHE_OFFSET(%rax, %rdx, 1), rPC
+   jne \slow_path
+   movq __SIZEOF_POINTER__+THREAD_INTERPRETER_CACHE_OFFSET(%rax, %rdx, 1), \dest_reg
+.endm
+
 // Helper for static field get.
 .macro OP_SGET load="movl", wide="0"
    // Fast-path which gets the field from thread-local cache.
-%  fetch_from_thread_cache("%rax", miss_label="2f")
+   FETCH_FROM_THREAD_CACHE %rax, 2f
 1:
    movl ART_FIELD_OFFSET_OFFSET(%rax), %edx
    movl ART_FIELD_DECLARING_CLASS_OFFSET(%rax), %eax
@@ -1535,7 +1534,7 @@ END_FUNCTION \name
 // Helper for static field put.
 .macro OP_SPUT rINST_reg="rINST", store="movl", wide="0":
    // Fast-path which gets the field from thread-local cache.
-%  fetch_from_thread_cache("%rax", miss_label="2f")
+   FETCH_FROM_THREAD_CACHE %rax, 2f
 1:
    movl ART_FIELD_OFFSET_OFFSET(%rax), %edx
    movl ART_FIELD_DECLARING_CLASS_OFFSET(%rax), %eax
@@ -1601,7 +1600,7 @@ END_FUNCTION \name
 // Helper for instance field put.
 .macro OP_IPUT rINST_reg="rINST", store="movl", wide="0":
    // Fast-path which gets the field from thread-local cache.
-%  fetch_from_thread_cache("%rax", miss_label="2f")
+   FETCH_FROM_THREAD_CACHE %rax, 2f
 1:
    OP_IPUT_INTERNAL \rINST_reg, \store, \wide
    ADVANCE_PC_FETCH_AND_GOTO_NEXT 2
@@ -1623,7 +1622,7 @@ END_FUNCTION \name
 // Helper for instance field get.
 .macro OP_IGET load="movl", wide="0"
    // Fast-path which gets the field from thread-local cache.
-%  fetch_from_thread_cache("%rax", miss_label="2f")
+   FETCH_FROM_THREAD_CACHE %rax, 2f
 1:
    movl    rINST, %ecx                     # rcx <- BA
    sarl    $$4, %ecx                       # ecx <- B
@@ -1818,17 +1817,6 @@ OAT_ENTRY ExecuteNterpImpl, EndExecuteNterpImpl
 
 %def helpers():
 
-%def fetch_from_thread_cache(dest_reg, miss_label):
-   // Fetch some information from the thread cache.
-   // Uses rax, rdx, rcx as temporaries.
-   movq rSELF:THREAD_SELF_OFFSET, %rax
-   movq rPC, %rdx
-   salq MACRO_LITERAL(THREAD_INTERPRETER_CACHE_SIZE_SHIFT), %rdx
-   andq MACRO_LITERAL(THREAD_INTERPRETER_CACHE_SIZE_MASK), %rdx
-   cmpq THREAD_INTERPRETER_CACHE_OFFSET(%rax, %rdx, 1), rPC
-   jne ${miss_label}
-   movq __SIZEOF_POINTER__+THREAD_INTERPRETER_CACHE_OFFSET(%rax, %rdx, 1), ${dest_reg}
-
 %def footer():
 /*
  * ===========================================================================
@@ -1899,7 +1887,7 @@ NterpHandleStringInitRange:
 NterpNewInstance:
    EXPORT_PC
    // Fast-path which gets the class from thread-local cache.
-%  fetch_from_thread_cache("%rdi", miss_label="2f")
+   FETCH_FROM_THREAD_CACHE %rdi, 2f
    cmpq $$0, rSELF:THREAD_READ_BARRIER_MARK_REG00_OFFSET
    jne 3f
 4:
@@ -1922,7 +1910,7 @@ NterpNewArray:
    /* new-array vA, vB, class@CCCC */
    EXPORT_PC
    // Fast-path which gets the class from thread-local cache.
-%  fetch_from_thread_cache("%rdi", miss_label="2f")
+   FETCH_FROM_THREAD_CACHE %rdi, 2f
    cmpq $$0, rSELF:THREAD_READ_BARRIER_MARK_REG00_OFFSET
    jne 3f
 1:
@@ -1951,7 +1939,7 @@ NterpPutObjectInstanceField:
    GET_VREG %ecx, %rbp                     # ecx <- v[A]
    sarl    $$4, rINST
    // Fast-path which gets the field from thread-local cache.
-%  fetch_from_thread_cache("%rax", miss_label="2f")
+   FETCH_FROM_THREAD_CACHE %rax, 2f
 1:
    GET_VREG rINST, rINSTq                  # vB (object we're operating on)
    testl   rINST, rINST                    # is object null?
@@ -1991,7 +1979,7 @@ NterpPutObjectInstanceField:
 
 NterpGetObjectInstanceField:
    // Fast-path which gets the field from thread-local cache.
-%  fetch_from_thread_cache("%rax", miss_label="2f")
+   FETCH_FROM_THREAD_CACHE %rax, 2f
 1:
    movl    rINST, %ecx                     # rcx <- BA
    sarl    $$4, %ecx                       # ecx <- B
@@ -2026,7 +2014,7 @@ NterpGetObjectInstanceField:
 NterpPutObjectStaticField:
    GET_VREG %ebp, rINSTq
    // Fast-path which gets the field from thread-local cache.
-%  fetch_from_thread_cache("%rax", miss_label="2f")
+   FETCH_FROM_THREAD_CACHE %rax, 2f
 1:
    movl ART_FIELD_OFFSET_OFFSET(%rax), %edx
    movl ART_FIELD_DECLARING_CLASS_OFFSET(%rax), %eax
@@ -2076,7 +2064,7 @@ NterpPutObjectStaticField:
 
 NterpGetObjectStaticField:
    // Fast-path which gets the field from thread-local cache.
-%  fetch_from_thread_cache("%rax", miss_label="2f")
+   FETCH_FROM_THREAD_CACHE %rax, 2f
 1:
    movl ART_FIELD_OFFSET_OFFSET(%rax), %edx
    movl ART_FIELD_DECLARING_CLASS_OFFSET(%rax), %eax
@@ -2169,12 +2157,71 @@ NterpGetWideInstanceField:
 NterpGetInstanceField:
   OP_IGET load="movl", wide=0
 
+NterpInstanceOf:
+    /* instance-of vA, vB, class@CCCC */
+   // Fast-path which gets the class from thread-local cache.
+   EXPORT_PC
+   FETCH_FROM_THREAD_CACHE %rsi, 2f
+   cmpq $$0, rSELF:THREAD_READ_BARRIER_MARK_REG00_OFFSET
+   jne 5f
+1:
+   movzbl  rINSTbl,%edi
+   sarl    $$4,%edi                          # edi<- B
+   GET_VREG %edi %rdi                        # edi<- vB (object)
+   andb    $$0xf,rINSTbl                     # rINST<- A
+   testl %edi, %edi
+   je 3f
+   call art_quick_instance_of
+   SET_VREG %eax, rINSTq            # fp[A] <- value
+4:
+   ADVANCE_PC_FETCH_AND_GOTO_NEXT 2
+3:
+   SET_VREG %edi, rINSTq            # fp[A] <-0
+   jmp 4b
+2:
+   movq rSELF:THREAD_SELF_OFFSET, %rdi
+   movq 0(%rsp), %rsi
+   movq rPC, %rdx
+   call nterp_get_class_or_allocate_object
+   movq %rax, %rsi
+   jmp 1b
+5:
+   // 06 is %rsi
+   call art_quick_read_barrier_mark_reg06
+   jmp 1b
+
+NterpCheckCast:
+   // Fast-path which gets the class from thread-local cache.
+   EXPORT_PC
+   FETCH_FROM_THREAD_CACHE %rsi, 3f
+   cmpq $$0, rSELF:THREAD_READ_BARRIER_MARK_REG00_OFFSET
+   jne 4f
+1:
+   GET_VREG %edi, rINSTq
+   testl %edi, %edi
+   je 2f
+   call art_quick_check_instance_of
+2:
+   ADVANCE_PC_FETCH_AND_GOTO_NEXT 2
+3:
+   movq rSELF:THREAD_SELF_OFFSET, %rdi
+   movq 0(%rsp), %rsi
+   movq rPC, %rdx
+   call nterp_get_class_or_allocate_object
+   movq %rax, %rsi
+   jmp 1b
+4:
+   // 06 is %rsi
+   call art_quick_read_barrier_mark_reg06
+   jmp 1b
+
 NterpHandleHotnessOverflow:
-    movq rPC, %rsi
+    leaq (rPC, rINSTq, 2), %rsi
     movq rFP, %rdx
     call nterp_hot_method
     testq %rax, %rax
     jne 1f
+    leaq    (rPC, rINSTq, 2), rPC
     FETCH_INST
     GOTO_NEXT
 1:
@@ -2302,13 +2349,14 @@ SYMBOL(artNterpAsmInstructionEnd):
 SYMBOL(artNterpAsmInstructionStart) = .L_op_nop
     .text
 
-%def opcode_name_prefix():
-%   return "nterp_"
+%def default_helper_prefix():
+%  return "nterp_"
+
 %def opcode_start():
     ENTRY nterp_${opcode}
 %def opcode_end():
     END nterp_${opcode}
-%def opcode_slow_path_start(name):
+%def helper_start(name):
     ENTRY ${name}
-%def opcode_slow_path_end(name):
+%def helper_end(name):
     END ${name}

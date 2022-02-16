@@ -159,7 +159,7 @@ SwapSpace::SpaceChunk SwapSpace::NewFileChunk(size_t min_size) {
     LOG(ERROR) << "Free list:";
     DumpFreeMap(free_by_size_);
     LOG(ERROR) << "In free list: " << CollectFree(free_by_start_, free_by_size_);
-    PLOG(FATAL) << "Unable to mmap new swap file chunk.";
+    LOG(FATAL) << "Aborting...";
   }
   size_ += next_part;
   SpaceChunk new_chunk = {ptr, next_part};

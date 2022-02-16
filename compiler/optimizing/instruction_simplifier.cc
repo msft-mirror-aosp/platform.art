@@ -22,9 +22,7 @@
 #include "data_type-inl.h"
 #include "escape.h"
 #include "intrinsics.h"
-#include "intrinsics_utils.h"
 #include "mirror/class-inl.h"
-#include "optimizing/data_type.h"
 #include "optimizing/nodes.h"
 #include "scoped_thread_state_change-inl.h"
 #include "sharpening.h"
@@ -113,6 +111,9 @@ class InstructionSimplifierVisitor : public HGraphDelegateVisitor {
   void VisitDeoptimize(HDeoptimize* deoptimize) override;
   void VisitVecMul(HVecMul* instruction) override;
   void VisitPredicatedInstanceFieldGet(HPredicatedInstanceFieldGet* instruction) override;
+
+  bool CanEnsureNotNullAt(HInstruction* instr, HInstruction* at) const;
+
   void SimplifySystemArrayCopy(HInvoke* invoke);
   void SimplifyStringEquals(HInvoke* invoke);
   void SimplifyFP2Int(HInvoke* invoke);
@@ -122,9 +123,6 @@ class InstructionSimplifierVisitor : public HGraphDelegateVisitor {
   void SimplifyNPEOnArgN(HInvoke* invoke, size_t);
   void SimplifyReturnThis(HInvoke* invoke);
   void SimplifyAllocationIntrinsic(HInvoke* invoke);
-  void SimplifyVarHandleIntrinsic(HInvoke* invoke);
-
-  static bool CanEnsureNotNullAt(HInstruction* input, HInstruction* at);
 
   CodeGenerator* codegen_;
   OptimizingCompilerStats* stats_;
@@ -582,7 +580,7 @@ void InstructionSimplifierVisitor::VisitNullCheck(HNullCheck* null_check) {
   }
 }
 
-bool InstructionSimplifierVisitor::CanEnsureNotNullAt(HInstruction* input, HInstruction* at) {
+bool InstructionSimplifierVisitor::CanEnsureNotNullAt(HInstruction* input, HInstruction* at) const {
   if (!input->CanBeNull()) {
     return true;
   }
@@ -1185,33 +1183,6 @@ static bool IsTypeConversionLossless(DataType::Type input_type, DataType::Type r
       !(result_type == DataType::Type::kInt64 && input_type == DataType::Type::kFloat32);
 }
 
-static bool CanRemoveRedundantAnd(HConstant* and_right,
-                                  HConstant* shr_right,
-                                  DataType::Type result_type) {
-  int64_t and_cst = Int64FromConstant(and_right);
-  int64_t shr_cst = Int64FromConstant(shr_right);
-
-  // In the following sequence A is the input value, D is the result:
-  // B := A & x
-  // C := B >> r
-  // D := TypeConv(n-bit type) C
-
-  // The value of D is entirely dependent on the bits [n-1:0] of C, which in turn are dependent
-  // on bits [r+n-1:r] of B.
-  // Therefore, if the AND does not change bits [r+n-1:r] of A then it will not affect D.
-  // This can be checked by ensuring that bits [r+n-1:r] of the AND Constant are 1.
-
-  // For example: return (byte) ((value & 0xff00) >> 8)
-  //              return (byte) ((value & 0xff000000) >> 31)
-
-  // The mask sets bits [r+n-1:r] to 1, and all others to 0.
-  int64_t mask = DataType::MaxValueOfIntegralType(DataType::ToUnsigned(result_type)) << shr_cst;
-
-  // If the result of a bitwise AND between the mask and the AND constant is the original mask, then
-  // the AND does not change bits [r+n-1:r], meaning that it is redundant and can be removed.
-  return ((and_cst & mask) == mask);
-}
-
 static inline bool TryReplaceFieldOrArrayGetType(HInstruction* maybe_get, DataType::Type new_type) {
   if (maybe_get->IsInstanceFieldGet()) {
     maybe_get->AsInstanceFieldGet()->SetType(new_type);
@@ -1330,36 +1301,6 @@ void InstructionSimplifierVisitor::VisitTypeConversion(HTypeConversion* instruct
         input_conversion->GetBlock()->RemoveInstruction(input_conversion);
         RecordSimplification();
         return;
-      }
-    }
-  } else if (input->IsShr() && DataType::IsIntegralType(result_type) &&
-            // Optimization only applies to lossy Type Conversions.
-            !IsTypeConversionLossless(input_type, result_type)) {
-    DCHECK(DataType::IsIntegralType(input_type));
-    HShr* shr_op = input->AsShr();
-    HConstant* shr_right = shr_op->GetConstantRight();
-    HInstruction* shr_left = shr_op->GetLeastConstantLeft();
-    if (shr_right != nullptr && shr_left->IsAnd()) {
-      // Optimization needs AND -> SHR -> TypeConversion pattern.
-      HAnd* and_op = shr_left->AsAnd();
-      HConstant* and_right = and_op->GetConstantRight();
-      HInstruction* and_left = and_op->GetLeastConstantLeft();
-      if (and_right != nullptr &&
-          !DataType::IsUnsignedType(and_left->GetType()) &&
-          !DataType::IsUnsignedType(result_type) &&
-          !DataType::IsUnsignedType(and_right->GetType()) &&
-          (DataType::Size(and_left->GetType()) < 8) &&
-          (DataType::Size(result_type) == 1)) {
-        // TODO: Support Unsigned Types.
-        // TODO: Support Long Types.
-        // TODO: Support result types other than byte.
-        if (and_op->HasOnlyOneNonEnvironmentUse() &&
-            CanRemoveRedundantAnd(and_right, shr_right, result_type)) {
-          and_op->ReplaceWith(and_left);
-          and_op->GetBlock()->RemoveInstruction(and_op);
-          RecordSimplification();
-          return;
-        }
       }
     }
   } else if (input->IsAnd() && DataType::IsIntegralType(result_type)) {
@@ -2645,15 +2586,12 @@ static bool TryReplaceStringBuilderAppend(HInvoke* invoke) {
   // Collect args and check for unexpected uses.
   // We expect one call to a constructor with no arguments, one constructor fence (unless
   // eliminated), some number of append calls and one call to StringBuilder.toString().
-  bool constructor_inlined = false;
   bool seen_constructor = false;
   bool seen_constructor_fence = false;
   bool seen_to_string = false;
   uint32_t format = 0u;
   uint32_t num_args = 0u;
   HInstruction* args[StringBuilderAppend::kMaxArgs];  // Added in reverse order.
-  // When inlining, `maybe_new_array` tracks an environment use that we want to allow.
-  HInstruction* maybe_new_array = nullptr;
   for (HBackwardInstructionIterator iter(block->GetInstructions()); !iter.Done(); iter.Advance()) {
     HInstruction* user = iter.Current();
     // Instructions of interest apply to `sb`, skip those that do not involve `sb`.
@@ -2734,25 +2672,13 @@ static bool TryReplaceStringBuilderAppend(HInvoke* invoke) {
       format = (format << StringBuilderAppend::kBitsPerArg) | static_cast<uint32_t>(arg);
       args[num_args] = as_invoke_virtual->InputAt(1u);
       ++num_args;
-    } else if (!seen_constructor) {
-      // At this point, we should see the constructor. However, we might have inlined it so we have
-      // to take care of both cases. We accept only the constructor with no extra arguments. This
-      // means that if we inline it, we have to check it is setting its field to a new array.
-      if (user->IsInvokeStaticOrDirect() &&
-          user->AsInvokeStaticOrDirect()->GetResolvedMethod() != nullptr &&
-          user->AsInvokeStaticOrDirect()->GetResolvedMethod()->IsConstructor() &&
-          user->AsInvokeStaticOrDirect()->GetNumberOfArguments() == 1u) {
-        constructor_inlined = false;
-      } else if (user->IsInstanceFieldSet() &&
-                 user->AsInstanceFieldSet()->GetFieldType() == DataType::Type::kReference &&
-                 user->AsInstanceFieldSet()->InputAt(0) == sb &&
-                 user->AsInstanceFieldSet()->GetValue()->IsNewArray()) {
-        maybe_new_array = user->AsInstanceFieldSet()->GetValue();
-        constructor_inlined = true;
-      } else {
-        // We were expecting a constructor but we haven't seen it. Abort optimization.
-        return false;
-      }
+    } else if (user->IsInvokeStaticOrDirect() &&
+               user->AsInvokeStaticOrDirect()->GetResolvedMethod() != nullptr &&
+               user->AsInvokeStaticOrDirect()->GetResolvedMethod()->IsConstructor() &&
+               user->AsInvokeStaticOrDirect()->GetNumberOfArguments() == 1u) {
+      // After arguments, we should see the constructor.
+      // We accept only the constructor with no extra arguments.
+      DCHECK(!seen_constructor);
       DCHECK(!seen_constructor_fence);
       seen_constructor = true;
     } else if (user->IsConstructorFence()) {
@@ -2778,10 +2704,6 @@ static bool TryReplaceStringBuilderAppend(HInvoke* invoke) {
     // Accept only calls on the StringBuilder (which shall all be removed).
     // TODO: Carve-out for const-string? Or rely on environment pruning (to be implemented)?
     if (holder->InputCount() == 0 || holder->InputAt(0) != sb) {
-      // When inlining the constructor, we have a NewArray as an environment use.
-      if (constructor_inlined && holder == maybe_new_array) {
-        continue;
-      }
       return false;
     }
   }
@@ -2815,18 +2737,6 @@ static bool TryReplaceStringBuilderAppend(HInvoke* invoke) {
   while (sb->HasNonEnvironmentUses()) {
     block->RemoveInstruction(sb->GetUses().front().GetUser());
   }
-  if (constructor_inlined) {
-    // We need to remove the inlined constructor instructions. That also removes all remaining
-    // environment uses.
-    DCHECK(sb->HasEnvironmentUses());
-    DCHECK(maybe_new_array != nullptr);
-    DCHECK(maybe_new_array->IsNewArray());
-    DCHECK(maybe_new_array->HasNonEnvironmentUses());
-    HInstruction* fence = maybe_new_array->GetUses().front().GetUser();
-    DCHECK(fence->IsConstructorFence());
-    block->RemoveInstruction(fence);
-    block->RemoveInstruction(maybe_new_array);
-  }
   DCHECK(!sb->HasEnvironmentUses());
   block->RemoveInstruction(sb);
   return true;
@@ -2849,32 +2759,6 @@ void InstructionSimplifierVisitor::SimplifyAllocationIntrinsic(HInvoke* invoke) 
   } else if (invoke->GetIntrinsic() == Intrinsics::kStringBuilderToString &&
              TryReplaceStringBuilderAppend(invoke)) {
     RecordSimplification();
-  }
-}
-
-void InstructionSimplifierVisitor::SimplifyVarHandleIntrinsic(HInvoke* invoke) {
-  DCHECK(invoke->IsInvokePolymorphic());
-  VarHandleOptimizations optimizations(invoke);
-
-  if (optimizations.GetDoNotIntrinsify()) {
-    // Preceding static checks disabled intrinsic, so no need to analyze further.
-    return;
-  }
-
-  size_t expected_coordinates_count = GetExpectedVarHandleCoordinatesCount(invoke);
-  if (expected_coordinates_count == 1u) {
-    HInstruction* object = invoke->InputAt(1);
-    // The following has been ensured by static checks in the instruction builder.
-    DCHECK(object->GetType() == DataType::Type::kReference);
-    // Re-check for null constant, as this might have changed after the inliner.
-    if (object->IsNullConstant()) {
-      optimizations.SetDoNotIntrinsify();
-      return;
-    }
-    // Test whether we can avoid the null check on the object.
-    if (CanEnsureNotNullAt(object, invoke)) {
-      optimizations.SetSkipObjectNullCheck();
-    }
   }
 }
 
@@ -2925,39 +2809,6 @@ void InstructionSimplifierVisitor::VisitInvoke(HInvoke* instruction) {
     case Intrinsics::kStringBuilderToString:
       SimplifyAllocationIntrinsic(instruction);
       break;
-    case Intrinsics::kVarHandleCompareAndExchange:
-    case Intrinsics::kVarHandleCompareAndExchangeAcquire:
-    case Intrinsics::kVarHandleCompareAndExchangeRelease:
-    case Intrinsics::kVarHandleCompareAndSet:
-    case Intrinsics::kVarHandleGet:
-    case Intrinsics::kVarHandleGetAcquire:
-    case Intrinsics::kVarHandleGetAndAdd:
-    case Intrinsics::kVarHandleGetAndAddAcquire:
-    case Intrinsics::kVarHandleGetAndAddRelease:
-    case Intrinsics::kVarHandleGetAndBitwiseAnd:
-    case Intrinsics::kVarHandleGetAndBitwiseAndAcquire:
-    case Intrinsics::kVarHandleGetAndBitwiseAndRelease:
-    case Intrinsics::kVarHandleGetAndBitwiseOr:
-    case Intrinsics::kVarHandleGetAndBitwiseOrAcquire:
-    case Intrinsics::kVarHandleGetAndBitwiseOrRelease:
-    case Intrinsics::kVarHandleGetAndBitwiseXor:
-    case Intrinsics::kVarHandleGetAndBitwiseXorAcquire:
-    case Intrinsics::kVarHandleGetAndBitwiseXorRelease:
-    case Intrinsics::kVarHandleGetAndSet:
-    case Intrinsics::kVarHandleGetAndSetAcquire:
-    case Intrinsics::kVarHandleGetAndSetRelease:
-    case Intrinsics::kVarHandleGetOpaque:
-    case Intrinsics::kVarHandleGetVolatile:
-    case Intrinsics::kVarHandleSet:
-    case Intrinsics::kVarHandleSetOpaque:
-    case Intrinsics::kVarHandleSetRelease:
-    case Intrinsics::kVarHandleSetVolatile:
-    case Intrinsics::kVarHandleWeakCompareAndSet:
-    case Intrinsics::kVarHandleWeakCompareAndSetAcquire:
-    case Intrinsics::kVarHandleWeakCompareAndSetPlain:
-    case Intrinsics::kVarHandleWeakCompareAndSetRelease:
-      SimplifyVarHandleIntrinsic(instruction);
-      break;
     case Intrinsics::kIntegerRotateRight:
     case Intrinsics::kLongRotateRight:
     case Intrinsics::kIntegerRotateLeft:
@@ -2972,9 +2823,6 @@ void InstructionSimplifierVisitor::VisitInvoke(HInvoke* instruction) {
     case Intrinsics::kUnsafeLoadFence:
     case Intrinsics::kUnsafeStoreFence:
     case Intrinsics::kUnsafeFullFence:
-    case Intrinsics::kJdkUnsafeLoadFence:
-    case Intrinsics::kJdkUnsafeStoreFence:
-    case Intrinsics::kJdkUnsafeFullFence:
     case Intrinsics::kVarHandleFullFence:
     case Intrinsics::kVarHandleAcquireFence:
     case Intrinsics::kVarHandleReleaseFence:

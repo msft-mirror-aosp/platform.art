@@ -57,7 +57,7 @@ inline mirror::Object* Heap::AllocObjectWithAllocator(Thread* self,
     CheckPreconditionsForAllocObject(klass, byte_count);
     // Since allocation can cause a GC which will need to SuspendAll, make sure all allocations are
     // done in the runnable state where suspension is expected.
-    CHECK_EQ(self->GetState(), ThreadState::kRunnable);
+    CHECK_EQ(self->GetState(), kRunnable);
     self->AssertThreadSuspensionIsAllowable();
     self->AssertNoPendingException();
     // Make sure to preserve klass.
@@ -160,14 +160,11 @@ inline mirror::Object* Heap::AllocObjectWithAllocator(Thread* self,
           if (!self->IsExceptionPending()) {
             // Since we are restarting, allow thread suspension.
             ScopedAllowThreadSuspension ats;
-            // Get the new class size in case class redefinition changed the class size since alloc
-            // started.
-            int new_byte_count = klass->IsVariableSize()? byte_count : klass->GetObjectSize();
             // AllocObject will pick up the new allocator type, and instrumented as true is the safe
             // default.
             return AllocObjectWithAllocator</*kInstrumented=*/true>(self,
                                                                     klass,
-                                                                    new_byte_count,
+                                                                    byte_count,
                                                                     GetUpdatedAllocator(allocator),
                                                                     pre_fence_visitor);
           }

@@ -65,7 +65,7 @@ LIBCORE_TEST_NAMES = [
   "libcore.highmemorytest.java.time.format.DateTimeFormatterTest",
   "libcore.highmemorytest.java.util.CalendarTest",
   "libcore.highmemorytest.java.util.CurrencyTest",
-  "libcore.highmemorytest.libcore.icu.SimpleDateFormatDataTest",
+  "libcore.highmemorytest.libcore.icu.LocaleDataTest",
   # All other tests in alphabetical order.
   "libcore.android.system",
   "libcore.build",
@@ -123,7 +123,7 @@ def get_jar_filename(classpath):
 
 def get_timeout_secs():
   default_timeout_secs = 600
-  if args.gcstress:
+  if args.mode == "device" and args.gcstress:
     default_timeout_secs = 1200
     if args.debug:
       default_timeout_secs = 1800
@@ -168,7 +168,6 @@ def get_vogar_command(test_name):
     cmd.append("--variant=" + args.variant)
   if args.gcstress:
     cmd.append("--vm-arg -Xgc:gcstress")
-    cmd.append('--vm-arg -Djsr166.delay.factor="1.50"')
   if args.debug:
     cmd.append("--vm-arg -XXlib:libartd.so --vm-arg -XX:SlowDebug=true")
 
@@ -183,10 +182,18 @@ def get_vogar_command(test_name):
 
   if args.mode != "jvm":
     cmd.append("--timeout {}".format(get_timeout_secs()))
+
+    # Suppress explicit gc logs that are triggered an absurd number of times by these tests.
+    cmd.append("--vm-arg -XX:AlwaysLogExplicitGcs:false")
     cmd.append("--toolchain d8 --language CUR")
     if args.jit:
       cmd.append("--vm-arg -Xcompiler-option --vm-arg --compiler-filter=quicken")
     cmd.append("--vm-arg -Xusejit:{}".format(str(args.jit).lower()))
+
+    if args.gcstress:
+      # Bump pause threshold as long pauses cause explicit gc logging to occur irrespective
+      # of -XX:AlwayLogExplicitGcs:false.
+      cmd.append("--vm-arg -XX:LongPauseLogThreshold=15") # 15 ms (default: 5ms))
 
   # Suppress color codes if not attached to a terminal
   if not sys.stdout.isatty():

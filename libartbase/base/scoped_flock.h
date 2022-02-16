@@ -32,7 +32,7 @@ class LockedFile;
 class LockedFileCloseNoFlush;
 
 // A scoped File object that calls Close without flushing.
-using ScopedFlock = std::unique_ptr<LockedFile, LockedFileCloseNoFlush>;
+typedef std::unique_ptr<LockedFile, LockedFileCloseNoFlush> ScopedFlock;
 
 class LockedFile : public unix_file::FdFile {
  public:

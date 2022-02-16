@@ -111,8 +111,8 @@ static inline size_t GetExpectedVarHandleCoordinatesCount(HInvoke *invoke) {
 
 static inline DataType::Type GetDataTypeFromShorty(HInvoke* invoke, uint32_t index) {
   DCHECK(invoke->IsInvokePolymorphic());
-  const DexFile* dex_file = invoke->GetMethodReference().dex_file;
-  const char* shorty = dex_file->GetShorty(invoke->AsInvokePolymorphic()->GetProtoIndex());
+  const DexFile& dex_file = invoke->GetBlock()->GetGraph()->GetDexFile();
+  const char* shorty = dex_file.GetShorty(invoke->AsInvokePolymorphic()->GetProtoIndex());
   DCHECK_LT(index, strlen(shorty));
 
   return DataType::FromShorty(shorty[index]);
@@ -143,56 +143,6 @@ static inline bool IsVarHandleGetAndAdd(HInvoke* invoke) {
       return true;
     default:
       return false;
-  }
-}
-
-static inline bool IsVarHandleGet(HInvoke* invoke) {
-  mirror::VarHandle::AccessModeTemplate access_mode =
-      mirror::VarHandle::GetAccessModeTemplateByIntrinsic(invoke->GetIntrinsic());
-  return access_mode == mirror::VarHandle::AccessModeTemplate::kGet;
-}
-
-static inline bool IsUnsafeGetObject(HInvoke* invoke) {
-  switch (invoke->GetIntrinsic()) {
-    case Intrinsics::kUnsafeGetObject:
-    case Intrinsics::kUnsafeGetObjectVolatile:
-    case Intrinsics::kJdkUnsafeGetObject:
-    case Intrinsics::kJdkUnsafeGetObjectVolatile:
-    case Intrinsics::kJdkUnsafeGetObjectAcquire:
-      return true;
-    default:
-      return false;
-  }
-}
-
-static inline bool IsUnsafeCASObject(HInvoke* invoke) {
-  switch (invoke->GetIntrinsic()) {
-    case Intrinsics::kUnsafeCASObject:
-    case Intrinsics::kJdkUnsafeCASObject:
-    case Intrinsics::kJdkUnsafeCompareAndSetObject:
-      return true;
-    default:
-      return false;
-  }
-}
-
-static inline bool IsVarHandleCASFamily(HInvoke* invoke) {
-  mirror::VarHandle::AccessModeTemplate access_mode =
-      mirror::VarHandle::GetAccessModeTemplateByIntrinsic(invoke->GetIntrinsic());
-  return access_mode == mirror::VarHandle::AccessModeTemplate::kCompareAndSet ||
-      access_mode == mirror::VarHandle::AccessModeTemplate::kGetAndUpdate ||
-      access_mode == mirror::VarHandle::AccessModeTemplate::kCompareAndExchange;
-}
-
-static inline DataType::Type GetVarHandleExpectedValueType(HInvoke* invoke,
-                                                           size_t expected_coordinates_count) {
-  DCHECK_EQ(expected_coordinates_count, GetExpectedVarHandleCoordinatesCount(invoke));
-  uint32_t number_of_arguments = invoke->GetNumberOfArguments();
-  DCHECK_GE(number_of_arguments, /* VarHandle object */ 1u + expected_coordinates_count);
-  if (number_of_arguments == /* VarHandle object */ 1u + expected_coordinates_count) {
-    return invoke->GetType();
-  } else {
-    return GetDataTypeFromShorty(invoke, number_of_arguments - 1u);
   }
 }
 

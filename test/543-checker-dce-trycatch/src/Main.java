@@ -15,6 +15,10 @@
  */
 
 public class Main {
+
+  // Workaround for b/18051191.
+  class InnerClass {}
+
   static boolean $inline$False() { return false; }
 
   // DCE should only merge blocks where the first ends with a Goto.

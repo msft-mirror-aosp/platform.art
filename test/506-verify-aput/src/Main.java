@@ -18,6 +18,8 @@ import java.lang.reflect.Method;
 
 public class Main {
   public static void main(String[] args) throws Exception {
+    // Workaround for b/18051191.
+    System.out.println("Enter");
     try {
       Class.forName("VerifyAPut1");
       throw new Error("expected verification error");

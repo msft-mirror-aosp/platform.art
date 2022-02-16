@@ -183,7 +183,7 @@ AdbConnectionState::~AdbConnectionState() {
 static jobject CreateAdbConnectionThread(art::Thread* thr) {
   JNIEnv* env = thr->GetJniEnv();
   // Move to native state to talk with the jnienv api.
-  art::ScopedThreadStateChange stsc(thr, art::ThreadState::kNative);
+  art::ScopedThreadStateChange stsc(thr, art::kNative);
   ScopedLocalRef<jstring> thr_name(env, env->NewStringUTF(kAdbConnectionThreadName));
   ScopedLocalRef<jobject> thr_group(
       env,
@@ -528,9 +528,9 @@ bool AdbConnectionState::SetupAdbConnection() {
 void AdbConnectionState::RunPollLoop(art::Thread* self) {
   DCHECK(IsDebuggingPossible() || art::Runtime::Current()->IsProfileableFromShell());
   CHECK_NE(agent_name_, "");
-  CHECK_EQ(self->GetState(), art::ThreadState::kNative);
+  CHECK_EQ(self->GetState(), art::kNative);
   art::Locks::mutator_lock_->AssertNotHeld(self);
-  self->SetState(art::ThreadState::kWaitingInMainDebuggerLoop);
+  self->SetState(art::kWaitingInMainDebuggerLoop);
   // shutting_down_ set by StopDebuggerThreads
   while (!shutting_down_) {
     // First, connect to adbd if we haven't already.

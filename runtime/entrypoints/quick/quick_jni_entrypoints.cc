@@ -41,10 +41,11 @@ namespace art {
 static_assert(sizeof(IRTSegmentState) == sizeof(uint32_t), "IRTSegmentState size unexpected");
 static_assert(std::is_trivial<IRTSegmentState>::value, "IRTSegmentState not trivial");
 
-extern "C" void artJniReadBarrier(ArtMethod* method) {
+static inline void GoToRunnableFast(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_);
+
+extern void ReadBarrierJni(mirror::CompressedReference<mirror::Class>* declaring_class,
+                           Thread* self ATTRIBUTE_UNUSED) {
   DCHECK(kUseReadBarrier);
-  mirror::CompressedReference<mirror::Object>* declaring_class =
-      method->GetDeclaringClassAddressWithoutBarrier();
   if (kUseBakerReadBarrier) {
     DCHECK(declaring_class->AsMirrorPtr() != nullptr)
         << "The class of a static jni call must not be null";
@@ -54,20 +55,72 @@ extern "C" void artJniReadBarrier(ArtMethod* method) {
     }
   }
   // Call the read barrier and update the handle.
-  mirror::Object* to_ref = ReadBarrier::BarrierForRoot(declaring_class);
+  mirror::Class* to_ref = ReadBarrier::BarrierForRoot(declaring_class);
   declaring_class->Assign(to_ref);
 }
 
+// Called on entry to fast JNI, push a new local reference table only.
+extern uint32_t JniMethodFastStart(Thread* self) {
+  JNIEnvExt* env = self->GetJniEnv();
+  DCHECK(env != nullptr);
+  uint32_t saved_local_ref_cookie = bit_cast<uint32_t>(env->GetLocalRefCookie());
+  env->SetLocalRefCookie(env->GetLocalsSegmentState());
+
+  if (kIsDebugBuild) {
+    ArtMethod* native_method = *self->GetManagedStack()->GetTopQuickFrame();
+    CHECK(native_method->IsFastNative()) << native_method->PrettyMethod();
+  }
+
+  return saved_local_ref_cookie;
+}
+
 // Called on entry to JNI, transition out of Runnable and release share of mutator_lock_.
-extern "C" void artJniMethodStart(Thread* self) {
+extern uint32_t JniMethodStart(Thread* self) {
+  JNIEnvExt* env = self->GetJniEnv();
+  DCHECK(env != nullptr);
+  uint32_t saved_local_ref_cookie = bit_cast<uint32_t>(env->GetLocalRefCookie());
+  env->SetLocalRefCookie(env->GetLocalsSegmentState());
+
   if (kIsDebugBuild) {
     ArtMethod* native_method = *self->GetManagedStack()->GetTopQuickFrame();
     CHECK(!native_method->IsFastNative()) << native_method->PrettyMethod();
-    CHECK(!native_method->IsCriticalNative()) << native_method->PrettyMethod();
   }
 
   // Transition out of runnable.
-  self->TransitionFromRunnableToSuspended(ThreadState::kNative);
+  self->TransitionFromRunnableToSuspended(kNative);
+  return saved_local_ref_cookie;
+}
+
+extern uint32_t JniMethodStartSynchronized(jobject to_lock, Thread* self) {
+  self->DecodeJObject(to_lock)->MonitorEnter(self);
+  return JniMethodStart(self);
+}
+
+// TODO: NO_THREAD_SAFETY_ANALYSIS due to different control paths depending on fast JNI.
+static void GoToRunnable(Thread* self) NO_THREAD_SAFETY_ANALYSIS {
+  if (kIsDebugBuild) {
+    ArtMethod* native_method = *self->GetManagedStack()->GetTopQuickFrame();
+    CHECK(!native_method->IsFastNative()) << native_method->PrettyMethod();
+  }
+
+  self->TransitionFromSuspendedToRunnable();
+}
+
+ALWAYS_INLINE static inline void GoToRunnableFast(Thread* self) {
+  if (kIsDebugBuild) {
+    // Should only enter here if the method is @FastNative.
+    ArtMethod* native_method = *self->GetManagedStack()->GetTopQuickFrame();
+    CHECK(native_method->IsFastNative()) << native_method->PrettyMethod();
+  }
+
+  // When we are in @FastNative, we are already Runnable.
+  // Only do a suspend check on the way out of JNI.
+  if (UNLIKELY(self->TestAllFlags())) {
+    // In fast JNI mode we never transitioned out of runnable. Perform a suspend check if there
+    // is a flag raised.
+    DCHECK(Locks::mutator_lock_->IsSharedHeld(self));
+    self->CheckSuspend();
+  }
 }
 
 static void PopLocalReferences(uint32_t saved_local_ref_cookie, Thread* self)
@@ -81,11 +134,8 @@ static void PopLocalReferences(uint32_t saved_local_ref_cookie, Thread* self)
 }
 
 // TODO: annotalysis disabled as monitor semantics are maintained in Java code.
-extern "C" void artJniUnlockObject(mirror::Object* locked, Thread* self)
+static inline void UnlockJniSynchronizedMethod(jobject locked, Thread* self)
     NO_THREAD_SAFETY_ANALYSIS REQUIRES(!Roles::uninterruptible_) {
-  // Note: No thread suspension is allowed for successful unlocking, otherwise plain
-  // `mirror::Object*` return value saved by the assembly stub would need to be updated.
-  uintptr_t old_poison_object_cookie = kIsDebugBuild ? self->GetPoisonObjectCookie() : 0u;
   // Save any pending exception over monitor exit call.
   ObjPtr<mirror::Throwable> saved_exception = nullptr;
   if (UNLIKELY(self->IsExceptionPending())) {
@@ -93,41 +143,51 @@ extern "C" void artJniUnlockObject(mirror::Object* locked, Thread* self)
     self->ClearException();
   }
   // Decode locked object and unlock, before popping local references.
-  locked->MonitorExit(self);
+  self->DecodeJObject(locked)->MonitorExit(self);
   if (UNLIKELY(self->IsExceptionPending())) {
-    LOG(FATAL) << "Exception during implicit MonitorExit for synchronized native method:\n"
-        << self->GetException()->Dump()
-        << (saved_exception != nullptr
-               ? "\nAn exception was already pending:\n" + saved_exception->Dump()
-               : "");
-    UNREACHABLE();
+    LOG(FATAL) << "Synchronized JNI code returning with an exception:\n"
+        << saved_exception->Dump()
+        << "\nEncountered second exception during implicit MonitorExit:\n"
+        << self->GetException()->Dump();
   }
   // Restore pending exception.
   if (saved_exception != nullptr) {
     self->SetException(saved_exception);
-  }
-  if (kIsDebugBuild) {
-    DCHECK_EQ(old_poison_object_cookie, self->GetPoisonObjectCookie());
   }
 }
 
 // TODO: These should probably be templatized or macro-ized.
 // Otherwise there's just too much repetitive boilerplate.
 
-extern "C" void artJniMethodEnd(Thread* self) {
-  self->TransitionFromSuspendedToRunnable();
-
-  if (kIsDebugBuild) {
-    ArtMethod* native_method = *self->GetManagedStack()->GetTopQuickFrame();
-    CHECK(!native_method->IsFastNative()) << native_method->PrettyMethod();
-    CHECK(!native_method->IsCriticalNative()) << native_method->PrettyMethod();
-  }
+extern void JniMethodEnd(uint32_t saved_local_ref_cookie, Thread* self) {
+  GoToRunnable(self);
+  PopLocalReferences(saved_local_ref_cookie, self);
 }
 
-extern mirror::Object* JniDecodeReferenceResult(jobject result, Thread* self)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  DCHECK(!self->IsExceptionPending());
-  ObjPtr<mirror::Object> o = self->DecodeJObject(result);
+extern void JniMethodFastEnd(uint32_t saved_local_ref_cookie, Thread* self) {
+  GoToRunnableFast(self);
+  PopLocalReferences(saved_local_ref_cookie, self);
+}
+
+extern void JniMethodEndSynchronized(uint32_t saved_local_ref_cookie,
+                                     jobject locked,
+                                     Thread* self) {
+  GoToRunnable(self);
+  UnlockJniSynchronizedMethod(locked, self);  // Must decode before pop.
+  PopLocalReferences(saved_local_ref_cookie, self);
+}
+
+// Common result handling for EndWithReference.
+static mirror::Object* JniMethodEndWithReferenceHandleResult(jobject result,
+                                                             uint32_t saved_local_ref_cookie,
+                                                             Thread* self)
+    NO_THREAD_SAFETY_ANALYSIS {
+  // Must decode before pop. The 'result' may not be valid in case of an exception, though.
+  ObjPtr<mirror::Object> o;
+  if (!self->IsExceptionPending()) {
+    o = self->DecodeJObject(result);
+  }
+  PopLocalReferences(saved_local_ref_cookie, self);
   // Process result.
   if (UNLIKELY(self->GetJniEnv()->IsCheckJniEnabled())) {
     // CheckReferenceResult can resolve types.
@@ -139,13 +199,35 @@ extern mirror::Object* JniDecodeReferenceResult(jobject result, Thread* self)
   return o.Ptr();
 }
 
+extern mirror::Object* JniMethodFastEndWithReference(jobject result,
+                                                     uint32_t saved_local_ref_cookie,
+                                                     Thread* self) {
+  GoToRunnableFast(self);
+  return JniMethodEndWithReferenceHandleResult(result, saved_local_ref_cookie, self);
+}
+
+extern mirror::Object* JniMethodEndWithReference(jobject result,
+                                                 uint32_t saved_local_ref_cookie,
+                                                 Thread* self) {
+  GoToRunnable(self);
+  return JniMethodEndWithReferenceHandleResult(result, saved_local_ref_cookie, self);
+}
+
+extern mirror::Object* JniMethodEndWithReferenceSynchronized(jobject result,
+                                                             uint32_t saved_local_ref_cookie,
+                                                             jobject locked,
+                                                             Thread* self) {
+  GoToRunnable(self);
+  UnlockJniSynchronizedMethod(locked, self);
+  return JniMethodEndWithReferenceHandleResult(result, saved_local_ref_cookie, self);
+}
+
 extern uint64_t GenericJniMethodEnd(Thread* self,
                                     uint32_t saved_local_ref_cookie,
                                     jvalue result,
                                     uint64_t result_f,
                                     ArtMethod* called)
-    // NO_THREAD_SAFETY_ANALYSIS because we can enter this function with the mutator lock
-    // unlocked for normal JNI, or locked for @FastNative and @CriticalNative.
+    // TODO: NO_THREAD_SAFETY_ANALYSIS as GoToRunnable() is NO_THREAD_SAFETY_ANALYSIS
     NO_THREAD_SAFETY_ANALYSIS {
   bool critical_native = called->IsCriticalNative();
   bool fast_native = called->IsFastNative();
@@ -154,31 +236,23 @@ extern uint64_t GenericJniMethodEnd(Thread* self,
   // @CriticalNative does not do a state transition. @FastNative usually does not do a state
   // transition either but it performs a suspend check that may do state transitions.
   if (LIKELY(normal_native)) {
-    if (UNLIKELY(self->ReadFlag(ThreadFlag::kMonitorJniEntryExit))) {
-      artJniMonitoredMethodEnd(self);
-    } else {
-      artJniMethodEnd(self);
-    }
+    MONITOR_JNI(PaletteNotifyEndJniInvocation);
+    GoToRunnable(self);
   } else if (fast_native) {
-    // When we are in @FastNative, we are already Runnable.
-    DCHECK(Locks::mutator_lock_->IsSharedHeld(self));
-    // Only do a suspend check on the way out of JNI just like compiled stubs.
-    self->CheckSuspend();
+    GoToRunnableFast(self);
   }
-  // We need the mutator lock (i.e., calling `artJniMethodEnd()`) before accessing
-  // the shorty or the locked object.
+  // We need the mutator lock (i.e., calling GoToRunnable()) before accessing the shorty or the
+  // locked object.
   if (called->IsSynchronized()) {
     DCHECK(normal_native) << "@FastNative/@CriticalNative and synchronize is not supported";
-    ObjPtr<mirror::Object> lock = GetGenericJniSynchronizationObject(self, called);
+    jobject lock = GetGenericJniSynchronizationObject(self, called);
     DCHECK(lock != nullptr);
-    artJniUnlockObject(lock.Ptr(), self);
+    UnlockJniSynchronizedMethod(lock, self);
   }
   char return_shorty_char = called->GetShorty()[0];
   if (return_shorty_char == 'L') {
-    uint64_t ret = reinterpret_cast<uint64_t>(
-        UNLIKELY(self->IsExceptionPending()) ? nullptr : JniDecodeReferenceResult(result.l, self));
-    PopLocalReferences(saved_local_ref_cookie, self);
-    return ret;
+    return reinterpret_cast<uint64_t>(JniMethodEndWithReferenceHandleResult(
+        result.l, saved_local_ref_cookie, self));
   } else {
     if (LIKELY(!critical_native)) {
       PopLocalReferences(saved_local_ref_cookie, self);
@@ -216,14 +290,44 @@ extern uint64_t GenericJniMethodEnd(Thread* self,
   }
 }
 
-extern "C" void artJniMonitoredMethodStart(Thread* self) {
-  artJniMethodStart(self);
+extern uint32_t JniMonitoredMethodStart(Thread* self) {
+  uint32_t result = JniMethodStart(self);
   MONITOR_JNI(PaletteNotifyBeginJniInvocation);
+  return result;
 }
 
-extern "C" void artJniMonitoredMethodEnd(Thread* self) {
+extern uint32_t JniMonitoredMethodStartSynchronized(jobject to_lock, Thread* self) {
+  uint32_t result = JniMethodStartSynchronized(to_lock, self);
+  MONITOR_JNI(PaletteNotifyBeginJniInvocation);
+  return result;
+}
+
+extern void JniMonitoredMethodEnd(uint32_t saved_local_ref_cookie, Thread* self) {
   MONITOR_JNI(PaletteNotifyEndJniInvocation);
-  artJniMethodEnd(self);
+  return JniMethodEnd(saved_local_ref_cookie, self);
+}
+
+extern void JniMonitoredMethodEndSynchronized(uint32_t saved_local_ref_cookie,
+                                             jobject locked,
+                                             Thread* self) {
+  MONITOR_JNI(PaletteNotifyEndJniInvocation);
+  return JniMethodEndSynchronized(saved_local_ref_cookie, locked, self);
+}
+
+extern mirror::Object* JniMonitoredMethodEndWithReference(jobject result,
+                                                          uint32_t saved_local_ref_cookie,
+                                                          Thread* self) {
+  MONITOR_JNI(PaletteNotifyEndJniInvocation);
+  return JniMethodEndWithReference(result, saved_local_ref_cookie, self);
+}
+
+extern mirror::Object* JniMonitoredMethodEndWithReferenceSynchronized(
+    jobject result,
+    uint32_t saved_local_ref_cookie,
+    jobject locked,
+    Thread* self) {
+  MONITOR_JNI(PaletteNotifyEndJniInvocation);
+  return JniMethodEndWithReferenceSynchronized(result, saved_local_ref_cookie, locked, self);
 }
 
 }  // namespace art

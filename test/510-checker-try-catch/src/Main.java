@@ -17,6 +17,10 @@
 import java.lang.reflect.Method;
 
 public class Main {
+
+  // Workaround for b/18051191.
+  class InnerClass {}
+
   public enum TestPath {
     ExceptionalFlow1(true, false, 3),
     ExceptionalFlow2(false, true, 8),

@@ -32,8 +32,8 @@ template <typename ElfTypes>
 class ElfFileImpl;
 
 // Explicitly instantiated in elf_file.cc
-using ElfFileImpl32 = ElfFileImpl<ElfTypes32>;
-using ElfFileImpl64 = ElfFileImpl<ElfTypes64>;
+typedef ElfFileImpl<ElfTypes32> ElfFileImpl32;
+typedef ElfFileImpl<ElfTypes64> ElfFileImpl64;
 
 // Used for compile time and runtime for ElfFile access. Because of
 // the need for use at runtime, cannot directly use LLVM classes such as

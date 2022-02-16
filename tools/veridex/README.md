@@ -1,8 +1,7 @@
 appcompat.sh
 ============
 
-Given an APK, finds API uses that fall into the
-blocklist/max-target-X/unsupported APIs.
+Given an APK, finds API uses that fall into the blacklist/greylists APIs.
 
 NOTE: appcompat.sh is still under development. It can report
 API uses that do not execute at runtime, and reflection uses

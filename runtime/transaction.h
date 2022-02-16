@@ -17,7 +17,6 @@
 #ifndef ART_RUNTIME_TRANSACTION_H_
 #define ART_RUNTIME_TRANSACTION_H_
 
-#include "base/scoped_arena_containers.h"
 #include "base/macros.h"
 #include "base/mutex.h"
 #include "base/safe_map.h"
@@ -48,31 +47,25 @@ class Transaction final {
  public:
   static constexpr const char* kAbortExceptionDescriptor = "Ldalvik/system/TransactionAbortError;";
 
-  Transaction(bool strict, mirror::Class* root, ArenaStack* arena_stack, ArenaPool* arena_pool);
+  Transaction(bool strict, mirror::Class* root);
   ~Transaction();
 
-  ArenaStack* GetArenaStack() {
-    return allocator_.GetArenaStack();
-  }
-
   void Abort(const std::string& abort_message)
+      REQUIRES(!log_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
   void ThrowAbortError(Thread* self, const std::string* abort_message)
+      REQUIRES(!log_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
-  bool IsAborted() const {
-    return aborted_;
-  }
+  bool IsAborted() REQUIRES(!log_lock_);
 
   // If the transaction is rollbacking. Transactions will set this flag when they start rollbacking,
   // because the nested transaction should be disabled when rollbacking to restore the memory.
-  bool IsRollingBack() const {
-    return rolling_back_;
-  }
+  bool IsRollingBack();
 
   // If the transaction is in strict mode, then all access of static fields will be constrained,
   // one class's clinit will not be allowed to read or modify another class's static fields, unless
   // the transaction is aborted.
-  bool IsStrict() const {
+  bool IsStrict() {
     return strict_;
   }
 
@@ -80,68 +73,82 @@ class Transaction final {
   void RecordWriteFieldBoolean(mirror::Object* obj,
                                MemberOffset field_offset,
                                uint8_t value,
-                               bool is_volatile);
+                               bool is_volatile)
+      REQUIRES(!log_lock_);
   void RecordWriteFieldByte(mirror::Object* obj,
                             MemberOffset field_offset,
                             int8_t value,
-                            bool is_volatile);
+                            bool is_volatile)
+      REQUIRES(!log_lock_);
   void RecordWriteFieldChar(mirror::Object* obj,
                             MemberOffset field_offset,
                             uint16_t value,
-                            bool is_volatile);
+                            bool is_volatile)
+      REQUIRES(!log_lock_);
   void RecordWriteFieldShort(mirror::Object* obj,
                              MemberOffset field_offset,
                              int16_t value,
-                             bool is_volatile);
+                             bool is_volatile)
+      REQUIRES(!log_lock_);
   void RecordWriteField32(mirror::Object* obj,
                           MemberOffset field_offset,
                           uint32_t value,
-                          bool is_volatile);
+                          bool is_volatile)
+      REQUIRES(!log_lock_);
   void RecordWriteField64(mirror::Object* obj,
                           MemberOffset field_offset,
                           uint64_t value,
-                          bool is_volatile);
+                          bool is_volatile)
+      REQUIRES(!log_lock_);
   void RecordWriteFieldReference(mirror::Object* obj,
                                  MemberOffset field_offset,
                                  mirror::Object* value,
-                                 bool is_volatile);
+                                 bool is_volatile)
+      REQUIRES(!log_lock_);
 
   // Record array change.
   void RecordWriteArray(mirror::Array* array, size_t index, uint64_t value)
+      REQUIRES(!log_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Record intern string table changes.
   void RecordStrongStringInsertion(ObjPtr<mirror::String> s)
-      REQUIRES(Locks::intern_table_lock_);
+      REQUIRES(Locks::intern_table_lock_)
+      REQUIRES(!log_lock_);
   void RecordWeakStringInsertion(ObjPtr<mirror::String> s)
-      REQUIRES(Locks::intern_table_lock_);
+      REQUIRES(Locks::intern_table_lock_)
+      REQUIRES(!log_lock_);
   void RecordStrongStringRemoval(ObjPtr<mirror::String> s)
-      REQUIRES(Locks::intern_table_lock_);
+      REQUIRES(Locks::intern_table_lock_)
+      REQUIRES(!log_lock_);
   void RecordWeakStringRemoval(ObjPtr<mirror::String> s)
-      REQUIRES(Locks::intern_table_lock_);
+      REQUIRES(Locks::intern_table_lock_)
+      REQUIRES(!log_lock_);
 
   // Record resolve string.
   void RecordResolveString(ObjPtr<mirror::DexCache> dex_cache, dex::StringIndex string_idx)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-
-  // Record resolve method type.
-  void RecordResolveMethodType(ObjPtr<mirror::DexCache> dex_cache, dex::ProtoIndex proto_idx)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+      REQUIRES_SHARED(Locks::mutator_lock_)
+      REQUIRES(!log_lock_);
 
   // Abort transaction by undoing all recorded changes.
   void Rollback()
-      REQUIRES_SHARED(Locks::mutator_lock_);
+      REQUIRES_SHARED(Locks::mutator_lock_)
+      REQUIRES(!log_lock_);
 
   void VisitRoots(RootVisitor* visitor)
+      REQUIRES(!log_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  bool ReadConstraint(ObjPtr<mirror::Object> obj) const
+  bool ReadConstraint(Thread* self, ObjPtr<mirror::Object> obj)
+      REQUIRES(!log_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  bool WriteConstraint(ObjPtr<mirror::Object> obj) const
+  bool WriteConstraint(Thread* self, ObjPtr<mirror::Object> obj)
+      REQUIRES(!log_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  bool WriteValueConstraint(ObjPtr<mirror::Object> value) const
+  bool WriteValueConstraint(Thread* self, ObjPtr<mirror::Object> value)
+      REQUIRES(!log_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
  private:
@@ -162,8 +169,7 @@ class Transaction final {
       return field_values_.size();
     }
 
-    explicit ObjectLog(ScopedArenaAllocator* allocator)
-        : field_values_(std::less<uint32_t>(), allocator->Adapter(kArenaAllocTransaction)) {}
+    ObjectLog() = default;
     ObjectLog(ObjectLog&& log) = default;
 
    private:
@@ -195,7 +201,7 @@ class Transaction final {
                         const FieldValue& field_value) const REQUIRES_SHARED(Locks::mutator_lock_);
 
     // Maps field's offset to its value.
-    ScopedArenaSafeMap<uint32_t, FieldValue> field_values_;
+    std::map<uint32_t, FieldValue> field_values_;
 
     DISALLOW_COPY_AND_ASSIGN(ObjectLog);
   };
@@ -210,9 +216,7 @@ class Transaction final {
       return array_values_.size();
     }
 
-    explicit ArrayLog(ScopedArenaAllocator* allocator)
-        : array_values_(std::less<size_t>(), allocator->Adapter(kArenaAllocTransaction)) {}
-
+    ArrayLog() = default;
     ArrayLog(ArrayLog&& log) = default;
 
    private:
@@ -223,7 +227,7 @@ class Transaction final {
 
     // Maps index to value.
     // TODO use JValue instead ?
-    ScopedArenaSafeMap<size_t, uint64_t> array_values_;
+    std::map<size_t, uint64_t> array_values_;
 
     DISALLOW_COPY_AND_ASSIGN(ArrayLog);
   };
@@ -271,69 +275,51 @@ class Transaction final {
     DISALLOW_COPY_AND_ASSIGN(ResolveStringLog);
   };
 
-  class ResolveMethodTypeLog : public ValueObject {
-   public:
-    ResolveMethodTypeLog(ObjPtr<mirror::DexCache> dex_cache, dex::ProtoIndex proto_idx);
-
-    void Undo() const REQUIRES_SHARED(Locks::mutator_lock_);
-
-    void VisitRoots(RootVisitor* visitor) REQUIRES_SHARED(Locks::mutator_lock_);
-
-   private:
-    GcRoot<mirror::DexCache> dex_cache_;
-    const dex::ProtoIndex proto_idx_;
-
-    DISALLOW_COPY_AND_ASSIGN(ResolveMethodTypeLog);
-  };
-
   void LogInternedString(InternStringLog&& log)
-      REQUIRES(Locks::intern_table_lock_);
+      REQUIRES(Locks::intern_table_lock_)
+      REQUIRES(!log_lock_);
 
   void UndoObjectModifications()
+      REQUIRES(log_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
   void UndoArrayModifications()
+      REQUIRES(log_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
   void UndoInternStringTableModifications()
       REQUIRES(Locks::intern_table_lock_)
+      REQUIRES(log_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
   void UndoResolveStringModifications()
-      REQUIRES_SHARED(Locks::mutator_lock_);
-  void UndoResolveMethodTypeModifications()
+      REQUIRES(log_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  void VisitObjectLogs(RootVisitor* visitor, ArenaStack* arena_stack)
+  void VisitObjectLogs(RootVisitor* visitor)
+      REQUIRES(log_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
-  void VisitArrayLogs(RootVisitor* visitor, ArenaStack* arena_stack)
+  void VisitArrayLogs(RootVisitor* visitor)
+      REQUIRES(log_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
   void VisitInternStringLogs(RootVisitor* visitor)
+      REQUIRES(log_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
   void VisitResolveStringLogs(RootVisitor* visitor)
+      REQUIRES(log_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
-  void VisitResolveMethodTypeLogs(RootVisitor* visitor)
-      REQUIRES_SHARED(Locks::mutator_lock_);
 
-  const std::string& GetAbortMessage() const;
+  const std::string& GetAbortMessage() REQUIRES(!log_lock_);
 
-  ObjectLog& GetOrCreateObjectLog(mirror::Object* obj);
-
-  // The top-level transaction creates an `ArenaStack` which is then
-  // passed down to nested transactions.
-  std::optional<ArenaStack> arena_stack_;
-  // The allocator uses the `ArenaStack` from the top-level transaction.
-  ScopedArenaAllocator allocator_;
-
-  ScopedArenaSafeMap<mirror::Object*, ObjectLog> object_logs_;
-  ScopedArenaSafeMap<mirror::Array*, ArrayLog> array_logs_;
-  ScopedArenaForwardList<InternStringLog> intern_string_logs_;
-  ScopedArenaForwardList<ResolveStringLog> resolve_string_logs_;
-  ScopedArenaForwardList<ResolveMethodTypeLog> resolve_method_type_logs_;
-  bool aborted_;
+  Mutex log_lock_ ACQUIRED_AFTER(Locks::intern_table_lock_);
+  std::map<mirror::Object*, ObjectLog> object_logs_ GUARDED_BY(log_lock_);
+  std::map<mirror::Array*, ArrayLog> array_logs_  GUARDED_BY(log_lock_);
+  std::list<InternStringLog> intern_string_logs_ GUARDED_BY(log_lock_);
+  std::list<ResolveStringLog> resolve_string_logs_ GUARDED_BY(log_lock_);
+  bool aborted_ GUARDED_BY(log_lock_);
   bool rolling_back_;  // Single thread, no race.
   gc::Heap* const heap_;
   const bool strict_;
-  std::string abort_message_;
-  mirror::Class* root_;
-  const char* assert_no_new_records_reason_;
+  std::string abort_message_ GUARDED_BY(log_lock_);
+  mirror::Class* root_ GUARDED_BY(log_lock_);
+  const char* assert_no_new_records_reason_ GUARDED_BY(log_lock_);
 
   friend class ScopedAssertNoNewTransactionRecords;
 

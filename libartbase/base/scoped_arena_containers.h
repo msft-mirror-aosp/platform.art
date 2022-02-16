@@ -18,7 +18,6 @@
 #define ART_LIBARTBASE_BASE_SCOPED_ARENA_CONTAINERS_H_
 
 #include <deque>
-#include <forward_list>
 #include <queue>
 #include <set>
 #include <type_traits>
@@ -47,9 +46,6 @@ class ScopedArenaAllocatorAdapter;
 
 template <typename T>
 using ScopedArenaDeque = std::deque<T, ScopedArenaAllocatorAdapter<T>>;
-
-template <typename T>
-using ScopedArenaForwardList = std::forward_list<T, ScopedArenaAllocatorAdapter<T>>;
 
 template <typename T>
 using ScopedArenaQueue = std::queue<T, ScopedArenaDeque<T>>;
@@ -107,13 +103,13 @@ class ScopedArenaAllocatorAdapter<void>
     : private DebugStackReference, private DebugStackIndirectTopRef,
       private ArenaAllocatorAdapterKind {
  public:
-  using value_type    = void;
-  using pointer       = void*;
-  using const_pointer = const void*;
+  typedef void value_type;
+  typedef void* pointer;
+  typedef const void* const_pointer;
 
   template <typename U>
   struct rebind {
-    using other = ScopedArenaAllocatorAdapter<U>;
+    typedef ScopedArenaAllocatorAdapter<U> other;
   };
 
   explicit ScopedArenaAllocatorAdapter(ScopedArenaAllocator* allocator,
@@ -146,17 +142,17 @@ class ScopedArenaAllocatorAdapter
     : private DebugStackReference, private DebugStackIndirectTopRef,
       private ArenaAllocatorAdapterKind {
  public:
-  using value_type      = T;
-  using pointer         = T*;
-  using reference       = T&;
-  using const_pointer   = const T*;
-  using const_reference = const T&;
-  using size_type       = size_t;
-  using difference_type = ptrdiff_t;
+  typedef T value_type;
+  typedef T* pointer;
+  typedef T& reference;
+  typedef const T* const_pointer;
+  typedef const T& const_reference;
+  typedef size_t size_type;
+  typedef ptrdiff_t difference_type;
 
   template <typename U>
   struct rebind {
-    using other = ScopedArenaAllocatorAdapter<U>;
+    typedef ScopedArenaAllocatorAdapter<U> other;
   };
 
   explicit ScopedArenaAllocatorAdapter(ScopedArenaAllocator* allocator,

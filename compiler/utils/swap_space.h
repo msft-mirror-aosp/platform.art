@@ -66,7 +66,7 @@ class SwapSpace {
     }
   };
 
-  using FreeByStartSet = std::set<SpaceChunk, SortChunkByPtr>;
+  typedef std::set<SpaceChunk, SortChunkByPtr> FreeByStartSet;
 
   // Map size to an iterator to free_by_start_'s entry.
   struct FreeBySizeEntry {
@@ -87,7 +87,7 @@ class SwapSpace {
       }
     }
   };
-  using FreeBySizeSet = std::set<FreeBySizeEntry, FreeBySizeComparator>;
+  typedef std::set<FreeBySizeEntry, FreeBySizeComparator> FreeBySizeSet;
 
   SpaceChunk NewFileChunk(size_t min_size) REQUIRES(lock_);
 
@@ -113,13 +113,13 @@ template <typename T> class SwapAllocator;
 template <>
 class SwapAllocator<void> {
  public:
-  using value_type    = void;
-  using pointer       = void*;
-  using const_pointer = const void*;
+  typedef void value_type;
+  typedef void* pointer;
+  typedef const void* const_pointer;
 
   template <typename U>
   struct rebind {
-    using other = SwapAllocator<U>;
+    typedef SwapAllocator<U> other;
   };
 
   explicit SwapAllocator(SwapSpace* swap_space) : swap_space_(swap_space) {}
@@ -145,17 +145,17 @@ class SwapAllocator<void> {
 template <typename T>
 class SwapAllocator {
  public:
-  using value_type      = T;
-  using pointer         = T*;
-  using reference       = T&;
-  using const_pointer   = const T*;
-  using const_reference = const T&;
-  using size_type       = size_t;
-  using difference_type = ptrdiff_t;
+  typedef T value_type;
+  typedef T* pointer;
+  typedef T& reference;
+  typedef const T* const_pointer;
+  typedef const T& const_reference;
+  typedef size_t size_type;
+  typedef ptrdiff_t difference_type;
 
   template <typename U>
   struct rebind {
-    using other = SwapAllocator<U>;
+    typedef SwapAllocator<U> other;
   };
 
   explicit SwapAllocator(SwapSpace* swap_space) : swap_space_(swap_space) {}

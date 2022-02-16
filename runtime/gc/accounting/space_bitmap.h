@@ -210,8 +210,8 @@ class SpaceBitmap {
   // however, we document that this is expected on heap_end_
 
   SpaceBitmap() = default;
-  SpaceBitmap(SpaceBitmap&&) noexcept = default;
-  SpaceBitmap& operator=(SpaceBitmap&&) noexcept = default;
+  SpaceBitmap(SpaceBitmap&&) = default;
+  SpaceBitmap& operator=(SpaceBitmap&&) = default;
 
   bool IsValid() const {
     return bitmap_begin_ != nullptr;
@@ -261,8 +261,8 @@ class SpaceBitmap {
   std::string name_;
 };
 
-using ContinuousSpaceBitmap = SpaceBitmap<kObjectAlignment>;
-using LargeObjectBitmap = SpaceBitmap<kLargeObjectAlignment>;
+typedef SpaceBitmap<kObjectAlignment> ContinuousSpaceBitmap;
+typedef SpaceBitmap<kLargeObjectAlignment> LargeObjectBitmap;
 
 template<size_t kAlignment>
 std::ostream& operator << (std::ostream& stream, const SpaceBitmap<kAlignment>& bitmap);

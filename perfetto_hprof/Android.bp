@@ -52,6 +52,7 @@ cc_defaults {
     shared_libs: [
         "libbase",
         "liblog",
+        "libdexfile",
     ],
     static_libs: [
         "libperfetto_client_experimental",
@@ -76,7 +77,6 @@ art_cc_library {
     shared_libs: [
         "libart",
         "libartbase",
-        "libdexfile",
     ],
     apex_available: [
         "com.android.art",
@@ -93,7 +93,6 @@ art_cc_library {
     shared_libs: [
         "libartd",
         "libartbased",
-        "libdexfiled",
     ],
     apex_available: [
         "com.android.art.debug",

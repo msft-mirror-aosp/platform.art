@@ -64,8 +64,12 @@ class InstructionHandler {
       DCHECK(abort_exception != nullptr);
       DCHECK(abort_exception->GetClass()->DescriptorEquals(Transaction::kAbortExceptionDescriptor));
       Self()->ClearException();
-      PerformNonStandardReturn<kMonitorState>(
-          Self(), shadow_frame_, ctx_->result, Instrumentation(), Accessor().InsSize());
+      PerformNonStandardReturn<kMonitorState>(Self(),
+                                              shadow_frame_,
+                                              ctx_->result,
+                                              Instrumentation(),
+                                              Accessor().InsSize(),
+                                              inst_->GetDexPc(Insns()));
       Self()->SetException(abort_exception.Get());
       ExitInterpreterLoop();
       return false;
@@ -76,8 +80,12 @@ class InstructionHandler {
   HANDLER_ATTRIBUTES bool CheckForceReturn() {
     if (shadow_frame_.GetForcePopFrame()) {
       DCHECK(Runtime::Current()->AreNonStandardExitsEnabled());
-      PerformNonStandardReturn<kMonitorState>(
-          Self(), shadow_frame_, ctx_->result, Instrumentation(), Accessor().InsSize());
+      PerformNonStandardReturn<kMonitorState>(Self(),
+                                              shadow_frame_,
+                                              ctx_->result,
+                                              Instrumentation(),
+                                              Accessor().InsSize(),
+                                              inst_->GetDexPc(Insns()));
       ExitInterpreterLoop();
       return false;
     }
@@ -95,11 +103,8 @@ class InstructionHandler {
     }
     bool skip_event = shadow_frame_.GetSkipNextExceptionEvent();
     shadow_frame_.SetSkipNextExceptionEvent(false);
-    if (!MoveToExceptionHandler(Self(),
-                                shadow_frame_,
-                                /* skip_listeners= */ skip_event,
-                                /* skip_throw_listener= */ skip_event)) {
-      // Structured locking is to be enforced for abnormal termination, too.
+    if (!MoveToExceptionHandler(Self(), shadow_frame_, skip_event ? nullptr : Instrumentation())) {
+      /* Structured locking is to be enforced for abnormal termination, too. */
       DoMonitorCheckOnExit<do_assignability_check>(Self(), &shadow_frame_);
       ctx_->result = JValue(); /* Handled in caller. */
       ExitInterpreterLoop();
@@ -211,7 +216,9 @@ class InstructionHandler {
                  !SendMethodExitEvents(Self(),
                                        Instrumentation(),
                                        shadow_frame_,
+                                       shadow_frame_.GetThisObject(Accessor().InsSize()),
                                        shadow_frame_.GetMethod(),
+                                       inst_->GetDexPc(Insns()),
                                        result))) {
       DCHECK(Self()->IsExceptionPending());
       // Do not raise exception event if it is caused by other instrumentation event.
@@ -248,7 +255,7 @@ class InstructionHandler {
       // Hotness update.
       jit::Jit* jit = Runtime::Current()->GetJit();
       if (jit != nullptr) {
-        jit->AddSamples(Self(), shadow_frame_.GetMethod());
+        jit->AddSamples(Self(), shadow_frame_.GetMethod(), 1, /*with_backedges=*/ true);
       }
       // Record new dex pc early to have consistent suspend point at loop header.
       shadow_frame_.SetDexPC(next_->GetDexPc(Insns()));
@@ -488,7 +495,9 @@ class InstructionHandler {
                  !SendMethodExitEvents(Self(),
                                        Instrumentation(),
                                        shadow_frame_,
+                                       shadow_frame_.GetThisObject(Accessor().InsSize()),
                                        shadow_frame_.GetMethod(),
+                                       inst_->GetDexPc(Insns()),
                                        h_result))) {
       DCHECK(Self()->IsExceptionPending());
       // Do not raise exception event if it is caused by other instrumentation event.

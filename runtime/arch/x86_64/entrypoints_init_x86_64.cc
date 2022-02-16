@@ -73,14 +73,12 @@ void UpdateReadBarrierEntrypoints(QuickEntryPoints* qpoints, bool is_active) {
   qpoints->pReadBarrierMarkReg15 = is_active ? art_quick_read_barrier_mark_reg15 : nullptr;
 }
 
-void InitEntryPoints(JniEntryPoints* jpoints,
-                     QuickEntryPoints* qpoints,
-                     bool monitor_jni_entry_exit) {
+void InitEntryPoints(JniEntryPoints* jpoints, QuickEntryPoints* qpoints) {
 #if defined(__APPLE__)
   UNUSED(jpoints, qpoints);
   UNIMPLEMENTED(FATAL);
 #else
-  DefaultInitEntryPoints(jpoints, qpoints, monitor_jni_entry_exit);
+  DefaultInitEntryPoints(jpoints, qpoints);
 
   // Cast
   qpoints->pInstanceofNonTrivial = art_quick_instance_of;
@@ -121,6 +119,7 @@ void InitEntryPoints(JniEntryPoints* jpoints,
   qpoints->pMemcpy = art_quick_memcpy;
 
   // Read barrier.
+  qpoints->pReadBarrierJni = ReadBarrierJni;
   UpdateReadBarrierEntrypoints(qpoints, /*is_active=*/ false);
   qpoints->pReadBarrierMarkReg04 = nullptr;  // Cannot use register 4 (RSP) to pass arguments.
   // x86-64 has only 16 core registers.

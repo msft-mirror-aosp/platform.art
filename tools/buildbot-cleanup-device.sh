@@ -14,7 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-. "$(dirname $0)/buildbot-utils.sh"
+if [ -t 1 ]; then
+  # Color sequences if terminal is a tty.
+  green='\033[0;32m'
+  nc='\033[0m'
+fi
 
 # Setup as root, as device cleanup requires it.
 adb root
@@ -28,16 +32,16 @@ if [[ -n "$ART_TEST_CHROOT" ]]; then
   fi
 
   if adb shell test -d "$ART_TEST_CHROOT"; then
-    msginfo "Remove entire /linkerconfig directory from chroot directory"
+    echo -e "${green}Remove entire /linkerconfig directory from chroot directory${nc}"
     adb shell rm -rf "$ART_TEST_CHROOT/linkerconfig"
 
-    msginfo "Remove entire /system directory from chroot directory"
+    echo -e "${green}Remove entire /system directory from chroot directory${nc}"
     adb shell rm -rf "$ART_TEST_CHROOT/system"
 
-    msginfo "Remove entire /data directory from chroot directory"
+    echo -e "${green}Remove entire /data directory from chroot directory${nc}"
     adb shell rm -rf "$ART_TEST_CHROOT/data"
 
-    msginfo "Remove entire chroot directory"
+    echo -e "${green}Remove entire chroot directory${nc}"
     adb shell rmdir "$ART_TEST_CHROOT" || adb shell ls -la "$ART_TEST_CHROOT"
   fi
 else

@@ -21,15 +21,17 @@ export ORIGINAL_JAVAC="$JAVAC"
 
 # Wrapper function for javac which invokes the compiler and applies
 # additional setup steps for the test.
-cat >javac_wrapper.sh <<"EOF"
+function javac_wrapper {
   set -e # Stop on error - the caller script may not have this set.
 
   $ORIGINAL_JAVAC "$@"
 
   mkdir classes-ex
   mv classes/Super.class classes-ex
-EOF
-export JAVAC=./javac_wrapper.sh
+}
+
+export -f javac_wrapper
+export JAVAC=javac_wrapper
 
 ######################################################################
 

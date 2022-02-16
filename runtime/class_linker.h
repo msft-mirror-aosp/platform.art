@@ -22,16 +22,15 @@
 #include <set>
 #include <string>
 #include <type_traits>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "base/enums.h"
 #include "base/hash_map.h"
+#include "base/mutex.h"
 #include "base/intrusive_forward_list.h"
 #include "base/locks.h"
 #include "base/macros.h"
-#include "base/mutex.h"
 #include "dex/class_accessor.h"
 #include "dex/dex_file_types.h"
 #include "gc_root.h"
@@ -39,7 +38,6 @@
 #include "jni.h"
 #include "mirror/class.h"
 #include "mirror/object.h"
-#include "oat_file.h"
 #include "verifier/verifier_enums.h"
 
 namespace art {
@@ -95,6 +93,9 @@ class MethodHandlesLookup;
 class MethodType;
 template<class T> class ObjectArray;
 class StackTraceElement;
+template <typename T> struct NativeDexCachePair;
+using MethodDexCachePair = NativeDexCachePair<ArtMethod>;
+using MethodDexCacheType = std::atomic<MethodDexCachePair>;
 }  // namespace mirror
 
 namespace verifier {
@@ -502,8 +503,6 @@ class ClassLinker {
   ObjPtr<mirror::DexCache> FindDexCache(Thread* self, const DexFile& dex_file)
       REQUIRES(!Locks::dex_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
-  ObjPtr<mirror::DexCache> FindDexCache(Thread* self, const OatDexFile& oat_dex_file)
-      REQUIRES(!Locks::dex_lock_) REQUIRES_SHARED(Locks::mutator_lock_);
   ClassTable* FindClassTable(Thread* self, ObjPtr<mirror::DexCache> dex_cache)
       REQUIRES(!Locks::dex_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
@@ -552,6 +551,10 @@ class ClassLinker {
       REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!Roles::uninterruptible_);
 
+  ObjPtr<mirror::IfTable> AllocIfTable(Thread* self, size_t ifcount)
+      REQUIRES_SHARED(Locks::mutator_lock_)
+      REQUIRES(!Roles::uninterruptible_);
+
   ObjPtr<mirror::ObjectArray<mirror::StackTraceElement>> AllocStackTraceElementArray(Thread* self,
                                                                                      size_t length)
       REQUIRES_SHARED(Locks::mutator_lock_)
@@ -585,6 +588,10 @@ class ClassLinker {
                                          jobjectArray throws)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
+  // Get the oat code for a method when its class isn't yet initialized.
+  const void* GetQuickOatCodeFor(ArtMethod* method)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
   pid_t GetClassesLockOwner();  // For SignalCatcher.
   pid_t GetDexLockOwner();  // For SignalCatcher.
 
@@ -615,6 +622,10 @@ class ClassLinker {
   InternTable* GetInternTable() const {
     return intern_table_;
   }
+
+  // Set the entrypoints up for method to the enter the interpreter.
+  void SetEntryPointsToInterpreter(ArtMethod* method) const
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Set the entrypoints up for an obsolete method.
   void SetEntryPointsForObsoleteMethod(ArtMethod* method) const
@@ -656,8 +667,7 @@ class ClassLinker {
                                      const std::vector<const DexFile*>& dex_files,
                                      jclass loader_class,
                                      jobject parent_loader,
-                                     jobject shared_libraries = nullptr,
-                                     jobject shared_libraries_after = nullptr)
+                                     jobject shared_libraries = nullptr)
       REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!Locks::dex_lock_);
 
@@ -675,8 +685,7 @@ class ClassLinker {
       const std::vector<const DexFile*>& dex_files,
       Handle<mirror::Class> loader_class,
       Handle<mirror::ClassLoader> parent_loader,
-      Handle<mirror::ObjectArray<mirror::ClassLoader>> shared_libraries,
-      Handle<mirror::ObjectArray<mirror::ClassLoader>> shared_libraries_after)
+      Handle<mirror::ObjectArray<mirror::ClassLoader>> shared_libraries)
           REQUIRES_SHARED(Locks::mutator_lock_)
           REQUIRES(!Locks::dex_lock_);
 
@@ -708,6 +717,9 @@ class ClassLinker {
   void InsertDexFileInToClassLoader(ObjPtr<mirror::Object> dex_file,
                                     ObjPtr<mirror::ClassLoader> class_loader)
       REQUIRES(!Locks::classlinker_classes_lock_)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  static bool ShouldUseInterpreterEntrypoint(ArtMethod* method, const void* quick_code)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   static bool IsBootClassLoader(ScopedObjectAccessAlreadyRunnable& soa,
@@ -795,26 +807,27 @@ class ClassLinker {
 
   struct DexCacheData {
     // Construct an invalid data object.
-    DexCacheData() : weak_root(nullptr), class_table(nullptr) {
-      static std::atomic_uint64_t s_registration_count(0);
-      registration_index = s_registration_count.fetch_add(1, std::memory_order_seq_cst);
+    DexCacheData()
+        : weak_root(nullptr),
+          dex_file(nullptr),
+          class_table(nullptr) { }
+
+    // Check if the data is valid.
+    bool IsValid() const {
+      return dex_file != nullptr;
     }
-    DexCacheData(DexCacheData&&) = default;
 
     // Weak root to the DexCache. Note: Do not decode this unnecessarily or else class unloading may
     // not work properly.
     jweak weak_root;
+    // The following field caches the DexCache's field here to avoid unnecessary jweak decode that
+    // triggers read barriers (and marks them alive unnecessarily and messes with class unloading.)
+    const DexFile* dex_file;
     // Identify the associated class loader's class table. This is used to make sure that
     // the Java call to native DexCache.setResolvedType() inserts the resolved type in that
     // class table. It is also used to make sure we don't register the same dex cache with
     // multiple class loaders.
     ClassTable* class_table;
-    // Monotonically increasing integer which records the order in which DexFiles were registered.
-    // Used only to preserve determinism when creating compiled image.
-    uint64_t registration_index;
-
-   private:
-    DISALLOW_COPY_AND_ASSIGN(DexCacheData);
   };
 
   // Forces a class to be marked as initialized without actually running initializers. Should only
@@ -853,10 +866,12 @@ class ClassLinker {
     return true;
   }
 
+  virtual bool IsUpdatableBootClassPathDescriptor(const char* descriptor);
+
  private:
   class LinkFieldsHelper;
-  template <PointerSize kPointerSize>
-  class LinkMethodsHelper;
+  class LinkInterfaceMethodsHelper;
+  class MethodTranslation;
   class VisiblyInitializedCallback;
 
   struct ClassLoaderData {
@@ -944,7 +959,7 @@ class ClassLinker {
   // Used for tests and AppendToBootClassPath.
   ObjPtr<mirror::DexCache> AllocAndInitializeDexCache(Thread* self,
                                                       const DexFile& dex_file,
-                                                      ObjPtr<mirror::ClassLoader> class_loader)
+                                                      LinearAlloc* linear_alloc)
       REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!Locks::dex_lock_)
       REQUIRES(!Roles::uninterruptible_);
@@ -1002,25 +1017,6 @@ class ClassLinker {
                                   size_t hash,
                                   Handle<mirror::ClassLoader> class_loader,
                                   /*out*/ ObjPtr<mirror::Class>* result)
-      REQUIRES_SHARED(Locks::mutator_lock_)
-      REQUIRES(!Locks::dex_lock_);
-
-  bool FindClassInSharedLibrariesHelper(ScopedObjectAccessAlreadyRunnable& soa,
-                                        Thread* self,
-                                        const char* descriptor,
-                                        size_t hash,
-                                        Handle<mirror::ClassLoader> class_loader,
-                                        ArtField* field,
-                                        /*out*/ ObjPtr<mirror::Class>* result)
-      REQUIRES_SHARED(Locks::mutator_lock_)
-      REQUIRES(!Locks::dex_lock_);
-
-  bool FindClassInSharedLibrariesAfter(ScopedObjectAccessAlreadyRunnable& soa,
-                                       Thread* self,
-                                       const char* descriptor,
-                                       size_t hash,
-                                       Handle<mirror::ClassLoader> class_loader,
-                                       /*out*/ ObjPtr<mirror::Class>* result)
       REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!Locks::dex_lock_);
 
@@ -1107,9 +1103,8 @@ class ClassLinker {
       REQUIRES(Locks::dex_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
   const DexCacheData* FindDexCacheDataLocked(const DexFile& dex_file)
-      REQUIRES_SHARED(Locks::dex_lock_);
-  const DexCacheData* FindDexCacheDataLocked(const OatDexFile& oat_dex_file)
-      REQUIRES_SHARED(Locks::dex_lock_);
+      REQUIRES(Locks::dex_lock_)
+      REQUIRES_SHARED(Locks::mutator_lock_);
   static ObjPtr<mirror::DexCache> DecodeDexCacheLocked(Thread* self, const DexCacheData* data)
       REQUIRES_SHARED(Locks::dex_lock_, Locks::mutator_lock_);
   bool IsSameClassLoader(ObjPtr<mirror::DexCache> dex_cache,
@@ -1163,6 +1158,77 @@ class ClassLinker {
       const dex::MethodHandleItem& method_handle,
       ArtMethod* referrer) REQUIRES_SHARED(Locks::mutator_lock_);
 
+  // Links the virtual methods for the given class and records any default methods that will need to
+  // be updated later.
+  //
+  // Arguments:
+  // * self - The current thread.
+  // * klass - class, whose vtable will be filled in.
+  // * default_translations - Vtable index to new method map.
+  //                          Any vtable entries that need to be updated with new default methods
+  //                          are stored into the default_translations map. The default_translations
+  //                          map is keyed on the vtable index that needs to be updated. We use this
+  //                          map because if we override a default method with another default
+  //                          method we need to update the vtable to point to the new method.
+  //                          Unfortunately since we copy the ArtMethod* we cannot just do a simple
+  //                          scan, we therefore store the vtable index's that might need to be
+  //                          updated with the method they will turn into.
+  // TODO This whole default_translations thing is very dirty. There should be a better way.
+  bool LinkVirtualMethods(
+        Thread* self,
+        Handle<mirror::Class> klass,
+        /*out*/HashMap<size_t, MethodTranslation>* default_translations)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // Sets up the interface lookup table (IFTable) in the correct order to allow searching for
+  // default methods.
+  bool SetupInterfaceLookupTable(Thread* self,
+                                 Handle<mirror::Class> klass,
+                                 Handle<mirror::ObjectArray<mirror::Class>> interfaces)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+
+  enum class DefaultMethodSearchResult {
+    kDefaultFound,
+    kAbstractFound,
+    kDefaultConflict
+  };
+
+  // Find the default method implementation for 'interface_method' in 'klass', if one exists.
+  //
+  // Arguments:
+  // * self - The current thread.
+  // * target_method - The method we are trying to find a default implementation for.
+  // * klass - The class we are searching for a definition of target_method.
+  // * out_default_method - The pointer we will store the found default method to on success.
+  //
+  // Return value:
+  // * kDefaultFound - There were no conflicting method implementations found in the class while
+  //                   searching for target_method. The default method implementation is stored into
+  //                   out_default_method.
+  // * kAbstractFound - There were no conflicting method implementations found in the class while
+  //                   searching for target_method but no default implementation was found either.
+  //                   out_default_method is set to null and the method should be considered not
+  //                   implemented.
+  // * kDefaultConflict - Conflicting method implementations were found when searching for
+  //                      target_method. The value of *out_default_method is null.
+  DefaultMethodSearchResult FindDefaultMethodImplementation(
+      Thread* self,
+      ArtMethod* target_method,
+      Handle<mirror::Class> klass,
+      /*out*/ArtMethod** out_default_method) const
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // Sets the imt entries and fixes up the vtable for the given class by linking all the interface
+  // methods. See LinkVirtualMethods for an explanation of what default_translations is.
+  bool LinkInterfaceMethods(
+      Thread* self,
+      Handle<mirror::Class> klass,
+      const HashMap<size_t, MethodTranslation>& default_translations,
+      bool* out_new_conflict,
+      ArtMethod** out_imt)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
   bool LinkStaticFields(Thread* self, Handle<mirror::Class> klass, size_t* class_size)
       REQUIRES_SHARED(Locks::mutator_lock_);
   bool LinkInstanceFields(Thread* self, Handle<mirror::Class> klass)
@@ -1178,7 +1244,7 @@ class ClassLinker {
   size_t GetDexCacheCount() REQUIRES_SHARED(Locks::mutator_lock_, Locks::dex_lock_) {
     return dex_caches_.size();
   }
-  const std::unordered_map<const DexFile*, DexCacheData>& GetDexCachesData()
+  const std::list<DexCacheData>& GetDexCachesData()
       REQUIRES_SHARED(Locks::mutator_lock_, Locks::dex_lock_) {
     return dex_caches_;
   }
@@ -1292,7 +1358,7 @@ class ClassLinker {
 
   // JNI weak globals and side data to allow dex caches to get unloaded. We lazily delete weak
   // globals when we register new dex files.
-  std::unordered_map<const DexFile*, DexCacheData> dex_caches_ GUARDED_BY(Locks::dex_lock_);
+  std::list<DexCacheData> dex_caches_ GUARDED_BY(Locks::dex_lock_);
 
   // This contains the class loaders which have class tables. It is populated by
   // InsertClassTableForClassLoader.

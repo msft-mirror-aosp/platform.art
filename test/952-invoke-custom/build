@@ -17,18 +17,18 @@
 # Stop on failure.
 set -e
 
-export ASM_JAR="${ANDROID_BUILD_TOP}/prebuilts/misc/common/asm/asm-7.0.jar"
+export ASM_JAR="${ANDROID_BUILD_TOP}/prebuilts/misc/common/asm/asm-6.0.jar"
 
 export ORIGINAL_JAVAC="$JAVAC"
 
 # Wrapper function for javac which invokes the compiler and applies
 # transforms to class files after compilation.
-cat >javac_wrapper.sh <<"EOF"
+function javac_wrapper {
   set -e # Stop on error - the caller script may not have this set.
 
   # Update arguments to add transformer and ASM to the compiler classpath.
-  classpath="./transformer.jar:$ASM_JAR"
-  args=(-cp $classpath)
+  local classpath="./transformer.jar:$ASM_JAR"
+  local args=(-cp $classpath)
   while [ $# -ne 0 ] ; do
     case $1 in
       -cp|-classpath|--class-path)
@@ -50,21 +50,23 @@ cat >javac_wrapper.sh <<"EOF"
   mkdir classes
 
   # Transform intermediate classes.
-  transformer_args="-cp ${ASM_JAR}:transformer.jar transformer.IndyTransformer"
+  local transformer_args="-cp ${ASM_JAR}:transformer.jar transformer.IndyTransformer"
   for class in intermediate-classes/*.class ; do
-    transformed_class=classes/$(basename ${class})
+    local transformed_class=classes/$(basename ${class})
     ${JAVA:-java} ${transformer_args} $PWD/${class} ${transformed_class}
   done
-EOF
-export JAVAC=./javac_wrapper.sh
+}
+
+export -f javac_wrapper
+export JAVAC=javac_wrapper
 
 ######################################################################
 
 # Build the transformer to apply to compiled classes.
 mkdir classes
 ${ORIGINAL_JAVAC:-javac} ${JAVAC_ARGS} -cp "${ASM_JAR}" -d classes $(find util-src -name '*.java')
-${SOONG_ZIP} --jar -o transformer.jar -C classes -D classes
+jar -cf transformer.jar -C classes transformer/ -C classes annotations/
 rm -rf classes
 
 # Use API level 28 for invoke-custom bytecode support.
-USE_DESUGAR=false ./default-build "$@" --api-level 28
+DESUGAR=false ./default-build "$@" --api-level 28

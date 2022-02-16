@@ -42,9 +42,9 @@ namespace gc {
 
 namespace accounting {
 template<typename T> class AtomicStack;
-using ObjectStack = AtomicStack<mirror::Object>;
+typedef AtomicStack<mirror::Object> ObjectStack;
 template <size_t kAlignment> class SpaceBitmap;
-using ContinuousSpaceBitmap = SpaceBitmap<kObjectAlignment>;
+typedef SpaceBitmap<kObjectAlignment> ContinuousSpaceBitmap;
 class HeapBitmap;
 class ReadBarrierTable;
 }  // namespace accounting

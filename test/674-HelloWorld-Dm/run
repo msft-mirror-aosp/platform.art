@@ -14,10 +14,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-${RUN} --dex2oat-dm "${@}"
-return_status1=$?
-
-${RUN} --runtime-dm "${@}"
-return_status2=$?
-
-(exit ${return_status1}) && (exit ${return_status2})
+exec ${RUN} --dm "${@}"

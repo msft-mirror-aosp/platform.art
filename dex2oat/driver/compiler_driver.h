@@ -104,7 +104,8 @@ class CompilerDriver {
   void PreCompile(jobject class_loader,
                   const std::vector<const DexFile*>& dex_files,
                   TimingLogger* timings,
-                  /*inout*/ HashSet<std::string>* image_classes)
+                  /*inout*/ HashSet<std::string>* image_classes,
+                  /*out*/ VerificationResults* verification_results)
       REQUIRES(!Locks::mutator_lock_);
   void CompileAll(jobject class_loader,
                   const std::vector<const DexFile*>& dex_files,
@@ -193,6 +194,10 @@ class CompilerDriver {
     return compiled_method_storage_.DedupeEnabled();
   }
 
+  // Checks whether profile guided compilation is enabled and if the method should be compiled
+  // according to the profile file.
+  bool ShouldCompileBasedOnProfile(const MethodReference& method_ref) const;
+
   // Checks whether profile guided verification is enabled and if the method should be verified
   // according to the profile file.
   bool ShouldVerifyClassBasedOnProfile(const DexFile& dex_file, uint16_t class_idx) const;
@@ -240,11 +245,13 @@ class CompilerDriver {
   // verification was successful.
   bool FastVerify(jobject class_loader,
                   const std::vector<const DexFile*>& dex_files,
-                  TimingLogger* timings);
+                  TimingLogger* timings,
+                  /*out*/ VerificationResults* verification_results);
 
   void Verify(jobject class_loader,
               const std::vector<const DexFile*>& dex_files,
-              TimingLogger* timings);
+              TimingLogger* timings,
+              /*out*/ VerificationResults* verification_results);
 
   void VerifyDexFile(jobject class_loader,
                      const DexFile& dex_file,
@@ -301,7 +308,7 @@ class CompilerDriver {
   // All class references that are in the classpath. Indexed by class defs.
   ClassStateTable classpath_classes_;
 
-  using MethodTable = AtomicDexRefMap<MethodReference, CompiledMethod*>;
+  typedef AtomicDexRefMap<MethodReference, CompiledMethod*> MethodTable;
 
   // All method references that this compiler has compiled.
   MethodTable compiled_methods_;

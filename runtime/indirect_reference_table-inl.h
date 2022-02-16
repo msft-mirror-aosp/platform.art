@@ -101,15 +101,15 @@ inline void IndirectReferenceTable::Update(IndirectRef iref, ObjPtr<mirror::Obje
 
 inline void IrtEntry::Add(ObjPtr<mirror::Object> obj) {
   ++serial_;
-  if (serial_ == kIRTMaxSerial) {
+  if (serial_ == kIRTPrevCount) {
     serial_ = 0;
   }
-  reference_ = GcRoot<mirror::Object>(obj);
+  references_[serial_] = GcRoot<mirror::Object>(obj);
 }
 
 inline void IrtEntry::SetReference(ObjPtr<mirror::Object> obj) {
-  DCHECK_LT(serial_, kIRTMaxSerial);
-  reference_ = GcRoot<mirror::Object>(obj);
+  DCHECK_LT(serial_, kIRTPrevCount);
+  references_[serial_] = GcRoot<mirror::Object>(obj);
 }
 
 }  // namespace art

@@ -229,7 +229,7 @@ struct CmdlineParser {
     }
 
     // Ensure we always move this when returning a new builder.
-    ArgumentBuilder(ArgumentBuilder&&) noexcept = default;
+    ArgumentBuilder(ArgumentBuilder&&) = default;
 
    protected:
     // Used by builder to internally ignore arguments by dropping them on the floor after parsing.
@@ -372,7 +372,7 @@ struct CmdlineParser {
     }
 
     // Ensure we always move this when returning a new builder.
-    UntypedArgumentBuilder(UntypedArgumentBuilder&&) noexcept = default;
+    UntypedArgumentBuilder(UntypedArgumentBuilder&&) = default;
 
    protected:
     void SetNames(std::vector<const char*>&& names) {
@@ -590,9 +590,9 @@ struct CmdlineParser {
   }
 
   // Ensure we have a default move constructor.
-  CmdlineParser(CmdlineParser&&) noexcept = default;
+  CmdlineParser(CmdlineParser&&) = default;
   // Ensure we have a default move assignment operator.
-  CmdlineParser& operator=(CmdlineParser&&) noexcept = default;
+  CmdlineParser& operator=(CmdlineParser&&) = default;
 
  private:
   friend struct Builder;

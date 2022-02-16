@@ -59,13 +59,6 @@ class ImageSpace : public MemMapSpace {
   //     <path>/<base-name>
   //     <base-name>
   // and the path of the first BCP component is used for the second form.
-  // The specification may be followed by one or more profile specifications, where each profile
-  // specification is one of
-  //     !<profile-path>/<profile-name>
-  //     !<profile-name>
-  // and the profiles will be used to compile the primary boot image when loading the boot image if
-  // the on-disk version is not acceptable (either not present or fails validation, presumably
-  // because it's out of date). The primary boot image is compiled with no dependency.
   //
   // Named extension specifications must correspond to an expansion of the
   // <base-name> with a BCP component (for example boot.art with the BCP
@@ -74,14 +67,15 @@ class ImageSpace : public MemMapSpace {
   //     <ext-path>/<ext-name>
   //     <ext-name>
   // and must be listed in the order of their corresponding BCP components.
-  // Similarly, the specification may be followed by one or more profile specifications, where each
-  // profile specification is one of
-  //     !<profile-path>/<profile-name>
-  //     !<profile-name>
-  // and the profiles will be used to compile the extension when loading the boot image if the
-  // on-disk version is not acceptable (either not present or fails validation, presumably because
-  // it's out of date). The primary boot image (i.e., the first element in "image location") is the
-  // dependency that each extension is compiled against.
+  // The specification may have a suffix with profile specification, one of
+  //     !<ext-path>/<ext-name>
+  //     !<ext-name>
+  // and this profile will be used to compile the extension when loading the
+  // boot image if the on-disk version is not acceptable (either not present
+  // or fails validation, presumably because it's out of date). The first
+  // extension specification that includes the profile specification also
+  // terminates the list of the boot image dependencies that each extension
+  // is compiled against.
   //
   // Search paths for remaining extensions can be specified after named
   // components as one of
@@ -91,14 +85,11 @@ class ImageSpace : public MemMapSpace {
   // should be used to search for that component's boot image extension.
   //
   // The actual filename shall be derived from the specified locations using
-  // `GetSystemImageFilename()`.
+  // `GetSystemImageFilename()` or `GetDalvikCacheFilename()`.
   //
   // Example image locations:
   //     /system/framework/boot.art
   //         - only primary boot image with full path.
-  //     /data/misc/apexdata/com.android.art/dalvik-cache/boot.art!/apex/com.android.art/etc/boot-image.prof!/system/etc/boot-image.prof
-  //         - only primary boot image with full path; if the primary boot image is not found or
-  //           broken, compile it in memory using two specified profile files at the exact paths.
   //     boot.art:boot-framework.art
   //         - primary and one extension, use BCP component paths.
   //     /apex/com.android.art/boot.art:*
@@ -133,11 +124,7 @@ class ImageSpace : public MemMapSpace {
   static bool LoadBootImage(
       const std::vector<std::string>& boot_class_path,
       const std::vector<std::string>& boot_class_path_locations,
-      const std::vector<int>& boot_class_path_fds,
-      const std::vector<int>& boot_class_path_image_fds,
-      const std::vector<int>& boot_class_path_vdex_fds,
-      const std::vector<int>& boot_class_path_oat_fds,
-      const std::vector<std::string>& image_locations,
+      const std::string& image_location,
       const InstructionSet image_isa,
       bool relocate,
       bool executable,
@@ -176,7 +163,7 @@ class ImageSpace : public MemMapSpace {
   }
 
   // Actual filename where image was loaded from.
-  // For example: /system/framework/arm64/boot.art
+  // For example: /data/dalvik-cache/arm/system@framework@boot.art
   const std::string GetImageFilename() const {
     return GetName();
   }
@@ -187,7 +174,9 @@ class ImageSpace : public MemMapSpace {
     return image_location_;
   }
 
-  const std::vector<std::string>& GetProfileFiles() const { return profile_files_; }
+  const std::string GetProfileFile() const {
+    return profile_file_;
+  }
 
   accounting::ContinuousSpaceBitmap* GetLiveBitmap() override {
     return &live_bitmap_;
@@ -217,7 +206,7 @@ class ImageSpace : public MemMapSpace {
   // Returns the filename of the image corresponding to
   // requested image_location, or the filename where a new image
   // should be written if one doesn't exist. Looks for a generated
-  // image in the specified location.
+  // image in the specified location and then in the dalvik-cache.
   //
   // Returns true if an image was found, false otherwise.
   static bool FindImageFilename(const char* image_location,
@@ -244,10 +233,9 @@ class ImageSpace : public MemMapSpace {
   // The boot image and dex files do not need to be loaded in memory.
   static bool VerifyBootClassPathChecksums(std::string_view oat_checksums,
                                            std::string_view oat_boot_class_path,
-                                           ArrayRef<const std::string> image_locations,
+                                           const std::string& image_location,
                                            ArrayRef<const std::string> boot_class_path_locations,
                                            ArrayRef<const std::string> boot_class_path,
-                                           ArrayRef<const int> boot_class_path_fds,
                                            InstructionSet image_isa,
                                            /*out*/std::string* error_msg);
 
@@ -266,9 +254,6 @@ class ImageSpace : public MemMapSpace {
       ArrayRef<const std::string> dex_locations,
       const std::string& image_location,
       bool boot_image_extension = false);
-
-  // Returns true if the APEX versions in the OAT file match the current APEX versions.
-  static bool ValidateApexVersions(const OatFile& oat_file, std::string* error_msg);
 
   // Returns true if the dex checksums in the given oat file match the
   // checksums of the original dex files on disk. This is intended to be used
@@ -307,8 +292,9 @@ class ImageSpace : public MemMapSpace {
   // Tries to initialize an ImageSpace from the given image path, returning null on error.
   //
   // If validate_oat_file is false (for /system), do not verify that image's OatFile is up-to-date
-  // relative to its DexFile inputs. Otherwise, validate `oat_file` and abandon it if the validation
-  // fails. If the oat_file is null, it uses the oat file from the image.
+  // relative to its DexFile inputs. Otherwise (for /data), validate the inputs and generate the
+  // OatFile in /data/dalvik-cache if necessary. If the oat_file is null, it uses the oat file from
+  // the image.
   static std::unique_ptr<ImageSpace> Init(const char* image_filename,
                                           const char* image_location,
                                           bool validate_oat_file,
@@ -322,7 +308,7 @@ class ImageSpace : public MemMapSpace {
 
   ImageSpace(const std::string& name,
              const char* image_location,
-             const std::vector<std::string>& profile_files,
+             const char* profile_file,
              MemMap&& mem_map,
              accounting::ContinuousSpaceBitmap&& live_bitmap,
              uint8_t* end);
@@ -337,7 +323,7 @@ class ImageSpace : public MemMapSpace {
   const OatFile* oat_file_non_owned_;
 
   const std::string image_location_;
-  const std::vector<std::string> profile_files_;
+  const std::string profile_file_;
 
   friend class Space;
 

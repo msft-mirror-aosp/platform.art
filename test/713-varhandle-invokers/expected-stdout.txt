@@ -1,5 +1,4 @@
-Main$FieldVarHandleExactInvokerTest
-Main$LongFieldVarHandleExactInvokerTest
+fieldVarHandleExactInvokerTest
 fieldVarHandleInvokerTest
 DivergenceExactInvokerTest
 DivergenceInvokerTest

@@ -18,7 +18,6 @@
 #define ART_LIBARTBASE_BASE_ARENA_CONTAINERS_H_
 
 #include <deque>
-#include <forward_list>
 #include <queue>
 #include <set>
 #include <stack>
@@ -49,9 +48,6 @@ class ArenaAllocatorAdapter;
 
 template <typename T>
 using ArenaDeque = std::deque<T, ArenaAllocatorAdapter<T>>;
-
-template <typename T>
-using ArenaForwardList = std::forward_list<T, ArenaAllocatorAdapter<T>>;
 
 template <typename T>
 using ArenaQueue = std::queue<T, ArenaDeque<T>>;
@@ -127,18 +123,18 @@ class ArenaAllocatorAdapterKindImpl {
   ArenaAllocKind kind_;
 };
 
-using ArenaAllocatorAdapterKind = ArenaAllocatorAdapterKindImpl<kArenaAllocatorCountAllocations>;
+typedef ArenaAllocatorAdapterKindImpl<kArenaAllocatorCountAllocations> ArenaAllocatorAdapterKind;
 
 template <>
 class ArenaAllocatorAdapter<void> : private ArenaAllocatorAdapterKind {
  public:
-  using value_type    = void;
-  using pointer       = void*;
-  using const_pointer = const void*;
+  typedef void value_type;
+  typedef void* pointer;
+  typedef const void* const_pointer;
 
   template <typename U>
   struct rebind {
-    using other = ArenaAllocatorAdapter<U>;
+    typedef ArenaAllocatorAdapter<U> other;
   };
 
   explicit ArenaAllocatorAdapter(ArenaAllocator* allocator,
@@ -165,17 +161,17 @@ class ArenaAllocatorAdapter<void> : private ArenaAllocatorAdapterKind {
 template <typename T>
 class ArenaAllocatorAdapter : private ArenaAllocatorAdapterKind {
  public:
-  using value_type      = T;
-  using pointer         = T*;
-  using reference       = T&;
-  using const_pointer   = const T*;
-  using const_reference = const T&;
-  using size_type       = size_t;
-  using difference_type = ptrdiff_t;
+  typedef T value_type;
+  typedef T* pointer;
+  typedef T& reference;
+  typedef const T* const_pointer;
+  typedef const T& const_reference;
+  typedef size_t size_type;
+  typedef ptrdiff_t difference_type;
 
   template <typename U>
   struct rebind {
-    using other = ArenaAllocatorAdapter<U>;
+    typedef ArenaAllocatorAdapter<U> other;
   };
 
   ArenaAllocatorAdapter(ArenaAllocator* allocator, ArenaAllocKind kind)

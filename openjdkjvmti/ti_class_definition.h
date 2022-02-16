@@ -65,12 +65,13 @@ class ArtClassDefinition {
         current_dex_memory_(),
         current_dex_file_(),
         redefined_(false),
+        from_class_ext_(false),
         initialized_(false),
         structural_transform_update_(false) {}
 
-  jvmtiError InitFirstLoad(const char* descriptor,
-                           art::Handle<art::mirror::ClassLoader> klass_loader,
-                           const art::DexFile& dex_file);
+  void InitFirstLoad(const char* descriptor,
+                     art::Handle<art::mirror::ClassLoader> klass_loader,
+                     const art::DexFile& dex_file);
   jvmtiError Init(art::Thread* self, jclass klass);
   jvmtiError Init(art::Thread* self, const jvmtiClassDefinition& def);
 
@@ -155,7 +156,10 @@ class ArtClassDefinition {
 
  private:
   jvmtiError InitCommon(art::Thread* self, jclass klass);
-  jvmtiError Init(const art::DexFile& dex_file);
+
+  template<typename GetOriginalDexFile>
+  void InitWithDex(GetOriginalDexFile get_original, const art::DexFile* quick_dex)
+      REQUIRES_SHARED(art::Locks::mutator_lock_);
 
   jclass klass_;
   jobject loader_;
@@ -186,6 +190,9 @@ class ArtClassDefinition {
   art::ArrayRef<const unsigned char> current_dex_file_;
 
   bool redefined_;
+
+  // If we got the initial dex_data_ from a class_ext
+  bool from_class_ext_;
 
   bool initialized_;
 

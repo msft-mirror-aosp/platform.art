@@ -40,7 +40,8 @@ if [ -z "$skip_host" ]; then
       echo "Skipping missing $build_dir"
     else
       for test_path in $build_dir/*/* ; do
-        echo_and_run LD_LIBRARY_PATH=$build_dir $test_path $*
+        test_rel_path=${test_path#${build_dir}/}
+        echo_and_run \( cd $build_dir \; $test_rel_path $* \)
       done
     fi
   done

@@ -131,10 +131,8 @@ void UpdateReadBarrierEntrypoints(QuickEntryPoints* qpoints, bool is_active) {
   qpoints->pReadBarrierMarkReg16 = is_active ? art_quick_read_barrier_mark_introspection : nullptr;
 }
 
-void InitEntryPoints(JniEntryPoints* jpoints,
-                     QuickEntryPoints* qpoints,
-                     bool monitor_jni_entry_exit) {
-  DefaultInitEntryPoints(jpoints, qpoints, monitor_jni_entry_exit);
+void InitEntryPoints(JniEntryPoints* jpoints, QuickEntryPoints* qpoints) {
+  DefaultInitEntryPoints(jpoints, qpoints);
 
   // Cast
   qpoints->pInstanceofNonTrivial = artInstanceOfFromCode;
@@ -189,6 +187,7 @@ void InitEntryPoints(JniEntryPoints* jpoints,
   qpoints->pMemcpy = memcpy;
 
   // Read barrier.
+  qpoints->pReadBarrierJni = ReadBarrierJni;
   qpoints->pReadBarrierMarkReg16 = nullptr;  // IP0 is used as a temp by the asm stub.
   UpdateReadBarrierEntrypoints(qpoints, /*is_active=*/ false);
   qpoints->pReadBarrierSlow = artReadBarrierSlow;

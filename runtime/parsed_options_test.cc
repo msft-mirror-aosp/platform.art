@@ -86,9 +86,7 @@ TEST_F(ParsedOptionsTest, ParsedOptions) {
 
   EXPECT_PARSED_EQ_AS_STRING_VECTOR(expected_boot_class_path, Opt::BootClassPath);
   EXPECT_PARSED_EQ(class_path, Opt::ClassPath);
-  std::vector<std::string> boot_images = map.GetOrDefault(Opt::Image);
-  ASSERT_EQ(1U, boot_images.size());
-  EXPECT_EQ(std::string("boot_image"), boot_images[0]);
+  EXPECT_PARSED_EQ(std::string("boot_image"), Opt::Image);
   EXPECT_PARSED_EXISTS(Opt::CheckJni);
   EXPECT_PARSED_EQ(2048U, Opt::MemoryInitialSize);
   EXPECT_PARSED_EQ(4 * KB, Opt::MemoryMaximumSize);

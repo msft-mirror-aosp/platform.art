@@ -53,24 +53,62 @@ struct PACKED(4) QuickEntryPoints {
 
 
 // JNI entrypoints.
-extern "C" void artJniMethodStart(Thread* self) UNLOCK_FUNCTION(Locks::mutator_lock_) HOT_ATTR;
-extern "C" void artJniMethodEnd(Thread* self) SHARED_LOCK_FUNCTION(Locks::mutator_lock_) HOT_ATTR;
-extern mirror::Object* JniDecodeReferenceResult(jobject result, Thread* self)
-    REQUIRES_SHARED(Locks::mutator_lock_) HOT_ATTR;
-extern "C" void artJniReadBarrier(ArtMethod* method)
-    REQUIRES_SHARED(Locks::mutator_lock_) HOT_ATTR;
-extern "C" void artJniUnlockObject(mirror::Object* locked, Thread* self)
-    REQUIRES_SHARED(Locks::mutator_lock_) HOT_ATTR;
+// TODO: NO_THREAD_SAFETY_ANALYSIS due to different control paths depending on fast JNI.
+extern uint32_t JniMethodStart(Thread* self) NO_THREAD_SAFETY_ANALYSIS HOT_ATTR;
+extern uint32_t JniMethodFastStart(Thread* self) NO_THREAD_SAFETY_ANALYSIS HOT_ATTR;
+extern uint32_t JniMethodStartSynchronized(jobject to_lock, Thread* self)
+    NO_THREAD_SAFETY_ANALYSIS HOT_ATTR;
+extern void JniMethodEnd(uint32_t saved_local_ref_cookie, Thread* self)
+    NO_THREAD_SAFETY_ANALYSIS HOT_ATTR;
+extern void JniMethodFastEnd(uint32_t saved_local_ref_cookie, Thread* self)
+    NO_THREAD_SAFETY_ANALYSIS HOT_ATTR;
+extern void JniMethodEndSynchronized(uint32_t saved_local_ref_cookie, jobject locked,
+                                     Thread* self)
+    NO_THREAD_SAFETY_ANALYSIS HOT_ATTR;
+extern mirror::Object* JniMethodEndWithReference(jobject result, uint32_t saved_local_ref_cookie,
+                                                 Thread* self)
+    NO_THREAD_SAFETY_ANALYSIS HOT_ATTR;
+extern mirror::Object* JniMethodFastEndWithReference(jobject result,
+                                                     uint32_t saved_local_ref_cookie,
+                                                     Thread* self)
+    NO_THREAD_SAFETY_ANALYSIS HOT_ATTR;
+
+
+extern mirror::Object* JniMethodEndWithReferenceSynchronized(jobject result,
+                                                             uint32_t saved_local_ref_cookie,
+                                                             jobject locked, Thread* self)
+    NO_THREAD_SAFETY_ANALYSIS HOT_ATTR;
 
 // JNI entrypoints when monitoring entry/exit.
-extern "C" void artJniMonitoredMethodStart(Thread* self) UNLOCK_FUNCTION(Locks::mutator_lock_);
-extern "C" void artJniMonitoredMethodEnd(Thread* self) SHARED_LOCK_FUNCTION(Locks::mutator_lock_);
+extern uint32_t JniMonitoredMethodStart(Thread* self) NO_THREAD_SAFETY_ANALYSIS HOT_ATTR;
+extern uint32_t JniMonitoredMethodStartSynchronized(jobject to_lock, Thread* self)
+    NO_THREAD_SAFETY_ANALYSIS HOT_ATTR;
+extern void JniMonitoredMethodEnd(uint32_t saved_local_ref_cookie, Thread* self)
+    NO_THREAD_SAFETY_ANALYSIS HOT_ATTR;
+extern void JniMonitoredMethodEndSynchronized(uint32_t saved_local_ref_cookie,
+                                              jobject locked,
+                                              Thread* self)
+    NO_THREAD_SAFETY_ANALYSIS HOT_ATTR;
+extern mirror::Object* JniMonitoredMethodEndWithReference(jobject result,
+                                                          uint32_t saved_local_ref_cookie,
+                                                          Thread* self)
+    NO_THREAD_SAFETY_ANALYSIS HOT_ATTR;
 
-// StringAppend pattern entrypoint.
+extern mirror::Object* JniMonitoredMethodEndWithReferenceSynchronized(
+    jobject result,
+    uint32_t saved_local_ref_cookie,
+    jobject locked, Thread* self)
+    NO_THREAD_SAFETY_ANALYSIS HOT_ATTR;
+
+
 extern "C" mirror::String* artStringBuilderAppend(uint32_t format,
                                                   const uint32_t* args,
                                                   Thread* self)
     REQUIRES_SHARED(Locks::mutator_lock_) HOT_ATTR;
+
+extern void ReadBarrierJni(mirror::CompressedReference<mirror::Class>* handle_on_stack,
+                           Thread* self)
+    NO_THREAD_SAFETY_ANALYSIS HOT_ATTR;
 
 // Read barrier entrypoints.
 //

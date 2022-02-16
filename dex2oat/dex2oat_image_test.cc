@@ -422,11 +422,7 @@ TEST_F(Dex2oatImageTest, TestExtension) {
     ScopedObjectAccess soa(Thread::Current());
     return gc::space::ImageSpace::LoadBootImage(/*boot_class_path=*/ boot_class_path,
                                                 /*boot_class_path_locations=*/ libcore_dex_files,
-                                                /*boot_class_path_fds=*/ std::vector<int>(),
-                                                /*boot_class_path_image_fds=*/ std::vector<int>(),
-                                                /*boot_class_path_vdex_fds=*/ std::vector<int>(),
-                                                /*boot_class_path_oat_fds=*/ std::vector<int>(),
-                                                android::base::Split(image_location, ":"),
+                                                image_location,
                                                 kRuntimeISA,
                                                 relocate,
                                                 /*executable=*/ true,
@@ -592,9 +588,9 @@ TEST_F(Dex2oatImageTest, TestExtension) {
   for (bool r : { false, true }) {
     relocate = r;
 
-    // Load primary boot image with a profile name.
+    // Try and fail to load everything as compiled extension.
     bool load_ok = silent_load(base_location + "!" + single_profile_filename);
-    ASSERT_TRUE(load_ok);
+    ASSERT_FALSE(load_ok);
 
     // Try and fail to load with invalid spec, two profile name separators.
     load_ok = silent_load(base_location + ":" + single_location + "!!arbitrary-profile-name");

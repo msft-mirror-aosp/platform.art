@@ -18,9 +18,8 @@
 #define ART_RUNTIME_COMPILER_CALLBACKS_H_
 
 #include "base/locks.h"
-#include "class_status.h"
 #include "dex/class_reference.h"
-#include "dex/method_reference.h"
+#include "class_status.h"
 
 namespace art {
 
@@ -34,6 +33,7 @@ class Class;
 
 namespace verifier {
 
+class MethodVerifier;
 class VerifierDeps;
 
 }  // namespace verifier
@@ -47,7 +47,8 @@ class CompilerCallbacks {
 
   virtual ~CompilerCallbacks() { }
 
-  virtual void AddUncompilableMethod(MethodReference ref) = 0;
+  virtual void MethodVerified(verifier::MethodVerifier* verifier)
+      REQUIRES_SHARED(Locks::mutator_lock_) = 0;
   virtual void ClassRejected(ClassReference ref) = 0;
 
   virtual verifier::VerifierDeps* GetVerifierDeps() const = 0;

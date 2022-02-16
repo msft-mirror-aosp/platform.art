@@ -26,7 +26,8 @@
     GOTO_OPCODE ip                      @ jump to next instruction
     .elseif $is_object
     $load   r2, [r0, #$data_offset]     @ w2<- vBB[vCC]
-    TEST_IF_MARKING 2f
+    cmp rMR, #0
+    bne 2f
 1:
     GET_INST_OPCODE ip                  @ extract opcode from rINST
     SET_VREG_OBJECT r2, r4              @ vAA<- w2

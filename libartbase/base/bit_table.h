@@ -77,11 +77,11 @@ class BitTableBase {
     return table_data_.Subregion(offset, NumColumnBits(column));
   }
 
-  uint32_t NumRows() const { return num_rows_; }
+  size_t NumRows() const { return num_rows_; }
 
   uint32_t NumRowBits() const { return column_offset_[kNumColumns]; }
 
-  constexpr uint32_t NumColumns() const { return kNumColumns; }
+  constexpr size_t NumColumns() const { return kNumColumns; }
 
   uint32_t NumColumnBits(uint32_t column) const {
     return column_offset_[column + 1] - column_offset_[column];
@@ -97,7 +97,7 @@ class BitTableBase {
 
  protected:
   BitMemoryRegion table_data_;
-  uint32_t num_rows_ = 0;
+  size_t num_rows_ = 0;
   uint16_t column_offset_[kNumColumns + 1] = {};
 };
 
@@ -226,7 +226,7 @@ typename BitTable<Accessor>::const_iterator operator+(
 template<typename Accessor>
 class BitTableRange : public IterationRange<typename BitTable<Accessor>::const_iterator> {
  public:
-  using const_iterator = typename BitTable<Accessor>::const_iterator;
+  typedef typename BitTable<Accessor>::const_iterator const_iterator;
 
   using IterationRange<const_iterator>::IterationRange;
   BitTableRange() : IterationRange<const_iterator>(const_iterator(), const_iterator()) { }

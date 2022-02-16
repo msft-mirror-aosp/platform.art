@@ -246,22 +246,11 @@ ZipArchive* ZipArchive::Open(const char* filename, std::string* error_msg) {
 }
 
 ZipArchive* ZipArchive::OpenFromFd(int fd, const char* filename, std::string* error_msg) {
-  return OpenFromFdInternal(fd, /*assume_ownership=*/true, filename, error_msg);
-}
-
-ZipArchive* ZipArchive::OpenFromOwnedFd(int fd, const char* filename, std::string* error_msg) {
-  return OpenFromFdInternal(fd, /*assume_ownership=*/false, filename, error_msg);
-}
-
-ZipArchive* ZipArchive::OpenFromFdInternal(int fd,
-                                           bool assume_ownership,
-                                           const char* filename,
-                                           std::string* error_msg) {
   DCHECK(filename != nullptr);
   DCHECK_GT(fd, 0);
 
   ZipArchiveHandle handle;
-  const int32_t error = OpenArchiveFd(fd, filename, &handle, assume_ownership);
+  const int32_t error = OpenArchiveFd(fd, filename, &handle);
   if (error != 0) {
     *error_msg = std::string(ErrorCodeString(error));
     CloseArchive(handle);

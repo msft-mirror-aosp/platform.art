@@ -258,7 +258,7 @@ constexpr size_t GetStackOverflowReservedBytes(InstructionSet isa) {
 //            are held when using!
 
 #if defined(__i386__) || defined(__arm__)
-using TwoWordReturn = uint64_t;
+typedef uint64_t TwoWordReturn;
 
 // Encodes method_ptr==nullptr and code_ptr==nullptr
 static inline constexpr TwoWordReturn GetTwoWordFailureValue() {

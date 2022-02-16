@@ -14,8 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Use the --secondary switch to add secondary dex file to class path.
 # Make sure we compile the required method using speed-profile compiler filter.
 # Enable JIT through runtime option to avoid the compiler filter set by --jit.
-exec ${RUN} "${@}" \
+exec ${RUN} "${@}" --secondary \
     -Xcompiler-option --compiler-filter=speed-profile --profile \
     --runtime-option -Xusejit:true

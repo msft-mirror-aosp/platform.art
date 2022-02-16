@@ -35,9 +35,6 @@ class CpuRegister {
   constexpr Register AsRegister() const {
     return reg_;
   }
-  bool operator==(const CpuRegister& other) const {
-    return reg_ == other.reg_;
-  }
   constexpr uint8_t LowBits() const {
     return reg_ & 7;
   }
@@ -62,7 +59,7 @@ class XmmRegister {
   constexpr bool NeedsRex() const {
     return reg_ > 7;
   }
-  bool operator==(const XmmRegister& other) const {
+  bool operator==(XmmRegister& other) {
     return reg_ == other.reg_;
   }
  private:
@@ -83,6 +80,13 @@ enum X87Register {
   kNoX87Register = -1  // Signals an illegal register.
 };
 std::ostream& operator<<(std::ostream& os, const X87Register& reg);
+
+enum ScaleFactor {
+  TIMES_1 = 0,
+  TIMES_2 = 1,
+  TIMES_4 = 2,
+  TIMES_8 = 3
+};
 
 enum Condition {
   kOverflow     =  0,

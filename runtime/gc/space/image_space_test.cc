@@ -19,11 +19,11 @@
 #include "android-base/logging.h"
 #include "android-base/stringprintf.h"
 #include "android-base/strings.h"
-#include "base/globals.h"
+
 #include "base/stl_util.h"
 #include "class_linker.h"
-#include "dex/utf.h"
 #include "dexopt_test.h"
+#include "dex/utf.h"
 #include "intern_table-inl.h"
 #include "noop_compiler_callbacks.h"
 #include "oat_file.h"
@@ -128,7 +128,7 @@ TEST_F(ImageSpaceTest, StringDeduplication) {
     ASSERT_TRUE(success) << error_msg;
   }
 
-  std::vector<std::string> full_image_locations;
+  std::string full_image_locations;
   std::vector<std::unique_ptr<gc::space::ImageSpace>> boot_image_spaces;
   MemMap extra_reservation;
   auto load_boot_image = [&]() REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -136,10 +136,6 @@ TEST_F(ImageSpaceTest, StringDeduplication) {
     extra_reservation = MemMap::Invalid();
     return ImageSpace::LoadBootImage(bcp,
                                      bcp_locations,
-                                     /*boot_class_path_fds=*/ std::vector<int>(),
-                                     /*boot_class_path_image_fds=*/ std::vector<int>(),
-                                     /*boot_class_path_vdex_fds=*/ std::vector<int>(),
-                                     /*boot_class_path_oat_fds=*/ std::vector<int>(),
                                      full_image_locations,
                                      kRuntimeISA,
                                      /*relocate=*/ false,
@@ -169,9 +165,9 @@ TEST_F(ImageSpaceTest, StringDeduplication) {
   // Load extensions and test for the presence of the test string.
   ScopedObjectAccess soa(Thread::Current());
   ASSERT_EQ(2u, extension_image_locations.size());
-  full_image_locations = {
-    base_image_location, extension_image_locations[0], extension_image_locations[1]
-  };
+  full_image_locations = base_image_location +
+                             ImageSpace::kComponentSeparator + extension_image_locations[0] +
+                             ImageSpace::kComponentSeparator + extension_image_locations[1];
   bool success = load_boot_image();
   ASSERT_TRUE(success);
   ASSERT_EQ(bcp.size(), boot_image_spaces.size());
@@ -182,9 +178,9 @@ TEST_F(ImageSpaceTest, StringDeduplication) {
   // Reload extensions in reverse order and test for the presence of the test string.
   std::swap(bcp[bcp.size() - 2u], bcp[bcp.size() - 1u]);
   std::swap(bcp_locations[bcp_locations.size() - 2u], bcp_locations[bcp_locations.size() - 1u]);
-  full_image_locations = {
-    base_image_location, extension_image_locations[1], extension_image_locations[0]
-  };
+  full_image_locations = base_image_location +
+                             ImageSpace::kComponentSeparator + extension_image_locations[1] +
+                             ImageSpace::kComponentSeparator + extension_image_locations[0];
   success = load_boot_image();
   ASSERT_TRUE(success);
   ASSERT_EQ(bcp.size(), boot_image_spaces.size());
@@ -195,7 +191,8 @@ TEST_F(ImageSpaceTest, StringDeduplication) {
   // Reload the image without the second extension.
   bcp.erase(bcp.end() - 2u);
   bcp_locations.erase(bcp_locations.end() - 2u);
-  full_image_locations = {base_image_location, extension_image_locations[0]};
+  full_image_locations =
+      base_image_location + ImageSpace::kComponentSeparator + extension_image_locations[0];
   success = load_boot_image();
   ASSERT_TRUE(success);
   ASSERT_EQ(bcp.size(), boot_image_spaces.size());
@@ -259,7 +256,6 @@ TEST_F(DexoptTest, ValidateOatFile) {
                                                 /*executable=*/ false,
                                                 /*low_4gb=*/ false,
                                                 ArrayRef<const std::string>(dex_filenames),
-                                                /*dex_fds=*/ ArrayRef<const int>(),
                                                 /*reservation=*/ nullptr,
                                                 &error_msg));
     ASSERT_TRUE(oat2 != nullptr) << error_msg;
@@ -338,10 +334,9 @@ TEST_F(DexoptTest, Checksums) {
     return gc::space::ImageSpace::VerifyBootClassPathChecksums(
         checksums,
         android::base::Join(bcp_locations, ':'),
-        ArrayRef<const std::string>(runtime->GetImageLocations()),
+        runtime->GetImageLocation(),
         ArrayRef<const std::string>(bcp_locations),
         ArrayRef<const std::string>(bcp),
-        /*boot_class_path_fds=*/ ArrayRef<const int>(),
         kRuntimeISA,
         &error_msg);
   };
@@ -375,8 +370,11 @@ template <bool kImage, bool kRelocate>
 class ImageSpaceLoadingTest : public CommonRuntimeTest {
  protected:
   void SetUpRuntimeOptions(RuntimeOptions* options) override {
-    missing_image_base_ = std::make_unique<ScratchFile>();
-    std::string image_location = PrepareImageLocation();
+    std::string image_location = GetCoreArtLocation();
+    if (!kImage) {
+      missing_image_base_ = std::make_unique<ScratchFile>();
+      image_location = missing_image_base_->GetFilename() + ".art";
+    }
     options->emplace_back(android::base::StringPrintf("-Ximage:%s", image_location.c_str()),
                           nullptr);
     options->emplace_back(kRelocate ? "-Xrelocate" : "-Xnorelocate", nullptr);
@@ -405,142 +403,64 @@ class ImageSpaceLoadingTest : public CommonRuntimeTest {
     missing_image_base_.reset();
   }
 
-  virtual std::string PrepareImageLocation() {
-    std::string image_location = GetCoreArtLocation();
-    if (!kImage) {
-      image_location = missing_image_base_->GetFilename() + ".art";
-    }
-    return image_location;
-  }
-
-  void CheckImageSpaceAndOatFile(size_t space_count) {
-    const std::vector<ImageSpace*>& image_spaces =
-        Runtime::Current()->GetHeap()->GetBootImageSpaces();
-    ASSERT_EQ(image_spaces.size(), space_count);
-
-    for (size_t i = 0; i < space_count; i++) {
-      // This test does not support multi-image compilation.
-      ASSERT_NE(image_spaces[i]->GetImageHeader().GetImageReservationSize(), 0u);
-
-      const OatFile* oat_file = image_spaces[i]->GetOatFile();
-      ASSERT_TRUE(oat_file != nullptr);
-
-      // Compiled by JIT Zygote.
-      EXPECT_EQ(oat_file->GetCompilerFilter(), CompilerFilter::Filter::kVerify);
-    }
-  }
-
-  std::unique_ptr<ScratchFile> missing_image_base_;
-
  private:
+  std::unique_ptr<ScratchFile> missing_image_base_;
   UniqueCPtr<const char[]> old_dex2oat_bcp_;
 };
 
-using ImageSpaceNoDex2oatTest = ImageSpaceLoadingTest</*kImage=*/true, /*kRelocate=*/true>;
+using ImageSpaceNoDex2oatTest = ImageSpaceLoadingTest<true, true>;
 TEST_F(ImageSpaceNoDex2oatTest, Test) {
   EXPECT_FALSE(Runtime::Current()->GetHeap()->GetBootImageSpaces().empty());
 }
 
-using ImageSpaceNoRelocateNoDex2oatTest =
-    ImageSpaceLoadingTest</*kImage=*/true, /*kRelocate=*/false>;
+using ImageSpaceNoRelocateNoDex2oatTest = ImageSpaceLoadingTest<true, false>;
 TEST_F(ImageSpaceNoRelocateNoDex2oatTest, Test) {
   EXPECT_FALSE(Runtime::Current()->GetHeap()->GetBootImageSpaces().empty());
 }
 
-using ImageSpaceNoImageNoProfileTest = ImageSpaceLoadingTest</*kImage=*/false, /*kRelocate=*/true>;
-TEST_F(ImageSpaceNoImageNoProfileTest, Test) {
-  // Imageless mode.
+class NoAccessAndroidDataTest : public ImageSpaceLoadingTest<false, true> {
+ protected:
+  NoAccessAndroidDataTest() : quiet_(LogSeverity::FATAL) {}
+
+  void SetUpRuntimeOptions(RuntimeOptions* options) override {
+    const char* android_data = getenv("ANDROID_DATA");
+    CHECK(android_data != nullptr);
+    old_android_data_ = android_data;
+    bad_android_data_ = old_android_data_ + "/no-android-data";
+    int result = setenv("ANDROID_DATA", bad_android_data_.c_str(), /* replace */ 1);
+    CHECK_EQ(result, 0) << strerror(errno);
+    result = mkdir(bad_android_data_.c_str(), /* mode */ 0700);
+    CHECK_EQ(result, 0) << strerror(errno);
+    // Create a regular file "dalvik_cache". GetDalvikCache() shall get EEXIST
+    // when trying to create a directory with the same name and creating a
+    // subdirectory for a particular architecture shall fail.
+    bad_dalvik_cache_ = bad_android_data_ + "/dalvik-cache";
+    int fd = creat(bad_dalvik_cache_.c_str(), /* mode */ 0);
+    CHECK_NE(fd, -1) << strerror(errno);
+    result = close(fd);
+    CHECK_EQ(result, 0) << strerror(errno);
+    ImageSpaceLoadingTest<false, true>::SetUpRuntimeOptions(options);
+  }
+
+  void TearDown() override {
+    ImageSpaceLoadingTest<false, true>::TearDown();
+    int result = unlink(bad_dalvik_cache_.c_str());
+    CHECK_EQ(result, 0) << strerror(errno);
+    result = rmdir(bad_android_data_.c_str());
+    CHECK_EQ(result, 0) << strerror(errno);
+    result = setenv("ANDROID_DATA", old_android_data_.c_str(), /* replace */ 1);
+    CHECK_EQ(result, 0) << strerror(errno);
+  }
+
+ private:
+  ScopedLogSeverity quiet_;
+  std::string old_android_data_;
+  std::string bad_android_data_;
+  std::string bad_dalvik_cache_;
+};
+
+TEST_F(NoAccessAndroidDataTest, Test) {
   EXPECT_TRUE(Runtime::Current()->GetHeap()->GetBootImageSpaces().empty());
-}
-
-class ImageSpaceLoadingSingleComponentWithProfilesTest
-    : public ImageSpaceLoadingTest</*kImage=*/false, /*kRelocate=*/true> {
- protected:
-  std::string PrepareImageLocation() override {
-    std::string image_location = missing_image_base_->GetFilename() + ".art";
-    // Compiling the primary boot image into a single image is not allowed on host.
-    if (kIsTargetBuild) {
-      std::vector<std::string> dex_files(GetLibCoreDexFileNames());
-      profile1_ = std::make_unique<ScratchFile>();
-      GenerateBootProfile(ArrayRef<const std::string>(dex_files),
-                          profile1_->GetFile(),
-                          /*method_frequency=*/6,
-                          /*type_frequency=*/6);
-      profile2_ = std::make_unique<ScratchFile>();
-      GenerateBootProfile(ArrayRef<const std::string>(dex_files),
-                          profile2_->GetFile(),
-                          /*method_frequency=*/8,
-                          /*type_frequency=*/8);
-      image_location += "!" + profile1_->GetFilename() + "!" + profile2_->GetFilename();
-    }
-    // "/path/to/image.art!/path/to/profile1!/path/to/profile2"
-    return image_location;
-  }
-
- private:
-  std::unique_ptr<ScratchFile> profile1_;
-  std::unique_ptr<ScratchFile> profile2_;
-};
-
-TEST_F(ImageSpaceLoadingSingleComponentWithProfilesTest, Test) {
-  // Compiling the primary boot image into a single image is not allowed on host.
-  TEST_DISABLED_FOR_HOST();
-
-  CheckImageSpaceAndOatFile(/*space_count=*/1);
-}
-
-class ImageSpaceLoadingMultipleComponentsWithProfilesTest
-    : public ImageSpaceLoadingTest</*kImage=*/false, /*kRelocate=*/true> {
- protected:
-  std::string PrepareImageLocation() override {
-    std::vector<std::string> dex_files(GetLibCoreDexFileNames());
-    CHECK_GE(dex_files.size(), 2);
-    std::string image_location_1 = missing_image_base_->GetFilename() + ".art";
-    std::string image_location_2 =
-        missing_image_base_->GetFilename() + "-" + Stem(dex_files[dex_files.size() - 1]) + ".art";
-    // Compiling the primary boot image into a single image is not allowed on host.
-    if (kIsTargetBuild) {
-      profile1_ = std::make_unique<ScratchFile>();
-      GenerateBootProfile(ArrayRef<const std::string>(dex_files).SubArray(
-                              /*pos=*/0, /*length=*/dex_files.size() - 1),
-                          profile1_->GetFile(),
-                          /*method_frequency=*/6,
-                          /*type_frequency=*/6);
-      image_location_1 += "!" + profile1_->GetFilename();
-      profile2_ = std::make_unique<ScratchFile>();
-      GenerateBootProfile(ArrayRef<const std::string>(dex_files).SubArray(
-                              /*pos=*/dex_files.size() - 1, /*length=*/1),
-                          profile2_->GetFile(),
-                          /*method_frequency=*/8,
-                          /*type_frequency=*/8);
-      image_location_2 += "!" + profile2_->GetFilename();
-    }
-    // "/path/to/image.art!/path/to/profile1:/path/to/image-lastdex.art!/path/to/profile2"
-    return image_location_1 + ":" + image_location_2;
-  }
-
-  std::string Stem(std::string filename) {
-    size_t last_slash = filename.rfind('/');
-    if (last_slash != std::string::npos) {
-      filename = filename.substr(last_slash + 1);
-    }
-    size_t last_dot = filename.rfind('.');
-    if (last_dot != std::string::npos) {
-      filename.resize(last_dot);
-    }
-    return filename;
-  }
-
- private:
-  std::unique_ptr<ScratchFile> profile1_;
-  std::unique_ptr<ScratchFile> profile2_;
-};
-
-TEST_F(ImageSpaceLoadingMultipleComponentsWithProfilesTest, Test) {
-  // Compiling the primary boot image into a single image is not allowed on host.
-  TEST_DISABLED_FOR_HOST();
-
-  CheckImageSpaceAndOatFile(/*space_count=*/1);
 }
 
 }  // namespace space

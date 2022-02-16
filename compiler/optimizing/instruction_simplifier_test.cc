@@ -36,10 +36,6 @@ class Throwable;
 template<typename SuperClass>
 class InstructionSimplifierTestBase : public SuperClass, public OptimizingUnitTestHelper {
  public:
-  InstructionSimplifierTestBase() {
-    this->use_boot_image_ = true;  // Make the Runtime creation cheaper.
-  }
-
   void SetUp() override {
     SuperClass::SetUp();
     gLogVerbosity.compiler = true;

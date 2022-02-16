@@ -511,7 +511,7 @@ class PACKED(8) ImageHeader {
  * The first element indicates the location of a managed object with a field that needs fixing up.
  * The second element of the pair is an object-relative offset to the field in question.
  */
-using AppImageReferenceOffsetInfo = std::pair<uint32_t, uint32_t>;
+typedef std::pair<uint32_t, uint32_t> AppImageReferenceOffsetInfo;
 
 std::ostream& operator<<(std::ostream& os, ImageHeader::ImageMethod method);
 std::ostream& operator<<(std::ostream& os, ImageHeader::ImageRoot root);

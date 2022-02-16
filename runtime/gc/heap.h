@@ -76,7 +76,7 @@ class Verification;
 
 namespace accounting {
 template <typename T> class AtomicStack;
-using ObjectStack = AtomicStack<mirror::Object>;
+typedef AtomicStack<mirror::Object> ObjectStack;
 class CardTable;
 class HeapBitmap;
 class ModUnionTable;
@@ -140,9 +140,7 @@ class Heap {
   static constexpr size_t kDefaultMaxFree = 2 * MB;
   static constexpr size_t kDefaultMinFree = kDefaultMaxFree / 4;
   static constexpr size_t kDefaultLongPauseLogThreshold = MsToNs(5);
-  static constexpr size_t kDefaultLongPauseLogThresholdGcStress = MsToNs(50);
   static constexpr size_t kDefaultLongGCLogThreshold = MsToNs(100);
-  static constexpr size_t kDefaultLongGCLogThresholdGcStress = MsToNs(1000);
   static constexpr size_t kDefaultTLABSize = 32 * KB;
   static constexpr double kDefaultTargetUtilization = 0.75;
   static constexpr double kDefaultHeapGrowthMultiplier = 2.0;
@@ -168,7 +166,7 @@ class Heap {
   // as object allocation time. time_to_call_mallinfo seems to be on the order of 1 usec
   // on Android.
 #ifdef __ANDROID__
-  static constexpr uint32_t kNotifyNativeInterval = 64;
+  static constexpr uint32_t kNotifyNativeInterval = 32;
 #else
   // Some host mallinfo() implementations are slow. And memory is less scarce.
   static constexpr uint32_t kNotifyNativeInterval = 384;
@@ -201,11 +199,7 @@ class Heap {
        size_t non_moving_space_capacity,
        const std::vector<std::string>& boot_class_path,
        const std::vector<std::string>& boot_class_path_locations,
-       const std::vector<int>& boot_class_path_fds,
-       const std::vector<int>& boot_class_path_image_fds,
-       const std::vector<int>& boot_class_path_vdex_fds,
-       const std::vector<int>& boot_class_path_oat_fds,
-       const std::vector<std::string>& image_file_names,
+       const std::string& image_file_name,
        InstructionSet image_instruction_set,
        CollectorType foreground_collector_type,
        CollectorType background_collector_type,
@@ -336,10 +330,9 @@ class Heap {
   void ChangeAllocator(AllocatorType allocator)
       REQUIRES(Locks::mutator_lock_, !Locks::runtime_shutdown_lock_);
 
-  // Change the collector to be one of the possible options (MS, CMS, SS). Only safe when no
-  // concurrent accesses to the heap are possible.
+  // Change the collector to be one of the possible options (MS, CMS, SS).
   void ChangeCollector(CollectorType collector_type)
-      REQUIRES(Locks::mutator_lock_, !*gc_complete_lock_);
+      REQUIRES(Locks::mutator_lock_);
 
   // The given reference is believed to be to an object in the Java heap, check the soundness of it.
   // TODO: NO_THREAD_SAFETY_ANALYSIS since we call this everywhere and it is impossible to find a
@@ -412,7 +405,7 @@ class Heap {
 
   // Removes the growth limit on the alloc space so it may grow to its maximum capacity. Used to
   // implement dalvik.system.VMRuntime.clearGrowthLimit.
-  void ClearGrowthLimit() REQUIRES(!*gc_complete_lock_);
+  void ClearGrowthLimit();
 
   // Make the current growth limit the new maximum capacity, unmaps pages at the end of spaces
   // which will never be used. Used to implement dalvik.system.VMRuntime.clampGrowthLimit.
@@ -465,7 +458,6 @@ class Heap {
 
   // For the alloc space, sets the maximum number of bytes that the heap is allowed to allocate
   // from the system. Doesn't allow the space to exceed its growth limit.
-  // Set while we hold gc_complete_lock or collector_type_running_ != kCollectorTypeNone.
   void SetIdealFootprint(size_t max_allowed_footprint);
 
   // Blocks the caller until the garbage collector becomes idle and returns the type of GC we
@@ -866,7 +858,6 @@ class Heap {
   uint64_t GetTotalTimeWaitingForGC() const {
     return total_wait_time_;
   }
-  uint64_t GetPreOomeGcCount() const;
 
   // Perfetto Art Heap Profiler Support.
   HeapSampler& GetHeapSampler() {
@@ -963,7 +954,7 @@ class Heap {
 
   const Verification* GetVerification() const;
 
-  void PostForkChildAction(Thread* self) REQUIRES(!*gc_complete_lock_);
+  void PostForkChildAction(Thread* self);
 
   void TraceHeapSize(size_t heap_size);
 
@@ -974,7 +965,6 @@ class Heap {
   class CollectorTransitionTask;
   class HeapTrimTask;
   class TriggerPostForkCCGcTask;
-  class ReduceTargetFootprintTask;
 
   // Compact source space to target space. Returns the collector used.
   collector::GarbageCollector* Compact(space::ContinuousMemMapAllocSpace* target_space,
@@ -1181,9 +1171,6 @@ class Heap {
   // the target utilization ratio.  This should only be called immediately after a full garbage
   // collection. bytes_allocated_before_gc is used to measure bytes / second for the period which
   // the GC was run.
-  // This is only called by the thread that set collector_type_running_ to a value other than
-  // kCollectorTypeNone, or while holding gc_complete_lock, and ensuring that
-  // collector_type_running_ is kCollectorTypeNone.
   void GrowForUtilization(collector::GarbageCollector* collector_ran,
                           size_t bytes_allocated_before_gc = 0)
       REQUIRES(!process_state_update_lock_);
@@ -1275,11 +1262,6 @@ class Heap {
   // are currently in use, and could possibly be reclaimed as an indirect result
   // of a garbage collection.
   size_t GetNativeBytes();
-
-  // Set concurrent_start_bytes_ to a reasonable guess, given target_footprint_ .
-  void SetDefaultConcurrentStartBytes() REQUIRES(!*gc_complete_lock_);
-  // This version assumes no concurrent updaters.
-  void SetDefaultConcurrentStartBytesLocked();
 
   // All-known continuous spaces, where objects lie within fixed bounds.
   std::vector<space::ContinuousSpace*> continuous_spaces_ GUARDED_BY(Locks::mutator_lock_);
@@ -1397,9 +1379,6 @@ class Heap {
   // Task processor, proxies heap trim requests to the daemon threads.
   std::unique_ptr<TaskProcessor> task_processor_;
 
-  // The following are declared volatile only for debugging purposes; it shouldn't otherwise
-  // matter.
-
   // Collector type of the running GC.
   volatile CollectorType collector_type_running_ GUARDED_BY(gc_complete_lock_);
 
@@ -1421,29 +1400,21 @@ class Heap {
   // Only weakly enforced for simultaneous allocations.
   size_t growth_limit_;
 
-  // Requested initial heap size. Temporarily ignored after a fork, but then reestablished after
-  // a while to usually trigger the initial GC.
-  size_t initial_heap_size_;
-
   // Target size (as in maximum allocatable bytes) for the heap. Weakly enforced as a limit for
   // non-concurrent GC. Used as a guideline for computing concurrent_start_bytes_ in the
-  // concurrent GC case. Updates normally occur while collector_type_running_ is not none.
+  // concurrent GC case.
   Atomic<size_t> target_footprint_;
-
-  Mutex process_state_update_lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
 
   // Computed with foreground-multiplier in GrowForUtilization() when run in
   // jank non-perceptible state. On update to process state from background to
   // foreground we set target_footprint_ to this value.
+  Mutex process_state_update_lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
   size_t min_foreground_target_footprint_ GUARDED_BY(process_state_update_lock_);
 
   // When num_bytes_allocated_ exceeds this amount then a concurrent GC should be requested so that
   // it completes ahead of an allocation failing.
   // A multiple of this is also used to determine when to trigger a GC in response to native
   // allocation.
-  // After initialization, this is only updated by the thread that set collector_type_running_ to
-  // a value other than kCollectorTypeNone, or while holding gc_complete_lock, and ensuring that
-  // collector_type_running_ is kCollectorTypeNone.
   size_t concurrent_start_bytes_;
 
   // Since the heap was created, how many bytes have been freed.
@@ -1474,10 +1445,6 @@ class Heap {
   // here to be subtracted from num_bytes_allocated_ later at the next
   // GC.
   Atomic<size_t> num_bytes_freed_revoke_;
-
-  // Records the number of bytes allocated at the time of GC, which is used later to calculate
-  // how many bytes have been allocated since the last GC
-  size_t num_bytes_alive_after_gc_;
 
   // Info related to the current or previous GC iteration.
   collector::Iteration current_gc_iteration_;
@@ -1692,9 +1659,6 @@ class Heap {
   // Boot image address range. Includes images and oat files.
   uint32_t boot_images_start_address_;
   uint32_t boot_images_size_;
-
-  // The number of times we initiated a GC of last resort to try to avoid an OOME.
-  Atomic<uint64_t> pre_oome_gc_count_;
 
   // An installed allocation listener.
   Atomic<AllocationListener*> alloc_listener_;

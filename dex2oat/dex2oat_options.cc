@@ -71,11 +71,6 @@ static void AddInputMappings(Builder& builder) {
                     "Eg: --dex-file=/home/build/out/system/framework/core.jar\n"
                     "    --dex-location=/system/framework/core.jar")
           .IntoKey(M::DexLocations)
-      .Define("--dex-fd=_")
-          .WithType<std::vector<int>>().AppendValues()
-          .WithHelp("Specifies a file descriptor of a dex file. It can be specified for multiple\n"
-                    "times, but the number must match the number of --dex-file. Eg: --dex-fd=5")
-          .IntoKey(M::DexFds)
       .Define("--zip-fd=_")
           .WithType<int>()
           .WithHelp("specifies a file descriptor of a zip file containing a classes.dex file to\n"
@@ -193,19 +188,14 @@ static void AddImageMappings(Builder& builder) {
           .WithHelp("list of known dirty objects in the image. The image writer will group them"
                     " together")
           .IntoKey(M::DirtyImageObjects)
-      .Define("--dirty-image-objects-fd=_")
-          .WithType<int>()
-          .WithHelp("Specify a file descriptor for reading the list of known dirty objects in\n"
-                    "the image. The image writer will group them together")
-          .IntoKey(M::DirtyImageObjectsFd)
       .Define("--updatable-bcp-packages-file=_")
           .WithType<std::string>()
-          .WithHelp("Deprecated. No longer takes effect.")
+          .WithHelp("file with a list of updatable boot class path packages. Classes in these\n"
+                    "packages and sub-packages shall not be resolved during app compilation to\n"
+                    "avoid AOT assumptions being invalidated after applying updates to these\n"
+                    "components."
+          )
           .IntoKey(M::UpdatableBcpPackagesFile)
-      .Define("--updatable-bcp-packages-fd=_")
-          .WithType<int>()
-          .WithHelp("Deprecated. No longer takes effect.")
-          .IntoKey(M::UpdatableBcpPackagesFd)
       .Define("--image-format=_")
           .WithType<ImageHeader::StorageMode>()
           .WithValueMap({{"lz4", ImageHeader::kStorageModeLZ4},
@@ -242,15 +232,11 @@ static void AddCompilerMappings(Builder& builder) {
           .WithType<std::string>()
           .IntoKey(M::Passes)
       .Define("--profile-file=_")
-          .WithType<std::vector<std::string>>().AppendValues()
-          .WithHelp("Specify profiler output file to use for compilation using a filename.\n"
-                    "When multiple profiles are used, the order matters: If multiple profiles \n"
-                    "contain classes and methods of the same dex file with different checksums, \n"
-                    "only the classes and methods from the first profile will be used for that \n"
-                    "particular dex file.")
+          .WithType<std::string>()
+          .WithHelp("Specify profiler output file to use for compilation using a filename.")
           .IntoKey(M::Profile)
       .Define("--profile-file-fd=_")
-          .WithType<std::vector<int>>().AppendValues()
+          .WithType<int>()
           .WithHelp("Specify profiler output file to use for compilation using a file-descriptor.")
           .IntoKey(M::ProfileFd)
       .Define("--no-inline-from=_")
@@ -299,7 +285,7 @@ Parser CreateDex2oatArgumentParser() {
           .IntoKey(M::Watchdog)
       .Define("--watchdog-timeout=_")
           .WithType<int>()
-          .WithHelp("Set the watchdog timeout value in milliseconds.")
+          .WithHelp("Set the watchdog timeout value in seconds.")
           .IntoKey(M::WatchdogTimeout)
       .Define("-j_")
           .WithType<unsigned int>()
@@ -307,7 +293,7 @@ Parser CreateDex2oatArgumentParser() {
                     "of detected hardware threads available on the host system.")
           .IntoKey(M::Threads)
       .Define("--cpu-set=_")
-          .WithType<ParseIntList<','>>()
+          .WithType<std::vector<int32_t>>()
           .WithHelp("sets the cpu affinitiy to the given <set>. The <set> is a comma separated\n"
                     "list of cpus. Eg: --cpu-set=0,1,2,3")
           .WithMetavar("<set>")
@@ -434,13 +420,7 @@ Parser CreateDex2oatArgumentParser() {
       .Define("--apex-versions=_")
           .WithType<std::string>()
           .WithHelp("Versions of apexes in the boot classpath, separated by '/'")
-          .IntoKey(M::ApexVersions)
-      .Define("--force-jit-zygote")
-          .WithHelp("Optimizes the app to be executed in an environment that uses JIT Zygote.")
-          .IntoKey(M::ForceJitZygote)
-      .Define("--force-palette-compilation-hooks")
-          .WithHelp("Force PaletteNotify{Start,End}Dex2oatCompilation calls.")
-          .IntoKey(M::ForcePaletteCompilationHooks);
+          .IntoKey(M::ApexVersions);
 
   AddCompilerOptionsArgumentParserOptions<Dex2oatArgumentMap>(*parser_builder);
 

@@ -39,9 +39,7 @@ constexpr bool kUseTrueRandomness = false;
 template<typename SuperTest>
 class ReferenceTypePropagationTestBase : public SuperTest, public OptimizingUnitTestHelper {
  public:
-  ReferenceTypePropagationTestBase() : graph_(nullptr), propagation_(nullptr) {
-    this->use_boot_image_ = true;  // Make the Runtime creation cheaper.
-  }
+  ReferenceTypePropagationTestBase() : graph_(nullptr), propagation_(nullptr) { }
 
   ~ReferenceTypePropagationTestBase() { }
 

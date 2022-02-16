@@ -75,7 +75,7 @@ ObjPtr<mirror::Reference> ReferenceQueue::DequeuePendingReference() {
 // This must be called whenever DequeuePendingReference is called.
 void ReferenceQueue::DisableReadBarrierForReference(ObjPtr<mirror::Reference> ref) {
   Heap* heap = Runtime::Current()->GetHeap();
-  if (kUseBakerReadBarrier && heap->CurrentCollectorType() == kCollectorTypeCC &&
+  if (kUseBakerOrBrooksReadBarrier && heap->CurrentCollectorType() == kCollectorTypeCC &&
       heap->ConcurrentCopyingCollector()->IsActive()) {
     // Change the gray ptr we left in ConcurrentCopying::ProcessMarkStackRef() to non-gray.
     // We check IsActive() above because we don't want to do this when the zygote compaction
@@ -131,8 +131,7 @@ size_t ReferenceQueue::GetLength() const {
 }
 
 void ReferenceQueue::ClearWhiteReferences(ReferenceQueue* cleared_references,
-                                          collector::GarbageCollector* collector,
-                                          bool report_cleared) {
+                                          collector::GarbageCollector* collector) {
   while (!IsEmpty()) {
     ObjPtr<mirror::Reference> ref = DequeuePendingReference();
     mirror::HeapReference<mirror::Object>* referent_addr = ref->GetReferentReferenceAddr();
@@ -146,15 +145,6 @@ void ReferenceQueue::ClearWhiteReferences(ReferenceQueue* cleared_references,
         ref->ClearReferent<false>();
       }
       cleared_references->EnqueueReference(ref);
-      if (report_cleared) {
-        static bool already_reported = false;
-        if (!already_reported) {
-          // TODO: Maybe do this only if the queue is non-null?
-          LOG(WARNING)
-              << "Cleared Reference was only reachable from finalizer (only reported once)";
-          already_reported = true;
-        }
-      }
     }
     // Delay disabling the read barrier until here so that the ClearReferent call above in
     // transaction mode will trigger the read barrier.
@@ -162,12 +152,10 @@ void ReferenceQueue::ClearWhiteReferences(ReferenceQueue* cleared_references,
   }
 }
 
-FinalizerStats ReferenceQueue::EnqueueFinalizerReferences(ReferenceQueue* cleared_references,
+void ReferenceQueue::EnqueueFinalizerReferences(ReferenceQueue* cleared_references,
                                                 collector::GarbageCollector* collector) {
-  uint32_t num_refs(0), num_enqueued(0);
   while (!IsEmpty()) {
     ObjPtr<mirror::FinalizerReference> ref = DequeuePendingReference()->AsFinalizerReference();
-    ++num_refs;
     mirror::HeapReference<mirror::Object>* referent_addr = ref->GetReferentReferenceAddr();
     // do_atomic_update is false because this happens during the reference processing phase where
     // Reference.clear() would block.
@@ -182,44 +170,28 @@ FinalizerStats ReferenceQueue::EnqueueFinalizerReferences(ReferenceQueue* cleare
         ref->ClearReferent<false>();
       }
       cleared_references->EnqueueReference(ref);
-      ++num_enqueued;
     }
     // Delay disabling the read barrier until here so that the ClearReferent call above in
     // transaction mode will trigger the read barrier.
     DisableReadBarrierForReference(ref->AsReference());
   }
-  return FinalizerStats(num_refs, num_enqueued);
 }
 
-uint32_t ReferenceQueue::ForwardSoftReferences(MarkObjectVisitor* visitor) {
-  uint32_t num_refs(0);
-  Thread* self = Thread::Current();
-  static constexpr int SR_BUF_SIZE = 32;
-  ObjPtr<mirror::Reference> buf[SR_BUF_SIZE];
-  int n_entries;
-  bool empty;
+void ReferenceQueue::ForwardSoftReferences(MarkObjectVisitor* visitor) {
+  if (UNLIKELY(IsEmpty())) {
+    return;
+  }
+  const ObjPtr<mirror::Reference> head = list_;
+  ObjPtr<mirror::Reference> ref = head;
   do {
-    {
-      // Acquire lock only a few times and hold it as briefly as possible.
-      MutexLock mu(self, *lock_);
-      empty = IsEmpty();
-      for (n_entries = 0; n_entries < SR_BUF_SIZE && !empty; ++n_entries) {
-        // Dequeuing the Reference here means it could possibly be enqueued again during this GC.
-        // That's unlikely and benign.
-        buf[n_entries] = DequeuePendingReference();
-        empty = IsEmpty();
-      }
+    mirror::HeapReference<mirror::Object>* referent_addr = ref->GetReferentReferenceAddr();
+    if (referent_addr->AsMirrorPtr() != nullptr) {
+      // do_atomic_update is false because mutators can't access the referent due to the weak ref
+      // access blocking.
+      visitor->MarkHeapReference(referent_addr, /*do_atomic_update=*/ false);
     }
-    for (int i = 0; i < n_entries; ++i) {
-      mirror::HeapReference<mirror::Object>* referent_addr = buf[i]->GetReferentReferenceAddr();
-      if (referent_addr->AsMirrorPtr() != nullptr) {
-        visitor->MarkHeapReference(referent_addr, /*do_atomic_update=*/ true);
-        ++num_refs;
-      }
-      DisableReadBarrierForReference(buf[i]->AsReference());
-    }
-  } while (!empty);
-  return num_refs;
+    ref = ref->GetPendingNext();
+  } while (LIKELY(ref != head));
 }
 
 void ReferenceQueue::UpdateRoots(IsMarkedVisitor* visitor) {

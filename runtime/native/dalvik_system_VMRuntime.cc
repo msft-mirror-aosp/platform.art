@@ -161,10 +161,6 @@ static jlong VMRuntime_addressOf(JNIEnv* env, jobject, jobject javaArray) {
     ThrowIllegalArgumentException("not an array");
     return 0;
   }
-  if (array->IsObjectArray()) {
-    ThrowIllegalArgumentException("not a primitive array");
-    return 0;
-  }
   if (Runtime::Current()->GetHeap()->IsMovableObject(array)) {
     ThrowRuntimeException("Trying to get address of movable array object");
     return 0;
@@ -481,10 +477,11 @@ class ClearJitCountersVisitor : public ClassVisitor {
         klass->IsErroneousResolved()) {
       return true;
     }
-    uint16_t threshold = Runtime::Current()->GetJITOptions()->GetWarmupThreshold();
     for (ArtMethod& m : klass->GetMethods(kRuntimePointerSize)) {
       if (!m.IsAbstract()) {
-        m.ResetCounter(threshold);
+        if (m.GetCounter() != 0) {
+          m.SetCounter(0);
+        }
       }
     }
     return true;

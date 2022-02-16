@@ -3291,7 +3291,6 @@ TooManyArgumentsCausingWrongMethodTypeTest...OK
 TooFewArgumentsCausingWrongMethodTypeTest...OK
 ReturnTypeCausingWrongMethodTypeTest...OK
 UnsupportedAccessModePreemptsWrongMethodTypeExceptionTest...OK
-ArrayStoreTest...OK
 FieldCoordinateTypeTest...OK
 ArrayElementOutOfBoundsIndexTest...OK
 ArrayElementBadIndexTypeTest...OK
@@ -3339,4 +3338,4 @@ SubtypeTest...OK
 SupertypeTest...OK
 InterfaceTest...OK
 ImplicitBoxingIntegerTest...OK
-3341 successes, 0 skips, 0 failures.
+3340 successes, 0 skips, 0 failures.

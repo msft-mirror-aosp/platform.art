@@ -19,7 +19,9 @@ package other2;
 import other.InaccessibleClass;
 
 public class GetInaccessibleClass {
-  public static Class<?> $inline$get() {
+  // TODO: Make this method `$inline$` once we do not flag access check
+  // failures as soft-fail in the verifier. b/28313047
+  public static Class<?> get() {
     return InaccessibleClass.class;
   }
 }

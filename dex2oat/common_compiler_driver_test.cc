@@ -41,7 +41,8 @@ void CommonCompilerDriverTest::CompileAll(jobject class_loader,
   compiler_driver_->PreCompile(class_loader,
                                dex_files,
                                timings,
-                               &compiler_options_->image_classes_);
+                               &compiler_options_->image_classes_,
+                               verification_results_.get());
 
   // Verification results in the `callback_` should not be used during compilation.
   down_cast<QuickCompilerCallbacks*>(callbacks_.get())->SetVerificationResults(
@@ -67,7 +68,7 @@ void CommonCompilerDriverTest::ReserveImageSpace() {
   MemMap::Init();
   image_reservation_ = MemMap::MapAnonymous("image reservation",
                                             reinterpret_cast<uint8_t*>(ART_BASE_ADDRESS),
-                                            static_cast<size_t>(120 * 1024 * 1024),  // 120MB
+                                            (size_t)120 * 1024 * 1024,  // 120MB
                                             PROT_NONE,
                                             false /* no need for 4gb flag with fixed mmap */,
                                             /*reuse=*/ false,

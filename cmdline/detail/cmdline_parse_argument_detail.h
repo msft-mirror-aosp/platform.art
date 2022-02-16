@@ -339,7 +339,7 @@ struct CmdlineParserArgumentInfo {
   CmdlineParserArgumentInfo() = default;
 
   // Ensure there's a default move constructor.
-  CmdlineParserArgumentInfo(CmdlineParserArgumentInfo&&) noexcept = default;
+  CmdlineParserArgumentInfo(CmdlineParserArgumentInfo&&) = default;
 
  private:
   // Perform type-specific checks at runtime.

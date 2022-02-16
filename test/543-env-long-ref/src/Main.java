@@ -17,6 +17,9 @@
 import java.lang.reflect.Method;
 
 public class Main {
+  // Workaround for b/18051191.
+  class InnerClass {}
+
   public static void main(String[] args) throws Throwable {
     System.loadLibrary(args[0]);
     Class<?> c = Class.forName("TestCase");

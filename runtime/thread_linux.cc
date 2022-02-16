@@ -70,8 +70,4 @@ void Thread::TearDownAlternateSignalStack() {
   delete[] allocated_signal_stack;
 }
 
-void Thread::MadviseAwayAlternateSignalStack() {
-  // We do not `madvise()` away the alternate signal stack on host.
-}
-
 }  // namespace art

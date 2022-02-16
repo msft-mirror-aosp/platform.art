@@ -43,7 +43,7 @@ public class Main {
     setDebuggingAllowed(debugging_allowed);
     // Setup is finished. Try to attach agent in 2 ways.
     try {
-      VMDebug.attachAgent(agent, null);
+      VMDebug.attachAgent(agent);
     } catch(SecurityException e) {
       System.out.println(e.getMessage());
     }

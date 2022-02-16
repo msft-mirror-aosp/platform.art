@@ -22,9 +22,9 @@
 
 namespace art {
 
-void QuickCompilerCallbacks::AddUncompilableMethod(MethodReference ref) {
+void QuickCompilerCallbacks::MethodVerified(verifier::MethodVerifier* verifier) {
   if (verification_results_ != nullptr) {
-    verification_results_->AddUncompilableMethod(ref);
+    verification_results_->ProcessVerifiedMethod(verifier);
   }
 }
 

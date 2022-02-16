@@ -42,9 +42,9 @@
 #include <sstream>
 
 #include "android-base/file.h"
-#include "android-base/logging.h"
 #include "android-base/stringprintf.h"
 #include "android-base/strings.h"
+
 #include "base/bit_utils.h"
 #include "base/globals.h"
 #include "base/os.h"
@@ -283,71 +283,69 @@ std::string GetArtApexData() {
   return GetAndroidDir(kArtApexDataEnvVar, kArtApexDataDefaultPath, /*must_exist=*/false);
 }
 
-std::string GetPrebuiltPrimaryBootImageDir() {
-  return StringPrintf("%s/javalib", kAndroidArtApexDefaultPath);
+static std::string GetFirstBootClasspathExtensionJar(const std::string& android_root) {
+  DCHECK(kIsTargetBuild);
+
+  // This method finds the first non-APEX DEX file in the boot class path as defined by the
+  // DEX2OATBOOTCLASSPATH environment variable. This corresponds to the first boot classpath
+  // extension (see IMAGE SECTION documentation in image.h). When on-device signing is used the
+  // boot class extensions are compiled together as a single image with a name derived from the
+  // first extension. This first boot classpath extension is usually
+  // '/system/framework/framework.jar'.
+  //
+  // DEX2OATBOOTCLASSPATH is generated at build time by in the init.environ.rc.in:
+  //   ${ANDROID_BUILD_TOP}/system/core/rootdir/Android.mk
+  // and initialized on Android by init in init.environ.rc:
+  //   ${ANDROID_BUILD_TOP}/system/core/rootdir/init.environ.rc.in.
+  // It is used by installd too.
+  const char* bcp = getenv("DEX2OATBOOTCLASSPATH");
+  const std::string kDefaultBcpExtensionJar = android_root + "/framework/framework.jar";
+  if (bcp != nullptr) {
+    for (std::string_view component : SplitString(bcp, ':')) {
+      if (component.empty()) {
+        continue;
+      }
+      if (!LocationIsOnApex(component)) {
+        return std::string{component};
+      }
+    }
+  }
+  return kDefaultBcpExtensionJar;
 }
 
 std::string GetDefaultBootImageLocation(const std::string& android_root,
                                         bool deny_art_apex_data_files) {
+  constexpr static const char* kJavalibBootArt = "javalib/boot.art";
   constexpr static const char* kEtcBootImageProf = "etc/boot-image.prof";
-  constexpr static const char* kBootImageStem = "boot";
-  constexpr static const char* kMinimalBootImageStem = "boot_minimal";
 
-  // If an update for the ART module has been been installed, a single boot image for the entire
-  // bootclasspath is in the ART APEX data directory.
+  // Boot image consists of two parts:
+  //  - the primary boot image in the ART APEX (contains the Core Libraries)
+  //  - the boot image extensions (contains framework libraries) on the system partition, or
+  //    in the ART APEX data directory, if an update for the ART module has been been installed.
   if (kIsTargetBuild && !deny_art_apex_data_files) {
-    const std::string boot_image =
-        GetApexDataDalvikCacheDirectory(InstructionSet::kNone) + "/" + kBootImageStem + ".art";
-    const std::string boot_image_filename = GetSystemImageFilename(boot_image.c_str(), kRuntimeISA);
-    if (OS::FileExists(boot_image_filename.c_str(), /*check_file_type=*/true)) {
-      // Typically "/data/misc/apexdata/com.android.art/dalvik-cache/boot.art!/apex/com.android.art
-      // /etc/boot-image.prof!/system/etc/boot-image.prof".
-      return StringPrintf("%s!%s/%s!%s/%s",
-                          boot_image.c_str(),
+    // If the ART APEX has been updated, the compiled boot image extension will be in the ART APEX
+    // data directory (assuming there is space and we trust the artifacts there). Otherwise, for a factory installed ART APEX it is
+    // under $ANDROID_ROOT/framework/.
+    const std::string first_extension_jar{GetFirstBootClasspathExtensionJar(android_root)};
+    const std::string boot_extension_image = GetApexDataBootImage(first_extension_jar);
+    const std::string boot_extension_filename =
+        GetSystemImageFilename(boot_extension_image.c_str(), kRuntimeISA);
+    if (OS::FileExists(boot_extension_filename.c_str(), /*check_file_type=*/true)) {
+      return StringPrintf("%s/%s:%s!%s/%s",
                           kAndroidArtApexDefaultPath,
-                          kEtcBootImageProf,
+                          kJavalibBootArt,
+                          boot_extension_image.c_str(),
                           android_root.c_str(),
                           kEtcBootImageProf);
     } else if (errno == EACCES) {
       // Additional warning for potential SELinux misconfiguration.
-      PLOG(ERROR) << "Default boot image check failed, could not stat: " << boot_image_filename;
-    }
-
-    // odrefresh can generate a minimal boot image, which only includes code from BCP jars in the
-    // ART module, when it fails to generate a single boot image for the entire bootclasspath (i.e.,
-    // full boot image). Use it if it exists.
-    const std::string minimal_boot_image = GetApexDataDalvikCacheDirectory(InstructionSet::kNone) +
-                                           "/" + kMinimalBootImageStem + ".art";
-    const std::string minimal_boot_image_filename =
-        GetSystemImageFilename(minimal_boot_image.c_str(), kRuntimeISA);
-    if (OS::FileExists(minimal_boot_image_filename.c_str(), /*check_file_type=*/true)) {
-      // Typically "/data/misc/apexdata/com.android.art/dalvik-cache/boot_minimal.art!/apex
-      // /com.android.art/etc/boot-image.prof:/nonx/boot_minimal-framework.art!/system/etc
-      // /boot-image.prof".
-      return StringPrintf("%s!%s/%s:/nonx/%s-framework.art!%s/%s",
-                          minimal_boot_image.c_str(),
-                          kAndroidArtApexDefaultPath,
-                          kEtcBootImageProf,
-                          kMinimalBootImageStem,
-                          android_root.c_str(),
-                          kEtcBootImageProf);
-    } else if (errno == EACCES) {
-      // Additional warning for potential SELinux misconfiguration.
-      PLOG(ERROR) << "Minimal boot image check failed, could not stat: " << boot_image_filename;
+      PLOG(ERROR) << "Default boot image check failed, could not stat: " << boot_extension_image;
     }
   }
-  // Boot image consists of two parts:
-  //  - the primary boot image (contains the Core Libraries)
-  //  - the boot image extensions (contains framework libraries)
-  // Typically "/apex/com.android.art/javalib/boot.art!/apex/com.android.art/etc/boot-image.prof:
-  // /system/framework/boot-framework.art!/system/etc/boot-image.prof".
-  return StringPrintf("%s/%s.art!%s/%s:%s/framework/%s-framework.art!%s/%s",
-                      GetPrebuiltPrimaryBootImageDir().c_str(),
-                      kBootImageStem,
+  return StringPrintf("%s/%s:%s/framework/boot-framework.art!%s/%s",
                       kAndroidArtApexDefaultPath,
-                      kEtcBootImageProf,
+                      kJavalibBootArt,
                       android_root.c_str(),
-                      kBootImageStem,
                       android_root.c_str(),
                       kEtcBootImageProf);
 }
@@ -360,18 +358,11 @@ std::string GetDefaultBootImageLocation(std::string* error_msg) {
   return GetDefaultBootImageLocation(android_root, /*deny_art_apex_data_files=*/false);
 }
 
-static /*constinit*/ std::string_view dalvik_cache_sub_dir = "dalvik-cache";
-
-void OverrideDalvikCacheSubDirectory(std::string sub_dir) {
-    static std::string overridden_dalvik_cache_sub_dir;
-    overridden_dalvik_cache_sub_dir = std::move(sub_dir);
-    dalvik_cache_sub_dir = overridden_dalvik_cache_sub_dir;
-}
-
 static std::string GetDalvikCacheDirectory(std::string_view root_directory,
                                            std::string_view sub_directory = {}) {
+  static constexpr std::string_view kDalvikCache = "dalvik-cache";
   std::stringstream oss;
-  oss << root_directory << '/' << dalvik_cache_sub_dir;
+  oss << root_directory << '/' << kDalvikCache;
   if (!sub_directory.empty()) {
     oss << '/' << sub_directory;
   }
@@ -412,12 +403,8 @@ void GetDalvikCache(const char* subdir, const bool create_if_absent, std::string
 #endif
 }
 
-// Returns a path formed by encoding the dex location into the filename. The path returned will be
-// rooted at `cache_location`.
-static bool GetLocationEncodedFilename(const char* location,
-                                       const char* cache_location,
-                                       std::string* filename,
-                                       std::string* error_msg) {
+bool GetDalvikCacheFilename(const char* location, const char* cache_location,
+                            std::string* filename, std::string* error_msg) {
   if (location[0] != '/') {
     *error_msg = StringPrintf("Expected path in location to be absolute: %s", location);
     return false;
@@ -434,14 +421,7 @@ static bool GetLocationEncodedFilename(const char* location,
   return true;
 }
 
-bool GetDalvikCacheFilename(const char* location,
-                            const char* cache_location,
-                            std::string* filename,
-                            std::string* error_msg) {
-  return GetLocationEncodedFilename(location, cache_location, filename, error_msg);
-}
-
-std::string GetApexDataDalvikCacheDirectory(InstructionSet isa) {
+static std::string GetApexDataDalvikCacheDirectory(InstructionSet isa) {
   if (isa != InstructionSet::kNone) {
     return GetDalvikCacheDirectory(GetArtApexData(), GetInstructionSetString(isa));
   }
@@ -450,14 +430,13 @@ std::string GetApexDataDalvikCacheDirectory(InstructionSet isa) {
 
 static std::string GetApexDataDalvikCacheFilename(std::string_view dex_location,
                                                   InstructionSet isa,
-                                                  bool is_boot_classpath_location,
+                                                  bool encode_location,
                                                   std::string_view file_extension) {
-  if (LocationIsOnApex(dex_location) && is_boot_classpath_location) {
-    // We don't compile boot images for updatable APEXes.
+  if (LocationIsOnApex(dex_location)) {
     return {};
   }
   std::string apex_data_dalvik_cache = GetApexDataDalvikCacheDirectory(isa);
-  if (!is_boot_classpath_location) {
+  if (encode_location) {
     // Arguments: "/system/framework/xyz.jar", "arm", true, "odex"
     // Result:
     // "/data/misc/apexdata/com.android.art/dalvik-cache/arm/system@framework@xyz.jar@classes.odex"
@@ -476,25 +455,24 @@ static std::string GetApexDataDalvikCacheFilename(std::string_view dex_location,
 }
 
 std::string GetApexDataOatFilename(std::string_view location, InstructionSet isa) {
-  return GetApexDataDalvikCacheFilename(location, isa, /*is_boot_classpath_location=*/true, "oat");
+  return GetApexDataDalvikCacheFilename(location, isa, /*encode_location=*/false, "oat");
 }
 
 std::string GetApexDataOdexFilename(std::string_view location, InstructionSet isa) {
-  return GetApexDataDalvikCacheFilename(
-      location, isa, /*is_boot_classpath_location=*/false, "odex");
+  return GetApexDataDalvikCacheFilename(location, isa, /*encode_location=*/true, "odex");
 }
 
 std::string GetApexDataBootImage(std::string_view dex_location) {
   return GetApexDataDalvikCacheFilename(dex_location,
                                         InstructionSet::kNone,
-                                        /*is_boot_classpath_location=*/true,
+                                        /*encode_location=*/false,
                                         kArtImageExtension);
 }
 
 std::string GetApexDataImage(std::string_view dex_location) {
   return GetApexDataDalvikCacheFilename(dex_location,
                                         InstructionSet::kNone,
-                                        /*is_boot_classpath_location=*/false,
+                                        /*encode_location=*/true,
                                         kArtImageExtension);
 }
 
@@ -502,27 +480,11 @@ std::string GetApexDataDalvikCacheFilename(std::string_view dex_location,
                                            InstructionSet isa,
                                            std::string_view file_extension) {
   return GetApexDataDalvikCacheFilename(
-      dex_location, isa, /*is_boot_classpath_location=*/false, file_extension);
+      dex_location, isa, /*encode_location=*/true, file_extension);
 }
 
 std::string GetVdexFilename(const std::string& oat_location) {
   return ReplaceFileExtension(oat_location, "vdex");
-}
-
-std::string GetDmFilename(const std::string& dex_location) {
-  return ReplaceFileExtension(dex_location, "dm");
-}
-
-std::string GetSystemOdexFilenameForApex(std::string_view location, InstructionSet isa) {
-  DCHECK(LocationIsOnApex(location));
-  std::string dir = GetAndroidRoot() + "/framework/oat/" + GetInstructionSetString(isa);
-  std::string result, error_msg;
-  bool ret =
-      GetLocationEncodedFilename(std::string{location}.c_str(), dir.c_str(), &result, &error_msg);
-  // This should never fail. The function fails only if the location is not absolute, and a location
-  // on /apex is always absolute.
-  DCHECK(ret) << error_msg;
-  return ReplaceFileExtension(result, "odex");
 }
 
 static void InsertIsaDirectory(const InstructionSet isa, std::string* filename) {
@@ -651,30 +613,20 @@ bool LocationIsOnApex(std::string_view full_path) {
   return android::base::StartsWith(full_path, kApexDefaultPath);
 }
 
-std::string_view ApexNameFromLocation(std::string_view full_path) {
-  if (!android::base::StartsWith(full_path, kApexDefaultPath)) {
-    return {};
-  }
-  size_t start = strlen(kApexDefaultPath);
-  size_t end = full_path.find('/', start);
-  if (end == std::string_view::npos) {
-    return {};
-  }
-  return full_path.substr(start, end - start);
-}
-
 bool LocationIsOnSystem(const std::string& location) {
 #ifdef _WIN32
   UNUSED(location);
   LOG(FATAL) << "LocationIsOnSystem is unsupported on Windows.";
   return false;
 #else
-  return android::base::StartsWith(location, GetAndroidRoot().c_str());
+  UniqueCPtr<const char[]> full_path(realpath(location.c_str(), nullptr));
+  return full_path != nullptr &&
+      android::base::StartsWith(full_path.get(), GetAndroidRoot().c_str());
 #endif
 }
 
 bool LocationIsTrusted(const std::string& location, bool trust_art_apex_data_files) {
-  if (LocationIsOnSystem(location) || LocationIsOnArtModule(location)) {
+  if (LocationIsOnSystem(location)) {
     return true;
   }
   return LocationIsOnArtApexData(location) & trust_art_apex_data_files;

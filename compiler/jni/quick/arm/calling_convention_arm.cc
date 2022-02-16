@@ -32,8 +32,8 @@ namespace arm {
 
 // List of parameters passed via registers for JNI.
 // JNI uses soft-float, so there is only a GPR list.
-static constexpr Register kJniArgumentRegisters[] = {
-    R0, R1, R2, R3
+static const Register kJniArgumentRegisters[] = {
+  R0, R1, R2, R3
 };
 
 static_assert(kJniArgumentRegisterCount == arraysize(kJniArgumentRegisters));
@@ -43,23 +43,20 @@ static_assert(kJniArgumentRegisterCount == arraysize(kJniArgumentRegisters));
 //
 
 // Used by hard float. (General purpose registers.)
-static constexpr ManagedRegister kHFCoreArgumentRegisters[] = {
-    ArmManagedRegister::FromCoreRegister(R0),
-    ArmManagedRegister::FromCoreRegister(R1),
-    ArmManagedRegister::FromCoreRegister(R2),
-    ArmManagedRegister::FromCoreRegister(R3),
+static const Register kHFCoreArgumentRegisters[] = {
+  R0, R1, R2, R3
 };
 static constexpr size_t kHFCoreArgumentRegistersCount = arraysize(kHFCoreArgumentRegisters);
 
 // (VFP single-precision registers.)
-static constexpr SRegister kHFSArgumentRegisters[] = {
-    S0, S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11, S12, S13, S14, S15
+static const SRegister kHFSArgumentRegisters[] = {
+  S0, S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11, S12, S13, S14, S15
 };
 static constexpr size_t kHFSArgumentRegistersCount = arraysize(kHFSArgumentRegisters);
 
 // (VFP double-precision registers.)
-static constexpr DRegister kHFDArgumentRegisters[] = {
-    D0, D1, D2, D3, D4, D5, D6, D7
+static const DRegister kHFDArgumentRegisters[] = {
+  D0, D1, D2, D3, D4, D5, D6, D7
 };
 static constexpr size_t kHFDArgumentRegistersCount = arraysize(kHFDArgumentRegisters);
 
@@ -162,7 +159,7 @@ static constexpr uint32_t kAapcsFpCalleeSpillMask =
 
 // Calling convention
 
-ManagedRegister ArmManagedRuntimeCallingConvention::ReturnRegister() const {
+ManagedRegister ArmManagedRuntimeCallingConvention::ReturnRegister() {
   switch (GetShorty()[0]) {
     case 'V':
       return ArmManagedRegister::NoRegister();
@@ -177,7 +174,7 @@ ManagedRegister ArmManagedRuntimeCallingConvention::ReturnRegister() const {
   }
 }
 
-ManagedRegister ArmJniCallingConvention::ReturnRegister() const {
+ManagedRegister ArmJniCallingConvention::ReturnRegister() {
   switch (GetShorty()[0]) {
   case 'V':
     return ArmManagedRegister::NoRegister();
@@ -189,7 +186,7 @@ ManagedRegister ArmJniCallingConvention::ReturnRegister() const {
   }
 }
 
-ManagedRegister ArmJniCallingConvention::IntReturnRegister() const {
+ManagedRegister ArmJniCallingConvention::IntReturnRegister() {
   return ArmManagedRegister::FromCoreRegister(R0);
 }
 
@@ -275,7 +272,7 @@ ManagedRegister ArmManagedRuntimeCallingConvention::CurrentParamRegister() {
       CHECK_EQ(RoundUp(gpr_index_, 2u), 2u);
       return ArmManagedRegister::FromRegisterPair(R2_R3);
     } else {
-      return kHFCoreArgumentRegisters[gpr_index_];
+      return ArmManagedRegister::FromCoreRegister(kHFCoreArgumentRegisters[gpr_index_]);
     }
   }
 }
@@ -290,12 +287,10 @@ FrameOffset ArmManagedRuntimeCallingConvention::CurrentParamStackOffset() {
 
 ArmJniCallingConvention::ArmJniCallingConvention(bool is_static,
                                                  bool is_synchronized,
-                                                 bool is_fast_native,
                                                  bool is_critical_native,
                                                  const char* shorty)
     : JniCallingConvention(is_static,
                            is_synchronized,
-                           is_fast_native,
                            is_critical_native,
                            shorty,
                            kArmPointerSize) {
@@ -390,40 +385,22 @@ uint32_t ArmJniCallingConvention::FpSpillMask() const {
   return is_critical_native_ ? 0u : kFpCalleeSpillMask;
 }
 
-ArrayRef<const ManagedRegister> ArmJniCallingConvention::CalleeSaveScratchRegisters() const {
-  DCHECK(!IsCriticalNative());
-  // Use R5-R8, R10-R11 from managed callee saves.
-  constexpr size_t kStart = 0u;
-  constexpr size_t kLength = 6u;
-  static_assert(kCalleeSaveRegisters[kStart].Equals(ArmManagedRegister::FromCoreRegister(R5)));
-  static_assert(kCalleeSaveRegisters[kStart + kLength - 1u].Equals(
-                    ArmManagedRegister::FromCoreRegister(R11)));
-  static_assert((kCoreCalleeSpillMask & (1u << R9)) == 0u);  // Does not contain thread register R9.
-  static_assert((kCoreCalleeSpillMask & ~kAapcsCoreCalleeSpillMask) == 0u);
-  return ArrayRef<const ManagedRegister>(kCalleeSaveRegisters).SubArray(kStart, kLength);
+ManagedRegister ArmJniCallingConvention::SavedLocalReferenceCookieRegister() const {
+  // The r5 is callee-save register in both managed and native ABIs.
+  // It is saved in the stack frame and it has no special purpose like `tr`.
+  static_assert((kCoreCalleeSpillMask & (1u << R5)) != 0u);  // Managed callee save register.
+  return ArmManagedRegister::FromCoreRegister(R5);
 }
 
-ArrayRef<const ManagedRegister> ArmJniCallingConvention::ArgumentScratchRegisters() const {
-  DCHECK(!IsCriticalNative());
-  // Exclude r0 or r0-r1 if they are used as return registers.
-  static_assert(kHFCoreArgumentRegisters[0].Equals(ArmManagedRegister::FromCoreRegister(R0)));
-  static_assert(kHFCoreArgumentRegisters[1].Equals(ArmManagedRegister::FromCoreRegister(R1)));
-  ArrayRef<const ManagedRegister> scratch_regs(kHFCoreArgumentRegisters);
-  ArmManagedRegister return_reg = ReturnRegister().AsArm();
-  auto return_reg_overlaps = [return_reg](ManagedRegister reg) {
-    return return_reg.Overlaps(reg.AsArm());
-  };
-  if (return_reg_overlaps(scratch_regs[0])) {
-    scratch_regs = scratch_regs.SubArray(/*pos=*/ return_reg_overlaps(scratch_regs[1]) ? 2u : 1u);
-  }
-  DCHECK(std::none_of(scratch_regs.begin(), scratch_regs.end(), return_reg_overlaps));
-  return scratch_regs;
+ManagedRegister ArmJniCallingConvention::ReturnScratchRegister() const {
+  return ArmManagedRegister::FromCoreRegister(R2);
 }
 
 size_t ArmJniCallingConvention::FrameSize() const {
   if (UNLIKELY(is_critical_native_)) {
     CHECK(!SpillsMethod());
     CHECK(!HasLocalReferenceSegmentState());
+    CHECK(!SpillsReturnValue());
     return 0u;  // There is no managed frame for @CriticalNative.
   }
 
@@ -435,6 +412,19 @@ size_t ArmJniCallingConvention::FrameSize() const {
 
   DCHECK(HasLocalReferenceSegmentState());
   // Cookie is saved in one of the spilled registers.
+
+  // Plus return value spill area size
+  if (SpillsReturnValue()) {
+    // For 64-bit return values there shall be a 4B alignment gap between
+    // the method pointer and the saved return value.
+    size_t padding = ReturnValueSaveLocation().SizeValue() - method_ptr_size;
+    DCHECK_EQ(padding,
+              (GetReturnType() == Primitive::kPrimLong || GetReturnType() == Primitive::kPrimDouble)
+                  ? 4u
+                  : 0u);
+    total_size += padding;
+    total_size += SizeOfReturnValue();
+  }
 
   return RoundUp(total_size, kStackAlignment);
 }
@@ -537,10 +527,10 @@ FrameOffset ArmJniCallingConvention::CurrentParamStackOffset() {
   return FrameOffset(offset);
 }
 
-// R4 is neither managed callee-save, nor argument register. It is suitable for use as the
-// locking argument for synchronized methods and hidden argument for @CriticalNative methods.
-// (It is native callee-save but the value coming from managed code can be clobbered.)
-static void AssertR4IsNeitherCalleeSaveNorArgumentRegister() {
+ManagedRegister ArmJniCallingConvention::HiddenArgumentRegister() const {
+  CHECK(IsCriticalNative());
+  // R4 is neither managed callee-save, nor argument register, nor scratch register.
+  // (It is native callee-save but the value coming from managed code can be clobbered.)
   // TODO: Change to static_assert; std::none_of should be constexpr since C++20.
   DCHECK(std::none_of(kCalleeSaveRegisters,
                       kCalleeSaveRegisters + std::size(kCalleeSaveRegisters),
@@ -549,20 +539,7 @@ static void AssertR4IsNeitherCalleeSaveNorArgumentRegister() {
                       }));
   DCHECK(std::none_of(kJniArgumentRegisters,
                       kJniArgumentRegisters + std::size(kJniArgumentRegisters),
-                      [](Register arg) { return arg == R4; }));
-}
-
-ManagedRegister ArmJniCallingConvention::LockingArgumentRegister() const {
-  DCHECK(!IsFastNative());
-  DCHECK(!IsCriticalNative());
-  DCHECK(IsSynchronized());
-  AssertR4IsNeitherCalleeSaveNorArgumentRegister();
-  return ArmManagedRegister::FromCoreRegister(R4);
-}
-
-ManagedRegister ArmJniCallingConvention::HiddenArgumentRegister() const {
-  CHECK(IsCriticalNative());
-  AssertR4IsNeitherCalleeSaveNorArgumentRegister();
+                      [](Register reg) { return reg == R4; }));
   return ArmManagedRegister::FromCoreRegister(R4);
 }
 

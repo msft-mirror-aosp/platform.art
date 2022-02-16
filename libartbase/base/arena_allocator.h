@@ -105,7 +105,6 @@ enum ArenaAllocKind {
   kArenaAllocScheduler,
   kArenaAllocProfile,
   kArenaAllocSuperblockCloner,
-  kArenaAllocTransaction,
   kNumArenaAllocKinds
 };
 
@@ -148,7 +147,7 @@ class ArenaAllocatorStatsImpl {
   static const char* const kAllocNames[];
 };
 
-using ArenaAllocatorStats = ArenaAllocatorStatsImpl<kArenaAllocatorCountAllocations>;
+typedef ArenaAllocatorStatsImpl<kArenaAllocatorCountAllocations> ArenaAllocatorStats;
 
 class ArenaAllocatorMemoryTool {
  public:

@@ -954,8 +954,7 @@ class JFuzz {
         // finally block always follows after try and catch
         // block. Code may only follow if the finally block permits
         // and either the try or catch block allows code to follow.
-        mayFollow = (mayFollow | emitCatch());
-        mayFollow &= emitFinally();
+        mayFollow = (mayFollow | emitCatch()) & emitFinally();
         break;
     }
     fputc('\n', out_);
