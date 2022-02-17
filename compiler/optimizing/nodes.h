@@ -21,6 +21,7 @@
 #include <array>
 #include <type_traits>
 
+#include "art_method.h"
 #include "base/arena_allocator.h"
 #include "base/arena_bit_vector.h"
 #include "base/arena_containers.h"
@@ -32,7 +33,6 @@
 #include "base/quasi_atomic.h"
 #include "base/stl_util.h"
 #include "base/transform_array_ref.h"
-#include "art_method.h"
 #include "block_namer.h"
 #include "class_root.h"
 #include "compilation_kind.h"
@@ -54,6 +54,7 @@
 namespace art {
 
 class ArenaStack;
+class CodeGenerator;
 class GraphChecker;
 class HBasicBlock;
 class HConstructorFence;
@@ -75,6 +76,7 @@ class HTryBoundary;
 class FieldInfo;
 class LiveInterval;
 class LocationSummary;
+class ProfilingInfo;
 class SlowPathCode;
 class SsaBuilder;
 
@@ -194,7 +196,7 @@ class HInstructionList : public ValueObject {
 
 class ReferenceTypeInfo : ValueObject {
  public:
-  typedef Handle<mirror::Class> TypeHandle;
+  using TypeHandle = Handle<mirror::Class>;
 
   static ReferenceTypeInfo Create(TypeHandle type_handle, bool is_exact);
 
@@ -426,6 +428,7 @@ class HGraph : public ArenaObject<kArenaAllocGraph> {
   }
 
   std::ostream& Dump(std::ostream& os,
+                     CodeGenerator* codegen,
                      std::optional<std::reference_wrapper<const BlockNamer>> namer = std::nullopt);
 
   ArenaAllocator* GetAllocator() const { return allocator_; }
@@ -680,7 +683,7 @@ class HGraph : public ArenaObject<kArenaAllocGraph> {
   }
 
   bool HasShouldDeoptimizeFlag() const {
-    return number_of_cha_guards_ != 0;
+    return number_of_cha_guards_ != 0 || debuggable_;
   }
 
   bool HasTryCatch() const { return has_try_catch_; }
@@ -703,6 +706,9 @@ class HGraph : public ArenaObject<kArenaAllocGraph> {
 
   ArtMethod* GetArtMethod() const { return art_method_; }
   void SetArtMethod(ArtMethod* method) { art_method_ = method; }
+
+  void SetProfilingInfo(ProfilingInfo* info) { profiling_info_ = info; }
+  ProfilingInfo* GetProfilingInfo() const { return profiling_info_; }
 
   // Returns an instruction with the opposite Boolean value from 'cond'.
   // The instruction has been inserted into the graph, either as a constant, or
@@ -870,6 +876,9 @@ class HGraph : public ArenaObject<kArenaAllocGraph> {
   // (such as when the superclass could not be found).
   ArtMethod* art_method_;
 
+  // The `ProfilingInfo` associated with the method being compiled.
+  ProfilingInfo* profiling_info_;
+
   // How we are compiling the graph: either optimized, osr, or baseline.
   // For osr, we will make all loops seen as irreducible and emit special
   // stack maps to mark compiled code entries which the interpreter can
@@ -885,10 +894,6 @@ class HGraph : public ArenaObject<kArenaAllocGraph> {
   ART_FRIEND_TEST(GraphTest, IfSuccessorSimpleJoinBlock1);
   DISALLOW_COPY_AND_ASSIGN(HGraph);
 };
-
-inline std::ostream& operator<<(std::ostream& os, HGraph& graph) {
-  return graph.Dump(os);
-}
 
 class HLoopInformation : public ArenaObject<kArenaAllocLoopInfo> {
  public:
@@ -1530,6 +1535,8 @@ class HLoopInformationOutwardIterator : public ValueObject {
   M(LongConstant, Constant)                                             \
   M(Max, Instruction)                                                   \
   M(MemoryBarrier, Instruction)                                         \
+  M(MethodEntryHook, Instruction)                                       \
+  M(MethodExitHook, Instruction)                                        \
   M(Min, BinaryOperation)                                               \
   M(MonitorOperation, Instruction)                                      \
   M(Mul, BinaryOperation)                                               \
@@ -2286,6 +2293,9 @@ class HInstruction : public ArenaObject<kArenaAllocInstruction> {
   }
 
   virtual bool NeedsEnvironment() const { return false; }
+  virtual bool NeedsBss() const {
+    return false;
+  }
 
   uint32_t GetDexPc() const { return dex_pc_; }
 
@@ -2989,6 +2999,42 @@ class HExpression<0> : public HInstruction {
 
  private:
   friend class SsaBuilder;
+};
+
+class HMethodEntryHook : public HExpression<0> {
+ public:
+  explicit HMethodEntryHook(uint32_t dex_pc)
+      : HExpression(kMethodEntryHook, SideEffects::All(), dex_pc) {}
+
+  bool NeedsEnvironment() const override {
+    return true;
+  }
+
+  bool CanThrow() const override { return true; }
+
+  DECLARE_INSTRUCTION(MethodEntryHook);
+
+ protected:
+  DEFAULT_COPY_CONSTRUCTOR(MethodEntryHook);
+};
+
+class HMethodExitHook : public HExpression<1> {
+ public:
+  HMethodExitHook(HInstruction* value, uint32_t dex_pc)
+      : HExpression(kMethodExitHook, SideEffects::All(), dex_pc) {
+    SetRawInputAt(0, value);
+  }
+
+  bool NeedsEnvironment() const override {
+    return true;
+  }
+
+  bool CanThrow() const override { return true; }
+
+  DECLARE_INSTRUCTION(MethodExitHook);
+
+ protected:
+  DEFAULT_COPY_CONSTRUCTOR(MethodExitHook);
 };
 
 // Represents dex's RETURN_VOID opcode. A HReturnVoid is a control flow
@@ -4882,6 +4928,9 @@ class HInvokeStaticOrDirect final : public HInvoke {
   }
 
   bool IsClonable() const override { return true; }
+  bool NeedsBss() const override {
+    return GetMethodLoadKind() == MethodLoadKind::kBssEntry;
+  }
 
   void SetDispatchInfo(DispatchInfo dispatch_info) {
     bool had_current_method_input = HasCurrentMethodInput();
@@ -5167,6 +5216,9 @@ class HInvokeInterface final : public HInvoke {
   }
 
   bool IsClonable() const override { return true; }
+  bool NeedsBss() const override {
+    return GetHiddenArgumentLoadKind() == MethodLoadKind::kBssEntry;
+  }
 
   bool CanDoImplicitNullCheckOn(HInstruction* obj) const override {
     // TODO: Add implicit null checks in intrinsics.
@@ -5716,7 +5768,7 @@ class HUShr final : public HBinaryOperation {
 
   template <typename T>
   static T Compute(T value, int32_t distance, int32_t max_shift_distance) {
-    typedef typename std::make_unsigned<T>::type V;
+    using V = std::make_unsigned_t<T>;
     V ux = static_cast<V>(value);
     return static_cast<T>(ux >> (distance & max_shift_distance));
   }
@@ -5873,7 +5925,7 @@ class HRor final : public HBinaryOperation {
 
   template <typename T>
   static T Compute(T value, int32_t distance, int32_t max_shift_value) {
-    typedef typename std::make_unsigned<T>::type V;
+    using V = std::make_unsigned_t<T>;
     V ux = static_cast<V>(value);
     if ((distance & max_shift_value) == 0) {
       return static_cast<T>(ux);
@@ -6813,6 +6865,12 @@ class HLoadClass final : public HInstruction {
   bool NeedsEnvironment() const override {
     return CanCallRuntime();
   }
+  bool NeedsBss() const override {
+    LoadKind load_kind = GetLoadKind();
+    return load_kind == LoadKind::kBssEntry ||
+           load_kind == LoadKind::kBssEntryPublic ||
+           load_kind == LoadKind::kBssEntryPackage;
+  }
 
   void SetMustGenerateClinitCheck(bool generate_clinit_check) {
     SetPackedFlag<kFlagGenerateClInitCheck>(generate_clinit_check);
@@ -7010,6 +7068,9 @@ class HLoadString final : public HInstruction {
   }
 
   bool IsClonable() const override { return true; }
+  bool NeedsBss() const override {
+    return GetLoadKind() == LoadKind::kBssEntry;
+  }
 
   void SetLoadKind(LoadKind load_kind);
 

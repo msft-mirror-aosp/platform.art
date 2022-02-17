@@ -113,6 +113,7 @@ class OatFileBase : public OatFile {
                                   bool executable,
                                   bool low_4gb,
                                   ArrayRef<const std::string> dex_filenames,
+                                  ArrayRef<const int> dex_fds,
                                   /*inout*/MemMap* reservation,  // Where to load if not null.
                                   /*out*/std::string* error_msg);
 
@@ -126,6 +127,7 @@ class OatFileBase : public OatFile {
                                   bool executable,
                                   bool low_4gb,
                                   ArrayRef<const std::string> dex_filenames,
+                                  ArrayRef<const int> dex_fds,
                                   /*inout*/MemMap* reservation,  // Where to load if not null.
                                   /*out*/std::string* error_msg);
 
@@ -166,7 +168,10 @@ class OatFileBase : public OatFile {
 
   virtual void PreSetup(const std::string& elf_filename) = 0;
 
-  bool Setup(int zip_fd, ArrayRef<const std::string> dex_filenames, std::string* error_msg);
+  bool Setup(int zip_fd,
+             ArrayRef<const std::string> dex_filenames,
+             ArrayRef<const int> dex_fds,
+             std::string* error_msg);
 
   bool Setup(const std::vector<const DexFile*>& dex_files, std::string* error_msg);
 
@@ -185,10 +190,6 @@ class OatFileBase : public OatFile {
   }
 
  private:
-  // Returns true if we want to remove quickened opcodes before loading the VDEX file, false
-  // otherwise.
-  bool ShouldUnquickenVDex() const;
-
   DISALLOW_COPY_AND_ASSIGN(OatFileBase);
 };
 
@@ -201,6 +202,7 @@ OatFileBase* OatFileBase::OpenOatFile(int zip_fd,
                                       bool executable,
                                       bool low_4gb,
                                       ArrayRef<const std::string> dex_filenames,
+                                      ArrayRef<const int> dex_fds,
                                       /*inout*/MemMap* reservation,
                                       /*out*/std::string* error_msg) {
   std::unique_ptr<OatFileBase> ret(new kOatFileBaseSubType(location, executable));
@@ -226,7 +228,7 @@ OatFileBase* OatFileBase::OpenOatFile(int zip_fd,
     return nullptr;
   }
 
-  if (!ret->Setup(zip_fd, dex_filenames, error_msg)) {
+  if (!ret->Setup(zip_fd, dex_filenames, dex_fds, error_msg)) {
     return nullptr;
   }
 
@@ -243,6 +245,7 @@ OatFileBase* OatFileBase::OpenOatFile(int zip_fd,
                                       bool executable,
                                       bool low_4gb,
                                       ArrayRef<const std::string> dex_filenames,
+                                      ArrayRef<const int> dex_fds,
                                       /*inout*/MemMap* reservation,
                                       /*out*/std::string* error_msg) {
   std::unique_ptr<OatFileBase> ret(new kOatFileBaseSubType(oat_location, executable));
@@ -266,28 +269,11 @@ OatFileBase* OatFileBase::OpenOatFile(int zip_fd,
     return nullptr;
   }
 
-  if (!ret->Setup(zip_fd, dex_filenames, error_msg)) {
+  if (!ret->Setup(zip_fd, dex_filenames, dex_fds, error_msg)) {
     return nullptr;
   }
 
   return ret.release();
-}
-
-bool OatFileBase::ShouldUnquickenVDex() const {
-  // We sometimes load oat files without a runtime (eg oatdump) and don't want to do anything in
-  // that case. If we are debuggable there are no -quick opcodes to unquicken. If the runtime is not
-  // debuggable we don't care whether there are -quick opcodes or not so no need to do anything.
-  Runtime* runtime = Runtime::Current();
-  return (runtime != nullptr && runtime->IsJavaDebuggable()) &&
-         // Note: This is called before `OatFileBase::Setup()` where we validate the
-         // oat file contents. Check that we have at least a valid header, including
-         // oat file version, to avoid parsing the key-value store for a different
-         // version (out-of-date oat file) which can lead to crashes. b/179221298.
-         // TODO: While this is a poor workaround and the correct solution would be
-         // to postpone the unquickening check until after `OatFileBase::Setup()`,
-         // we prefer to avoid larger rewrites because quickening is deprecated and
-         // should be removed completely anyway. b/170086509
-         (GetOatHeader().IsValid() && !IsDebuggable());
 }
 
 bool OatFileBase::LoadVdex(const std::string& vdex_filename,
@@ -300,7 +286,6 @@ bool OatFileBase::LoadVdex(const std::string& vdex_filename,
                                   vdex_filename,
                                   writable,
                                   low_4gb,
-                                  ShouldUnquickenVDex(),
                                   error_msg);
   if (vdex_.get() == nullptr) {
     *error_msg = StringPrintf("Failed to load vdex file '%s' %s",
@@ -331,7 +316,6 @@ bool OatFileBase::LoadVdex(int vdex_fd,
           vdex_filename,
           writable,
           low_4gb,
-          ShouldUnquickenVDex(),
           error_msg);
       if (vdex_.get() == nullptr) {
         *error_msg = "Failed opening vdex file.";
@@ -569,6 +553,7 @@ bool OatFileBase::Setup(const std::vector<const DexFile*>& dex_files, std::strin
 
 bool OatFileBase::Setup(int zip_fd,
                         ArrayRef<const std::string> dex_filenames,
+                        ArrayRef<const int> dex_fds,
                         std::string* error_msg) {
   if (!GetOatHeader().IsValid()) {
     std::string cause = GetOatHeader().GetValidationErrorMessage();
@@ -652,6 +637,7 @@ bool OatFileBase::Setup(int zip_fd,
 
   std::string_view primary_location;
   std::string_view primary_location_replacement;
+  int dex_fd = -1;
   size_t dex_filenames_pos = 0u;
   uint32_t dex_file_count = GetOatHeader().GetDexFileCount();
   oat_dex_files_storage_.reserve(dex_file_count);
@@ -708,6 +694,7 @@ bool OatFileBase::Setup(int zip_fd,
           return false;
         }
         primary_location_replacement = dex_filenames[dex_filenames_pos];
+        dex_fd = dex_filenames_pos < dex_fds.size() ? dex_fds[dex_filenames_pos] : -1;
         ++dex_filenames_pos;
       }
     }
@@ -782,6 +769,7 @@ bool OatFileBase::Setup(int zip_fd,
         // No dex files, load it from location.
         const ArtDexFileLoader dex_file_loader;
         bool loaded = false;
+        CHECK(zip_fd == -1 || dex_fds.empty());  // Allow only the supported combinations.
         if (zip_fd != -1) {
           loaded = dex_file_loader.OpenZip(zip_fd,
                                            dex_file_location,
@@ -789,6 +777,14 @@ bool OatFileBase::Setup(int zip_fd,
                                            /*verify_checksum=*/ false,
                                            error_msg,
                                            &new_dex_files);
+        } else if (dex_fd != -1) {
+          // Note that we assume dex_fds are backing by jars.
+          loaded = dex_file_loader.OpenZipFromOwnedFd(dex_fd,
+                                                      dex_file_location,
+                                                      /*verify=*/ false,
+                                                      /*verify_checksum=*/ false,
+                                                      error_msg,
+                                                      &new_dex_files);
         } else {
           loaded = dex_file_loader.Open(dex_file_name.c_str(),
                                         dex_file_location,
@@ -1558,7 +1554,7 @@ bool ElfOatFile::InitializeFromElfFile(int zip_fd,
   SetBegin(elf_file->Begin() + offset);
   SetEnd(elf_file->Begin() + size + offset);
   // Ignore the optional .bss section when opening non-executable.
-  return Setup(zip_fd, dex_filenames, error_msg);
+  return Setup(zip_fd, dex_filenames, /*dex_fds=*/ArrayRef<const int>(), error_msg);
 }
 
 bool ElfOatFile::Load(const std::string& elf_filename,
@@ -1819,6 +1815,7 @@ OatFile* OatFile::Open(int zip_fd,
                        bool executable,
                        bool low_4gb,
                        ArrayRef<const std::string> dex_filenames,
+                       ArrayRef<const int> dex_fds,
                        /*inout*/MemMap* reservation,
                        /*out*/std::string* error_msg) {
   ScopedTrace trace("Open oat file " + oat_location);
@@ -1845,6 +1842,7 @@ OatFile* OatFile::Open(int zip_fd,
                                                                  executable,
                                                                  low_4gb,
                                                                  dex_filenames,
+                                                                 dex_fds,
                                                                  reservation,
                                                                  error_msg);
   if (with_dlopen != nullptr) {
@@ -1885,6 +1883,7 @@ OatFile* OatFile::Open(int zip_fd,
                                                                 executable,
                                                                 low_4gb,
                                                                 dex_filenames,
+                                                                dex_fds,
                                                                 reservation,
                                                                 error_msg);
   return with_internal;
@@ -1897,6 +1896,7 @@ OatFile* OatFile::Open(int zip_fd,
                        bool executable,
                        bool low_4gb,
                        ArrayRef<const std::string> dex_filenames,
+                       ArrayRef<const int> dex_fds,
                        /*inout*/MemMap* reservation,
                        /*out*/std::string* error_msg) {
   CHECK(!oat_location.empty()) << oat_location;
@@ -1912,6 +1912,7 @@ OatFile* OatFile::Open(int zip_fd,
                                                                 executable,
                                                                 low_4gb,
                                                                 dex_filenames,
+                                                                dex_fds,
                                                                 reservation,
                                                                 error_msg);
   return with_internal;
@@ -2280,14 +2281,14 @@ const dex::ClassDef* OatDexFile::FindClassDef(const DexFile& dex_file,
 }
 
 // Madvise the dex file based on the state we are moving to.
-void OatDexFile::MadviseDexFile(const DexFile& dex_file, MadviseState state) {
+void OatDexFile::MadviseDexFileAtLoad(const DexFile& dex_file) {
   Runtime* const runtime = Runtime::Current();
   const bool low_ram = runtime->GetHeap()->IsLowMemoryMode();
-  // TODO: Also do madvise hints for non low ram devices.
+  // TODO(b/196052575): Revisit low-ram madvise behavior in light of vdex/odex/art madvise hints.
   if (!low_ram) {
     return;
   }
-  if (state == MadviseState::kMadviseStateAtLoad && runtime->MAdviseRandomAccess()) {
+  if (runtime->MAdviseRandomAccess()) {
     // Default every dex file to MADV_RANDOM when its loaded by default for low ram devices.
     // Other devices have enough page cache to get performance benefits from loading more pages
     // into the page cache.
@@ -2300,7 +2301,7 @@ void OatDexFile::MadviseDexFile(const DexFile& dex_file, MadviseState state) {
     // Should always be there.
     const DexLayoutSections* const sections = oat_dex_file->GetDexLayoutSections();
     if (sections != nullptr) {
-      sections->Madvise(&dex_file, state);
+      sections->MadviseAtLoad(&dex_file);
     } else {
       DCHECK(oat_dex_file->IsBackedByVdexOnly());
     }

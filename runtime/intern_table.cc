@@ -32,6 +32,7 @@
 #include "object_callbacks.h"
 #include "scoped_thread_state_change-inl.h"
 #include "thread.h"
+#include "thread-inl.h"
 
 namespace art {
 
@@ -187,7 +188,7 @@ void InternTable::BroadcastForNewInterns() {
 void InternTable::WaitUntilAccessible(Thread* self) {
   Locks::intern_table_lock_->ExclusiveUnlock(self);
   {
-    ScopedThreadSuspension sts(self, kWaitingWeakGcRootRead);
+    ScopedThreadSuspension sts(self, ThreadState::kWaitingWeakGcRootRead);
     MutexLock mu(self, *Locks::intern_table_lock_);
     while ((!kUseReadBarrier && weak_root_state_ == gc::kWeakRootStateNoReadsOrWrites) ||
            (kUseReadBarrier && !self->GetWeakRefAccessEnabled())) {

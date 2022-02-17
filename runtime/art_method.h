@@ -32,6 +32,7 @@
 #include "dex/dex_file_structs.h"
 #include "dex/modifiers.h"
 #include "dex/primitive.h"
+#include "interpreter/mterp/nterp.h"
 #include "gc_root.h"
 #include "obj_ptr.h"
 #include "offsets.h"
@@ -63,10 +64,6 @@ class Object;
 template <typename MirrorType> class ObjectArray;
 class PointerArray;
 class String;
-
-template <typename T> struct NativeDexCachePair;
-using MethodDexCachePair = NativeDexCachePair<ArtMethod>;
-using MethodDexCacheType = std::atomic<MethodDexCachePair>;
 }  // namespace mirror
 
 class ArtMethod final {
@@ -233,7 +230,6 @@ class ArtMethod final {
 
   bool IsPreCompiled() const {
     // kAccCompileDontBother and kAccPreCompiled overlap with kAccIntrinsicBits.
-    // Intrinsics should be compiled in primary boot image, not pre-compiled by JIT.
     static_assert((kAccCompileDontBother & kAccIntrinsicBits) != 0);
     static_assert((kAccPreCompiled & kAccIntrinsicBits) != 0);
     static constexpr uint32_t kMask = kAccIntrinsic | kAccCompileDontBother | kAccPreCompiled;
@@ -244,6 +240,13 @@ class ArtMethod final {
   void SetPreCompiled() REQUIRES_SHARED(Locks::mutator_lock_) {
     DCHECK(IsInvokable());
     DCHECK(IsCompilable());
+    // kAccPreCompiled and kAccCompileDontBother overlaps with kAccIntrinsicBits.
+    // We don't mark the intrinsics as precompiled, which means in JIT zygote
+    // mode, compiled code for intrinsics will not be shared, and apps will
+    // compile intrinsics themselves if needed.
+    if (IsIntrinsic()) {
+      return;
+    }
     AddAccessFlags(kAccPreCompiled | kAccCompileDontBother);
   }
 
@@ -325,23 +328,6 @@ class ArtMethod final {
   bool IsProxyMethod() REQUIRES_SHARED(Locks::mutator_lock_);
 
   bool IsSignaturePolymorphic() REQUIRES_SHARED(Locks::mutator_lock_);
-
-  bool UseFastInterpreterToInterpreterInvoke() const {
-    // The bit is applicable only if the method is not intrinsic.
-    constexpr uint32_t mask = kAccFastInterpreterToInterpreterInvoke | kAccIntrinsic;
-    return (GetAccessFlags() & mask) == kAccFastInterpreterToInterpreterInvoke;
-  }
-
-  void SetFastInterpreterToInterpreterInvokeFlag() REQUIRES_SHARED(Locks::mutator_lock_) {
-    DCHECK(!IsIntrinsic());
-    AddAccessFlags(kAccFastInterpreterToInterpreterInvoke);
-  }
-
-  void ClearFastInterpreterToInterpreterInvokeFlag() REQUIRES_SHARED(Locks::mutator_lock_) {
-    if (!IsIntrinsic()) {
-      ClearAccessFlags(kAccFastInterpreterToInterpreterInvoke);
-    }
-  }
 
   bool SkipAccessChecks() const {
     // The kAccSkipAccessChecks flag value is used with a different meaning for native methods,
@@ -498,8 +484,6 @@ class ArtMethod final {
     SetNativePointer(EntryPointFromQuickCompiledCodeOffset(pointer_size),
                      entry_point_from_quick_compiled_code,
                      pointer_size);
-    // We might want to invoke compiled code, so don't use the fast path.
-    ClearFastInterpreterToInterpreterInvokeFlag();
   }
 
   static constexpr MemberOffset DataOffset(PointerSize pointer_size) {
@@ -558,6 +542,7 @@ class ArtMethod final {
     DCHECK(!IsNative());
     // Non-abstract method's single implementation is just itself.
     DCHECK(IsAbstract());
+    DCHECK(method == nullptr || method->IsInvokable());
     SetDataPtrSize(method, pointer_size);
   }
 
@@ -604,7 +589,10 @@ class ArtMethod final {
     return !IsRuntimeMethod() && !IsNative() && !IsProxyMethod() && !IsAbstract();
   }
 
-  void SetCodeItem(const dex::CodeItem* code_item) REQUIRES_SHARED(Locks::mutator_lock_);
+  // We need to explicitly indicate whether the code item is obtained from the compact dex file,
+  // because in JVMTI, we obtain the code item from the standard dex file to update the method.
+  void SetCodeItem(const dex::CodeItem* code_item, bool is_compact_dex_code_item)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Is this a hand crafted method used for something like describing callee saves?
   bool IsCalleeSaveMethod() REQUIRES_SHARED(Locks::mutator_lock_);
@@ -639,6 +627,8 @@ class ArtMethod final {
   ALWAYS_INLINE std::string_view GetNameView() REQUIRES_SHARED(Locks::mutator_lock_);
 
   ObjPtr<mirror::String> ResolveNameString() REQUIRES_SHARED(Locks::mutator_lock_);
+
+  bool NameEquals(ObjPtr<mirror::String> name) REQUIRES_SHARED(Locks::mutator_lock_);
 
   const dex::CodeItem* GetCodeItem() REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -689,13 +679,13 @@ class ArtMethod final {
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Size of an instance of this native class.
-  static size_t Size(PointerSize pointer_size) {
+  static constexpr size_t Size(PointerSize pointer_size) {
     return PtrSizedFieldsOffset(pointer_size) +
         (sizeof(PtrSizedFields) / sizeof(void*)) * static_cast<size_t>(pointer_size);
   }
 
   // Alignment of an instance of this native class.
-  static size_t Alignment(PointerSize pointer_size) {
+  static constexpr size_t Alignment(PointerSize pointer_size) {
     // The ArtMethod alignment is the same as image pointer size. This differs from
     // alignof(ArtMethod) if cross-compiling with pointer_size != sizeof(void*).
     return static_cast<size_t>(pointer_size);
@@ -704,9 +694,13 @@ class ArtMethod final {
   void CopyFrom(ArtMethod* src, PointerSize image_pointer_size)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  ALWAYS_INLINE void SetCounter(uint16_t hotness_count);
-
+  ALWAYS_INLINE void ResetCounter(uint16_t new_value);
+  ALWAYS_INLINE void UpdateCounter(int32_t new_samples);
+  ALWAYS_INLINE void SetHotCounter();
+  ALWAYS_INLINE bool CounterIsHot();
+  ALWAYS_INLINE bool CounterHasReached(uint16_t samples, uint16_t threshold);
   ALWAYS_INLINE uint16_t GetCounter();
+  ALWAYS_INLINE bool CounterHasChanged(uint16_t threshold);
 
   ALWAYS_INLINE static constexpr uint16_t MaxCounter() {
     return std::numeric_limits<decltype(hotness_count_)>::max();

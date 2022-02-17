@@ -75,7 +75,7 @@ namespace helper {
 
 /*
  * This class represents the information whether a field/method is in
- * public API (whitelist) or if it isn't, apps targeting which SDK
+ * public API (SDK) or if it isn't, apps targeting which SDK
  * versions are allowed to access it.
  */
 class ApiList {
@@ -324,6 +324,10 @@ class ApiList {
   // Returns true if the ApiList is on blocklist.
   bool IsBlocked() const {
     return GetValue() == Value::kBlocked;
+  }
+
+  bool IsSdkApi() const {
+    return GetValue() == Value::kSdk;
   }
 
   // Returns true if the ApiList is a test API.

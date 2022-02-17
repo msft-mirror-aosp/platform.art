@@ -1403,7 +1403,7 @@ jvmtiError HeapUtil::FollowReferences(jvmtiEnv* env,
   {
     art::ScopedObjectAccess soa(self);      // Now we know we have the shared lock.
     art::jni::ScopedEnableSuspendAllJniIdQueries sjni;  // make sure we can get JNI ids.
-    art::ScopedThreadSuspension sts(self, art::kWaitingForVisitObjects);
+    art::ScopedThreadSuspension sts(self, art::ThreadState::kWaitingForVisitObjects);
     art::ScopedSuspendAll ssa("FollowReferences");
 
     art::ObjPtr<art::mirror::Class> class_filter = klass == nullptr
@@ -1780,7 +1780,7 @@ static void ReplaceStrongRoots(art::Thread* self, const ObjectMap& map)
       // already have.
       // TODO We technically only need to do this if the frames are not already being interpreted.
       // The cost for doing an extra stack walk is unlikely to be worth it though.
-      instr->InstrumentThreadStack(t);
+      instr->InstrumentThreadStack(t, /* deopt_all_frames= */ true);
     }
   }
 }

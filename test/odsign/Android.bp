@@ -26,15 +26,18 @@ java_test_host {
         "frameworks-base-hostutils",
     ],
     data: [
-        ":test_com.android.art",
         ":odsign_e2e_test_app",
     ],
     test_config: "odsign-e2e-tests.xml",
-    test_suites: ["device-tests"],
+    test_suites: [
+        "device-tests",
+        "cts",
+    ],
 }
 
 cc_library_shared {
     name: "libOdsignTestAppJni",
+    defaults: ["art_defaults"],
     srcs: ["jni/**/*.cc"],
     shared_libs: [
         "libnativehelper_compat_libc++",
@@ -43,16 +46,13 @@ cc_library_shared {
     static_libs: [
         "libbase_ndk",
     ],
-    cflags: [
-        "-Wall",
-        "-Werror",
-    ],
     stl: "c++_static",
     sdk_version: "current",
 }
 
 android_test_helper_app {
     name: "odsign_e2e_test_app",
+    defaults: ["art_module_source_build_java_defaults"],
     manifest: "AndroidManifest.xml",
     srcs: ["src/**/*.java"],
     jni_libs: [

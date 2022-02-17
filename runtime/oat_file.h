@@ -105,6 +105,7 @@ class OatFile {
                        bool executable,
                        bool low_4gb,
                        ArrayRef<const std::string> dex_filenames,
+                       ArrayRef<const int> dex_fds,
                        /*inout*/MemMap* reservation,  // Where to load if not null.
                        /*out*/std::string* error_msg);
   // Helper overload that takes a single dex filename and no reservation.
@@ -121,6 +122,7 @@ class OatFile {
                 executable,
                 low_4gb,
                 ArrayRef<const std::string>(&dex_filename, /*size=*/ 1u),
+                /*dex_fds=*/ ArrayRef<const int>(),  // not currently supported
                 /*reservation=*/ nullptr,
                 error_msg);
   }
@@ -136,7 +138,8 @@ class OatFile {
                 location,
                 executable,
                 low_4gb,
-                ArrayRef<const std::string>(),
+                /*dex_filenames=*/ ArrayRef<const std::string>(),
+                /*dex_fds=*/ ArrayRef<const int>(),  // not currently supported
                 /*reservation=*/ nullptr,
                 error_msg);
   }
@@ -151,6 +154,7 @@ class OatFile {
                        bool executable,
                        bool low_4gb,
                        ArrayRef<const std::string> dex_filenames,
+                       ArrayRef<const int> dex_fds,
                        /*inout*/MemMap* reservation,  // Where to load if not null.
                        /*out*/std::string* error_msg);
 
@@ -193,7 +197,7 @@ class OatFile {
 
   class OatMethod final {
    public:
-    uint32_t GetCodeOffset() const;
+    uint32_t GetCodeOffset() const { return code_offset_; }
 
     const void* GetQuickCode() const;
 
@@ -228,14 +232,6 @@ class OatFile {
     }
 
    private:
-    template<class T>
-    T GetOatPointer(uint32_t offset) const {
-      if (offset == 0) {
-        return nullptr;
-      }
-      return reinterpret_cast<T>(begin_ + offset);
-    }
-
     const uint8_t* begin_;
     uint32_t code_offset_;
 
@@ -547,8 +543,8 @@ class OatDexFile final {
                                            const char* descriptor,
                                            size_t hash);
 
-  // Madvise the dex file based on the state we are moving to.
-  static void MadviseDexFile(const DexFile& dex_file, MadviseState state);
+  // Madvise the dex file for load-time usage.
+  static void MadviseDexFileAtLoad(const DexFile& dex_file);
 
   const TypeLookupTable& GetTypeLookupTable() const {
     return lookup_table_;

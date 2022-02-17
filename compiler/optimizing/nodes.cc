@@ -2014,8 +2014,9 @@ std::ostream& operator<<(std::ostream& os, const HUseList<HEnvironment*>& lst) {
 }
 
 std::ostream& HGraph::Dump(std::ostream& os,
+                           CodeGenerator* codegen,
                            std::optional<std::reference_wrapper<const BlockNamer>> namer) {
-  HGraphVisualizer vis(&os, this, nullptr, namer);
+  HGraphVisualizer vis(&os, this, codegen, namer);
   vis.DumpGraphDebug();
   return os;
 }
@@ -2913,7 +2914,10 @@ HInstruction* HGraph::InlineInto(HGraph* outer_graph, HInvoke* invoke) {
     } else if (current->IsCurrentMethod()) {
       replacement = outer_graph->GetCurrentMethod();
     } else {
-      DCHECK(current->IsGoto() || current->IsSuspendCheck());
+      // It is OK to ignore MethodEntryHook for inlined functions.
+      // In debug mode we don't inline and in release mode method
+      // tracing is best effort so OK to ignore them.
+      DCHECK(current->IsGoto() || current->IsSuspendCheck() || current->IsMethodEntryHook());
       entry_block_->RemoveInstruction(current);
     }
     if (replacement != nullptr) {

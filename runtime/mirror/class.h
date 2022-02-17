@@ -71,6 +71,7 @@ class ClassExt;
 class ClassLoader;
 class Constructor;
 class DexCache;
+class Field;
 class IfTable;
 class Method;
 template <typename T> struct PACKED(8) DexCachePair;
@@ -179,7 +180,7 @@ class MANAGED Class final : public Object {
   // executed with access checks.
   template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
   bool IsVerifiedNeedsAccessChecks() REQUIRES_SHARED(Locks::mutator_lock_) {
-    return GetStatus<kVerifyFlags>() >= ClassStatus::kVerifiedNeedsAccessChecks;
+    return GetStatus<kVerifyFlags>() == ClassStatus::kVerifiedNeedsAccessChecks;
   }
 
   // Returns true if the class has been verified.
@@ -319,22 +320,6 @@ class MANAGED Class final : public Object {
   // Returns true if the class is synthetic.
   ALWAYS_INLINE bool IsSynthetic() REQUIRES_SHARED(Locks::mutator_lock_) {
     return (GetAccessFlags() & kAccSynthetic) != 0;
-  }
-
-  // Return whether the class had run the verifier at least once.
-  // This does not necessarily mean that access checks are avoidable,
-  // since the class methods might still need to be run with access checks.
-  bool WasVerificationAttempted() REQUIRES_SHARED(Locks::mutator_lock_) {
-    return (GetAccessFlags() & kAccVerificationAttempted) != 0;
-  }
-
-  // Mark the class as having gone through a verification attempt.
-  // Mutually exclusive from whether or not each method is allowed to skip access checks.
-  void SetVerificationAttempted() REQUIRES_SHARED(Locks::mutator_lock_) {
-    uint32_t flags = GetField32(OFFSET_OF_OBJECT_MEMBER(Class, access_flags_));
-    if ((flags & kAccVerificationAttempted) == 0) {
-      SetAccessFlags(flags | kAccVerificationAttempted);
-    }
   }
 
   bool IsObsoleteObject() REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -605,6 +590,16 @@ class MANAGED Class final : public Object {
 
   static bool IsInSamePackage(std::string_view descriptor1, std::string_view descriptor2);
 
+  // Returns true if a class member should be discoverable with reflection given
+  // the criteria. Some reflection calls only return public members
+  // (public_only == true), some members should be hidden from non-boot class path
+  // callers (hiddenapi_context).
+  template<typename T>
+  ALWAYS_INLINE static bool IsDiscoverable(bool public_only,
+                                           const hiddenapi::AccessContext& access_context,
+                                           T* member)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
   // Returns true if this class can access that class.
   bool CanAccess(ObjPtr<Class> that) REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -651,6 +646,9 @@ class MANAGED Class final : public Object {
   // that extends) another can be assigned to its parent, but not vice-versa. All Classes may assign
   // to themselves. Classes for primitive types may not assign to each other.
   ALWAYS_INLINE bool IsAssignableFrom(ObjPtr<Class> src) REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // Check if this class implements a given interface.
+  bool Implements(ObjPtr<Class> klass) REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Checks if 'klass' is a redefined version of this.
   bool IsObsoleteVersionOf(ObjPtr<Class> klass) REQUIRES_SHARED(Locks::mutator_lock_);
@@ -1125,6 +1123,12 @@ class MANAGED Class final : public Object {
   ArtField* FindDeclaredStaticField(ObjPtr<DexCache> dex_cache, uint32_t dex_field_idx)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
+  ObjPtr<mirror::ObjectArray<mirror::Field>> GetDeclaredFields(Thread* self,
+                                                               bool public_only,
+                                                               bool force_resolve)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+
   pid_t GetClinitThreadId() REQUIRES_SHARED(Locks::mutator_lock_) {
     DCHECK(IsIdxLoaded() || IsErroneous()) << PrettyClass();
     return GetField32(OFFSET_OF_OBJECT_MEMBER(Class, clinit_thread_id_));
@@ -1369,7 +1373,6 @@ class MANAGED Class final : public Object {
                                 InvokeType throw_invoke_type)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  bool Implements(ObjPtr<Class> klass) REQUIRES_SHARED(Locks::mutator_lock_);
   bool IsArrayAssignableFromArray(ObjPtr<Class> klass) REQUIRES_SHARED(Locks::mutator_lock_);
   bool IsAssignableFromArray(ObjPtr<Class> klass) REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -1393,8 +1396,6 @@ class MANAGED Class final : public Object {
 
   template<VerifyObjectFlags kVerifyFlags>
   void GetAccessFlagsDCheck() REQUIRES_SHARED(Locks::mutator_lock_);
-
-  void SetAccessFlagsDCheck(uint32_t new_access_flags) REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Check that the pointer size matches the one in the class linker.
   ALWAYS_INLINE static void CheckPointerSize(PointerSize pointer_size);

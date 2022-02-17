@@ -65,24 +65,17 @@ static constexpr int kJitPoolThreadPthreadDefaultPriority = 9;
 // 19 is the lowest background priority on device.
 // See android/os/Process.java.
 static constexpr int kJitZygotePoolThreadPthreadDefaultPriority = 19;
-// We check whether to jit-compile the method every Nth invoke.
-// The tests often use threshold of 1000 (and thus 500 to start profiling).
-static constexpr uint32_t kJitSamplesBatchSize = 512;  // Must be power of 2.
 
 class JitOptions {
  public:
   static JitOptions* CreateFromRuntimeArguments(const RuntimeArgumentMap& options);
 
-  uint16_t GetCompileThreshold() const {
-    return compile_threshold_;
+  uint16_t GetOptimizeThreshold() const {
+    return optimize_threshold_;
   }
 
   uint16_t GetWarmupThreshold() const {
     return warmup_threshold_;
-  }
-
-  uint16_t GetOsrThreshold() const {
-    return osr_threshold_;
   }
 
   uint16_t GetPriorityThreadWeight() const {
@@ -143,7 +136,7 @@ class JitOptions {
 
   void SetJitAtFirstUse() {
     use_jit_compilation_ = true;
-    compile_threshold_ = 0;
+    optimize_threshold_ = 0;
   }
 
   void SetUseBaselineCompiler() {
@@ -164,9 +157,8 @@ class JitOptions {
   bool use_baseline_compiler_;
   size_t code_cache_initial_capacity_;
   size_t code_cache_max_capacity_;
-  uint32_t compile_threshold_;
+  uint32_t optimize_threshold_;
   uint32_t warmup_threshold_;
-  uint32_t osr_threshold_;
   uint16_t priority_thread_weight_;
   uint16_t invoke_transition_weight_;
   bool dump_info_on_shutdown_;
@@ -180,9 +172,8 @@ class JitOptions {
         use_baseline_compiler_(false),
         code_cache_initial_capacity_(0),
         code_cache_max_capacity_(0),
-        compile_threshold_(0),
+        optimize_threshold_(0),
         warmup_threshold_(0),
-        osr_threshold_(0),
         priority_thread_weight_(0),
         invoke_transition_weight_(0),
         dump_info_on_shutdown_(false),
@@ -203,6 +194,7 @@ class JitCompilerInterface {
       REQUIRES_SHARED(Locks::mutator_lock_) = 0;
   virtual bool GenerateDebugInfo() = 0;
   virtual void ParseCompilerOptions() = 0;
+  virtual bool IsBaselineCompiler() const;
 
   virtual std::vector<uint8_t> PackElfFileForJIT(ArrayRef<const JITCodeEntry*> elf_files,
                                                  ArrayRef<const void*> removed_symbols,
@@ -281,12 +273,12 @@ class Jit {
     return options_->GetThreadPoolPthreadPriority();
   }
 
-  uint16_t OSRMethodThreshold() const {
-    return options_->GetOsrThreshold();
+  int GetZygoteThreadPoolPthreadPriority() const {
+    return options_->GetZygoteThreadPoolPthreadPriority();
   }
 
   uint16_t HotMethodThreshold() const {
-    return options_->GetCompileThreshold();
+    return options_->GetOptimizeThreshold();
   }
 
   uint16_t WarmMethodThreshold() const {
@@ -314,24 +306,17 @@ class Jit {
   void MethodEntered(Thread* thread, ArtMethod* method)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  ALWAYS_INLINE void AddSamples(Thread* self,
-                                ArtMethod* method,
-                                uint16_t samples,
-                                bool with_backedges)
+  ALWAYS_INLINE void AddSamples(Thread* self, ArtMethod* method)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   void NotifyInterpreterToCompiledCodeTransition(Thread* self, ArtMethod* caller)
       REQUIRES_SHARED(Locks::mutator_lock_) {
-    if (!IgnoreSamplesForMethod(caller)) {
-      AddSamples(self, caller, options_->GetInvokeTransitionWeight(), false);
-    }
+    AddSamples(self, caller);
   }
 
   void NotifyCompiledCodeToInterpreterTransition(Thread* self, ArtMethod* callee)
       REQUIRES_SHARED(Locks::mutator_lock_) {
-    if (!IgnoreSamplesForMethod(callee)) {
-      AddSamples(self, callee, options_->GetInvokeTransitionWeight(), false);
-    }
+    AddSamples(self, callee);
   }
 
   // Starts the profile saver if the config options allow profile recording.
@@ -360,9 +345,6 @@ class Jit {
 
   // Return whether we can invoke JIT code for `method`.
   bool CanInvokeCompiledCode(ArtMethod* method);
-
-  // Return whether the runtime should use a priority thread weight when sampling.
-  static bool ShouldUsePriorityThreadWeight(Thread* self);
 
   // Return the information required to do an OSR jump. Return null if the OSR
   // cannot be done.
@@ -453,7 +435,7 @@ class Jit {
 
   void EnqueueOptimizedCompilation(ArtMethod* method, Thread* self);
 
-  void EnqueueCompilationFromNterp(ArtMethod* method, Thread* self)
+  void EnqueueCompilation(ArtMethod* method, Thread* self)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
  private:
@@ -472,15 +454,6 @@ class Jit {
                                 Handle<mirror::ClassLoader> class_loader,
                                 bool add_to_queue,
                                 bool compile_after_boot)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-
-  // Compile the method if the number of samples passes a threshold.
-  // Returns false if we can not compile now - don't increment the counter and retry later.
-  bool MaybeCompileMethod(Thread* self,
-                          ArtMethod* method,
-                          uint32_t old_count,
-                          uint32_t new_count,
-                          bool with_backedges)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   static bool BindCompilerMethods(std::string* error_msg);

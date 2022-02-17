@@ -62,8 +62,8 @@ include $(art_path)/build/Android.cpplint.mk
 ifneq ($(HOST_OS),darwin)
 include $(CLEAR_VARS)
 LOCAL_MODULE := art-tools
-LOCAL_LICENSE_KINDS := SPDX-license-identifier-Apache-2.0 SPDX-license-identifier-BSD SPDX-license-identifier-GPL-2.0
-LOCAL_LICENSE_CONDITIONS := notice restricted
+LOCAL_LICENSE_KINDS := SPDX-license-identifier-Apache-2.0
+LOCAL_LICENSE_CONDITIONS := notice
 LOCAL_NOTICE_FILE := $(LOCAL_PATH)/NOTICE
 LOCAL_IS_HOST_MODULE := true
 
@@ -388,8 +388,8 @@ art_apex_manifest_file :=
 
 include $(CLEAR_VARS)
 LOCAL_MODULE := art-runtime
-LOCAL_LICENSE_KINDS := SPDX-license-identifier-Apache-2.0 SPDX-license-identifier-BSD SPDX-license-identifier-GPL-2.0
-LOCAL_LICENSE_CONDITIONS := notice restricted
+LOCAL_LICENSE_KINDS := SPDX-license-identifier-Apache-2.0
+LOCAL_LICENSE_CONDITIONS := notice
 LOCAL_NOTICE_FILE := $(LOCAL_PATH)/NOTICE
 
 # Reference the libraries and binaries in the appropriate APEX module, because
@@ -423,10 +423,10 @@ LOCAL_REQUIRED_MODULES := \
 #
 # * We will never add them if PRODUCT_ART_TARGET_INCLUDE_DEBUG_BUILD = false.
 # * We will always add them if PRODUCT_ART_TARGET_INCLUDE_DEBUG_BUILD = true.
-# * Otherwise, we will add them by default to userdebug and eng builds.
+# * Otherwise, we will add them by default to eng builds.
 art_target_include_debug_build := $(PRODUCT_ART_TARGET_INCLUDE_DEBUG_BUILD)
 ifneq (false,$(art_target_include_debug_build))
-ifneq (,$(filter userdebug eng,$(TARGET_BUILD_VARIANT)))
+ifneq (,$(filter eng,$(TARGET_BUILD_VARIANT)))
   art_target_include_debug_build := true
 endif
 ifeq (true,$(art_target_include_debug_build))
@@ -465,8 +465,8 @@ ifneq ($(HOST_OS),darwin)
 ifeq ($(ART_BUILD_HOST_DEBUG),true)
 include $(CLEAR_VARS)
 LOCAL_MODULE := art-libartd-libopenjdkd-host-dependency
-LOCAL_LICENSE_KINDS := SPDX-license-identifier-Apache-2.0 SPDX-license-identifier-BSD SPDX-license-identifier-GPL-2.0
-LOCAL_LICENSE_CONDITIONS := notice restricted
+LOCAL_LICENSE_KINDS := SPDX-license-identifier-Apache-2.0
+LOCAL_LICENSE_CONDITIONS := notice
 LOCAL_NOTICE_FILE := $(LOCAL_PATH)/NOTICE
 LOCAL_MULTILIB := both
 LOCAL_REQUIRED_MODULES := libopenjdkd
@@ -711,6 +711,7 @@ build-art-target-golem: $(RELEASE_ART_APEX) com.android.runtime $(CONSCRYPT_APEX
                         $(TARGET_OUT_EXECUTABLES)/dex2oat_wrapper \
                         $(ART_TARGET_PLATFORM_DEPENDENCIES) \
                         $(ART_TARGET_SHARED_LIBRARY_BENCHMARK) \
+                        $(PRODUCT_OUT)/apex/art_boot_images/javalib/$(TARGET_ARCH)/boot.art \
                         standalone-apex-files
 	# remove debug libraries from public.libraries.txt because golem builds
 	# won't have it.
@@ -738,11 +739,21 @@ build-art-unbundled-golem: art-runtime linker oatdump $(art_apex_jars) conscrypt
 ########################################################################
 # Rules for building all dependencies for tests.
 
-.PHONY: build-art-host-tests
-build-art-host-tests:   build-art-host $(TEST_ART_RUN_TEST_DEPENDENCIES) $(ART_TEST_HOST_RUN_TEST_DEPENDENCIES) $(ART_TEST_HOST_GTEST_DEPENDENCIES) | $(TEST_ART_RUN_TEST_ORDERONLY_DEPENDENCIES)
+.PHONY: build-art-host-gtests build-art-host-run-tests build-art-host-tests
 
-.PHONY: build-art-target-tests
-build-art-target-tests:   build-art-target $(TEST_ART_RUN_TEST_DEPENDENCIES) $(ART_TEST_TARGET_RUN_TEST_DEPENDENCIES) $(ART_TEST_TARGET_GTEST_DEPENDENCIES) | $(TEST_ART_RUN_TEST_ORDERONLY_DEPENDENCIES)
+build-art-host-gtests: build-art-host $(ART_TEST_HOST_GTEST_DEPENDENCIES)
+
+build-art-host-run-tests: build-art-host $(TEST_ART_RUN_TEST_DEPENDENCIES) $(ART_TEST_HOST_RUN_TEST_DEPENDENCIES)
+
+build-art-host-tests: build-art-host-gtests build-art-host-run-tests
+
+.PHONY: build-art-target-gtests build-art-target-run-tests build-art-target-tests
+
+build-art-target-gtests: build-art-target $(ART_TEST_TARGET_GTEST_DEPENDENCIES)
+
+build-art-target-run-tests: build-art-target $(TEST_ART_RUN_TEST_DEPENDENCIES) $(ART_TEST_TARGET_RUN_TEST_DEPENDENCIES)
+
+build-art-target-tests: build-art-target-gtests build-art-target-run-tests
 
 ########################################################################
 # targets to switch back and forth from libdvm to libart
