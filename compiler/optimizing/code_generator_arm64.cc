@@ -283,7 +283,9 @@ class LoadClassSlowPathARM64 : public SlowPathCodeARM64 {
     InvokeRuntimeCallingConvention calling_convention;
     if (must_resolve_type) {
       DCHECK(IsSameDexFile(cls_->GetDexFile(), arm64_codegen->GetGraph()->GetDexFile()) ||
-             arm64_codegen->GetCompilerOptions().WithinOatFile(&cls_->GetDexFile()));
+             arm64_codegen->GetCompilerOptions().WithinOatFile(&cls_->GetDexFile()) ||
+             ContainsElement(Runtime::Current()->GetClassLinker()->GetBootClassPath(),
+                             &cls_->GetDexFile()));
       dex::TypeIndex type_index = cls_->GetTypeIndex();
       __ Mov(calling_convention.GetRegisterAt(0).W(), type_index.index_);
       if (cls_->NeedsAccessCheck()) {
@@ -2418,9 +2420,9 @@ void InstructionCodeGeneratorARM64::VisitDataProcWithShifterOp(
   // operand. Note that VIXL would still manage if it was passed by generating
   // the extension as a separate instruction.
   // `HNeg` also does not support extension. See comments in `ShifterOperandSupportsExtension()`.
-  DCHECK(!right_operand.IsExtendedRegister() ||
-         (kind != HInstruction::kAnd && kind != HInstruction::kOr && kind != HInstruction::kXor &&
-          kind != HInstruction::kNeg));
+  DCHECK_IMPLIES(right_operand.IsExtendedRegister(),
+                 kind != HInstruction::kAnd && kind != HInstruction::kOr &&
+                     kind != HInstruction::kXor && kind != HInstruction::kNeg);
   switch (kind) {
     case HInstruction::kAdd:
       __ Add(out, left, right_operand);
@@ -4620,14 +4622,9 @@ void CodeGeneratorARM64::LoadMethod(MethodLoadKind load_kind, Location temp, HIn
       break;
     }
     case MethodLoadKind::kBootImageRelRo: {
-      // Add ADRP with its PC-relative .data.bimg.rel.ro patch.
-      uint32_t boot_image_offset = GetBootImageOffset(invoke);
-      vixl::aarch64::Label* adrp_label = NewBootImageRelRoPatch(boot_image_offset);
-      EmitAdrpPlaceholder(adrp_label, XRegisterFrom(temp));
-      // Add LDR with its PC-relative .data.bimg.rel.ro patch.
-      vixl::aarch64::Label* ldr_label = NewBootImageRelRoPatch(boot_image_offset, adrp_label);
       // Note: Boot image is in the low 4GiB and the entry is 32-bit, so emit a 32-bit load.
-      EmitLdrOffsetPlaceholder(ldr_label, WRegisterFrom(temp), XRegisterFrom(temp));
+      uint32_t boot_image_offset = GetBootImageOffset(invoke);
+      LoadBootImageRelRoEntry(WRegisterFrom(temp), boot_image_offset);
       break;
     }
     case MethodLoadKind::kBssEntry: {
@@ -5033,6 +5030,17 @@ void CodeGeneratorARM64::EmitLdrOffsetPlaceholder(vixl::aarch64::Label* fixup_la
   __ ldr(out, MemOperand(base, /* offset placeholder */ 0));
 }
 
+void CodeGeneratorARM64::LoadBootImageRelRoEntry(vixl::aarch64::Register reg,
+                                                 uint32_t boot_image_offset) {
+  DCHECK(reg.IsW());
+  // Add ADRP with its PC-relative .data.bimg.rel.ro patch.
+  vixl::aarch64::Label* adrp_label = NewBootImageRelRoPatch(boot_image_offset);
+  EmitAdrpPlaceholder(adrp_label, reg.X());
+  // Add LDR with its PC-relative .data.bimg.rel.ro patch.
+  vixl::aarch64::Label* ldr_label = NewBootImageRelRoPatch(boot_image_offset, adrp_label);
+  EmitLdrOffsetPlaceholder(ldr_label, reg.W(), reg.X());
+}
+
 void CodeGeneratorARM64::LoadBootImageAddress(vixl::aarch64::Register reg,
                                               uint32_t boot_image_reference) {
   if (GetCompilerOptions().IsBootImage()) {
@@ -5043,12 +5051,7 @@ void CodeGeneratorARM64::LoadBootImageAddress(vixl::aarch64::Register reg,
     vixl::aarch64::Label* add_label = NewBootImageIntrinsicPatch(boot_image_reference, adrp_label);
     EmitAddPlaceholder(add_label, reg.X(), reg.X());
   } else if (GetCompilerOptions().GetCompilePic()) {
-    // Add ADRP with its PC-relative .data.bimg.rel.ro patch.
-    vixl::aarch64::Label* adrp_label = NewBootImageRelRoPatch(boot_image_reference);
-    EmitAdrpPlaceholder(adrp_label, reg.X());
-    // Add LDR with its PC-relative .data.bimg.rel.ro patch.
-    vixl::aarch64::Label* ldr_label = NewBootImageRelRoPatch(boot_image_reference, adrp_label);
-    EmitLdrOffsetPlaceholder(ldr_label, reg.W(), reg.X());
+    LoadBootImageRelRoEntry(reg, boot_image_reference);
   } else {
     DCHECK(GetCompilerOptions().IsJitCompiler());
     gc::Heap* heap = Runtime::Current()->GetHeap();
@@ -5061,7 +5064,7 @@ void CodeGeneratorARM64::LoadBootImageAddress(vixl::aarch64::Register reg,
 void CodeGeneratorARM64::LoadTypeForBootImageIntrinsic(vixl::aarch64::Register reg,
                                                        TypeReference target_type) {
   // Load the class the same way as for HLoadClass::LoadKind::kBootImageLinkTimePcRelative.
-  DCHECK(GetCompilerOptions().IsBootImage());
+  DCHECK(GetCompilerOptions().IsBootImage() || GetCompilerOptions().IsBootImageExtension());
   // Add ADRP with its PC-relative type patch.
   vixl::aarch64::Label* adrp_label =
       NewBootImageTypePatch(*target_type.dex_file, target_type.TypeIndex());
@@ -5385,13 +5388,7 @@ void InstructionCodeGeneratorARM64::VisitLoadClass(HLoadClass* cls) NO_THREAD_SA
     case HLoadClass::LoadKind::kBootImageRelRo: {
       DCHECK(!codegen_->GetCompilerOptions().IsBootImage());
       uint32_t boot_image_offset = CodeGenerator::GetBootImageOffset(cls);
-      // Add ADRP with its PC-relative .data.bimg.rel.ro patch.
-      vixl::aarch64::Label* adrp_label = codegen_->NewBootImageRelRoPatch(boot_image_offset);
-      codegen_->EmitAdrpPlaceholder(adrp_label, out.X());
-      // Add LDR with its PC-relative .data.bimg.rel.ro patch.
-      vixl::aarch64::Label* ldr_label =
-          codegen_->NewBootImageRelRoPatch(boot_image_offset, adrp_label);
-      codegen_->EmitLdrOffsetPlaceholder(ldr_label, out.W(), out.X());
+      codegen_->LoadBootImageRelRoEntry(out.W(), boot_image_offset);
       break;
     }
     case HLoadClass::LoadKind::kBssEntry:
@@ -5559,14 +5556,8 @@ void InstructionCodeGeneratorARM64::VisitLoadString(HLoadString* load) NO_THREAD
     }
     case HLoadString::LoadKind::kBootImageRelRo: {
       DCHECK(!codegen_->GetCompilerOptions().IsBootImage());
-      // Add ADRP with its PC-relative .data.bimg.rel.ro patch.
       uint32_t boot_image_offset = CodeGenerator::GetBootImageOffset(load);
-      vixl::aarch64::Label* adrp_label = codegen_->NewBootImageRelRoPatch(boot_image_offset);
-      codegen_->EmitAdrpPlaceholder(adrp_label, out.X());
-      // Add LDR with its PC-relative .data.bimg.rel.ro patch.
-      vixl::aarch64::Label* ldr_label =
-          codegen_->NewBootImageRelRoPatch(boot_image_offset, adrp_label);
-      codegen_->EmitLdrOffsetPlaceholder(ldr_label, out.W(), out.X());
+      codegen_->LoadBootImageRelRoEntry(out.W(), boot_image_offset);
       return;
     }
     case HLoadString::LoadKind::kBssEntry: {
@@ -7169,7 +7160,7 @@ void CodeGeneratorARM64::CompileBakerReadBarrierThunk(Arm64Assembler& assembler,
 
   // For JIT, the slow path is considered part of the compiled method,
   // so JIT should pass null as `debug_name`.
-  DCHECK(!GetCompilerOptions().IsJitCompiler() || debug_name == nullptr);
+  DCHECK_IMPLIES(GetCompilerOptions().IsJitCompiler(), debug_name == nullptr);
   if (debug_name != nullptr && GetCompilerOptions().GenerateAnyDebugInfo()) {
     std::ostringstream oss;
     oss << "BakerReadBarrierThunk";

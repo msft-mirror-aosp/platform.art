@@ -2020,9 +2020,11 @@ std::string ProfileCompilationInfo::DumpInfo(const std::vector<const DexFile*>& 
     os << " [num_method_ids=" << dex_data->num_method_ids << "]";
     const DexFile* dex_file = nullptr;
     for (const DexFile* current : dex_files) {
-      if (GetBaseKeyViewFromAugmentedKey(dex_data->profile_key) == current->GetLocation() &&
-          dex_data->checksum == current->GetLocationChecksum()) {
+      if (GetBaseKeyViewFromAugmentedKey(dex_data->profile_key) ==
+          GetProfileDexFileBaseKeyView(current->GetLocation()) &&
+          ChecksumMatch(dex_data->checksum, current->GetLocationChecksum())) {
         dex_file = current;
+        break;
       }
     }
     os << "\n\thot methods: ";
@@ -2596,7 +2598,7 @@ void ProfileCompilationInfo::DexFileData::WriteMethods(SafeBuffer& buffer) const
     if ((method_flags & flag) != 0u) {
       size_t index = FlagBitmapIndex(static_cast<MethodHotness::Flag>(flag));
       BitMemoryRegion src = method_bitmap.Subregion(index * num_method_ids, num_method_ids);
-      saved_bitmap.StoreBits(saved_bitmap_index * num_method_ids, src, num_method_ids);
+      saved_bitmap.Subregion(saved_bitmap_index * num_method_ids, num_method_ids).CopyBits(src);
       ++saved_bitmap_index;
     }
     return true;
@@ -2704,7 +2706,7 @@ ProfileCompilationInfo::ProfileLoadStatus ProfileCompilationInfo::DexFileData::R
       size_t index = FlagBitmapIndex(static_cast<MethodHotness::Flag>(flag));
       BitMemoryRegion src =
           saved_bitmap.Subregion(saved_bitmap_index * num_method_ids, num_method_ids);
-      method_bitmap.OrBits(index * num_method_ids, src, num_method_ids);
+      method_bitmap.Subregion(index * num_method_ids, num_method_ids).OrBits(src);
       ++saved_bitmap_index;
     }
     return true;

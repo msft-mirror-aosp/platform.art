@@ -188,6 +188,8 @@ enum class WeakRefAccessState : int32_t {
 // This should match RosAlloc::kNumThreadLocalSizeBrackets.
 static constexpr size_t kNumRosAllocThreadLocalSizeBracketsInThread = 16;
 
+static constexpr size_t kSharedMethodHotnessThreshold = 0xffff;
+
 // Thread's stack layout for implicit stack overflow checks:
 //
 //   +---------------------+  <- highest address of stack memory
@@ -413,7 +415,7 @@ class Thread {
   // End region where no thread suspension is expected.
   void EndAssertNoThreadSuspension(const char* old_cause) RELEASE(Roles::uninterruptible_) {
     if (kIsDebugBuild) {
-      CHECK(old_cause != nullptr || tls32_.no_thread_suspension == 1);
+      CHECK_IMPLIES(old_cause == nullptr, tls32_.no_thread_suspension == 1);
       CHECK_GT(tls32_.no_thread_suspension, 0U);
       tls32_.no_thread_suspension--;
       tlsPtr_.last_no_thread_suspension_cause = old_cause;
@@ -766,6 +768,13 @@ class Thread {
 
   static constexpr size_t IsGcMarkingSize() {
     return sizeof(tls32_.is_gc_marking);
+  }
+
+  template<PointerSize pointer_size>
+  static constexpr ThreadOffset<pointer_size> SharedMethodHotnessOffset() {
+    return ThreadOffset<pointer_size>(
+        OFFSETOF_MEMBER(Thread, tls32_) +
+        OFFSETOF_MEMBER(tls_32bit_sized_values, shared_method_hotness));
   }
 
   // Deoptimize the Java stack.
@@ -1388,6 +1397,19 @@ class Thread {
     return StateAndFlags::EncodeState(state);
   }
 
+  void ResetSharedMethodHotness() {
+    tls32_.shared_method_hotness = kSharedMethodHotnessThreshold;
+  }
+
+  uint32_t GetSharedMethodHotness() const {
+    return tls32_.shared_method_hotness;
+  }
+
+  uint32_t DecrementSharedMethodHotness() {
+    tls32_.shared_method_hotness = (tls32_.shared_method_hotness - 1) & 0xffff;
+    return tls32_.shared_method_hotness;
+  }
+
  private:
   explicit Thread(bool daemon);
   ~Thread() REQUIRES(!Locks::mutator_lock_, !Locks::thread_suspend_count_lock_);
@@ -1541,7 +1563,8 @@ class Thread {
   template <bool kPrecise>
   void VisitRoots(RootVisitor* visitor) REQUIRES_SHARED(Locks::mutator_lock_);
 
-  void SweepInterpreterCache(IsMarkedVisitor* visitor) REQUIRES_SHARED(Locks::mutator_lock_);
+  static void SweepInterpreterCaches(IsMarkedVisitor* visitor)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   static bool IsAotCompiler();
 
@@ -1695,7 +1718,9 @@ class Thread {
           force_interpreter_count(0),
           make_visibly_initialized_counter(0),
           define_class_counter(0),
-          num_name_readers(0) {}
+          num_name_readers(0),
+          shared_method_hotness(kSharedMethodHotnessThreshold)
+        {}
 
     // The state and flags field must be changed atomically so that flag values aren't lost.
     // See `StateAndFlags` for bit assignments of `ThreadFlag` and `ThreadState` values.
@@ -1789,6 +1814,14 @@ class Thread {
     // retrieved.
     mutable std::atomic<uint32_t> num_name_readers;
     static_assert(std::atomic<uint32_t>::is_always_lock_free);
+
+    // Thread-local hotness counter for shared memory methods. Initialized with
+    // `kSharedMethodHotnessThreshold`. The interpreter decrements it and goes
+    // into the runtime when hitting zero. Note that all previous decrements
+    // could have been executed by another method than the one seeing zero.
+    // There is a second level counter in `Jit::shared_method_counters_` to make
+    // sure we at least have a few samples before compiling a method.
+    uint32_t shared_method_hotness;
   } tls32_;
 
   struct PACKED(8) tls_64bit_sized_values {

@@ -101,6 +101,7 @@
 #include "palette/palette.h"
 #include "profile/profile_compilation_info.h"
 #include "runtime.h"
+#include "runtime_intrinsics.h"
 #include "runtime_options.h"
 #include "scoped_thread_state_change-inl.h"
 #include "stream/buffered_output_stream.h"
@@ -524,7 +525,6 @@ class Dex2Oat final {
         zip_fd_(-1),
         image_fd_(-1),
         have_multi_image_arg_(false),
-        multi_image_(false),
         image_base_(0U),
         image_storage_mode_(ImageHeader::kStorageModeUncompressed),
         passes_to_run_filename_(nullptr),
@@ -770,19 +770,20 @@ class Dex2Oat final {
       }
     } else {
       // Use the default, i.e. multi-image for boot image and boot image extension.
-      multi_image_ = IsBootImage() || IsBootImageExtension();  // Shall pass checks below.
+      // This shall pass the checks below.
+      compiler_options_->multi_image_ = IsBootImage() || IsBootImageExtension();
     }
     // On target we support generating a single image for the primary boot image.
     if (!kIsTargetBuild) {
-      if (IsBootImage() && !multi_image_) {
+      if (IsBootImage() && !compiler_options_->multi_image_) {
         Usage("--single-image specified for primary boot image on host");
       }
     }
-    if (IsAppImage() && multi_image_) {
+    if (IsAppImage() && compiler_options_->multi_image_) {
       Usage("--multi-image specified for app image");
     }
 
-    if (image_fd_ != -1 && multi_image_) {
+    if (image_fd_ != -1 && compiler_options_->multi_image_) {
       Usage("--single-image not specified for --image-fd");
     }
 
@@ -820,6 +821,10 @@ class Dex2Oat final {
 
     if (dirty_image_objects_filename_ != nullptr && dirty_image_objects_fd_ != -1) {
       Usage("--dirty-image-objects and --dirty-image-objects-fd should not be both specified");
+    }
+
+    if (!preloaded_classes_files_.empty() && !preloaded_classes_fds_.empty()) {
+      Usage("--preloaded-classes and --preloaded-classes-fds should not be both specified");
     }
 
     if (!cpu_set_.empty()) {
@@ -904,7 +909,7 @@ class Dex2Oat final {
 
   void ExpandOatAndImageFilenames() {
     ArrayRef<const std::string> locations(dex_locations_);
-    if (!multi_image_) {
+    if (!compiler_options_->multi_image_) {
       locations = locations.SubArray(/*pos=*/ 0u, /*length=*/ 1u);
     }
     if (image_fd_ == -1) {
@@ -920,7 +925,7 @@ class Dex2Oat final {
       oat_filenames_ = ImageSpace::ExpandMultiImageLocations(
           locations, oat_filenames_[0], IsBootImageExtension());
     } else {
-      DCHECK(!multi_image_);
+      DCHECK(!compiler_options_->multi_image_);
       std::vector<std::string> oat_locations = ImageSpace::ExpandMultiImageLocations(
           locations, oat_location_, IsBootImageExtension());
       DCHECK_EQ(1u, oat_locations.size());
@@ -953,7 +958,6 @@ class Dex2Oat final {
     key_value_store_->Put(OatHeader::kCompilerFilter,
                           CompilerFilter::NameOfFilter(compiler_options_->GetCompilerFilter()));
     key_value_store_->Put(OatHeader::kConcurrentCopying, kUseReadBarrier);
-    key_value_store_->Put(OatHeader::kRequiresImage, compiler_options_->IsGeneratingImage());
     if (invocation_file_.get() != -1) {
       std::ostringstream oss;
       for (int i = 0; i < argc; ++i) {
@@ -1069,6 +1073,8 @@ class Dex2Oat final {
     AssignIfExists(args, M::AndroidRoot, &android_root_);
     AssignIfExists(args, M::Profile, &profile_files_);
     AssignIfExists(args, M::ProfileFd, &profile_file_fds_);
+    AssignIfExists(args, M::PreloadedClasses, &preloaded_classes_files_);
+    AssignIfExists(args, M::PreloadedClassesFds, &preloaded_classes_fds_);
     AssignIfExists(args, M::RuntimeOptions, &runtime_args_);
     AssignIfExists(args, M::SwapFile, &swap_file_name_);
     AssignIfExists(args, M::SwapFileFd, &swap_fd_);
@@ -1113,7 +1119,7 @@ class Dex2Oat final {
     AssignIfExists(args, M::CopyDexFiles, &copy_dex_files_);
 
     AssignTrueIfExists(args, M::MultiImage, &have_multi_image_arg_);
-    AssignIfExists(args, M::MultiImage, &multi_image_);
+    AssignIfExists(args, M::MultiImage, &compiler_options_->multi_image_);
 
     if (args.Exists(M::ForceDeterminism)) {
       force_determinism_ = true;
@@ -1423,6 +1429,10 @@ class Dex2Oat final {
       return dex2oat::ReturnCode::kOther;
     }
 
+    if (!PreparePreloadedClasses()) {
+      return dex2oat::ReturnCode::kOther;
+    }
+
     callbacks_.reset(new QuickCompilerCallbacks(
         // For class verification purposes, boot image extension is the same as boot image.
         (IsBootImage() || IsBootImageExtension())
@@ -1514,10 +1524,10 @@ class Dex2Oat final {
     }
     if (runtime_->GetHeap()->GetBootImageSpaces().empty() &&
         (IsBootImageExtension() || IsAppImage())) {
-      LOG(ERROR) << "Cannot create "
-                 << (IsBootImageExtension() ? "boot image extension" : "app image")
-                 << " without a primary boot image.";
-      return dex2oat::ReturnCode::kOther;
+      LOG(WARNING) << "Cannot create "
+                   << (IsBootImageExtension() ? "boot image extension" : "app image")
+                   << " without a primary boot image.";
+      compiler_options_->image_type_ = CompilerOptions::ImageType::kNone;
     }
     ArrayRef<const DexFile* const> bcp_dex_files(runtime_->GetClassLinker()->GetBootClassPath());
     if (IsBootImage() || IsBootImageExtension()) {
@@ -1656,6 +1666,10 @@ class Dex2Oat final {
       key_value_store_->Put(OatHeader::kApexVersionsKey, versions);
     }
 
+    // Now that we have adjusted whether we generate an image, encode it in the
+    // key/value store.
+    key_value_store_->Put(OatHeader::kRequiresImage, compiler_options_->IsGeneratingImage());
+
     // Now that we have finalized key_value_store_, start writing the .rodata section.
     // Among other things, this creates type lookup tables that speed up the compilation.
     {
@@ -1687,13 +1701,6 @@ class Dex2Oat final {
       }
     }
     // Note that dex2oat won't close the swap_fd_. The compiler driver's swap space will do that.
-
-    // If we're doing the image, override the compiler filter to force full compilation. Must be
-    // done ahead of WellKnownClasses::Init that causes verification.  Note: doesn't force
-    // compilation of class initializers.
-    // Whilst we're in native take the opportunity to initialize well known classes.
-    Thread* self = Thread::Current();
-    WellKnownClasses::Init(self->GetJniEnv());
 
     if (!IsBootImage() && !IsBootImageExtension()) {
       constexpr bool kSaveDexInput = false;
@@ -2320,7 +2327,11 @@ class Dex2Oat final {
   }
 
   bool DoDexLayoutOptimizations() const {
-    return DoProfileGuidedOptimizations() || DoGenerateCompactDex();
+    // Only run dexlayout when being asked to generate compact dex. We do this
+    // to avoid having multiple arguments being passed to dex2oat and the main
+    // user of dex2oat (installd) will have the same reasons for
+    // disabling/enabling compact dex and dex layout.
+    return DoGenerateCompactDex();
   }
 
   bool DoOatLayoutOptimizations() const {
@@ -2526,6 +2537,24 @@ class Dex2Oat final {
     return true;
   }
 
+  bool PreparePreloadedClasses() {
+    preloaded_classes_ = std::make_unique<HashSet<std::string>>();
+    if (!preloaded_classes_fds_.empty()) {
+      for (int fd : preloaded_classes_fds_) {
+        if (!ReadCommentedInputFromFd(fd, nullptr, preloaded_classes_.get())) {
+          return false;
+        }
+      }
+    } else {
+      for (const std::string& file : preloaded_classes_files_) {
+        if (!ReadCommentedInputFromFile(file.c_str(), nullptr, preloaded_classes_.get())) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
   void PruneNonExistentDexFiles() {
     DCHECK_EQ(dex_filenames_.size(), dex_locations_.size());
     size_t kept = 0u;
@@ -2708,6 +2737,13 @@ class Dex2Oat final {
     // Runtime::Start, give it away now so that we don't starve GC.
     self->TransitionFromRunnableToSuspended(ThreadState::kNative);
 
+    // Now that we are in native state, initialize well known classes and
+    // intrinsics if we don't have a boot image.
+    WellKnownClasses::Init(self->GetJniEnv());
+    if (IsBootImage() || runtime_->GetHeap()->GetBootImageSpaces().empty()) {
+      InitializeIntrinsics();
+    }
+
     WatchDog::SetRuntime(runtime_.get());
 
     return true;
@@ -2747,17 +2783,38 @@ class Dex2Oat final {
     return true;
   }
 
+  template <typename T>
+  static bool ReadCommentedInputFromFile(
+      const char* input_filename, std::function<std::string(const char*)>* process, T* output) {
+    auto input_file = std::unique_ptr<FILE, decltype(&fclose)>{fopen(input_filename, "r"), fclose};
+    if (!input_file) {
+      LOG(ERROR) << "Failed to open input file " << input_filename;
+      return false;
+    }
+    ReadCommentedInputStream<T>(input_file.get(), process, output);
+    return true;
+  }
+
+  template <typename T>
+  static bool ReadCommentedInputFromFd(
+      int input_fd, std::function<std::string(const char*)>* process, T* output) {
+    auto input_file = std::unique_ptr<FILE, decltype(&fclose)>{fdopen(input_fd, "r"), fclose};
+    if (!input_file) {
+      LOG(ERROR) << "Failed to re-open input fd from /prof/self/fd/" << input_fd;
+      return false;
+    }
+    ReadCommentedInputStream<T>(input_file.get(), process, output);
+    return true;
+  }
+
   // Read lines from the given file, dropping comments and empty lines. Post-process each line with
   // the given function.
   template <typename T>
   static std::unique_ptr<T> ReadCommentedInputFromFile(
       const char* input_filename, std::function<std::string(const char*)>* process) {
-    auto input_file = std::unique_ptr<FILE, decltype(&fclose)>{fopen(input_filename, "r"), fclose};
-    if (!input_file) {
-      LOG(ERROR) << "Failed to open input file " << input_filename;
-      return nullptr;
-    }
-    return ReadCommentedInputStream<T>(input_file.get(), process);
+    std::unique_ptr<T> output(new T());
+    ReadCommentedInputFromFile(input_filename, process, output.get());
+    return output;
   }
 
   // Read lines from the given fd, dropping comments and empty lines. Post-process each line with
@@ -2765,21 +2822,17 @@ class Dex2Oat final {
   template <typename T>
   static std::unique_ptr<T> ReadCommentedInputFromFd(
       int input_fd, std::function<std::string(const char*)>* process) {
-    auto input_file = std::unique_ptr<FILE, decltype(&fclose)>{fdopen(input_fd, "r"), fclose};
-    if (!input_file) {
-      LOG(ERROR) << "Failed to re-open input fd from /prof/self/fd/" << input_fd;
-      return nullptr;
-    }
-    return ReadCommentedInputStream<T>(input_file.get(), process);
+    std::unique_ptr<T> output(new T());
+    ReadCommentedInputFromFd(input_fd, process, output.get());
+    return output;
   }
 
   // Read lines from the given stream, dropping comments and empty lines. Post-process each line
   // with the given function.
-  template <typename T>
-  static std::unique_ptr<T> ReadCommentedInputStream(
+  template <typename T> static void ReadCommentedInputStream(
       std::FILE* in_stream,
-      std::function<std::string(const char*)>* process) {
-    std::unique_ptr<T> output(new T());
+      std::function<std::string(const char*)>* process,
+      T* output) {
     char* line = nullptr;
     size_t line_alloc = 0;
     ssize_t len = 0;
@@ -2798,7 +2851,6 @@ class Dex2Oat final {
       }
     }
     free(line);
-    return output;
   }
 
   void LogCompletionTime() {
@@ -2884,13 +2936,13 @@ class Dex2Oat final {
   std::vector<std::string> image_filenames_;
   int image_fd_;
   bool have_multi_image_arg_;
-  bool multi_image_;
   uintptr_t image_base_;
   ImageHeader::StorageMode image_storage_mode_;
   const char* passes_to_run_filename_;
   const char* dirty_image_objects_filename_;
   int dirty_image_objects_fd_;
   std::unique_ptr<HashSet<std::string>> dirty_image_objects_;
+  std::unique_ptr<HashSet<std::string>> preloaded_classes_;
   std::unique_ptr<std::vector<std::string>> passes_to_run_;
   bool is_host_;
   std::string android_root_;
@@ -2919,6 +2971,8 @@ class Dex2Oat final {
   int app_image_fd_;
   std::vector<std::string> profile_files_;
   std::vector<int> profile_file_fds_;
+  std::vector<std::string> preloaded_classes_files_;
+  std::vector<int> preloaded_classes_fds_;
   std::unique_ptr<ProfileCompilationInfo> profile_compilation_info_;
   TimingLogger* timings_;
   std::vector<std::vector<const DexFile*>> dex_files_per_oat_file_;

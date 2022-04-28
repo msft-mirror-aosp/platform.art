@@ -114,11 +114,13 @@ ENTRY art_jni_dlsym_lookup_stub
     add    sp, #12                        @ restore stack pointer
     .cfi_adjust_cfa_offset -12
     cbz    r0, 1f                         @ is method code null?
+    .cfi_remember_state
     pop    {r0, r1, r2, r3, lr}           @ restore regs
     .cfi_adjust_cfa_offset -20
     .cfi_restore lr
     bx     r12                            @ if non-null, tail call to method's code
 1:
+    CFI_RESTORE_STATE_AND_DEF_CFA sp, 20
     pop    {r0, r1, r2, r3, pc}           @ restore regs and return to caller to handle exception
 END art_jni_dlsym_lookup_stub
 
@@ -205,7 +207,7 @@ ENTRY art_jni_dlsym_lookup_critical_stub
     str    lr, [r4, #(FRAME_SIZE_SAVE_REFS_AND_ARGS - __SIZEOF_POINTER__)]
 
     // Replace the target method with the SaveRefsAndArgs runtime method.
-    RUNTIME_CURRENT1 r1
+    LOAD_RUNTIME_INSTANCE r1
     ldr    r1, [r1, #RUNTIME_SAVE_REFS_AND_ARGS_METHOD_OFFSET]
 
     mov    r2, r4                 // Prepare untagged managed SP for the runtime method.
@@ -302,7 +304,7 @@ ENTRY art_jni_dlsym_lookup_critical_stub
     vstmia ip, {s16-s31}
 
     // Store ArtMethod* Runtime::callee_save_methods_[kSaveAllCalleeSaves] to the managed frame.
-    RUNTIME_CURRENT2 ip
+    LOAD_RUNTIME_INSTANCE ip
     ldr   ip, [ip, #RUNTIME_SAVE_ALL_CALLEE_SAVES_METHOD_OFFSET]
     str   ip, [r4]
 

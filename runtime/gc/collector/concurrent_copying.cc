@@ -1080,35 +1080,7 @@ class ConcurrentCopying::ComputeLiveBytesAndMarkRefFieldsVisitor {
       REQUIRES_SHARED(Locks::heap_bitmap_lock_) {
     DCHECK_EQ(collector_->RegionSpace()->RegionIdxForRef(obj), obj_region_idx_);
     DCHECK(kHandleInterRegionRefs || collector_->immune_spaces_.ContainsObject(obj));
-    mirror::Object* ref =
-            obj->GetFieldObject<mirror::Object, kVerifyNone, kWithoutReadBarrier>(offset);
-    // TODO(lokeshgidra): Remove the following condition once b/173676071 is fixed.
-    if (UNLIKELY(ref == nullptr && offset == mirror::Object::ClassOffset())) {
-      // It has been verified as a race condition (see b/173676071)! After a small
-      // wait when we reload the class pointer, it turns out to be a valid class
-      // object. So as a workaround, we can continue execution and log an error
-      // that this happened.
-      for (size_t i = 0; i < 1000; i++) {
-        // Wait for 1ms at a time. Don't wait for more than 1 second in total.
-        usleep(1000);
-        ref = obj->GetClass<kVerifyNone, kWithoutReadBarrier>();
-        if (ref != nullptr) {
-          LOG(ERROR) << "klass pointer for obj: "
-                     << obj << " (" << mirror::Object::PrettyTypeOf(obj)
-                     << ") found to be null first. Reloading after a small wait fetched klass: "
-                     << ref << " (" << mirror::Object::PrettyTypeOf(ref) << ")";
-          break;
-        }
-      }
-
-      if (UNLIKELY(ref == nullptr)) {
-        // It must be heap corruption. Remove memory protection and dump data.
-        collector_->region_space_->Unprotect();
-        LOG(FATAL_WITHOUT_ABORT) << "klass pointer for ref: " << obj << " found to be null.";
-        collector_->heap_->GetVerification()->LogHeapCorruption(obj, offset, ref, /* fatal */ true);
-      }
-    }
-    CheckReference(ref);
+    CheckReference(obj->GetFieldObject<mirror::Object, kVerifyNone, kWithoutReadBarrier>(offset));
   }
 
   void operator()(ObjPtr<mirror::Class> klass, ObjPtr<mirror::Reference> ref) const
@@ -3152,7 +3124,7 @@ class ConcurrentCopying::RefFieldsVisitor {
   explicit RefFieldsVisitor(ConcurrentCopying* collector, Thread* const thread)
       : collector_(collector), thread_(thread) {
     // Cannot have `kNoUnEvac` when Generational CC collection is disabled.
-    DCHECK(!kNoUnEvac || collector_->use_generational_cc_);
+    DCHECK_IMPLIES(kNoUnEvac, collector_->use_generational_cc_);
   }
 
   void operator()(mirror::Object* obj, MemberOffset offset, bool /* is_static */)
@@ -3189,7 +3161,7 @@ class ConcurrentCopying::RefFieldsVisitor {
 template <bool kNoUnEvac>
 inline void ConcurrentCopying::Scan(mirror::Object* to_ref, size_t obj_size) {
   // Cannot have `kNoUnEvac` when Generational CC collection is disabled.
-  DCHECK(!kNoUnEvac || use_generational_cc_);
+  DCHECK_IMPLIES(kNoUnEvac, use_generational_cc_);
   if (kDisallowReadBarrierDuringScan && !Runtime::Current()->IsActiveTransaction()) {
     // Avoid all read barriers during visit references to help performance.
     // Don't do this in transaction mode because we may read the old value of an field which may
@@ -3215,7 +3187,7 @@ inline void ConcurrentCopying::Scan(mirror::Object* to_ref, size_t obj_size) {
 template <bool kNoUnEvac>
 inline void ConcurrentCopying::Process(mirror::Object* obj, MemberOffset offset) {
   // Cannot have `kNoUnEvac` when Generational CC collection is disabled.
-  DCHECK(!kNoUnEvac || use_generational_cc_);
+  DCHECK_IMPLIES(kNoUnEvac, use_generational_cc_);
   DCHECK_EQ(Thread::Current(), thread_running_gc_);
   mirror::Object* ref = obj->GetFieldObject<
       mirror::Object, kVerifyNone, kWithoutReadBarrier, false>(offset);

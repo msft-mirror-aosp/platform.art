@@ -81,6 +81,7 @@ class SafeMap {
   node_type extract(const_iterator pos) { return map_.extract(pos); }
   node_type extract(const key_type& k) { return map_.extract(k); }
 
+  std::pair<iterator, bool> insert(value_type&& value) { return map_.insert(std::move(value)); }
   insert_return_type insert(node_type&& node) { return map_.insert(std::move(node)); }
   insert_return_type insert(const_iterator hint, node_type&& node) {
     return map_.insert(hint, std::move(node));
@@ -148,7 +149,7 @@ class SafeMap {
 
   template <typename CreateFn>
   V& GetOrCreate(const K& k, CreateFn create) {
-    static_assert(std::is_same<V, typename std::result_of<CreateFn()>::type>::value,
+    static_assert(std::is_same_v<V, std::result_of_t<CreateFn()>>,
                   "Argument `create` should return a value of type V.");
     auto lb = lower_bound(k);
     if (lb != end() && !key_comp()(k, lb->first)) {

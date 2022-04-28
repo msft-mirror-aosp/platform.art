@@ -2864,7 +2864,7 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyInstruction(uint32_t* start_g
                                    return_type_class,
                                    return_type_class->CannotBeAssignedFromOtherTypes());
         } else {
-          DCHECK(!can_load_classes_ || self_->IsExceptionPending());
+          DCHECK_IMPLIES(can_load_classes_, self_->IsExceptionPending());
           self_->ClearException();
         }
       }
@@ -2909,7 +2909,7 @@ bool MethodVerifier<kVerifierDebug>::CodeFlowVerifyInstruction(uint32_t* start_g
                                    return_type_class,
                                    return_type_class->CannotBeAssignedFromOtherTypes());
         } else {
-          DCHECK(!can_load_classes_ || self_->IsExceptionPending());
+          DCHECK_IMPLIES(can_load_classes_, self_->IsExceptionPending());
           self_->ClearException();
         }
       }
@@ -3636,8 +3636,14 @@ const RegType& MethodVerifier<kVerifierDebug>::ResolveClass(dex::TypeIndex class
     const RegType& referrer = GetDeclaringClass();
     if ((IsSdkVersionSetAndAtLeast(api_level_, SdkVersion::kP) || !referrer.IsUnresolvedTypes()) &&
         !referrer.CanAccess(*result)) {
-      Fail(VERIFY_ERROR_ACCESS_CLASS) << "(possibly) illegal class access: '"
-                                      << referrer << "' -> '" << *result << "'";
+      if (IsAotMode()) {
+        Fail(VERIFY_ERROR_ACCESS_CLASS);
+        VLOG(verifier)
+            << "(possibly) illegal class access: '" << referrer << "' -> '" << *result << "'";
+      } else {
+        Fail(VERIFY_ERROR_ACCESS_CLASS)
+            << "(possibly) illegal class access: '" << referrer << "' -> '" << *result << "'";
+      }
     }
   }
   return *result;
@@ -4710,7 +4716,7 @@ void MethodVerifier<kVerifierDebug>::VerifyISFieldAccess(const Instruction* inst
                               field_type_class,
                               field_type_class->CannotBeAssignedFromOtherTypes());
     } else {
-      DCHECK(!can_load_classes_ || self_->IsExceptionPending());
+      DCHECK_IMPLIES(can_load_classes_, self_->IsExceptionPending());
       self_->ClearException();
     }
   } else if (IsSdkVersionSetAndAtLeast(api_level_, SdkVersion::kP)) {

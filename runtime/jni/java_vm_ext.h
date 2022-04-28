@@ -27,6 +27,10 @@
 
 namespace art {
 
+namespace linker {
+class ImageWriter;
+}  // namespace linker
+
 namespace mirror {
 class Array;
 }  // namespace mirror
@@ -119,7 +123,7 @@ class JavaVMExt : public JavaVM {
    * Returns a pointer to the code for the native method 'm', found
    * using dlsym(3) on every native library that's been loaded so far.
    */
-  void* FindCodeForNativeMethod(ArtMethod* m)
+  void* FindCodeForNativeMethod(ArtMethod* m, std::string* error_msg, bool can_suspend)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   void DumpForSigQuit(std::ostream& os)
@@ -219,10 +223,7 @@ class JavaVMExt : public JavaVM {
   JavaVMExt(Runtime* runtime, const RuntimeArgumentMap& runtime_options, std::string* error_msg);
 
   // Return true if self can currently access weak globals.
-  bool MayAccessWeakGlobalsUnlocked(Thread* self) const REQUIRES_SHARED(Locks::mutator_lock_);
-  bool MayAccessWeakGlobals(Thread* self) const
-      REQUIRES_SHARED(Locks::mutator_lock_)
-      REQUIRES(Locks::jni_weak_globals_lock_);
+  bool MayAccessWeakGlobals(Thread* self) const REQUIRES_SHARED(Locks::mutator_lock_);
 
   void WaitForWeakGlobalsAccess(Thread* self)
       REQUIRES_SHARED(Locks::mutator_lock_)
@@ -281,7 +282,7 @@ class JavaVMExt : public JavaVM {
   uint32_t global_ref_report_counter_ GUARDED_BY(Locks::jni_globals_lock_)
       = kGlobalRefReportInterval;
 
-
+  friend class linker::ImageWriter;  // Uses `globals_` and `weak_globals_` without read barrier.
   friend IndirectReferenceTable* GetIndirectReferenceTable(ScopedObjectAccess& soa,
                                                            IndirectRefKind kind);
 

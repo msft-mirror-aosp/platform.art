@@ -316,12 +316,7 @@ END \name
     beq NterpHandleHotnessOverflow
     add r2, r2, #-1
     strh r2, [r0, #ART_METHOD_HOTNESS_COUNT_OFFSET]
-    // Otherwise, do a suspend check.
-    ldr r0, [rSELF, #THREAD_FLAGS_OFFSET]
-    tst r0, #THREAD_SUSPEND_OR_CHECKPOINT_REQUEST
-    beq 1b
-    EXPORT_PC
-    bl    art_quick_test_suspend
+    DO_SUSPEND_CHECK continue_label=1b
     b 1b
 .endm
 
@@ -455,25 +450,22 @@ END \name
     ldr r0, [sp]
     ldrh r2, [r0, #ART_METHOD_HOTNESS_COUNT_OFFSET]
     cmp r2, #NTERP_HOTNESS_VALUE
-    beq 2f
+    beq 3f
     add r2, r2, #-1
     strh r2, [r0, #ART_METHOD_HOTNESS_COUNT_OFFSET]
-    ldr r0, [rSELF, #THREAD_FLAGS_OFFSET]
-    tst r0, #THREAD_SUSPEND_OR_CHECKPOINT_REQUEST
-    bne 3f
 1:
+    DO_SUSPEND_CHECK continue_label=2f
+2:
     FETCH_INST
     GET_INST_OPCODE ip
     GOTO_OPCODE ip
-2:
+3:
+    CHECK_AND_UPDATE_SHARED_MEMORY_METHOD if_hot=4f, if_not_hot=1b
+4:
     mov r1, #0
     mov r2, rFP
     bl nterp_hot_method
-    b 1b
-3:
-    EXPORT_PC
-    bl art_quick_test_suspend
-    b 1b
+    b 2b
 .endm
 
 .macro SPILL_ALL_CALLEE_SAVES
@@ -496,6 +488,7 @@ END \name
     .cfi_adjust_cfa_offset -4
     .if \lr_to_pc
     pop {r9-r11, pc}  @ 9 words of callee saves and args.
+    .cfi_adjust_cfa_offset -16
     .else
     pop {r9-r11, lr}  @ 9 words of callee saves and args.
     .cfi_adjust_cfa_offset -16
@@ -1584,6 +1577,28 @@ END \name
     bne 1b
 .endm
 
+.macro DO_SUSPEND_CHECK continue_label
+    // Otherwise, do a suspend check.
+    ldr ip, [rSELF, #THREAD_FLAGS_OFFSET]
+    tst ip, #THREAD_SUSPEND_OR_CHECKPOINT_REQUEST
+    beq \continue_label
+    EXPORT_PC
+    bl    art_quick_test_suspend
+.endm
+
+.macro CHECK_AND_UPDATE_SHARED_MEMORY_METHOD if_hot, if_not_hot
+    ldr ip, [r0, #ART_METHOD_ACCESS_FLAGS_OFFSET]
+    tst ip, #ART_METHOD_IS_MEMORY_SHARED_FLAG
+    beq \if_hot
+    ldr ip, [rSELF, #THREAD_SHARED_METHOD_HOTNESS_OFFSET]
+    cmp ip, #0
+    beq \if_hot
+    add ip, ip, #-1
+    str ip, [rSELF, #THREAD_SHARED_METHOD_HOTNESS_OFFSET]
+    b \if_not_hot
+.endm
+
+
 %def entry():
 /*
  * ArtMethod entry point.
@@ -1770,15 +1785,18 @@ NterpHandleStringInitRange:
 
 
 NterpHandleHotnessOverflow:
+    CHECK_AND_UPDATE_SHARED_MEMORY_METHOD if_hot=1f, if_not_hot=5f
+1:
     mov r1, rPC
     mov r2, rFP
     bl nterp_hot_method
     cmp r0, #0
-    bne 1f
+    bne 3f
+2:
     FETCH_INST                          // load rINST
     GET_INST_OPCODE ip                  // extract opcode from rINST
     GOTO_OPCODE ip                      // jump to next instruction
-1:
+3:
     // Drop the current frame.
     ldr ip, [rREFS, #-4]
     mov sp, ip
@@ -1815,12 +1833,12 @@ NterpHandleHotnessOverflow:
     sub sp, sp, r1
 
     add r2, r0, #OSR_DATA_MEMORY
-2:
+4:
     sub r1, r1, #4
     ldr ip, [r2, r1]
     str ip, [sp, r1]
     cmp r1, #0
-    bne 2b
+    bne 4b
 
     // Fetch the native PC to jump to and save it in a callee-save register.
     ldr rFP, [r0, #OSR_DATA_NATIVE_PC]
@@ -1830,6 +1848,10 @@ NterpHandleHotnessOverflow:
 
     // Jump to the compiled code.
     bx rFP
+5:
+    DO_SUSPEND_CHECK continue_label=2b
+    b 2b
+
 // This is the logical end of ExecuteNterpImpl, where the frame info applies.
 // EndExecuteNterpImpl includes the methods below as we want the runtime to
 // see them as part of the Nterp PCs.
@@ -1887,7 +1909,7 @@ EndExecuteNterpImpl:
  * expected common case is a "reasonable" value that converts directly
  * to modest integer.  The EABI convert function isn't doing this for us.
  */
-nterp_d2l_doconv:
+ENTRY nterp_d2l_doconv
     ubfx    r2, r1, #20, #11            @ grab the exponent
     movw    r3, #0x43e
     cmp     r2, r3                      @ MINLONG < x > MAXLONG?
@@ -1910,6 +1932,7 @@ d2l_maybeNaN:
     mov     r0, #0
     mov     r1, #0
     bx      lr                          @ return 0 for NaN
+END nterp_d2l_doconv
 
 /*
  * Convert the float in r0 to a long in r0/r1.
@@ -1918,7 +1941,7 @@ d2l_maybeNaN:
  * expected common case is a "reasonable" value that converts directly
  * to modest integer.  The EABI convert function isn't doing this for us.
  */
-nterp_f2l_doconv:
+ENTRY nterp_f2l_doconv
     ubfx    r2, r0, #23, #8             @ grab the exponent
     cmp     r2, #0xbe                   @ MININT < x > MAXINT?
     bhs     f2l_special_cases
@@ -1939,6 +1962,7 @@ f2l_maybeNaN:
     mov     r0, #0
     mov     r1, #0
     bx      lr                          @ return 0 for NaN
+END nterp_f2l_doconv
 
 // Entrypoints into runtime.
 NTERP_TRAMPOLINE nterp_get_static_field, NterpGetStaticField
@@ -1954,7 +1978,7 @@ NTERP_TRAMPOLINE nterp_load_object, NterpLoadObject
 // within [ExecuteNterpImpl, EndExecuteNterpImpl).
 %def instruction_end():
 
-    .type artNterpAsmInstructionEnd, #object
+    .type artNterpAsmInstructionEnd, #function
     .hidden artNterpAsmInstructionEnd
     .global artNterpAsmInstructionEnd
 artNterpAsmInstructionEnd:
@@ -1965,7 +1989,7 @@ artNterpAsmInstructionEnd:
 
 %def instruction_start():
 
-    .type artNterpAsmInstructionStart, #object
+    .type artNterpAsmInstructionStart, #function
     .hidden artNterpAsmInstructionStart
     .global artNterpAsmInstructionStart
 artNterpAsmInstructionStart = .L_op_nop
@@ -1975,6 +1999,8 @@ artNterpAsmInstructionStart = .L_op_nop
 %   return "nterp_"
 %def opcode_start():
     NAME_START nterp_${opcode}
+    # Explicitly restore CFA, just in case the previous opcode clobbered it (by .cfi_def_*).
+    CFI_DEF_CFA_BREG_PLUS_UCONST CFI_REFS, -4, CALLEE_SAVES_SIZE
 %def opcode_end():
     NAME_END nterp_${opcode}
     // Advance to the end of this handler. Causes error if we are past that point.

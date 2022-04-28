@@ -154,14 +154,14 @@ inline bool ArtMethod::IsCalleeSaveMethod() {
 inline bool ArtMethod::IsResolutionMethod() {
   bool result = this == Runtime::Current()->GetResolutionMethod();
   // Check that if we do think it is phony it looks like the resolution method.
-  DCHECK(!result || IsRuntimeMethod());
+  DCHECK_IMPLIES(result, IsRuntimeMethod());
   return result;
 }
 
 inline bool ArtMethod::IsImtUnimplementedMethod() {
   bool result = this == Runtime::Current()->GetImtUnimplementedMethod();
   // Check that if we do think it is phony it looks like the imt unimplemented method.
-  DCHECK(!result || IsRuntimeMethod());
+  DCHECK_IMPLIES(result, IsRuntimeMethod());
   return result;
 }
 
@@ -357,8 +357,8 @@ inline ArtMethod* ArtMethod::GetInterfaceMethodIfProxy(PointerSize pointer_size)
   ArtMethod* interface_method = GetInterfaceMethodForProxyUnchecked(pointer_size);
   // We can check that the proxy class implements the interface only if the proxy class
   // is resolved, otherwise the interface table is not yet initialized.
-  DCHECK(!GetDeclaringClass()->IsResolved() ||
-         interface_method->GetDeclaringClass()->IsAssignableFrom(GetDeclaringClass()));
+  DCHECK_IMPLIES(GetDeclaringClass()->IsResolved(),
+                 interface_method->GetDeclaringClass()->IsAssignableFrom(GetDeclaringClass()));
   return interface_method;
 }
 
@@ -441,6 +441,9 @@ inline void ArtMethod::ResetCounter(uint16_t new_value) {
   if (IsAbstract()) {
     return;
   }
+  if (IsMemorySharedMethod()) {
+    return;
+  }
   DCHECK_EQ(new_value, Runtime::Current()->GetJITOptions()->GetWarmupThreshold());
   // Avoid dirtying the value if possible.
   if (hotness_count_ != new_value) {
@@ -460,6 +463,9 @@ inline void ArtMethod::UpdateCounter(int32_t new_samples) {
   DCHECK(!IsAbstract());
   DCHECK_GT(new_samples, 0);
   DCHECK_LE(new_samples, std::numeric_limits<uint16_t>::max());
+  if (IsMemorySharedMethod()) {
+    return;
+  }
   uint16_t old_hotness_count = hotness_count_;
   uint16_t new_count = (old_hotness_count <= new_samples) ? 0u : old_hotness_count - new_samples;
   // Avoid dirtying the value if possible.

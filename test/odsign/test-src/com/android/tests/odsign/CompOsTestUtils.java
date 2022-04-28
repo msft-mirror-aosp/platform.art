@@ -24,16 +24,19 @@ import static org.junit.Assume.assumeTrue;
 
 import com.android.tradefed.device.DeviceNotAvailableException;
 import com.android.tradefed.device.ITestDevice;
+import com.android.tradefed.device.TestDevice;
 import com.android.tradefed.util.CommandResult;
 
 import java.util.concurrent.TimeUnit;
 
 public class CompOsTestUtils {
+    public static final String APEXDATA_DIR = "/data/misc/apexdata/com.android.compos";
+
     public static final String PENDING_ARTIFACTS_DIR =
             "/data/misc/apexdata/com.android.art/compos-pending";
 
-    /** odrefresh is currently hard-coded to fail if it does not complete in 300 seconds. */
-    private static final int ODREFRESH_MAX_SECONDS = 300;
+    /** Maximum time for a slow VM like cuttlefish to boot and finish odrefresh. */
+    private static final int VM_ODREFRESH_MAX_SECONDS = 360;
 
     /** Waiting time for the job to be scheduled after staging an APEX */
     private static final int JOB_CREATION_MAX_SECONDS = 5;
@@ -64,11 +67,7 @@ public class CompOsTestUtils {
         // It takes time. Just don't spam.
         TimeUnit.SECONDS.sleep(SECONDS_BEFORE_PROGRESS_CHECK);
         // The job runs asynchronously. To wait until it completes.
-        waitForJobExit(ODREFRESH_MAX_SECONDS - SECONDS_BEFORE_PROGRESS_CHECK);
-
-        // Checks the output validity, then store the hashes of pending files.
-        assertThat(mDevice.getChildren(PENDING_ARTIFACTS_DIR)).asList().containsAtLeast(
-                "cache-info.xml", "compos.info", "compos.info.signature");
+        waitForJobExit(VM_ODREFRESH_MAX_SECONDS - SECONDS_BEFORE_PROGRESS_CHECK);
     }
 
     public String checksumDirectoryContentPartial(String path) throws Exception {
@@ -120,7 +119,9 @@ public class CompOsTestUtils {
 
     public void assumeCompOsPresent() throws Exception {
         // We have to have kernel support for a VM.
-        assumeTrue(mDevice.doesFileExist("/dev/kvm"));
+        assumeTrue("Need an actual TestDevice", mDevice instanceof TestDevice);
+        TestDevice testDevice = (TestDevice) mDevice;
+        assumeTrue("Requires VM support", testDevice.supportsMicrodroid());
 
         // And the CompOS APEX must be present.
         assumeTrue(mDevice.doesFileExist("/apex/com.android.compos/"));

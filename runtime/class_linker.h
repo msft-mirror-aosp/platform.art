@@ -787,7 +787,7 @@ class ClassLinker {
   // Registers the native method and returns the new entry point. NB The returned entry point
   // might be different from the native_method argument if some MethodCallback modifies it.
   const void* RegisterNative(Thread* self, ArtMethod* method, const void* native_method)
-      REQUIRES_SHARED(Locks::mutator_lock_) WARN_UNUSED;
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Unregister native code for a method.
   void UnregisterNative(Thread* self, ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_);
@@ -975,7 +975,7 @@ class ClassLinker {
 
   void LoadMethod(const DexFile& dex_file,
                   const ClassAccessor::Method& method,
-                  Handle<mirror::Class> klass,
+                  ObjPtr<mirror::Class> klass,
                   ArtMethod* dst)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -1237,12 +1237,6 @@ class ClassLinker {
       REQUIRES(!Locks::dex_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  // Allocate method arrays for interfaces.
-  bool AllocateIfTableMethodArrays(Thread* self,
-                                   Handle<mirror::Class> klass,
-                                   Handle<mirror::IfTable> iftable)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-
   // Sets imt_ref appropriately for LinkInterfaceMethods.
   // If there is no method in the imt location of imt_ref it will store the given method there.
   // Otherwise it will set the conflict method which will figure out which method to use during
@@ -1261,12 +1255,6 @@ class ClassLinker {
                           bool ignore_copied_methods,
                           /*out*/bool* new_conflict,
                           /*out*/ArtMethod** imt) REQUIRES_SHARED(Locks::mutator_lock_);
-
-  void FillImtFromSuperClass(Handle<mirror::Class> klass,
-                             ArtMethod* unimplemented_method,
-                             ArtMethod* imt_conflict_method,
-                             bool* new_conflict,
-                             ArtMethod** imt) REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Check invoke type against the referenced class. Throws IncompatibleClassChangeError
   // (if `kThrowOnError`) and returns true on mismatch (kInterface on a non-interface class,

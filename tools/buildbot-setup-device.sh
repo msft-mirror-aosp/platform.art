@@ -52,10 +52,14 @@ msginfo "Killing llkd, seen killing adb"
 adb shell setprop ctl.stop llkd-0
 adb shell setprop ctl.stop llkd-1
 
-# Kill logd first, so that when we set the adb buffer size later in this file,
-# it is brought up again.
-msginfo "Killing logd, seen leaking on fugu/N"
-adb shell pkill -9 -U logd logd && msginfo "...logd killed"
+product_name=$(adb shell getprop ro.build.product)
+
+if [ "x$product_name" = xfugu ]; then
+  # Kill logd first, so that when we set the adb buffer size later in this file,
+  # it is brought up again.
+  msginfo "Killing logd, seen leaking on fugu/N"
+  adb shell pkill -9 -U logd logd && msginfo "...logd killed"
+fi
 
 # Update date on device if the difference with host is more than one hour.
 if [ $abs_time_difference_in_seconds -gt $seconds_per_hour ]; then
@@ -83,8 +87,6 @@ if $verbose; then
 fi
 
 # Fugu only handles buffer size up to 16MB.
-product_name=$(adb shell getprop ro.build.product)
-
 if [ "x$product_name" = xfugu ]; then
   buffer_size=16MB
 else
@@ -169,6 +171,8 @@ if [[ -n "$ART_TEST_CHROOT" ]]; then
   adb shell mkdir -p "$ART_TEST_CHROOT/dev"
   adb shell mount | grep -q "^tmpfs on $ART_TEST_CHROOT/dev type tmpfs " \
     || adb shell mount -o bind /dev "$ART_TEST_CHROOT/dev"
+  adb shell mount | grep -q "^devpts on $ART_TEST_CHROOT/dev/pts type devpts " \
+    || adb shell mount -o bind /dev/pts "$ART_TEST_CHROOT/dev/pts"
 
   # Create /apex directory in chroot.
   adb shell mkdir -p "$ART_TEST_CHROOT/apex"

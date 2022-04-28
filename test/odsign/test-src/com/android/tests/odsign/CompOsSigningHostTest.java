@@ -16,11 +16,15 @@
 
 package com.android.tests.odsign;
 
+import static com.android.tests.odsign.CompOsTestUtils.PENDING_ARTIFACTS_DIR;
+import static com.android.tradefed.testtype.DeviceJUnit4ClassRunner.TestLogData;
+
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.Truth.assertWithMessage;
 
 import static org.junit.Assume.assumeTrue;
 
+import com.android.tests.odsign.annotation.CtsTestCase;
 import com.android.tradefed.device.DeviceNotAvailableException;
 import com.android.tradefed.device.ITestDevice;
 import com.android.tradefed.invoker.TestInformation;
@@ -28,6 +32,7 @@ import com.android.tradefed.testtype.DeviceJUnit4ClassRunner;
 import com.android.tradefed.testtype.junit4.AfterClassWithInfo;
 import com.android.tradefed.testtype.junit4.BeforeClassWithInfo;
 
+import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
@@ -46,6 +51,8 @@ public class CompOsSigningHostTest extends ActivationTest {
     private static final String PENDING_CHECKSUMS_KEY = "compos_test_pending_checksums";
     private static final String TIMESTAMP_VM_START_KEY = "compos_test_timestamp_vm_start";
     private static final String TIMESTAMP_REBOOT_KEY = "compos_test_timestamp_reboot";
+
+    @Rule public TestLogData mTestLogs = new TestLogData();
 
     @BeforeClassWithInfo
     public static void beforeClassWithDevice(TestInformation testInfo) throws Exception {
@@ -67,8 +74,7 @@ public class CompOsSigningHostTest extends ActivationTest {
         compOsTestUtils.runCompilationJobEarlyAndWait();
 
         testInfo.properties().put(PENDING_CHECKSUMS_KEY,
-                compOsTestUtils.checksumDirectoryContentPartial(
-                        CompOsTestUtils.PENDING_ARTIFACTS_DIR));
+                compOsTestUtils.checksumDirectoryContentPartial(PENDING_ARTIFACTS_DIR));
 
         testInfo.properties().put(TIMESTAMP_REBOOT_KEY,
                         String.valueOf(testUtils.getCurrentTimeMs()));
@@ -80,10 +86,25 @@ public class CompOsSigningHostTest extends ActivationTest {
         OdsignTestUtils testUtils = new OdsignTestUtils(testInfo);
         testUtils.uninstallTestApex();
         testUtils.reboot();
-        testUtils.restoreAdbRoot();
     }
 
     @Test
+    public void vmLogCollector() throws Exception {
+        // This is not a test. The purpose is to collect VM's log, which is generated once per
+        // class. It's implemented as a test methond because TestLogData doesn't seem to work in a
+        // class method.
+
+        // The log files are currently only available through a rooted shell.
+        OdsignTestUtils testUtils = new OdsignTestUtils(getTestInformation());
+
+        testUtils.archiveLogThenDelete(mTestLogs, CompOsTestUtils.APEXDATA_DIR + "/vm.log",
+                        "vm.log-CompOsSigningHostTest");
+        testUtils.archiveLogThenDelete(mTestLogs, CompOsTestUtils.APEXDATA_DIR + "/vm_console.log",
+                        "vm_console.log-CompOsSigningHostTest");
+    }
+
+    @Test
+    @CtsTestCase
     public void checkFileChecksums() throws Exception {
         CompOsTestUtils compOsTestUtils = new CompOsTestUtils(getDevice());
         String actualChecksums = compOsTestUtils.checksumDirectoryContentPartial(
@@ -98,6 +119,7 @@ public class CompOsSigningHostTest extends ActivationTest {
     }
 
     @Test
+    @CtsTestCase
     public void checkFileCreationTimeAfterVmStartAndBeforeReboot() throws Exception {
         OdsignTestUtils testUtils = new OdsignTestUtils(getTestInformation());
 

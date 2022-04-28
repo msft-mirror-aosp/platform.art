@@ -16,9 +16,10 @@
 
 package com.android.tests.odsign;
 
-import static com.google.common.truth.Truth.assertThat;
+import static com.android.tests.odsign.CompOsTestUtils.PENDING_ARTIFACTS_DIR;
+import static com.android.tradefed.testtype.DeviceJUnit4ClassRunner.TestLogData;
 
-import static org.junit.Assume.assumeTrue;
+import static com.google.common.truth.Truth.assertThat;
 
 import com.android.tradefed.device.DeviceNotAvailableException;
 import com.android.tradefed.device.ITestDevice;
@@ -29,6 +30,7 @@ import com.android.tradefed.testtype.junit4.BaseHostJUnit4Test;
 import com.android.tradefed.testtype.junit4.BeforeClassWithInfo;
 
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
@@ -46,6 +48,8 @@ public class CompOsDenialHostTest extends BaseHostJUnit4Test {
     private OdsignTestUtils mTestUtils;
     private String mFirstArch;
 
+    @Rule public TestLogData mTestLogs = new TestLogData();
+
     @BeforeClassWithInfo
     public static void beforeClassWithDevice(TestInformation testInfo) throws Exception {
         ITestDevice device = testInfo.getDevice();
@@ -53,7 +57,6 @@ public class CompOsDenialHostTest extends BaseHostJUnit4Test {
         CompOsTestUtils compOsTestUtils = new CompOsTestUtils(device);
 
         compOsTestUtils.assumeCompOsPresent();
-        testUtils.enableAdbRootOrSkipTest();
 
         testUtils.installTestApex();
 
@@ -63,7 +66,7 @@ public class CompOsDenialHostTest extends BaseHostJUnit4Test {
         testInfo.properties().put(TIMESTAMP_COMPOS_COMPILED_KEY,
                 String.valueOf(testUtils.getCurrentTimeMs()));
         testUtils.assertCommandSucceeds(
-                "mv " + CompOsTestUtils.PENDING_ARTIFACTS_DIR + " " + PENDING_ARTIFACTS_BACKUP_DIR);
+                "mv " + PENDING_ARTIFACTS_DIR + " " + PENDING_ARTIFACTS_BACKUP_DIR);
     }
 
     @AfterClassWithInfo
@@ -71,15 +74,13 @@ public class CompOsDenialHostTest extends BaseHostJUnit4Test {
         OdsignTestUtils testUtils = new OdsignTestUtils(testInfo);
 
         // Remove all test states.
-        testInfo.getDevice().executeShellV2Command("rm -rf " +
-                CompOsTestUtils.PENDING_ARTIFACTS_DIR);
+        testInfo.getDevice().executeShellV2Command("rm -rf " + PENDING_ARTIFACTS_DIR);
         testInfo.getDevice().executeShellV2Command("rm -rf " + PENDING_ARTIFACTS_BACKUP_DIR);
         testUtils.removeCompilationLogToAvoidBackoff();
         testUtils.uninstallTestApex();
 
         // Reboot should restore the device back to a good state.
         testUtils.reboot();
-        testUtils.restoreAdbRoot();
     }
 
     @Before
@@ -89,9 +90,21 @@ public class CompOsDenialHostTest extends BaseHostJUnit4Test {
         mFirstArch = mTestUtils.assertCommandSucceeds("getprop ro.bionic.arch");
 
         // Restore the pending artifacts for each test to mess up with.
-        mTestUtils.assertCommandSucceeds("rm -rf " + CompOsTestUtils.PENDING_ARTIFACTS_DIR);
+        mTestUtils.assertCommandSucceeds("rm -rf " + PENDING_ARTIFACTS_DIR);
         mTestUtils.assertCommandSucceeds("cp -rp " + PENDING_ARTIFACTS_BACKUP_DIR + " " +
-                CompOsTestUtils.PENDING_ARTIFACTS_DIR);
+                PENDING_ARTIFACTS_DIR);
+    }
+
+    @Test
+    public void vmLogCollector() throws Exception {
+        // This is not a test. The purpose is to collect VM's log, which is generated once per
+        // class, in beforeClassWithDevice before any tests run. It's implemented as a test methond
+        // because TestLogData doesn't seem to work in a class method.
+        OdsignTestUtils testUtils = new OdsignTestUtils(getTestInformation());
+        testUtils.archiveLogThenDelete(mTestLogs, CompOsTestUtils.APEXDATA_DIR + "/vm.log",
+                "vm.log-CompOsDenialHostTest");
+        testUtils.archiveLogThenDelete(mTestLogs, CompOsTestUtils.APEXDATA_DIR + "/vm_console.log",
+                "vm_console.log-CompOsDenialHostTest");
     }
 
     @Test
@@ -101,7 +114,7 @@ public class CompOsDenialHostTest extends BaseHostJUnit4Test {
         assertThat(paths.length).isGreaterThan(1);
         String odex1 = paths[0];
         String odex2 = paths[1];
-        String temp = CompOsTestUtils.PENDING_ARTIFACTS_DIR + "/temp";
+        String temp = PENDING_ARTIFACTS_DIR + "/temp";
         mTestUtils.assertCommandSucceeds(
                 "mv " + odex1 + " " + temp + " && " +
                 "mv " + odex2 + " " + odex1 + " && " +
@@ -124,6 +137,22 @@ public class CompOsDenialHostTest extends BaseHostJUnit4Test {
         expectNoCurrentFilesFromCompOs();
     }
 
+    @Test
+    public void denyDueToSignatureMismatch() throws Exception {
+        // Attack emulation: tamper with the compos.info file or its signature (which could allow
+        // a modified artifact to be accepted).
+
+        // The signature file will always be 64 bytes, just overwrite with randomness.
+        // (Which has ~ 1 in 2^250 chance of being a valid signature at all.)
+        mTestUtils.assertCommandSucceeds("dd if=/dev/urandom"
+                + " of=" + PENDING_ARTIFACTS_DIR + "/compos.info.signature"
+                + " ibs=64 count=1");
+
+        // Expect the pending artifacts to be denied by odsign during the reboot.
+        mTestUtils.reboot();
+        expectNoCurrentFilesFromCompOs();
+    }
+
     private void expectNoCurrentFilesFromCompOs() throws DeviceNotAvailableException {
         // None of the files should have a timestamp earlier than the first reboot.
         long timestamp = Long.parseLong(getTestInformation().properties().get(
@@ -134,11 +163,11 @@ public class CompOsDenialHostTest extends BaseHostJUnit4Test {
         assertThat(numFiles).isEqualTo(0);
 
         // odsign should have deleted the pending directory.
-        assertThat(getDevice().isDirectory(CompOsTestUtils.PENDING_ARTIFACTS_DIR)).isFalse();
+        assertThat(getDevice().isDirectory(PENDING_ARTIFACTS_DIR)).isFalse();
     }
 
     private String[] getAllPendingOdexPaths() throws DeviceNotAvailableException {
-        String dir = CompOsTestUtils.PENDING_ARTIFACTS_DIR + "/" + mFirstArch;
+        String dir = PENDING_ARTIFACTS_DIR + "/" + mFirstArch;
         return Stream.of(getDevice().getChildren(dir))
                 .filter(name -> name.endsWith(".odex"))
                 .map(name -> dir + "/" + name)

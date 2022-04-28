@@ -309,6 +309,13 @@ class Instrumentation {
   // Return the code that we can execute for an invoke including from the JIT.
   const void* GetCodeForInvoke(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_);
 
+  // Return the code that we can execute considering the current instrumentation level.
+  // If interpreter stubs are installed return interpreter bridge. If the entry exit stubs
+  // are installed return an instrumentation entry point. Otherwise, return the code that
+  // can be executed including from the JIT.
+  const void* GetMaybeInstrumentedCodeForInvoke(ArtMethod* method)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
   void ForceInterpretOnly() {
     forced_interpret_only_ = true;
   }
@@ -578,6 +585,10 @@ class Instrumentation {
                !Locks::thread_list_lock_,
                !Locks::classlinker_classes_lock_);
 
+  // If there are no pending deoptimizations restores the stack to the normal state by updating the
+  // return pcs to actual return addresses from the instrumentation stack and clears the
+  // instrumentation stack.
+  void MaybeRestoreInstrumentationStack() REQUIRES(Locks::mutator_lock_);
 
   // No thread safety analysis to get around SetQuickAllocEntryPointsInstrumented requiring
   // exclusive access to mutator lock which you can't get if the runtime isn't started.
@@ -742,13 +753,11 @@ struct InstrumentationStackFrame {
   InstrumentationStackFrame(mirror::Object* this_object,
                             ArtMethod* method,
                             uintptr_t return_pc,
-                            size_t frame_id,
                             bool interpreter_entry,
                             uint64_t force_deopt_id)
       : this_object_(this_object),
         method_(method),
         return_pc_(return_pc),
-        frame_id_(frame_id),
         interpreter_entry_(interpreter_entry),
         force_deopt_id_(force_deopt_id) {
   }
@@ -758,7 +767,6 @@ struct InstrumentationStackFrame {
   mirror::Object* this_object_;
   ArtMethod* method_;
   uintptr_t return_pc_;
-  size_t frame_id_;
   bool interpreter_entry_;
   uint64_t force_deopt_id_;
 };

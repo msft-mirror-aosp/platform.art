@@ -140,7 +140,8 @@ bool HInliner::Run() {
     return false;
   }
 
-  bool didInline = false;
+  bool did_inline = false;
+  bool did_set_always_throws = false;
 
   // Initialize the number of instructions for the method being compiled. Recursive calls
   // to HInliner::Run have already updated the instruction count.
@@ -181,8 +182,8 @@ bool HInliner::Run() {
               call->GetMethodReference().PrettyMethod(/* with_signature= */ false);
           // Tests prevent inlining by having $noinline$ in their method names.
           if (callee_name.find("$noinline$") == std::string::npos) {
-            if (TryInline(call)) {
-              didInline = true;
+            if (TryInline(call, &did_set_always_throws)) {
+              did_inline = true;
             } else if (honor_inline_directives) {
               bool should_have_inlined = (callee_name.find("$inline$") != std::string::npos);
               CHECK(!should_have_inlined) << "Could not inline " << callee_name;
@@ -191,8 +192,8 @@ bool HInliner::Run() {
         } else {
           DCHECK(!honor_inline_directives);
           // Normal case: try to inline.
-          if (TryInline(call)) {
-            didInline = true;
+          if (TryInline(call, &did_set_always_throws)) {
+            did_inline = true;
           }
         }
       }
@@ -200,7 +201,7 @@ bool HInliner::Run() {
     }
   }
 
-  return didInline;
+  return did_inline || did_set_always_throws;
 }
 
 static bool IsMethodOrDeclaringClassFinal(ArtMethod* method)
@@ -435,7 +436,7 @@ static bool AlwaysThrows(ArtMethod* method)
   return throw_seen;
 }
 
-bool HInliner::TryInline(HInvoke* invoke_instruction) {
+bool HInliner::TryInline(HInvoke* invoke_instruction, /*inout*/ bool* did_set_always_throws) {
   MaybeRecordStat(stats_, MethodCompilationStat::kTryInline);
 
   // Don't bother to move further if we know the method is unresolved or the invocation is
@@ -490,6 +491,7 @@ bool HInliner::TryInline(HInvoke* invoke_instruction) {
       // target.
       if (AlwaysThrows(actual_method)) {
         invoke_to_analyze->SetAlwaysThrows(true);
+        *did_set_always_throws = true;
       }
     }
     return result;
@@ -958,7 +960,14 @@ bool HInliner::TryInlinePolymorphicCall(
     dex::TypeIndex class_index = FindClassIndexIn(handle.Get(), caller_compilation_unit_);
     HInstruction* return_replacement = nullptr;
 
+    // In monomorphic cases when UseOnlyPolymorphicInliningWithNoDeopt() is true, we call
+    // `TryInlinePolymorphicCall` even though we are monomorphic.
+    const bool actually_monomorphic = number_of_types == 1;
+    DCHECK_IMPLIES(actually_monomorphic, UseOnlyPolymorphicInliningWithNoDeopt());
+
+    // We only want to limit recursive polymorphic cases, not monomorphic ones.
     const bool too_many_polymorphic_recursive_calls =
+        !actually_monomorphic &&
         CountRecursiveCallsOf(method) > kMaximumNumberOfPolymorphicRecursiveCalls;
     if (too_many_polymorphic_recursive_calls) {
       LOG_FAIL(stats_, MethodCompilationStat::kNotInlinedPolymorphicRecursiveBudget)
@@ -1544,14 +1553,19 @@ bool HInliner::TryPatternSubstitution(HInvoke* invoke_instruction,
       *return_replacement = GetInvokeInputForArgVRegIndex(invoke_instruction,
                                                           inline_method.d.return_data.arg);
       break;
-    case kInlineOpNonWideConst:
-      if (method->GetShorty()[0] == 'L') {
+    case kInlineOpNonWideConst: {
+      char shorty0 = method->GetShorty()[0];
+      if (shorty0 == 'L') {
         DCHECK_EQ(inline_method.d.data, 0u);
         *return_replacement = graph_->GetNullConstant();
+      } else if (shorty0 == 'F') {
+        *return_replacement = graph_->GetFloatConstant(
+            bit_cast<float, int32_t>(static_cast<int32_t>(inline_method.d.data)));
       } else {
         *return_replacement = graph_->GetIntConstant(static_cast<int32_t>(inline_method.d.data));
       }
       break;
+    }
     case kInlineOpIGet: {
       const InlineIGetIPutData& data = inline_method.d.ifield_data;
       if (data.method_is_static || data.object_arg != 0u) {
@@ -1732,12 +1746,11 @@ static bool CanEncodeInlinedMethodInStackMap(const DexFile& outer_dex_file,
 
   // Inline across dexfiles if the callee's DexFile is:
   // 1) in the bootclasspath, or
-  if (callee->GetDeclaringClass()->GetClassLoader() == nullptr) {
-    // There are cases in which the BCP DexFiles are within the OatFile as far as the compiler
-    // options are concerned, but they have their own OatWriter (and therefore not in the same
-    // OatFile). Then, we request the BSS check for all BCP DexFiles.
-    // TODO(solanes): Add .bss support for BCP.
-    *out_needs_bss_check = true;
+  if (callee->GetDeclaringClass()->IsBootStrapClassLoaded()) {
+    // In multi-image, each BCP DexFile has their own OatWriter. Since they don't cooperate with
+    // each other, we request the BSS check for them.
+    // TODO(solanes, 154012332): Add .bss support for BCP multi-image.
+    *out_needs_bss_check = codegen->GetCompilerOptions().IsMultiImage();
     return true;
   }
 
@@ -1926,13 +1939,14 @@ bool HInliner::CanInlineBody(const HGraph* callee_graph,
         return false;
       }
 
-      // We currently don't have support for inlining across dex files if the inlined method needs a
-      // .bss entry. This only happens when we are:
+      // We currently don't have support for inlining across dex files if we are:
       // 1) In AoT,
-      // 2) cross-dex inlining, and
-      // 3) have an instruction that needs a bss entry, which will always be
-      // 3)b) an instruction that needs an environment.
-      // TODO(solanes, 154012332): Add this support.
+      // 2) cross-dex inlining,
+      // 3) the callee is a BCP DexFile,
+      // 4) we are compiling multi image, and
+      // 5) have an instruction that needs a bss entry, which will always be
+      // 5)b) an instruction that needs an environment.
+      // 1) - 4) are encoded in `needs_bss_check` (see CanEncodeInlinedMethodInStackMap).
       if (needs_bss_check && current->NeedsBss()) {
         DCHECK(current->NeedsEnvironment());
         LOG_FAIL(stats_, MethodCompilationStat::kNotInlinedBss)

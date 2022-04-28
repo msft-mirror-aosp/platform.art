@@ -397,7 +397,7 @@ bool Jit::CanInvokeCompiledCode(ArtMethod* method) {
 }
 
 Jit::~Jit() {
-  DCHECK(!options_->GetSaveProfilingInfo() || !ProfileSaver::IsStarted());
+  DCHECK_IMPLIES(options_->GetSaveProfilingInfo(), !ProfileSaver::IsStarted());
   if (options_->DumpJitInfoOnShutdown()) {
     DumpInfo(LOG_STREAM(INFO));
     Runtime::Current()->DumpDeoptimizations(LOG_STREAM(INFO));
@@ -836,18 +836,26 @@ class JitDoneCompilingProfileTask final : public SelfDeletingTask {
         }
       }
     }
-
-    if (Runtime::Current()->IsZygote()) {
-      // Record that we are done compiling the profile.
-      Runtime::Current()->GetJit()->GetCodeCache()->GetZygoteMap()->SetCompilationState(
-          ZygoteCompilationState::kDone);
-    }
   }
 
  private:
   std::vector<const DexFile*> dex_files_;
 
   DISALLOW_COPY_AND_ASSIGN(JitDoneCompilingProfileTask);
+};
+
+class JitZygoteDoneCompilingTask final : public SelfDeletingTask {
+ public:
+  JitZygoteDoneCompilingTask() {}
+
+  void Run(Thread* self ATTRIBUTE_UNUSED) override {
+    DCHECK(Runtime::Current()->IsZygote());
+    Runtime::Current()->GetJit()->GetCodeCache()->GetZygoteMap()->SetCompilationState(
+        ZygoteCompilationState::kDone);
+  }
+
+ private:
+  DISALLOW_COPY_AND_ASSIGN(JitZygoteDoneCompilingTask);
 };
 
 /**
@@ -942,6 +950,8 @@ class ZygoteTask final : public Task {
             self, boot_class_path, profile_file, null_handle, /* add_to_queue= */ true);
       }
     }
+    DCHECK(runtime->GetJit()->InZygoteUsingJit());
+    runtime->GetJit()->AddPostBootTask(self, new JitZygoteDoneCompilingTask());
 
     JitCodeCache* code_cache = runtime->GetJit()->GetCodeCache();
     code_cache->GetZygoteMap()->Initialize(added_to_queue);
@@ -1146,20 +1156,9 @@ void Jit::MapBootImageMethods() {
   LOG(INFO) << "Successfully mapped boot image methods";
 }
 
-// Return whether a boot image has a profile. This means we'll need to pre-JIT
-// methods in that profile for performance.
-static bool HasImageWithProfile() {
-  for (gc::space::ImageSpace* space : Runtime::Current()->GetHeap()->GetBootImageSpaces()) {
-    if (!space->GetProfileFiles().empty()) {
-      return true;
-    }
-  }
-  return false;
-}
-
 bool Jit::InZygoteUsingJit() {
   Runtime* runtime = Runtime::Current();
-  return runtime->IsZygote() && HasImageWithProfile() && runtime->UseJitCompilation();
+  return runtime->IsZygote() && runtime->HasImageWithProfile() && runtime->UseJitCompilation();
 }
 
 void Jit::CreateThreadPool() {
@@ -1280,7 +1279,7 @@ void Jit::RegisterDexFiles(const std::vector<std::unique_ptr<const DexFile>>& de
   if (runtime->IsSystemServer() &&
       UseJitCompilation() &&
       options_->UseProfiledJitCompilation() &&
-      HasImageWithProfile() &&
+      runtime->HasImageWithProfile() &&
       !runtime->IsJavaDebuggable()) {
     thread_pool_->AddTask(Thread::Current(), new JitProfileTask(dex_files, class_loader));
   }
@@ -1322,14 +1321,10 @@ bool Jit::CompileMethodFromProfile(Thread* self,
       Task* task = new JitCompileTask(
           method, JitCompileTask::TaskKind::kPreCompile, CompilationKind::kOptimized);
       if (compile_after_boot) {
-        MutexLock mu(Thread::Current(), boot_completed_lock_);
-        if (!boot_completed_) {
-          tasks_after_boot_.push_back(task);
-          return true;
-        }
-        DCHECK(tasks_after_boot_.empty());
+        AddPostBootTask(self, task);
+      } else {
+        thread_pool_->AddTask(self, task);
       }
-      thread_pool_->AddTask(self, task);
       return true;
     }
   }
@@ -1438,14 +1433,7 @@ uint32_t Jit::CompileMethodsFromProfile(
   }
 
   // Add a task to run when all compilation is done.
-  JitDoneCompilingProfileTask* task = new JitDoneCompilingProfileTask(dex_files);
-  MutexLock mu(Thread::Current(), boot_completed_lock_);
-  if (!boot_completed_) {
-    tasks_after_boot_.push_back(task);
-  } else {
-    DCHECK(tasks_after_boot_.empty());
-    thread_pool_->AddTask(self, task);
-  }
+  AddPostBootTask(self, new JitDoneCompilingProfileTask(dex_files));
   return added_to_queue;
 }
 
@@ -1625,11 +1613,12 @@ void Jit::PostForkChildAction(bool is_system_server, bool is_zygote) {
   // JitAtFirstUse compiles the methods synchronously on mutator threads. While this should work
   // in theory it is causing deadlocks in some jvmti tests related to Jit GC. Hence, disabling
   // Jit GC for now (b/147208992).
-  code_cache_->SetGarbageCollectCode(!jit_compiler_->GenerateDebugInfo() &&
-      !Runtime::Current()->GetInstrumentation()->AreExitStubsInstalled() &&
+  code_cache_->SetGarbageCollectCode(
+      !jit_compiler_->GenerateDebugInfo() &&
+      !runtime->GetInstrumentation()->AreExitStubsInstalled() &&
       !JitAtFirstUse());
 
-  if (is_system_server && HasImageWithProfile()) {
+  if (is_system_server && runtime->HasImageWithProfile()) {
     // Disable garbage collection: we don't want it to delete methods we're compiling
     // through boot and system server profiles.
     // TODO(ngeoffray): Fix this so we still collect deoptimized and unused code.
@@ -1678,6 +1667,15 @@ void Jit::PostZygoteFork() {
           : options_->GetThreadPoolPthreadPriority());
 }
 
+void Jit::AddPostBootTask(Thread* self, Task* task) {
+  MutexLock mu(self, boot_completed_lock_);
+  if (boot_completed_) {
+    thread_pool_->AddTask(self, task);
+  } else {
+    tasks_after_boot_.push_back(task);
+  }
+}
+
 void Jit::BootCompleted() {
   Thread* self = Thread::Current();
   std::deque<Task*> tasks;
@@ -1720,7 +1718,7 @@ bool Jit::CanAssumeInitialized(ObjPtr<mirror::Class> cls, bool is_for_shared_reg
   }
 }
 
-void Jit::EnqueueCompilation(ArtMethod* method, Thread* self) {
+void Jit::MaybeEnqueueCompilation(ArtMethod* method, Thread* self) {
   if (thread_pool_ == nullptr) {
     return;
   }
@@ -1731,6 +1729,10 @@ void Jit::EnqueueCompilation(ArtMethod* method, Thread* self) {
   }
 
   if (!UseJitCompilation()) {
+    return;
+  }
+
+  if (IgnoreSamplesForMethod(method)) {
     return;
   }
 
@@ -1757,8 +1759,20 @@ void Jit::EnqueueCompilation(ArtMethod* method, Thread* self) {
     return;
   }
 
-  if (IgnoreSamplesForMethod(method)) {
-    return;
+  static constexpr size_t kIndividualSharedMethodHotnessThreshold = 0xff;
+  if (method->IsMemorySharedMethod()) {
+    MutexLock mu(self, lock_);
+    auto it = shared_method_counters_.find(method);
+    if (it == shared_method_counters_.end()) {
+      shared_method_counters_[method] = kIndividualSharedMethodHotnessThreshold;
+      return;
+    } else if (it->second != 0) {
+      DCHECK_LE(it->second, kIndividualSharedMethodHotnessThreshold);
+      shared_method_counters_[method] = it->second - 1;
+      return;
+    } else {
+      shared_method_counters_[method] = kIndividualSharedMethodHotnessThreshold;
+    }
   }
 
   if (!method->IsNative() && GetCodeCache()->CanAllocateProfilingInfo()) {

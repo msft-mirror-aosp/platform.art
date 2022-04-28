@@ -77,6 +77,7 @@
 #include "dex/dex_file_loader.h"
 #include "elf_file.h"
 #include "entrypoints/runtime_asm_entrypoints.h"
+#include "entrypoints/entrypoint_utils-inl.h"
 #include "experimental_flags.h"
 #include "fault_handler.h"
 #include "gc/accounting/card_table-inl.h"
@@ -130,6 +131,7 @@
 #include "native/java_lang_Thread.h"
 #include "native/java_lang_Throwable.h"
 #include "native/java_lang_VMClassLoader.h"
+#include "native/java_lang_invoke_MethodHandle.h"
 #include "native/java_lang_invoke_MethodHandleImpl.h"
 #include "native/java_lang_ref_FinalizerReference.h"
 #include "native/java_lang_ref_Reference.h"
@@ -141,6 +143,7 @@
 #include "native/java_lang_reflect_Parameter.h"
 #include "native/java_lang_reflect_Proxy.h"
 #include "native/java_util_concurrent_atomic_AtomicLong.h"
+#include "native/libcore_io_Memory.h"
 #include "native/libcore_util_CharsetUtils.h"
 #include "native/org_apache_harmony_dalvik_ddmc_DdmServer.h"
 #include "native/org_apache_harmony_dalvik_ddmc_DdmVmInternal.h"
@@ -694,9 +697,54 @@ void Runtime::Abort(const char* msg) {
   // notreached
 }
 
+class FindNativeMethodsVisitor : public ClassVisitor {
+ public:
+  FindNativeMethodsVisitor(Thread* self, ClassLinker* class_linker)
+      : vm_(down_cast<JNIEnvExt*>(self->GetJniEnv())->GetVm()),
+        self_(self),
+        class_linker_(class_linker) {}
+
+  bool operator()(ObjPtr<mirror::Class> klass) override REQUIRES_SHARED(Locks::mutator_lock_) {
+    bool is_initialized = klass->IsVisiblyInitialized();
+    for (ArtMethod& method : klass->GetDeclaredMethods(kRuntimePointerSize)) {
+      if (method.IsNative() && (is_initialized || !NeedsClinitCheckBeforeCall(&method))) {
+        const void* existing = method.GetEntryPointFromJni();
+        if (method.IsCriticalNative()
+                ? class_linker_->IsJniDlsymLookupCriticalStub(existing)
+                : class_linker_->IsJniDlsymLookupStub(existing)) {
+          const void* native_code =
+              vm_->FindCodeForNativeMethod(&method, /*error_msg=*/ nullptr, /*can_suspend=*/ false);
+          if (native_code != nullptr) {
+            class_linker_->RegisterNative(self_, &method, native_code);
+          }
+        }
+      }
+    }
+    return true;
+  }
+
+ private:
+  JavaVMExt* vm_;
+  Thread* self_;
+  ClassLinker* class_linker_;
+
+  DISALLOW_COPY_AND_ASSIGN(FindNativeMethodsVisitor);
+};
+
 void Runtime::PreZygoteFork() {
   if (GetJit() != nullptr) {
     GetJit()->PreZygoteFork();
+  }
+  if (!heap_->HasZygoteSpace()) {
+    // This is the first fork. Update ArtMethods in the boot classpath now to
+    // avoid having forked apps dirty the memory.
+    ScopedObjectAccess soa(Thread::Current());
+    // Ensure we call FixupStaticTrampolines on all methods that are
+    // initialized.
+    class_linker_->MakeInitializedClassesVisiblyInitialized(soa.Self(), /*wait=*/ true);
+    // Update native method JNI entrypoints.
+    FindNativeMethodsVisitor visitor(soa.Self(), class_linker_);
+    class_linker_->VisitClasses(&visitor);
   }
   heap_->PreZygoteFork();
   PreZygoteForkNativeBridge();
@@ -739,7 +787,7 @@ void Runtime::SweepSystemWeaks(IsMarkedVisitor* visitor) {
     // from mutators. See b/32167580.
     GetJit()->GetCodeCache()->SweepRootTables(visitor);
   }
-  thread_list_->SweepInterpreterCaches(visitor);
+  Thread::SweepInterpreterCaches(visitor);
 
   // All other generic system-weak holders.
   for (gc::AbstractSystemWeakHolder* holder : system_weak_holders_) {
@@ -1493,7 +1541,7 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
   // (a) runtime was started with a command line flag that enables the checks, or
   // (b) Zygote forked a new process that is not exempt (see ZygoteHooks).
   hidden_api_policy_ = runtime_options.GetOrDefault(Opt::HiddenApiPolicy);
-  DCHECK(!is_zygote_ || hidden_api_policy_ == hiddenapi::EnforcementPolicy::kDisabled);
+  DCHECK_IMPLIES(is_zygote_, hidden_api_policy_ == hiddenapi::EnforcementPolicy::kDisabled);
 
   // Set core platform API enforcement policy. The checks are disabled by default and
   // can be enabled with a command line flag. AndroidRuntime will pass the flag if
@@ -2146,26 +2194,26 @@ void Runtime::InitThreadGroups(Thread* self) {
       env->NewGlobalRef(env->GetStaticObjectField(
           WellKnownClasses::java_lang_ThreadGroup,
           WellKnownClasses::java_lang_ThreadGroup_mainThreadGroup));
-  CHECK(main_thread_group_ != nullptr || IsAotCompiler());
+  CHECK_IMPLIES(main_thread_group_ == nullptr, IsAotCompiler());
   system_thread_group_ =
       env->NewGlobalRef(env->GetStaticObjectField(
           WellKnownClasses::java_lang_ThreadGroup,
           WellKnownClasses::java_lang_ThreadGroup_systemThreadGroup));
-  CHECK(system_thread_group_ != nullptr || IsAotCompiler());
+  CHECK_IMPLIES(system_thread_group_ == nullptr, IsAotCompiler());
 }
 
 jobject Runtime::GetMainThreadGroup() const {
-  CHECK(main_thread_group_ != nullptr || IsAotCompiler());
+  CHECK_IMPLIES(main_thread_group_ == nullptr, IsAotCompiler());
   return main_thread_group_;
 }
 
 jobject Runtime::GetSystemThreadGroup() const {
-  CHECK(system_thread_group_ != nullptr || IsAotCompiler());
+  CHECK_IMPLIES(system_thread_group_ == nullptr, IsAotCompiler());
   return system_thread_group_;
 }
 
 jobject Runtime::GetSystemClassLoader() const {
-  CHECK(system_class_loader_ != nullptr || IsAotCompiler());
+  CHECK_IMPLIES(system_class_loader_ == nullptr, IsAotCompiler());
   return system_class_loader_;
 }
 
@@ -2178,6 +2226,7 @@ void Runtime::RegisterRuntimeNativeMethods(JNIEnv* env) {
   register_dalvik_system_ZygoteHooks(env);
   register_java_lang_Class(env);
   register_java_lang_Object(env);
+  register_java_lang_invoke_MethodHandle(env);
   register_java_lang_invoke_MethodHandleImpl(env);
   register_java_lang_ref_FinalizerReference(env);
   register_java_lang_reflect_Array(env);
@@ -2196,6 +2245,7 @@ void Runtime::RegisterRuntimeNativeMethods(JNIEnv* env) {
   register_java_lang_VMClassLoader(env);
   register_java_util_concurrent_atomic_AtomicLong(env);
   register_jdk_internal_misc_Unsafe(env);
+  register_libcore_io_Memory(env);
   register_libcore_util_CharsetUtils(env);
   register_org_apache_harmony_dalvik_ddmc_DdmServer(env);
   register_org_apache_harmony_dalvik_ddmc_DdmVmInternal(env);
@@ -3347,6 +3397,15 @@ void Runtime::MadviseFileForRange(size_t madvise_size_limit_bytes,
       }
     }
   }
+}
+
+bool Runtime::HasImageWithProfile() const {
+  for (gc::space::ImageSpace* space : GetHeap()->GetBootImageSpaces()) {
+    if (!space->GetProfileFiles().empty()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 }  // namespace art

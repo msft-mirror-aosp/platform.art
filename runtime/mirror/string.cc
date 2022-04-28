@@ -48,15 +48,10 @@ int32_t String::FastIndexOf(int32_t ch, int32_t start) {
   }
 }
 
-int String::ComputeHashCode() {
-  int32_t hash_code = 0;
-  if (IsCompressed()) {
-    hash_code = ComputeUtf16Hash(GetValueCompressed(), GetLength());
-  } else {
-    hash_code = ComputeUtf16Hash(GetValue(), GetLength());
-  }
-  SetHashCode(hash_code);
-  return hash_code;
+int32_t String::ComputeAndSetHashCode() {
+  int32_t new_hash_code = ComputeHashCode();
+  SetHashCode(new_hash_code);
+  return new_hash_code;
 }
 
 inline bool String::AllASCIIExcept(const uint16_t* chars, int32_t length, uint16_t non_ascii) {
@@ -106,7 +101,7 @@ ObjPtr<String> String::DoReplace(Thread* self, Handle<String> src, uint16_t old_
       } else {
         std::transform(src->value_, src->value_ + length, out, replace);
       }
-      DCHECK(!kUseStringCompression || !AllASCII(out, length));
+      DCHECK_IMPLIES(kUseStringCompression, !AllASCII(out, length));
     }
   };
   return Alloc(self, length_with_flag, allocator_type, visitor);
@@ -202,7 +197,7 @@ ObjPtr<String> String::DoRepeat(Thread* self, Handle<String> h_this, int32_t cou
 ObjPtr<String> String::AllocFromUtf16(Thread* self,
                                       int32_t utf16_length,
                                       const uint16_t* utf16_data_in) {
-  CHECK(utf16_data_in != nullptr || utf16_length == 0);
+  CHECK_IMPLIES(utf16_data_in == nullptr, utf16_length == 0);
   gc::AllocatorType allocator_type = Runtime::Current()->GetHeap()->GetCurrentAllocator();
   const bool compressible = kUseStringCompression &&
                             String::AllASCII<uint16_t>(utf16_data_in, utf16_length);

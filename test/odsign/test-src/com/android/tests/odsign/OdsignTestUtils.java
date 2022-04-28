@@ -16,6 +16,8 @@
 
 package com.android.tests.odsign;
 
+import static com.android.tradefed.testtype.DeviceJUnit4ClassRunner.TestLogData;
+
 import static com.google.common.truth.Truth.assertWithMessage;
 
 import static org.junit.Assert.assertNotNull;
@@ -26,8 +28,12 @@ import static org.junit.Assume.assumeTrue;
 import android.cts.install.lib.host.InstallUtilsHost;
 
 import com.android.tradefed.device.DeviceNotAvailableException;
+import com.android.tradefed.device.ITestDevice;
 import com.android.tradefed.device.ITestDevice.ApexInfo;
+import com.android.tradefed.device.TestDeviceOptions;
 import com.android.tradefed.invoker.TestInformation;
+import com.android.tradefed.result.FileInputStreamSource;
+import com.android.tradefed.result.LogDataType;
 import com.android.tradefed.util.CommandResult;
 
 import java.io.File;
@@ -56,12 +62,10 @@ public class OdsignTestUtils {
     private static final String ODREFRESH_COMPILATION_LOG =
             "/data/misc/odrefresh/compilation-log.txt";
 
-    private static final Duration BOOT_COMPLETE_TIMEOUT = Duration.ofMinutes(2);
-    private static final Duration RESTART_ZYGOTE_COMPLETE_TIMEOUT = Duration.ofMinutes(1);
+    private static final Duration BOOT_COMPLETE_TIMEOUT = Duration.ofMinutes(5);
+    private static final Duration RESTART_ZYGOTE_COMPLETE_TIMEOUT = Duration.ofMinutes(3);
 
     private static final String TAG = "OdsignTestUtils";
-    private static final String WAS_ADB_ROOT_KEY = TAG + ":WAS_ADB_ROOT";
-    private static final String ADB_ROOT_ENABLED_KEY = TAG + ":ADB_ROOT_ENABLED";
     private static final String PACKAGE_NAME_KEY = TAG + ":PACKAGE_NAME";
 
     private final InstallUtilsHost mInstallUtils;
@@ -82,17 +86,18 @@ public class OdsignTestUtils {
         String packagesOutput =
                 mTestInfo.getDevice().executeShellCommand("pm list packages -f --apex-only");
         Pattern p = Pattern.compile(
-                "^package:(.*)=com(\\.google)?\\.android\\.art$", Pattern.MULTILINE);
+                "^package:(.*)=(com(?:\\.google)?\\.android\\.art)$", Pattern.MULTILINE);
         Matcher m = p.matcher(packagesOutput);
         assertTrue("ART module not found. Packages are:\n" + packagesOutput, m.find());
         String artApexPath = m.group(1);
+        String artApexName = m.group(2);
 
-        File artApexFile = mTestInfo.getDevice().pullFile(artApexPath);
-        String installResult = mTestInfo.getDevice().installPackage(artApexFile, false);
-        assertNull("Failed to install APEX. Reason: " + installResult, installResult);
+        CommandResult result = mTestInfo.getDevice().executeShellV2Command(
+                "pm install --apex " + artApexPath);
+        assertWithMessage("Failed to install APEX. Reason: " + result.toString())
+            .that(result.getExitCode()).isEqualTo(0);
 
-        ApexInfo apex = mInstallUtils.getApexInfo(artApexFile);
-        mTestInfo.properties().put(PACKAGE_NAME_KEY, apex.name);
+        mTestInfo.properties().put(PACKAGE_NAME_KEY, artApexName);
 
         removeCompilationLogToAvoidBackoff();
     }
@@ -236,9 +241,23 @@ public class OdsignTestUtils {
     }
 
     public void reboot() throws Exception {
+        TestDeviceOptions options = mTestInfo.getDevice().getOptions();
+        // store default value and increase time-out for reboot
+        int rebootTimeout = options.getRebootTimeout();
+        long onlineTimeout = options.getOnlineTimeout();
+        options.setRebootTimeout((int)BOOT_COMPLETE_TIMEOUT.toMillis());
+        options.setOnlineTimeout(BOOT_COMPLETE_TIMEOUT.toMillis());
+        mTestInfo.getDevice().setOptions(options);
+
         mTestInfo.getDevice().reboot();
         boolean success =
                 mTestInfo.getDevice().waitForBootComplete(BOOT_COMPLETE_TIMEOUT.toMillis());
+
+        // restore default values
+        options.setRebootTimeout(rebootTimeout);
+        options.setOnlineTimeout(onlineTimeout);
+        mTestInfo.getDevice().setOptions(options);
+
         assertWithMessage("Device didn't boot in %s", BOOT_COMPLETE_TIMEOUT).that(success).isTrue();
     }
 
@@ -250,25 +269,6 @@ public class OdsignTestUtils {
                 .waitForBootComplete(RESTART_ZYGOTE_COMPLETE_TIMEOUT.toMillis());
         assertWithMessage("Zygote didn't start in %s", BOOT_COMPLETE_TIMEOUT).that(success)
                 .isTrue();
-    }
-
-    /**
-     * Enables adb root or skips the test if adb root is not supported.
-     */
-    public void enableAdbRootOrSkipTest() throws Exception {
-        setBoolean(WAS_ADB_ROOT_KEY, mTestInfo.getDevice().isAdbRoot());
-        boolean adbRootEnabled = mTestInfo.getDevice().enableAdbRoot();
-        assumeTrue("ADB root failed and required to get process maps", adbRootEnabled);
-        setBoolean(ADB_ROOT_ENABLED_KEY, adbRootEnabled);
-    }
-
-    /**
-     * Restores the device to the state before {@link enableAdbRootOrSkipTest} was called.
-     */
-    public void restoreAdbRoot() throws Exception {
-        if (getBooleanOrDefault(ADB_ROOT_ENABLED_KEY) && !getBooleanOrDefault(WAS_ADB_ROOT_KEY)) {
-            mTestInfo.getDevice().disableAdbRoot();
-        }
     }
 
     /**
@@ -355,4 +355,16 @@ public class OdsignTestUtils {
         assertWithMessage(result.toString()).that(result.getExitCode()).isEqualTo(0);
         return result.getStdout().trim();
     }
+
+    public void archiveLogThenDelete(TestLogData logs, String remotePath, String localName)
+            throws DeviceNotAvailableException {
+        ITestDevice device = mTestInfo.getDevice();
+        File logFile = device.pullFile(remotePath);
+        if (logFile != null) {
+            logs.addTestLog(localName, LogDataType.TEXT, new FileInputStreamSource(logFile));
+            // Delete to avoid confusing logs from a previous run, just in case.
+            device.deleteFile(remotePath);
+        }
+    }
+
 }
