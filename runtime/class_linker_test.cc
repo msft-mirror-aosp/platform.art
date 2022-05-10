@@ -116,8 +116,7 @@ class ClassLinkerTest : public CommonRuntimeTest {
     EXPECT_EQ(0, primitive->GetIfTableCount());
     EXPECT_TRUE(primitive->GetIfTable() != nullptr);
     EXPECT_EQ(primitive->GetIfTable()->Count(), 0u);
-    EXPECT_EQ(kAccPublic | kAccFinal | kAccAbstract | kAccVerificationAttempted,
-              primitive->GetAccessFlags());
+    EXPECT_EQ(kAccPublic | kAccFinal | kAccAbstract, primitive->GetAccessFlags());
   }
 
   void AssertObjectClass(ObjPtr<mirror::Class> JavaLangObject)
@@ -149,21 +148,11 @@ class ClassLinkerTest : public CommonRuntimeTest {
     EXPECT_FALSE(JavaLangObject->IsSynthetic());
     EXPECT_EQ(4U, JavaLangObject->NumDirectMethods());
     EXPECT_EQ(11U, JavaLangObject->NumVirtualMethods());
-    if (!kUseBrooksReadBarrier) {
-      EXPECT_EQ(2U, JavaLangObject->NumInstanceFields());
-    } else {
-      EXPECT_EQ(4U, JavaLangObject->NumInstanceFields());
-    }
+    EXPECT_EQ(2U, JavaLangObject->NumInstanceFields());
     EXPECT_STREQ(JavaLangObject->GetInstanceField(0)->GetName(),
                  "shadow$_klass_");
     EXPECT_STREQ(JavaLangObject->GetInstanceField(1)->GetName(),
                  "shadow$_monitor_");
-    if (kUseBrooksReadBarrier) {
-      EXPECT_STREQ(JavaLangObject->GetInstanceField(2)->GetName(),
-                   "shadow$_x_rb_ptr_");
-      EXPECT_STREQ(JavaLangObject->GetInstanceField(3)->GetName(),
-                   "shadow$_x_xpadding_");
-    }
 
     EXPECT_EQ(0U, JavaLangObject->NumStaticFields());
     EXPECT_EQ(0U, JavaLangObject->NumDirectInterfaces());
@@ -569,10 +558,6 @@ struct ObjectOffsets : public CheckOffsets<mirror::Object> {
   ObjectOffsets() : CheckOffsets<mirror::Object>(false, "Ljava/lang/Object;") {
     addOffset(OFFSETOF_MEMBER(mirror::Object, klass_), "shadow$_klass_");
     addOffset(OFFSETOF_MEMBER(mirror::Object, monitor_), "shadow$_monitor_");
-#ifdef USE_BROOKS_READ_BARRIER
-    addOffset(OFFSETOF_MEMBER(mirror::Object, x_rb_ptr_), "shadow$_x_rb_ptr_");
-    addOffset(OFFSETOF_MEMBER(mirror::Object, x_xpadding_), "shadow$_x_xpadding_");
-#endif
   }
 };
 
@@ -613,6 +598,7 @@ struct ClassOffsets : public CheckOffsets<mirror::Class> {
 
 struct ClassExtOffsets : public CheckOffsets<mirror::ClassExt> {
   ClassExtOffsets() : CheckOffsets<mirror::ClassExt>(false, "Ldalvik/system/ClassExt;") {
+    addOffset(OFFSETOF_MEMBER(mirror::ClassExt, erroneous_state_error_), "erroneousStateError");
     addOffset(OFFSETOF_MEMBER(mirror::ClassExt, instance_jfield_ids_), "instanceJfieldIDs");
     addOffset(OFFSETOF_MEMBER(mirror::ClassExt, jmethod_ids_), "jmethodIDs");
     addOffset(OFFSETOF_MEMBER(mirror::ClassExt, obsolete_class_), "obsoleteClass");
@@ -624,7 +610,6 @@ struct ClassExtOffsets : public CheckOffsets<mirror::ClassExt> {
     addOffset(OFFSETOF_MEMBER(mirror::ClassExt, pre_redefine_dex_file_ptr_),
               "preRedefineDexFilePtr");
     addOffset(OFFSETOF_MEMBER(mirror::ClassExt, static_jfield_ids_), "staticJfieldIDs");
-    addOffset(OFFSETOF_MEMBER(mirror::ClassExt, verify_error_), "verifyError");
   }
 };
 
@@ -758,10 +743,10 @@ struct MethodHandleOffsets : public CheckOffsets<mirror::MethodHandle> {
   MethodHandleOffsets() : CheckOffsets<mirror::MethodHandle>(
       false, "Ljava/lang/invoke/MethodHandle;") {
     addOffset(OFFSETOF_MEMBER(mirror::MethodHandle, art_field_or_method_), "artFieldOrMethod");
+    addOffset(OFFSETOF_MEMBER(mirror::MethodHandle, as_type_cache_), "asTypeCache");
     addOffset(OFFSETOF_MEMBER(mirror::MethodHandle, cached_spread_invoker_),
               "cachedSpreadInvoker");
     addOffset(OFFSETOF_MEMBER(mirror::MethodHandle, handle_kind_), "handleKind");
-    addOffset(OFFSETOF_MEMBER(mirror::MethodHandle, nominal_type_), "nominalType");
     addOffset(OFFSETOF_MEMBER(mirror::MethodHandle, method_type_), "type");
   }
 };
@@ -784,7 +769,6 @@ struct MethodHandlesLookupOffsets : public CheckOffsets<mirror::MethodHandlesLoo
 struct EmulatedStackFrameOffsets : public CheckOffsets<mirror::EmulatedStackFrame> {
   EmulatedStackFrameOffsets() : CheckOffsets<mirror::EmulatedStackFrame>(
       false, "Ldalvik/system/EmulatedStackFrame;") {
-    addOffset(OFFSETOF_MEMBER(mirror::EmulatedStackFrame, callsite_type_), "callsiteType");
     addOffset(OFFSETOF_MEMBER(mirror::EmulatedStackFrame, references_), "references");
     addOffset(OFFSETOF_MEMBER(mirror::EmulatedStackFrame, stack_frame_), "stackFrame");
     addOffset(OFFSETOF_MEMBER(mirror::EmulatedStackFrame, type_), "type");
@@ -812,6 +796,13 @@ struct FieldVarHandleOffsets : public CheckOffsets<mirror::FieldVarHandle> {
   FieldVarHandleOffsets() : CheckOffsets<mirror::FieldVarHandle>(
       false, "Ljava/lang/invoke/FieldVarHandle;") {
     addOffset(OFFSETOF_MEMBER(mirror::FieldVarHandle, art_field_), "artField");
+  }
+};
+
+struct StaticFieldVarHandleOffsets : public CheckOffsets<mirror::StaticFieldVarHandle> {
+  StaticFieldVarHandleOffsets() : CheckOffsets<mirror::StaticFieldVarHandle>(
+      false, "Ljava/lang/invoke/StaticFieldVarHandle;") {
+    addOffset(OFFSETOF_MEMBER(mirror::StaticFieldVarHandle, declaring_class_), "declaringClass");
   }
 };
 
@@ -1439,8 +1430,6 @@ static void CheckMethod(ArtMethod* method, bool verified)
 
 static void CheckVerificationAttempted(ObjPtr<mirror::Class> c, bool preverified)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  EXPECT_EQ((c->GetAccessFlags() & kAccVerificationAttempted) != 0U, preverified)
-      << "Class " << mirror::Class::PrettyClass(c) << " not as expected";
   for (auto& m : c->GetMethods(kRuntimePointerSize)) {
     CheckMethod(&m, preverified);
   }
@@ -1516,7 +1505,8 @@ TEST_F(ClassLinkerTest, RegisterDexFileName) {
   MutableHandle<mirror::DexCache> dex_cache(hs.NewHandle<mirror::DexCache>(nullptr));
   {
     ReaderMutexLock mu(soa.Self(), *Locks::dex_lock_);
-    for (const ClassLinker::DexCacheData& data : class_linker->GetDexCachesData()) {
+    for (const auto& entry : class_linker->GetDexCachesData()) {
+      const ClassLinker::DexCacheData& data = entry.second;
       dex_cache.Assign(soa.Self()->DecodeJObject(data.weak_root)->AsDexCache());
       if (dex_cache != nullptr) {
         break;
@@ -1537,8 +1527,9 @@ TEST_F(ClassLinkerTest, RegisterDexFileName) {
                                                         nullptr,
                                                         nullptr));
   // Make a copy of the dex cache with changed name.
-  LinearAlloc* alloc = Runtime::Current()->GetLinearAlloc();
-  dex_cache.Assign(class_linker->AllocAndInitializeDexCache(Thread::Current(), *dex_file, alloc));
+  dex_cache.Assign(class_linker->AllocAndInitializeDexCache(Thread::Current(),
+                                                            *dex_file,
+                                                            /* class_loader= */ nullptr));
   DCHECK_EQ(dex_cache->GetLocation()->CompareTo(location.Get()), 0);
   {
     WriterMutexLock mu(soa.Self(), *Locks::dex_lock_);
