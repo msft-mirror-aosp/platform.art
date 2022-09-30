@@ -4403,15 +4403,6 @@ class Heap::ReduceTargetFootprintTask : public HeapTask {
   uint32_t initial_gc_num_;
 };
 
-// Return a pseudo-random integer between 0 and 19999, using the uid as a seed.  We want this to
-// be deterministic for a given process, but to vary randomly across processes. Empirically, the
-// uids for processes for which this matters are distinct.
-static uint32_t GetPseudoRandomFromUid() {
-  std::default_random_engine rng(getuid());
-  std::uniform_int_distribution<int> dist(0, 19999);
-  return dist(rng);
-}
-
 void Heap::PostForkChildAction(Thread* self) {
   uint32_t starting_gc_num = GetCurrentGcNum();
   uint64_t last_adj_time = NanoTime();
@@ -4440,12 +4431,6 @@ void Heap::PostForkChildAction(Thread* self) {
           new ReduceTargetFootprintTask(last_adj_time, initial_heap_size_, starting_gc_num));
     }
   }
-  // Schedule a GC after a substantial period of time. This will become a no-op if another GC is
-  // scheduled in the interim. If not, we want to avoid holding onto start-up garbage.
-  uint64_t post_fork_gc_time = last_adj_time
-      + MsToNs(4 * kPostForkMaxHeapDurationMS + GetPseudoRandomFromUid());
-  GetTaskProcessor()->AddTask(self,
-                              new TriggerPostForkCCGcTask(post_fork_gc_time, starting_gc_num));
 }
 
 void Heap::VisitReflectiveTargets(ReflectiveValueVisitor *visit) {
