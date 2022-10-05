@@ -165,7 +165,7 @@ class Heap {
   // Should be chosen so that time_to_call_mallinfo / kNotifyNativeInterval is on the same order
   // as object allocation time. time_to_call_mallinfo seems to be on the order of 1 usec.
 #ifdef __ANDROID__
-  static constexpr uint32_t kNotifyNativeInterval = 32;
+  static constexpr uint32_t kNotifyNativeInterval = 64;
 #else
   // Some host mallinfo() implementations are slow. And memory is less scarce.
   static constexpr uint32_t kNotifyNativeInterval = 512;
@@ -321,9 +321,10 @@ class Heap {
   void ChangeAllocator(AllocatorType allocator)
       REQUIRES(Locks::mutator_lock_, !Locks::runtime_shutdown_lock_);
 
-  // Change the collector to be one of the possible options (MS, CMS, SS).
+  // Change the collector to be one of the possible options (MS, CMS, SS). Only safe when no
+  // concurrent accesses to the heap are possible.
   void ChangeCollector(CollectorType collector_type)
-      REQUIRES(Locks::mutator_lock_);
+      REQUIRES(Locks::mutator_lock_, !*gc_complete_lock_);
 
   // The given reference is believed to be to an object in the Java heap, check the soundness of it.
   // TODO: NO_THREAD_SAFETY_ANALYSIS since we call this everywhere and it is impossible to find a
@@ -375,13 +376,14 @@ class Heap {
       REQUIRES(Locks::heap_bitmap_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  // Initiates an explicit garbage collection.
+  // Initiates an explicit garbage collection. Guarantees that a GC started after this call has
+  // completed.
   void CollectGarbage(bool clear_soft_references, GcCause cause = kGcCauseExplicit)
       REQUIRES(!*gc_complete_lock_, !*pending_task_lock_, !process_state_update_lock_);
 
-  // Does a concurrent GC, should only be called by the GC daemon thread
-  // through runtime.
-  void ConcurrentGC(Thread* self, GcCause cause, bool force_full)
+  // Does a concurrent GC, provided the GC numbered requested_gc_num has not already been
+  // completed. Should only be called by the GC daemon thread through runtime.
+  void ConcurrentGC(Thread* self, GcCause cause, bool force_full, uint32_t requested_gc_num)
       REQUIRES(!Locks::runtime_shutdown_lock_, !*gc_complete_lock_,
                !*pending_task_lock_, !process_state_update_lock_);
 
@@ -412,7 +414,7 @@ class Heap {
 
   // Removes the growth limit on the alloc space so it may grow to its maximum capacity. Used to
   // implement dalvik.system.VMRuntime.clearGrowthLimit.
-  void ClearGrowthLimit();
+  void ClearGrowthLimit() REQUIRES(!*gc_complete_lock_);
 
   // Make the current growth limit the new maximum capacity, unmaps pages at the end of spaces
   // which will never be used. Used to implement dalvik.system.VMRuntime.clampGrowthLimit.
@@ -465,10 +467,12 @@ class Heap {
 
   // For the alloc space, sets the maximum number of bytes that the heap is allowed to allocate
   // from the system. Doesn't allow the space to exceed its growth limit.
+  // Set while we hold gc_complete_lock or collector_type_running_ != kCollectorTypeNone.
   void SetIdealFootprint(size_t max_allowed_footprint);
 
   // Blocks the caller until the garbage collector becomes idle and returns the type of GC we
-  // waited for.
+  // waited for. Only waits for running collections, ignoring a requested but unstarted GC. Only
+  // heuristic, since a new GC may have started by the time we return.
   collector::GcType WaitForGcToComplete(GcCause cause, Thread* self) REQUIRES(!*gc_complete_lock_);
 
   // Update the heap's process state to a new value, may cause compaction to occur.
@@ -826,8 +830,19 @@ class Heap {
   // Request an asynchronous trim.
   void RequestTrim(Thread* self) REQUIRES(!*pending_task_lock_);
 
-  // Request asynchronous GC.
-  void RequestConcurrentGC(Thread* self, GcCause cause, bool force_full)
+  // Retrieve the current GC number, i.e. the number n such that we completed n GCs so far.
+  // Provides acquire ordering, so that if we read this first, and then check whether a GC is
+  // required, we know that the GC number read actually preceded the test.
+  uint32_t GetCurrentGcNum() {
+    return gcs_completed_.load(std::memory_order_acquire);
+  }
+
+  // Request asynchronous GC. Observed_gc_num is the value of GetCurrentGcNum() when we started to
+  // evaluate the GC triggering condition. If a GC has been completed since then, we consider our
+  // job done. If we return true, then we ensured that gcs_completed_ will eventually be
+  // incremented beyond observed_gc_num. We return false only in corner cases in which we cannot
+  // ensure that.
+  bool RequestConcurrentGC(Thread* self, GcCause cause, bool force_full, uint32_t observed_gc_num)
       REQUIRES(!*pending_task_lock_);
 
   // Whether or not we may use a garbage collector, used so that we only create collectors we need.
@@ -917,7 +932,7 @@ class Heap {
 
   const Verification* GetVerification() const;
 
-  void PostForkChildAction(Thread* self);
+  void PostForkChildAction(Thread* self) REQUIRES(!*gc_complete_lock_);
 
   void TraceHeapSize(size_t heap_size);
 
@@ -928,6 +943,7 @@ class Heap {
   class CollectorTransitionTask;
   class HeapTrimTask;
   class TriggerPostForkCCGcTask;
+  class ReduceTargetFootprintTask;
 
   // Compact source space to target space. Returns the collector used.
   collector::GarbageCollector* Compact(space::ContinuousMemMapAllocSpace* target_space,
@@ -991,11 +1007,6 @@ class Heap {
   // Checks whether we should garbage collect:
   ALWAYS_INLINE bool ShouldConcurrentGCForJava(size_t new_num_bytes_allocated);
   float NativeMemoryOverTarget(size_t current_native_bytes, bool is_gc_concurrent);
-  ALWAYS_INLINE void CheckConcurrentGCForJava(Thread* self,
-                                              size_t new_num_bytes_allocated,
-                                              ObjPtr<mirror::Object>* obj)
-      REQUIRES_SHARED(Locks::mutator_lock_)
-      REQUIRES(!*pending_task_lock_, !*gc_complete_lock_);
   void CheckGCForNative(Thread* self)
       REQUIRES(!*pending_task_lock_, !*gc_complete_lock_, !process_state_update_lock_);
 
@@ -1080,16 +1091,25 @@ class Heap {
   void RequestCollectorTransition(CollectorType desired_collector_type, uint64_t delta_time)
       REQUIRES(!*pending_task_lock_);
 
-  void RequestConcurrentGCAndSaveObject(Thread* self, bool force_full, ObjPtr<mirror::Object>* obj)
+  void RequestConcurrentGCAndSaveObject(Thread* self,
+                                        bool force_full,
+                                        uint32_t observed_gc_num,
+                                        ObjPtr<mirror::Object>* obj)
       REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!*pending_task_lock_);
-  bool IsGCRequestPending() const;
+
+  static constexpr uint32_t GC_NUM_ANY = std::numeric_limits<uint32_t>::max();
 
   // Sometimes CollectGarbageInternal decides to run a different Gc than you requested. Returns
-  // which type of Gc was actually ran.
+  // which type of Gc was actually run.
+  // We pass in the intended GC sequence number to ensure that multiple approximately concurrent
+  // requests result in a single GC; clearly redundant request will be pruned.  A requested_gc_num
+  // of GC_NUM_ANY indicates that we should not prune redundant requests.  (In the unlikely case
+  // that gcs_completed_ gets this big, we just accept a potential extra GC or two.)
   collector::GcType CollectGarbageInternal(collector::GcType gc_plan,
                                            GcCause gc_cause,
-                                           bool clear_soft_references)
+                                           bool clear_soft_references,
+                                           uint32_t requested_gc_num)
       REQUIRES(!*gc_complete_lock_, !Locks::heap_bitmap_lock_, !Locks::thread_suspend_count_lock_,
                !*pending_task_lock_, !process_state_update_lock_);
 
@@ -1127,6 +1147,9 @@ class Heap {
   // the target utilization ratio.  This should only be called immediately after a full garbage
   // collection. bytes_allocated_before_gc is used to measure bytes / second for the period which
   // the GC was run.
+  // This is only called by the thread that set collector_type_running_ to a value other than
+  // kCollectorTypeNone, or while holding gc_complete_lock, and ensuring that
+  // collector_type_running_ is kCollectorTypeNone.
   void GrowForUtilization(collector::GarbageCollector* collector_ran,
                           size_t bytes_allocated_before_gc = 0)
       REQUIRES(!process_state_update_lock_);
@@ -1156,7 +1179,6 @@ class Heap {
       REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!*gc_complete_lock_, !*pending_task_lock_, !process_state_update_lock_);
 
-  void ClearConcurrentGCRequest();
   void ClearPendingTrim(Thread* self) REQUIRES(!*pending_task_lock_);
   void ClearPendingCollectorTransition(Thread* self) REQUIRES(!*pending_task_lock_);
 
@@ -1219,6 +1241,11 @@ class Heap {
   // are currently in use, and could possibly be reclaimed as an indirect result
   // of a garbage collection.
   size_t GetNativeBytes();
+
+  // Set concurrent_start_bytes_ to a reasonable guess, given target_footprint_ .
+  void SetDefaultConcurrentStartBytes() REQUIRES(!*gc_complete_lock_);
+  // This version assumes no concurrent updaters.
+  void SetDefaultConcurrentStartBytesLocked();
 
   // All-known continuous spaces, where objects lie within fixed bounds.
   std::vector<space::ContinuousSpace*> continuous_spaces_ GUARDED_BY(Locks::mutator_lock_);
@@ -1332,6 +1359,9 @@ class Heap {
   // Task processor, proxies heap trim requests to the daemon threads.
   std::unique_ptr<TaskProcessor> task_processor_;
 
+  // The following are declared volatile only for debugging purposes; it shouldn't otherwise
+  // matter.
+
   // Collector type of the running GC.
   volatile CollectorType collector_type_running_ GUARDED_BY(gc_complete_lock_);
 
@@ -1353,21 +1383,29 @@ class Heap {
   // Only weakly enforced for simultaneous allocations.
   size_t growth_limit_;
 
+  // Requested initial heap size. Temporarily ignored after a fork, but then reestablished after
+  // a while to usually trigger the initial GC.
+  size_t initial_heap_size_;
+
   // Target size (as in maximum allocatable bytes) for the heap. Weakly enforced as a limit for
   // non-concurrent GC. Used as a guideline for computing concurrent_start_bytes_ in the
-  // concurrent GC case.
+  // concurrent GC case. Updates normally occur while collector_type_running_ is not none.
   Atomic<size_t> target_footprint_;
+
+  Mutex process_state_update_lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
 
   // Computed with foreground-multiplier in GrowForUtilization() when run in
   // jank non-perceptible state. On update to process state from background to
   // foreground we set target_footprint_ to this value.
-  Mutex process_state_update_lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
   size_t min_foreground_target_footprint_ GUARDED_BY(process_state_update_lock_);
 
   // When num_bytes_allocated_ exceeds this amount then a concurrent GC should be requested so that
   // it completes ahead of an allocation failing.
   // A multiple of this is also used to determine when to trigger a GC in response to native
   // allocation.
+  // After initialization, this is only updated by the thread that set collector_type_running_ to
+  // a value other than kCollectorTypeNone, or while holding gc_complete_lock, and ensuring that
+  // collector_type_running_ is kCollectorTypeNone.
   size_t concurrent_start_bytes_;
 
   // Since the heap was created, how many bytes have been freed.
@@ -1398,6 +1436,10 @@ class Heap {
   // here to be subtracted from num_bytes_allocated_ later at the next
   // GC.
   Atomic<size_t> num_bytes_freed_revoke_;
+
+  // Records the number of bytes allocated at the time of GC, which is used later to calculate
+  // how many bytes have been allocated since the last GC
+  size_t num_bytes_alive_after_gc_;
 
   // Info related to the current or previous GC iteration.
   collector::Iteration current_gc_iteration_;
@@ -1534,8 +1576,16 @@ class Heap {
   // Count for performed homogeneous space compaction.
   Atomic<size_t> count_performed_homogeneous_space_compaction_;
 
-  // Whether or not a concurrent GC is pending.
-  Atomic<bool> concurrent_gc_pending_;
+  // The number of garbage collections (either young or full, not trims or the like) we have
+  // completed since heap creation. We include requests that turned out to be impossible
+  // because they were disabled. We guard against wrapping, though that's unlikely.
+  // Increment is guarded by gc_complete_lock_.
+  Atomic<uint32_t> gcs_completed_;
+
+  // The number of the last garbage collection that has been requested.  A value of gcs_completed
+  // + 1 indicates that another collection is needed or in progress. A value of gcs_completed_ or
+  // (logically) less means that no new GC has been requested.
+  Atomic<uint32_t> max_gc_requested_;
 
   // Active tasks which we can modify (change target time, desired collector type, etc..).
   CollectorTransitionTask* pending_collector_transition_ GUARDED_BY(pending_task_lock_);
