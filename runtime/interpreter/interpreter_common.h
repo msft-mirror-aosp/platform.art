@@ -20,7 +20,6 @@
 #include "android-base/macros.h"
 #include "instrumentation.h"
 #include "interpreter.h"
-#include "interpreter_intrinsics.h"
 #include "transaction.h"
 
 #include <math.h>
@@ -126,8 +125,13 @@ void RecordArrayElementsInTransaction(ObjPtr<mirror::Array> array, int32_t count
 // DoFastInvoke and DoInvokeVirtualQuick functions.
 // Returns true on success, otherwise throws an exception and returns false.
 template<bool is_range, bool do_assignability_check>
-bool DoCall(ArtMethod* called_method, Thread* self, ShadowFrame& shadow_frame,
-            const Instruction* inst, uint16_t inst_data, JValue* result);
+bool DoCall(ArtMethod* called_method,
+            Thread* self,
+            ShadowFrame& shadow_frame,
+            const Instruction* inst,
+            uint16_t inst_data,
+            bool string_init,
+            JValue* result);
 
 // Called by the switch interpreter to know if we can stay in it.
 bool ShouldStayInSwitchInterpreter(ArtMethod* method)
@@ -220,7 +224,7 @@ static inline ALWAYS_INLINE void PerformNonStandardReturn(
 
 // Handles all invoke-XXX/range instructions except for invoke-polymorphic[/range].
 // Returns true on success, otherwise throws an exception and returns false.
-template<InvokeType type, bool is_range, bool do_access_check, bool is_mterp>
+template<InvokeType type, bool is_range, bool do_access_check>
 static ALWAYS_INLINE bool DoInvoke(Thread* self,
                                    ShadowFrame& shadow_frame,
                                    const Instruction* inst,
@@ -231,68 +235,19 @@ static ALWAYS_INLINE bool DoInvoke(Thread* self,
   if (UNLIKELY(self->ObserveAsyncException())) {
     return false;
   }
-  const uint32_t method_idx = (is_range) ? inst->VRegB_3rc() : inst->VRegB_35c();
-  const uint32_t vregC = (is_range) ? inst->VRegC_3rc() : inst->VRegC_35c();
+  const uint32_t vregC = is_range ? inst->VRegC_3rc() : inst->VRegC_35c();
+  ObjPtr<mirror::Object> obj = type == kStatic ? nullptr : shadow_frame.GetVRegReference(vregC);
   ArtMethod* sf_method = shadow_frame.GetMethod();
-
-  // Try to find the method in small thread-local cache first (only used when
-  // nterp is not used as mterp and nterp use the cache in an incompatible way).
-  InterpreterCache* tls_cache = self->GetInterpreterCache();
-  size_t tls_value;
-  ArtMethod* resolved_method;
-  if (!IsNterpSupported() && LIKELY(tls_cache->Get(self, inst, &tls_value))) {
-    resolved_method = reinterpret_cast<ArtMethod*>(tls_value);
-  } else {
-    ClassLinker* const class_linker = Runtime::Current()->GetClassLinker();
-    constexpr ClassLinker::ResolveMode resolve_mode =
-        do_access_check ? ClassLinker::ResolveMode::kCheckICCEAndIAE
-                        : ClassLinker::ResolveMode::kNoChecks;
-    resolved_method = class_linker->ResolveMethod<resolve_mode>(self, method_idx, sf_method, type);
-    if (UNLIKELY(resolved_method == nullptr)) {
-      CHECK(self->IsExceptionPending());
-      result->SetJ(0);
-      return false;
-    }
-    if (!IsNterpSupported()) {
-      tls_cache->Set(self, inst, reinterpret_cast<size_t>(resolved_method));
-    }
-  }
-
-  // Null pointer check and virtual method resolution.
-  ArtMethod* called_method = nullptr;
-  {
-    // `FindMethodToCall` might suspend, so don't keep `receiver` as a local
-    // variable after the call.
-    ObjPtr<mirror::Object> receiver =
-        (type == kStatic) ? nullptr : shadow_frame.GetVRegReference(vregC);
-    called_method = FindMethodToCall<type, do_access_check>(
-        method_idx, resolved_method, &receiver, sf_method, self);
-    if (UNLIKELY(called_method == nullptr)) {
-      CHECK(self->IsExceptionPending());
-      result->SetJ(0);
-      return false;
-    }
-  }
-  if (UNLIKELY(!called_method->IsInvokable())) {
-    called_method->ThrowInvocationTimeError(
-        (type == kStatic) ? nullptr : shadow_frame.GetVRegReference(vregC));
+  bool string_init = false;
+  ArtMethod* called_method = FindMethodToCall<type>(self, sf_method, &obj, *inst, &string_init);
+  if (called_method == nullptr) {
+    DCHECK(self->IsExceptionPending());
     result->SetJ(0);
     return false;
   }
 
-  jit::Jit* jit = Runtime::Current()->GetJit();
-  if (is_mterp && !is_range && called_method->IsIntrinsic()) {
-    if (MterpHandleIntrinsic(&shadow_frame, called_method, inst, inst_data,
-                             shadow_frame.GetResultRegister())) {
-      if (jit != nullptr && sf_method != nullptr) {
-        jit->NotifyInterpreterToCompiledCodeTransition(self, sf_method);
-      }
-      return !self->IsExceptionPending();
-    }
-  }
-
-  return DoCall<is_range, do_access_check>(called_method, self, shadow_frame, inst, inst_data,
-                                           result);
+  return DoCall<is_range, do_access_check>(
+      called_method, self, shadow_frame, inst, inst_data, string_init, result);
 }
 
 static inline ObjPtr<mirror::MethodHandle> ResolveMethodHandle(Thread* self,
@@ -391,24 +346,78 @@ ALWAYS_INLINE static JValue GetFieldValue(const ShadowFrame& shadow_frame, uint3
   return field_value;
 }
 
+extern "C" size_t NterpGetStaticField(Thread* self,
+                                      ArtMethod* caller,
+                                      const uint16_t* dex_pc_ptr,
+                                      size_t resolve_field_type);
+
+extern "C" uint32_t NterpGetInstanceFieldOffset(Thread* self,
+                                                ArtMethod* caller,
+                                                const uint16_t* dex_pc_ptr,
+                                                size_t resolve_field_type);
+
+static inline void GetFieldInfo(Thread* self,
+                                ArtMethod* caller,
+                                const uint16_t* dex_pc_ptr,
+                                bool is_static,
+                                bool resolve_field_type,
+                                ArtField** field,
+                                bool* is_volatile,
+                                MemberOffset* offset) {
+  size_t tls_value = 0u;
+  if (!self->GetInterpreterCache()->Get(self, dex_pc_ptr, &tls_value)) {
+    if (is_static) {
+      tls_value = NterpGetStaticField(self, caller, dex_pc_ptr, resolve_field_type);
+    } else {
+      tls_value = NterpGetInstanceFieldOffset(self, caller, dex_pc_ptr, resolve_field_type);
+    }
+
+    if (self->IsExceptionPending()) {
+      return;
+    }
+  }
+
+  if (is_static) {
+    DCHECK_NE(tls_value, 0u);
+    *is_volatile = ((tls_value & 1) != 0);
+    *field = reinterpret_cast<ArtField*>(tls_value & ~static_cast<size_t>(1u));
+    *offset = (*field)->GetOffset();
+  } else {
+    *is_volatile = (static_cast<int32_t>(tls_value) < 0);
+    *offset = MemberOffset(std::abs(static_cast<int32_t>(tls_value)));
+  }
+}
+
 // Handles iget-XXX and sget-XXX instructions.
 // Returns true on success, otherwise throws an exception and returns false.
-template<FindFieldType find_type, Primitive::Type field_type, bool do_access_check,
+template<FindFieldType find_type,
+         Primitive::Type field_type,
+         bool do_access_check,
          bool transaction_active = false>
-ALWAYS_INLINE bool DoFieldGet(Thread* self, ShadowFrame& shadow_frame, const Instruction* inst,
+ALWAYS_INLINE bool DoFieldGet(Thread* self,
+                              ShadowFrame& shadow_frame,
+                              const Instruction* inst,
                               uint16_t inst_data) REQUIRES_SHARED(Locks::mutator_lock_) {
   const bool is_static = (find_type == StaticObjectRead) || (find_type == StaticPrimitiveRead);
-  const uint32_t field_idx = is_static ? inst->VRegB_21c() : inst->VRegC_22c();
-  ArtMethod* method = shadow_frame.GetMethod();
-  ArtField* f = FindFieldFromCode<find_type, do_access_check>(
-      field_idx, method, self, Primitive::ComponentSize(field_type));
-  if (UNLIKELY(f == nullptr)) {
-    CHECK(self->IsExceptionPending());
+  bool should_report = Runtime::Current()->GetInstrumentation()->HasFieldReadListeners();
+  ArtField* field = nullptr;
+  MemberOffset offset(0u);
+  bool is_volatile;
+  GetFieldInfo(self,
+               shadow_frame.GetMethod(),
+               reinterpret_cast<const uint16_t*>(inst),
+               is_static,
+               /*resolve_field_type=*/ false,
+               &field,
+               &is_volatile,
+               &offset);
+  if (self->IsExceptionPending()) {
     return false;
   }
+
   ObjPtr<mirror::Object> obj;
   if (is_static) {
-    obj = f->GetDeclaringClass();
+    obj = field->GetDeclaringClass();
     if (transaction_active) {
       if (Runtime::Current()->GetTransaction()->ReadConstraint(obj)) {
         Runtime::Current()->AbortTransactionAndThrowAbortError(self, "Can't read static fields of "
@@ -418,40 +427,57 @@ ALWAYS_INLINE bool DoFieldGet(Thread* self, ShadowFrame& shadow_frame, const Ins
     }
   } else {
     obj = shadow_frame.GetVRegReference(inst->VRegB_22c(inst_data));
-    if (UNLIKELY(obj == nullptr)) {
-      ThrowNullPointerExceptionForFieldAccess(f, method, true);
+    if (should_report || obj == nullptr) {
+      field = ResolveFieldWithAccessChecks(self,
+                                           Runtime::Current()->GetClassLinker(),
+                                           inst->VRegC_22c(),
+                                           shadow_frame.GetMethod(),
+                                           /* is_static= */ false,
+                                           /* is_put= */ false,
+                                           /* resolve_field_type= */ false);
+      if (obj == nullptr) {
+        ThrowNullPointerExceptionForFieldAccess(
+            field, shadow_frame.GetMethod(), /* is_read= */ true);
+        return false;
+      }
+      // Reload in case suspension happened during field resolution.
+      obj = shadow_frame.GetVRegReference(inst->VRegB_22c(inst_data));
+    }
+  }
+
+  uint32_t vregA = is_static ? inst->VRegA_21c(inst_data) : inst->VRegA_22c(inst_data);
+  JValue result;
+  if (should_report) {
+    DCHECK(field != nullptr);
+    if (UNLIKELY(!DoFieldGetCommon<field_type>(self, shadow_frame, obj, field, &result))) {
+      // Instrumentation threw an error!
+      CHECK(self->IsExceptionPending());
       return false;
     }
   }
 
-  JValue result;
-  if (UNLIKELY(!DoFieldGetCommon<field_type>(self, shadow_frame, obj, f, &result))) {
-    // Instrumentation threw an error!
-    CHECK(self->IsExceptionPending());
-    return false;
-  }
-  uint32_t vregA = is_static ? inst->VRegA_21c(inst_data) : inst->VRegA_22c(inst_data);
+#define FIELD_GET(prim, type, jtype, vreg)                                      \
+  case Primitive::kPrim ##prim:                                                 \
+    shadow_frame.SetVReg ##vreg(vregA,                                          \
+        should_report ? result.Get ##jtype()                                    \
+                      : is_volatile ? obj->GetField ## type ## Volatile(offset) \
+                                    : obj->GetField ##type(offset));            \
+    break;
+
   switch (field_type) {
-    case Primitive::kPrimBoolean:
-      shadow_frame.SetVReg(vregA, result.GetZ());
-      break;
-    case Primitive::kPrimByte:
-      shadow_frame.SetVReg(vregA, result.GetB());
-      break;
-    case Primitive::kPrimChar:
-      shadow_frame.SetVReg(vregA, result.GetC());
-      break;
-    case Primitive::kPrimShort:
-      shadow_frame.SetVReg(vregA, result.GetS());
-      break;
-    case Primitive::kPrimInt:
-      shadow_frame.SetVReg(vregA, result.GetI());
-      break;
-    case Primitive::kPrimLong:
-      shadow_frame.SetVRegLong(vregA, result.GetJ());
-      break;
+    FIELD_GET(Boolean, Boolean, Z, )
+    FIELD_GET(Byte, Byte, B, )
+    FIELD_GET(Char, Char, C, )
+    FIELD_GET(Short, Short, S, )
+    FIELD_GET(Int, 32, I, )
+    FIELD_GET(Long, 64, J, Long)
+#undef FIELD_GET
     case Primitive::kPrimNot:
-      shadow_frame.SetVRegReference(vregA, result.GetL());
+      shadow_frame.SetVRegReference(
+          vregA,
+          should_report ? result.GetL()
+                        : is_volatile ? obj->GetFieldObjectVolatile<mirror::Object>(offset)
+                                      : obj->GetFieldObject<mirror::Object>(offset));
       break;
     default:
       LOG(FATAL) << "Unreachable: " << field_type;
@@ -492,34 +518,57 @@ static inline bool CheckWriteValueConstraint(Thread* self, ObjPtr<mirror::Object
 // Returns true on success, otherwise throws an exception and returns false.
 template<FindFieldType find_type, Primitive::Type field_type, bool do_access_check,
          bool transaction_active>
-ALWAYS_INLINE bool DoFieldPut(Thread* self, const ShadowFrame& shadow_frame,
-                              const Instruction* inst, uint16_t inst_data)
+ALWAYS_INLINE bool DoFieldPut(Thread* self,
+                              const ShadowFrame& shadow_frame,
+                              const Instruction* inst,
+                              uint16_t inst_data)
     REQUIRES_SHARED(Locks::mutator_lock_) {
+  bool should_report = Runtime::Current()->GetInstrumentation()->HasFieldWriteListeners();
   const bool do_assignability_check = do_access_check;
   bool is_static = (find_type == StaticObjectWrite) || (find_type == StaticPrimitiveWrite);
-  uint32_t field_idx = is_static ? inst->VRegB_21c() : inst->VRegC_22c();
-  ArtMethod* method = shadow_frame.GetMethod();
-  ArtField* f = FindFieldFromCode<find_type, do_access_check>(
-      field_idx, method, self, Primitive::ComponentSize(field_type));
-  if (UNLIKELY(f == nullptr)) {
-    CHECK(self->IsExceptionPending());
+  uint32_t vregA = is_static ? inst->VRegA_21c(inst_data) : inst->VRegA_22c(inst_data);
+  bool resolve_field_type = (shadow_frame.GetVRegReference(vregA) != nullptr);
+  ArtField* field = nullptr;
+  MemberOffset offset(0u);
+  bool is_volatile;
+  GetFieldInfo(self,
+               shadow_frame.GetMethod(),
+               reinterpret_cast<const uint16_t*>(inst),
+               is_static,
+               resolve_field_type,
+               &field,
+               &is_volatile,
+               &offset);
+  if (self->IsExceptionPending()) {
     return false;
   }
+
   ObjPtr<mirror::Object> obj;
   if (is_static) {
-    obj = f->GetDeclaringClass();
+    obj = field->GetDeclaringClass();
   } else {
     obj = shadow_frame.GetVRegReference(inst->VRegB_22c(inst_data));
-    if (UNLIKELY(obj == nullptr)) {
-      ThrowNullPointerExceptionForFieldAccess(f, method, false);
-      return false;
+    if (should_report || obj == nullptr) {
+      field = ResolveFieldWithAccessChecks(self,
+                                           Runtime::Current()->GetClassLinker(),
+                                           inst->VRegC_22c(),
+                                           shadow_frame.GetMethod(),
+                                           /* is_static= */ false,
+                                           /* is_put= */ true,
+                                           resolve_field_type);
+      if (UNLIKELY(obj == nullptr)) {
+        ThrowNullPointerExceptionForFieldAccess(
+            field, shadow_frame.GetMethod(), /* is_read= */ false);
+        return false;
+      }
+      // Reload in case suspension happened during field resolution.
+      obj = shadow_frame.GetVRegReference(inst->VRegB_22c(inst_data));
     }
   }
   if (transaction_active && !CheckWriteConstraint(self, obj)) {
     return false;
   }
 
-  uint32_t vregA = is_static ? inst->VRegA_21c(inst_data) : inst->VRegA_22c(inst_data);
   JValue value = GetFieldValue<field_type>(shadow_frame, vregA);
 
   if (transaction_active &&
@@ -527,12 +576,43 @@ ALWAYS_INLINE bool DoFieldPut(Thread* self, const ShadowFrame& shadow_frame,
       !CheckWriteValueConstraint(self, value.GetL())) {
     return false;
   }
+  if (should_report) {
+    return DoFieldPutCommon<field_type, do_assignability_check, transaction_active>(self,
+                                                                                    shadow_frame,
+                                                                                    obj,
+                                                                                    field,
+                                                                                    value);
+  }
+#define FIELD_SET(prim, type, jtype) \
+  case Primitive::kPrim ## prim: \
+    if (is_volatile) { \
+      obj->SetField ## type ## Volatile<transaction_active>(offset, value.Get ## jtype()); \
+    } else { \
+      obj->SetField ## type<transaction_active>(offset, value.Get ## jtype()); \
+    } \
+    break;
 
-  return DoFieldPutCommon<field_type, do_assignability_check, transaction_active>(self,
-                                                                                  shadow_frame,
-                                                                                  obj,
-                                                                                  f,
-                                                                                  value);
+  switch (field_type) {
+    FIELD_SET(Boolean, Boolean, Z)
+    FIELD_SET(Byte, Byte, B)
+    FIELD_SET(Char, Char, C)
+    FIELD_SET(Short, Short, S)
+    FIELD_SET(Int, 32, I)
+    FIELD_SET(Long, 64, J)
+    FIELD_SET(Not, Object, L)
+    case Primitive::kPrimVoid: {
+      LOG(FATAL) << "Unreachable " << field_type;
+      break;
+    }
+  }
+#undef FIELD_SET
+
+  if (transaction_active) {
+    if (UNLIKELY(self->IsExceptionPending())) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // Handles string resolution for const-string and const-string-jumbo instructions. Also ensures the
@@ -759,34 +839,6 @@ void ArtInterpreterToCompiledCodeBridge(Thread* self,
                                         ShadowFrame* shadow_frame,
                                         uint16_t arg_offset,
                                         JValue* result);
-
-static inline bool IsStringInit(const DexFile* dex_file, uint32_t method_idx)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  const dex::MethodId& method_id = dex_file->GetMethodId(method_idx);
-  const char* class_name = dex_file->StringByTypeIdx(method_id.class_idx_);
-  const char* method_name = dex_file->GetMethodName(method_id);
-  // Instead of calling ResolveMethod() which has suspend point and can trigger
-  // GC, look up the method symbolically.
-  // Compare method's class name and method name against string init.
-  // It's ok since it's not allowed to create your own java/lang/String.
-  // TODO: verify that assumption.
-  if ((strcmp(class_name, "Ljava/lang/String;") == 0) &&
-      (strcmp(method_name, "<init>") == 0)) {
-    return true;
-  }
-  return false;
-}
-
-static inline bool IsStringInit(const Instruction* instr, ArtMethod* caller)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  if (instr->Opcode() == Instruction::INVOKE_DIRECT ||
-      instr->Opcode() == Instruction::INVOKE_DIRECT_RANGE) {
-    uint16_t callee_method_idx = (instr->Opcode() == Instruction::INVOKE_DIRECT_RANGE) ?
-        instr->VRegB_3rc() : instr->VRegB_35c();
-    return IsStringInit(caller->GetDexFile(), callee_method_idx);
-  }
-  return false;
-}
 
 // Set string value created from StringFactory.newStringFromXXX() into all aliases of
 // StringFactory.newEmptyString().

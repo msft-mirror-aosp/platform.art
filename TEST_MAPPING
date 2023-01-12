@@ -71,6 +71,9 @@
       "name": "art-run-test-022-interface[com.google.android.art.apex]"
     },
     {
+      "name": "art-run-test-024-illegal-access[com.google.android.art.apex]"
+    },
+    {
       "name": "art-run-test-025-access-controller[com.google.android.art.apex]"
     },
     {
@@ -84,6 +87,9 @@
     },
     {
       "name": "art-run-test-029-assert[com.google.android.art.apex]"
+    },
+    {
+      "name": "art-run-test-032-concrete-sub[com.google.android.art.apex]"
     },
     {
       "name": "art-run-test-033-class-init-deadlock[com.google.android.art.apex]"
@@ -105,6 +111,9 @@
     },
     {
       "name": "art-run-test-041-narrowing[com.google.android.art.apex]"
+    },
+    {
+      "name": "art-run-test-042-new-instance[com.google.android.art.apex]"
     },
     {
       "name": "art-run-test-043-privates[com.google.android.art.apex]"
@@ -155,6 +164,9 @@
       "name": "art-run-test-067-preemptive-unpark[com.google.android.art.apex]"
     },
     {
+      "name": "art-run-test-069-field-type[com.google.android.art.apex]"
+    },
+    {
       "name": "art-run-test-070-nio-buffer[com.google.android.art.apex]"
     },
     {
@@ -164,10 +176,19 @@
       "name": "art-run-test-072-reachability-fence[com.google.android.art.apex]"
     },
     {
+      "name": "art-run-test-073-mismatched-field[com.google.android.art.apex]"
+    },
+    {
       "name": "art-run-test-074-gc-thrash[com.google.android.art.apex]"
     },
     {
+      "name": "art-run-test-075-verification-error[com.google.android.art.apex]"
+    },
+    {
       "name": "art-run-test-076-boolean-put[com.google.android.art.apex]"
+    },
+    {
+      "name": "art-run-test-077-method-override[com.google.android.art.apex]"
     },
     {
       "name": "art-run-test-078-polymorphic-virtual[com.google.android.art.apex]"
@@ -305,13 +326,7 @@
       "name": "art-run-test-143-string-value[com.google.android.art.apex]"
     },
     {
-      "name": "art-run-test-144-static-field-sigquit[com.google.android.art.apex]"
-    },
-    {
       "name": "art-run-test-145-alloc-tracking-stress[com.google.android.art.apex]"
-    },
-    {
-      "name": "art-run-test-151-OpenFileLimit[com.google.android.art.apex]"
     },
     {
       "name": "art-run-test-152-dead-large-object[com.google.android.art.apex]"
@@ -348,6 +363,9 @@
     },
     {
       "name": "art-run-test-176-app-image-string[com.google.android.art.apex]"
+    },
+    {
+      "name": "art-run-test-182-method-linking[com.google.android.art.apex]"
     },
     {
       "name": "art-run-test-1960-checker-bounds-codegen[com.google.android.art.apex]"
@@ -407,10 +425,10 @@
       "name": "art-run-test-2043-reference-pauses[com.google.android.art.apex]"
     },
     {
-      "name": "art-run-test-2231-checker-heap-poisoning[com.google.android.art.apex]"
+      "name": "art-run-test-2044-get-stack-traces[com.google.android.art.apex]"
     },
     {
-      "name": "art-run-test-2232-write-metrics-to-log[com.google.android.art.apex]"
+      "name": "art-run-test-2231-checker-heap-poisoning[com.google.android.art.apex]"
     },
     {
       "name": "art-run-test-2233-checker-remove-loop-suspend-check[com.google.android.art.apex]"
@@ -420,6 +438,18 @@
     },
     {
       "name": "art-run-test-2236-JdkUnsafeGetLong-regression[com.google.android.art.apex]"
+    },
+    {
+      "name": "art-run-test-2241-checker-inline-try-catch[com.google.android.art.apex]"
+    },
+    {
+      "name": "art-run-test-2242-checker-lse-acquire-release-operations[com.google.android.art.apex]"
+    },
+    {
+      "name": "art-run-test-2243-checker-not-inline-into-throw[com.google.android.art.apex]"
+    },
+    {
+      "name": "art-run-test-2244-checker-remove-try-boundary[com.google.android.art.apex]"
     },
     {
       "name": "art-run-test-300-package-override[com.google.android.art.apex]"
@@ -809,7 +839,13 @@
       "name": "art-run-test-536-checker-intrinsic-optimization[com.google.android.art.apex]"
     },
     {
+      "name": "art-run-test-536-checker-needs-access-check[com.google.android.art.apex]"
+    },
+    {
       "name": "art-run-test-537-checker-arraycopy[com.google.android.art.apex]"
+    },
+    {
+      "name": "art-run-test-537-checker-inline-and-unverified[com.google.android.art.apex]"
     },
     {
       "name": "art-run-test-537-checker-jump-over-jump[com.google.android.art.apex]"
@@ -1109,6 +1145,9 @@
       "name": "art-run-test-662-regression-alias[com.google.android.art.apex]"
     },
     {
+      "name": "art-run-test-663-checker-select-generator[com.google.android.art.apex]"
+    },
+    {
       "name": "art-run-test-665-checker-simd-zero[com.google.android.art.apex]"
     },
     {
@@ -1238,7 +1277,19 @@
       "name": "art-run-test-839-clinit-throw[com.google.android.art.apex]"
     },
     {
+      "name": "art-run-test-841-defaults[com.google.android.art.apex]"
+    },
+    {
+      "name": "art-run-test-843-default-interface[com.google.android.art.apex]"
+    },
+    {
       "name": "art-run-test-963-default-range-smali[com.google.android.art.apex]"
+    },
+    {
+      "name": "art-run-test-965-default-verify[com.google.android.art.apex]"
+    },
+    {
+      "name": "art-run-test-967-default-ame[com.google.android.art.apex]"
     },
     {
       "name": "art_libnativebridge_cts_tests[com.google.android.art.apex]"
@@ -1250,7 +1301,12 @@
       "name": "art_standalone_cmdline_tests[com.google.android.art.apex]"
     },
     {
-      "name": "art_standalone_compiler_tests[com.google.android.art.apex]"
+      "name": "art_standalone_compiler_tests[com.google.android.art.apex]",
+      "options": [
+        {
+          "exclude-filter": "JniCompilerTest*"
+        }
+      ]
     },
     {
       "name": "art_standalone_dex2oat_tests[com.google.android.art.apex]"
@@ -1289,16 +1345,19 @@
       "name": "art_standalone_oatdump_tests[com.google.android.art.apex]"
     },
     {
-      "name": "art_standalone_profman_tests[com.google.android.art.apex]"
+      "name": "art_standalone_odrefresh_tests[com.google.android.art.apex]"
     },
     {
-      "name": "art_standalone_runtime_compiler_tests[com.google.android.art.apex]"
+      "name": "art_standalone_profman_tests[com.google.android.art.apex]"
     },
     {
       "name": "art_standalone_runtime_tests[com.google.android.art.apex]"
     },
     {
       "name": "art_standalone_sigchain_tests[com.google.android.art.apex]"
+    },
+    {
+      "name": "libnativeloader_e2e_tests[com.google.android.art.apex]"
     },
     {
       "name": "libnativeloader_test[com.google.android.art.apex]"
@@ -1390,6 +1449,9 @@
       "name": "art-run-test-022-interface"
     },
     {
+      "name": "art-run-test-024-illegal-access"
+    },
+    {
       "name": "art-run-test-025-access-controller"
     },
     {
@@ -1403,6 +1465,9 @@
     },
     {
       "name": "art-run-test-029-assert"
+    },
+    {
+      "name": "art-run-test-032-concrete-sub"
     },
     {
       "name": "art-run-test-033-class-init-deadlock"
@@ -1424,6 +1489,9 @@
     },
     {
       "name": "art-run-test-041-narrowing"
+    },
+    {
+      "name": "art-run-test-042-new-instance"
     },
     {
       "name": "art-run-test-043-privates"
@@ -1474,6 +1542,9 @@
       "name": "art-run-test-067-preemptive-unpark"
     },
     {
+      "name": "art-run-test-069-field-type"
+    },
+    {
       "name": "art-run-test-070-nio-buffer"
     },
     {
@@ -1483,10 +1554,19 @@
       "name": "art-run-test-072-reachability-fence"
     },
     {
+      "name": "art-run-test-073-mismatched-field"
+    },
+    {
       "name": "art-run-test-074-gc-thrash"
     },
     {
+      "name": "art-run-test-075-verification-error"
+    },
+    {
       "name": "art-run-test-076-boolean-put"
+    },
+    {
+      "name": "art-run-test-077-method-override"
     },
     {
       "name": "art-run-test-078-polymorphic-virtual"
@@ -1624,13 +1704,7 @@
       "name": "art-run-test-143-string-value"
     },
     {
-      "name": "art-run-test-144-static-field-sigquit"
-    },
-    {
       "name": "art-run-test-145-alloc-tracking-stress"
-    },
-    {
-      "name": "art-run-test-151-OpenFileLimit"
     },
     {
       "name": "art-run-test-152-dead-large-object"
@@ -1667,6 +1741,9 @@
     },
     {
       "name": "art-run-test-176-app-image-string"
+    },
+    {
+      "name": "art-run-test-182-method-linking"
     },
     {
       "name": "art-run-test-1960-checker-bounds-codegen"
@@ -1726,10 +1803,10 @@
       "name": "art-run-test-2043-reference-pauses"
     },
     {
-      "name": "art-run-test-2231-checker-heap-poisoning"
+      "name": "art-run-test-2044-get-stack-traces"
     },
     {
-      "name": "art-run-test-2232-write-metrics-to-log"
+      "name": "art-run-test-2231-checker-heap-poisoning"
     },
     {
       "name": "art-run-test-2233-checker-remove-loop-suspend-check"
@@ -1739,6 +1816,18 @@
     },
     {
       "name": "art-run-test-2236-JdkUnsafeGetLong-regression"
+    },
+    {
+      "name": "art-run-test-2241-checker-inline-try-catch"
+    },
+    {
+      "name": "art-run-test-2242-checker-lse-acquire-release-operations"
+    },
+    {
+      "name": "art-run-test-2243-checker-not-inline-into-throw"
+    },
+    {
+      "name": "art-run-test-2244-checker-remove-try-boundary"
     },
     {
       "name": "art-run-test-300-package-override"
@@ -2128,7 +2217,13 @@
       "name": "art-run-test-536-checker-intrinsic-optimization"
     },
     {
+      "name": "art-run-test-536-checker-needs-access-check"
+    },
+    {
       "name": "art-run-test-537-checker-arraycopy"
+    },
+    {
+      "name": "art-run-test-537-checker-inline-and-unverified"
     },
     {
       "name": "art-run-test-537-checker-jump-over-jump"
@@ -2428,6 +2523,9 @@
       "name": "art-run-test-662-regression-alias"
     },
     {
+      "name": "art-run-test-663-checker-select-generator"
+    },
+    {
       "name": "art-run-test-665-checker-simd-zero"
     },
     {
@@ -2557,7 +2655,19 @@
       "name": "art-run-test-839-clinit-throw"
     },
     {
+      "name": "art-run-test-841-defaults"
+    },
+    {
+      "name": "art-run-test-843-default-interface"
+    },
+    {
       "name": "art-run-test-963-default-range-smali"
+    },
+    {
+      "name": "art-run-test-965-default-verify"
+    },
+    {
+      "name": "art-run-test-967-default-ame"
     },
     {
       "name": "art_libnativebridge_cts_tests"
@@ -2614,13 +2724,13 @@
       "name": "art_standalone_profman_tests"
     },
     {
-      "name": "art_standalone_runtime_compiler_tests"
-    },
-    {
       "name": "art_standalone_runtime_tests"
     },
     {
       "name": "art_standalone_sigchain_tests"
+    },
+    {
+      "name": "libnativeloader_e2e_tests"
     },
     {
       "name": "libnativeloader_test"
@@ -2706,6 +2816,9 @@
       "name": "art-run-test-022-interface"
     },
     {
+      "name": "art-run-test-024-illegal-access"
+    },
+    {
       "name": "art-run-test-025-access-controller"
     },
     {
@@ -2719,6 +2832,9 @@
     },
     {
       "name": "art-run-test-029-assert"
+    },
+    {
+      "name": "art-run-test-032-concrete-sub"
     },
     {
       "name": "art-run-test-033-class-init-deadlock"
@@ -2740,6 +2856,9 @@
     },
     {
       "name": "art-run-test-041-narrowing"
+    },
+    {
+      "name": "art-run-test-042-new-instance"
     },
     {
       "name": "art-run-test-043-privates"
@@ -2790,6 +2909,9 @@
       "name": "art-run-test-067-preemptive-unpark"
     },
     {
+      "name": "art-run-test-069-field-type"
+    },
+    {
       "name": "art-run-test-070-nio-buffer"
     },
     {
@@ -2799,10 +2921,19 @@
       "name": "art-run-test-072-reachability-fence"
     },
     {
+      "name": "art-run-test-073-mismatched-field"
+    },
+    {
       "name": "art-run-test-074-gc-thrash"
     },
     {
+      "name": "art-run-test-075-verification-error"
+    },
+    {
       "name": "art-run-test-076-boolean-put"
+    },
+    {
+      "name": "art-run-test-077-method-override"
     },
     {
       "name": "art-run-test-078-polymorphic-virtual"
@@ -2940,13 +3071,7 @@
       "name": "art-run-test-143-string-value"
     },
     {
-      "name": "art-run-test-144-static-field-sigquit"
-    },
-    {
       "name": "art-run-test-145-alloc-tracking-stress"
-    },
-    {
-      "name": "art-run-test-151-OpenFileLimit"
     },
     {
       "name": "art-run-test-152-dead-large-object"
@@ -2983,6 +3108,9 @@
     },
     {
       "name": "art-run-test-176-app-image-string"
+    },
+    {
+      "name": "art-run-test-182-method-linking"
     },
     {
       "name": "art-run-test-1960-checker-bounds-codegen"
@@ -3042,10 +3170,10 @@
       "name": "art-run-test-2043-reference-pauses"
     },
     {
-      "name": "art-run-test-2231-checker-heap-poisoning"
+      "name": "art-run-test-2044-get-stack-traces"
     },
     {
-      "name": "art-run-test-2232-write-metrics-to-log"
+      "name": "art-run-test-2231-checker-heap-poisoning"
     },
     {
       "name": "art-run-test-2233-checker-remove-loop-suspend-check"
@@ -3055,6 +3183,18 @@
     },
     {
       "name": "art-run-test-2236-JdkUnsafeGetLong-regression"
+    },
+    {
+      "name": "art-run-test-2241-checker-inline-try-catch"
+    },
+    {
+      "name": "art-run-test-2242-checker-lse-acquire-release-operations"
+    },
+    {
+      "name": "art-run-test-2243-checker-not-inline-into-throw"
+    },
+    {
+      "name": "art-run-test-2244-checker-remove-try-boundary"
     },
     {
       "name": "art-run-test-300-package-override"
@@ -3444,7 +3584,13 @@
       "name": "art-run-test-536-checker-intrinsic-optimization"
     },
     {
+      "name": "art-run-test-536-checker-needs-access-check"
+    },
+    {
       "name": "art-run-test-537-checker-arraycopy"
+    },
+    {
+      "name": "art-run-test-537-checker-inline-and-unverified"
     },
     {
       "name": "art-run-test-537-checker-jump-over-jump"
@@ -3744,6 +3890,9 @@
       "name": "art-run-test-662-regression-alias"
     },
     {
+      "name": "art-run-test-663-checker-select-generator"
+    },
+    {
       "name": "art-run-test-665-checker-simd-zero"
     },
     {
@@ -3873,7 +4022,19 @@
       "name": "art-run-test-839-clinit-throw"
     },
     {
+      "name": "art-run-test-841-defaults"
+    },
+    {
+      "name": "art-run-test-843-default-interface"
+    },
+    {
       "name": "art-run-test-963-default-range-smali"
+    },
+    {
+      "name": "art-run-test-965-default-verify"
+    },
+    {
+      "name": "art-run-test-967-default-ame"
     },
     {
       "name": "art_libnativebridge_cts_tests"
@@ -3883,6 +4044,12 @@
     },
     {
       "name": "art_standalone_cmdline_tests"
+    },
+    {
+      "name": "art_standalone_compiler_tests"
+    },
+    {
+      "name": "art_standalone_dex2oat_tests"
     },
     {
       "name": "art_standalone_dexdump_tests"
@@ -3924,13 +4091,13 @@
       "name": "art_standalone_profman_tests"
     },
     {
-      "name": "art_standalone_runtime_compiler_tests"
-    },
-    {
       "name": "art_standalone_runtime_tests"
     },
     {
       "name": "art_standalone_sigchain_tests"
+    },
+    {
+      "name": "libnativeloader_e2e_tests"
     },
     {
       "name": "libnativeloader_test"

@@ -32,7 +32,7 @@
 #include "scoped_thread_state_change-inl.h"
 #include "thread-current-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 std::ostream& operator<<(std::ostream& os, const Intrinsics& intrinsic) {
   switch (intrinsic) {
@@ -392,7 +392,7 @@ void IntrinsicVisitor::CreateReferenceGetReferentLocations(HInvoke* invoke,
 }
 
 void IntrinsicVisitor::CreateReferenceRefersToLocations(HInvoke* invoke) {
-  if (kEmitCompilerReadBarrier && !kUseBakerReadBarrier) {
+  if (gUseReadBarrier && !kUseBakerReadBarrier) {
     // Unimplemented for non-Baker read barrier.
     return;
   }

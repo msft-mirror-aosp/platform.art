@@ -44,13 +44,6 @@ static constexpr size_t kMonitorsMax = 4096;  // Maximum number of monitors held
 
 const JNINativeInterface* JNIEnvExt::table_override_ = nullptr;
 
-bool JNIEnvExt::CheckLocalsValid(JNIEnvExt* in) NO_THREAD_SAFETY_ANALYSIS {
-  if (in == nullptr) {
-    return false;
-  }
-  return in->locals_.IsValid();
-}
-
 jint JNIEnvExt::GetEnvHandler(JavaVMExt* vm, /*out*/void** env, jint version) {
   UNUSED(vm);
   // GetEnv always returns a JNIEnv* for the most current supported JNI version,
@@ -66,18 +59,18 @@ jint JNIEnvExt::GetEnvHandler(JavaVMExt* vm, /*out*/void** env, jint version) {
 }
 
 JNIEnvExt* JNIEnvExt::Create(Thread* self_in, JavaVMExt* vm_in, std::string* error_msg) {
-  std::unique_ptr<JNIEnvExt> ret(new JNIEnvExt(self_in, vm_in, error_msg));
-  if (CheckLocalsValid(ret.get())) {
-    return ret.release();
+  std::unique_ptr<JNIEnvExt> ret(new JNIEnvExt(self_in, vm_in));
+  if (!ret->Initialize(error_msg)) {
+    return nullptr;
   }
-  return nullptr;
+  return ret.release();
 }
 
-JNIEnvExt::JNIEnvExt(Thread* self_in, JavaVMExt* vm_in, std::string* error_msg)
+JNIEnvExt::JNIEnvExt(Thread* self_in, JavaVMExt* vm_in)
     : self_(self_in),
       vm_(vm_in),
-      local_ref_cookie_(kIRTFirstSegment),
-      locals_(1, kLocal, IndirectReferenceTable::ResizableCapacity::kYes, error_msg),
+      local_ref_cookie_(jni::kLRTFirstSegment),
+      locals_(),
       monitors_("monitors", kMonitorsInitial, kMonitorsMax),
       critical_(0),
       check_jni_(false),
@@ -86,6 +79,10 @@ JNIEnvExt::JNIEnvExt(Thread* self_in, JavaVMExt* vm_in, std::string* error_msg)
   check_jni_ = vm_in->IsCheckJniEnabled();
   functions = GetFunctionTable(check_jni_);
   unchecked_functions_ = GetJniNativeInterface();
+}
+
+bool JNIEnvExt::Initialize(std::string* error_msg) {
+  return locals_.Initialize(/*max_count=*/ 1u, error_msg);
 }
 
 void JNIEnvExt::SetFunctionsToRuntimeShutdownFunctions() {
@@ -157,7 +154,7 @@ MemberOffset JNIEnvExt::SegmentStateOffset(size_t pointer_size) {
                          4 +                         // local_ref_cookie.
                          (pointer_size - 4);         // Padding.
   size_t irt_segment_state_offset =
-      IndirectReferenceTable::SegmentStateOffset(pointer_size).Int32Value();
+      jni::LocalReferenceTable::SegmentStateOffset(pointer_size).Int32Value();
   return MemberOffset(locals_offset + irt_segment_state_offset);
 }
 

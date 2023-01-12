@@ -16,8 +16,8 @@
 
 #include <memory>
 
+#include "base/common_art_test.h"
 #include "base/macros.h"
-#include "common_runtime_test.h"
 #include "thread.h"
 
 // This test checks the offsets of values in the thread TLS and entrypoint structures. A failure
@@ -59,7 +59,7 @@ namespace art {
 #define EXPECT_OFFSET_DIFF_GT3(type, first_field, second_field, diff, name) \
   EXPECT_OFFSET_DIFF_GT(type, first_field, type, second_field, diff, name)
 
-class EntrypointsOrderTest : public CommonRuntimeTest {
+class EntrypointsOrderTest : public CommonArtTest {
  protected:
   void CheckThreadOffsets() {
     CHECKED(OFFSETOF_MEMBER(Thread, tls32_.state_and_flags) == 0, thread_flags_at_zero);
@@ -135,10 +135,14 @@ class EntrypointsOrderTest : public CommonRuntimeTest {
     EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, thread_local_mark_stack, async_exception, sizeof(void*));
     EXPECT_OFFSET_DIFFP(Thread, tlsPtr_, async_exception, top_reflective_handle_scope,
                         sizeof(void*));
+    EXPECT_OFFSET_DIFFP(
+        Thread, tlsPtr_, top_reflective_handle_scope, method_trace_buffer, sizeof(void*));
+    EXPECT_OFFSET_DIFFP(
+        Thread, tlsPtr_, method_trace_buffer, method_trace_buffer_index, sizeof(void*));
     // The first field after tlsPtr_ is forced to a 16 byte alignment so it might have some space.
     auto offset_tlsptr_end = OFFSETOF_MEMBER(Thread, tlsPtr_) +
         sizeof(decltype(reinterpret_cast<Thread*>(16)->tlsPtr_));
-    CHECKED(offset_tlsptr_end - OFFSETOF_MEMBER(Thread, tlsPtr_.top_reflective_handle_scope) ==
+    CHECKED(offset_tlsptr_end - OFFSETOF_MEMBER(Thread, tlsPtr_.method_trace_buffer_index) ==
                 sizeof(void*),
             "async_exception last field");
   }
@@ -301,7 +305,9 @@ class EntrypointsOrderTest : public CommonRuntimeTest {
 
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pA64Store, pNewEmptyString, sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pNewEmptyString, pNewStringFromBytes_B, sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pNewStringFromBytes_B, pNewStringFromBytes_BI,
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pNewStringFromBytes_B, pNewStringFromBytes_BB,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pNewStringFromBytes_BB, pNewStringFromBytes_BI,
                          sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pNewStringFromBytes_BI, pNewStringFromBytes_BII,
                          sizeof(void*));
@@ -329,7 +335,9 @@ class EntrypointsOrderTest : public CommonRuntimeTest {
                          sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pNewStringFromStringBuffer, pNewStringFromStringBuilder,
                          sizeof(void*));
-    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pNewStringFromStringBuilder, pStringBuilderAppend,
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pNewStringFromStringBuilder, pNewStringFromUtf16Bytes_BII,
+                         sizeof(void*));
+    EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pNewStringFromUtf16Bytes_BII, pStringBuilderAppend,
                          sizeof(void*));
     EXPECT_OFFSET_DIFFNP(QuickEntryPoints, pStringBuilderAppend, pUpdateInlineCache,
                          sizeof(void*));

@@ -242,7 +242,8 @@ static ALWAYS_INLINE bool DoCallCommon(ArtMethod* called_method,
                                        JValue* result,
                                        uint16_t number_of_inputs,
                                        uint32_t (&arg)[Instruction::kMaxVarArgRegs],
-                                       uint32_t vregC) REQUIRES_SHARED(Locks::mutator_lock_);
+                                       uint32_t vregC,
+                                       bool string_init) REQUIRES_SHARED(Locks::mutator_lock_);
 
 template <bool is_range>
 ALWAYS_INLINE void CopyRegisters(ShadowFrame& caller_frame,
@@ -999,11 +1000,9 @@ static ObjPtr<mirror::CallSite> InvokeBootstrapMethod(Thread* self,
   // Set-up a shadow frame for invoking the bootstrap method handle.
   ShadowFrameAllocaUniquePtr bootstrap_frame =
       CREATE_SHADOW_FRAME(call_site_type->NumberOfVRegs(),
-                          nullptr,
                           referrer,
                           shadow_frame.GetDexPC());
-  ScopedStackedShadowFramePusher pusher(
-      self, bootstrap_frame.get(), StackedShadowFrameType::kShadowFrameUnderConstruction);
+  ScopedStackedShadowFramePusher pusher(self, bootstrap_frame.get());
   ShadowFrameSetter setter(bootstrap_frame.get(), 0u);
 
   // The first parameter is a MethodHandles lookup instance.
@@ -1194,15 +1193,8 @@ static inline bool DoCallCommon(ArtMethod* called_method,
                                 JValue* result,
                                 uint16_t number_of_inputs,
                                 uint32_t (&arg)[Instruction::kMaxVarArgRegs],
-                                uint32_t vregC) {
-  bool string_init = false;
-  // Replace calls to String.<init> with equivalent StringFactory call.
-  if (UNLIKELY(called_method->GetDeclaringClass()->IsStringClass()
-               && called_method->IsConstructor())) {
-    called_method = WellKnownClasses::StringInitToStringFactory(called_method);
-    string_init = true;
-  }
-
+                                uint32_t vregC,
+                                bool string_init) {
   // Compute method information.
   CodeItemDataAccessor accessor(called_method->DexInstructionData());
   // Number of registers for the callee's call frame.
@@ -1269,7 +1261,7 @@ static inline bool DoCallCommon(ArtMethod* called_method,
   // Allocate shadow frame on the stack.
   const char* old_cause = self->StartAssertNoThreadSuspension("DoCallCommon");
   ShadowFrameAllocaUniquePtr shadow_frame_unique_ptr =
-      CREATE_SHADOW_FRAME(num_regs, &shadow_frame, called_method, /* dex pc */ 0);
+      CREATE_SHADOW_FRAME(num_regs, called_method, /* dex pc */ 0);
   ShadowFrame* new_shadow_frame = shadow_frame_unique_ptr.get();
 
   // Initialize new shadow frame by copying the registers from the callee shadow frame.
@@ -1277,8 +1269,7 @@ static inline bool DoCallCommon(ArtMethod* called_method,
     // Slow path.
     // We might need to do class loading, which incurs a thread state change to kNative. So
     // register the shadow frame as under construction and allow suspension again.
-    ScopedStackedShadowFramePusher pusher(
-        self, new_shadow_frame, StackedShadowFrameType::kShadowFrameUnderConstruction);
+    ScopedStackedShadowFramePusher pusher(self, new_shadow_frame);
     self->EndAssertNoThreadSuspension(old_cause);
 
     // ArtMethod here is needed to check type information of the call site against the callee.
@@ -1393,8 +1384,13 @@ static inline bool DoCallCommon(ArtMethod* called_method,
 
 template<bool is_range, bool do_assignability_check>
 NO_STACK_PROTECTOR
-bool DoCall(ArtMethod* called_method, Thread* self, ShadowFrame& shadow_frame,
-            const Instruction* inst, uint16_t inst_data, JValue* result) {
+bool DoCall(ArtMethod* called_method,
+            Thread* self,
+            ShadowFrame& shadow_frame,
+            const Instruction* inst,
+            uint16_t inst_data,
+            bool is_string_init,
+            JValue* result) {
   // Argument word count.
   const uint16_t number_of_inputs =
       (is_range) ? inst->VRegA_3rc(inst_data) : inst->VRegA_35c(inst_data);
@@ -1411,8 +1407,14 @@ bool DoCall(ArtMethod* called_method, Thread* self, ShadowFrame& shadow_frame,
   }
 
   return DoCallCommon<is_range, do_assignability_check>(
-      called_method, self, shadow_frame,
-      result, number_of_inputs, arg, vregC);
+      called_method,
+      self,
+      shadow_frame,
+      result,
+      number_of_inputs,
+      arg,
+      vregC,
+      is_string_init);
 }
 
 template <bool is_range, bool do_access_check, bool transaction_active>
@@ -1539,9 +1541,12 @@ void RecordArrayElementsInTransaction(ObjPtr<mirror::Array> array, int32_t count
 // Explicit DoCall template function declarations.
 #define EXPLICIT_DO_CALL_TEMPLATE_DECL(_is_range, _do_assignability_check)                      \
   template REQUIRES_SHARED(Locks::mutator_lock_)                                                \
-  bool DoCall<_is_range, _do_assignability_check>(ArtMethod* method, Thread* self,              \
+  bool DoCall<_is_range, _do_assignability_check>(ArtMethod* method,                            \
+                                                  Thread* self,                                 \
                                                   ShadowFrame& shadow_frame,                    \
-                                                  const Instruction* inst, uint16_t inst_data,  \
+                                                  const Instruction* inst,                      \
+                                                  uint16_t inst_data,                           \
+                                                  bool string_init,                             \
                                                   JValue* result)
 EXPLICIT_DO_CALL_TEMPLATE_DECL(false, false);
 EXPLICIT_DO_CALL_TEMPLATE_DECL(false, true);

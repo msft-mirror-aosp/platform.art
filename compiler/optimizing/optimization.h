@@ -18,10 +18,11 @@
 #define ART_COMPILER_OPTIMIZING_OPTIMIZATION_H_
 
 #include "base/arena_object.h"
+#include "base/macros.h"
 #include "nodes.h"
 #include "optimizing_compiler_stats.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class CodeGenerator;
 class DexCompilationUnit;
@@ -83,6 +84,7 @@ enum class OptimizationPass {
   kScheduling,
   kSelectGenerator,
   kSideEffectsAnalysis,
+  kWriteBarrierElimination,
 #ifdef ART_ENABLE_CODEGEN_arm
   kInstructionSimplifierArm,
   kCriticalNativeAbiFixupArm,

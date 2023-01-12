@@ -385,9 +385,8 @@ void EnterInterpreterFromInvoke(Thread* self,
     }
   }
   // Set up shadow frame with matching number of reference slots to vregs.
-  ShadowFrame* last_shadow_frame = self->GetManagedStack()->GetTopShadowFrame();
   ShadowFrameAllocaUniquePtr shadow_frame_unique_ptr =
-      CREATE_SHADOW_FRAME(num_regs, last_shadow_frame, method, /* dex pc */ 0);
+      CREATE_SHADOW_FRAME(num_regs, method, /* dex pc */ 0);
   ShadowFrame* shadow_frame = shadow_frame_unique_ptr.get();
 
   size_t cur_reg = num_regs - num_ins;
@@ -511,7 +510,7 @@ void EnterInterpreterFromDeoptimize(Thread* self,
         new_dex_pc = dex_pc + instr->SizeInCodeUnits();
       } else if (instr->IsInvoke()) {
         DCHECK(deopt_method_type == DeoptimizationMethodType::kDefault);
-        if (IsStringInit(instr, shadow_frame->GetMethod())) {
+        if (IsStringInit(*instr, shadow_frame->GetMethod())) {
           uint16_t this_obj_vreg = GetReceiverRegisterForStringInit(instr);
           // Move the StringFactory.newStringFromChars() result into the register representing
           // "this object" when invoking the string constructor in the original dex instruction.

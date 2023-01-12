@@ -29,6 +29,7 @@
 #include "android-base/scopeguard.h"
 #include "android-base/stringprintf.h"
 #include "android-base/strings.h"
+#include "android-modules-utils/sdk_level.h"
 #include "arch/instruction_set.h"
 #include "base/common_art_test.h"
 #include "base/file_utils.h"
@@ -71,11 +72,10 @@ class MockExecUtils : public ExecUtils {
  public:
   // A workaround to avoid MOCK_METHOD on a method with an `std::string*` parameter, which will lead
   // to a conflict between gmock and android-base/logging.h (b/132668253).
-  int ExecAndReturnCode(const std::vector<std::string>& arg_vector,
-                        int,
-                        bool*,
-                        std::string*) const override {
-    return DoExecAndReturnCode(arg_vector);
+  ExecResult ExecAndReturnResult(const std::vector<std::string>& arg_vector,
+                                 int,
+                                 std::string*) const override {
+    return {.status = ExecResult::kExited, .exit_code = DoExecAndReturnCode(arg_vector)};
   }
 
   MOCK_METHOD(int, DoExecAndReturnCode, (const std::vector<std::string>& arg_vector), (const));
@@ -423,8 +423,8 @@ TEST_F(OdRefreshTest, CompileSetsCompilerFilterWithExplicitValue) {
       ExitCode::kCompilationSuccess);
 }
 
-// Test setup: The compiler filter is not explicitly set. Use "speed-profile" if there is a profile,
-// otherwise fall back to "speed".
+// Test setup: The compiler filter is not explicitly set. Use "speed-profile" if there is a vetted
+// profile (on U+), otherwise fall back to "speed".
 TEST_F(OdRefreshTest, CompileSetsCompilerFilterWithDefaultValue) {
   // Uninteresting calls.
   EXPECT_CALL(
@@ -439,12 +439,20 @@ TEST_F(OdRefreshTest, CompileSetsCompilerFilterWithDefaultValue) {
                                 Not(Contains(HasSubstr("--profile-file-fd="))),
                                 Contains("--compiler-filter=speed"))))
       .WillOnce(Return(0));
-  EXPECT_CALL(
-      *mock_exec_utils_,
-      DoExecAndReturnCode(AllOf(Contains(Concatenate({"--dex-file=", services_jar_})),
-                                Contains(HasSubstr("--profile-file-fd=")),
-                                Contains("--compiler-filter=speed-profile"))))
-      .WillOnce(Return(0));
+  // Only on U+ should we use the profile by default if available.
+  if (android::modules::sdklevel::IsAtLeastU()) {
+    EXPECT_CALL(*mock_exec_utils_,
+                DoExecAndReturnCode(AllOf(Contains(Concatenate({"--dex-file=", services_jar_})),
+                                          Contains(HasSubstr("--profile-file-fd=")),
+                                          Contains("--compiler-filter=speed-profile"))))
+        .WillOnce(Return(0));
+  } else {
+    EXPECT_CALL(*mock_exec_utils_,
+                DoExecAndReturnCode(AllOf(Contains(Concatenate({"--dex-file=", services_jar_})),
+                                          Not(Contains(HasSubstr("--profile-file-fd="))),
+                                          Contains("--compiler-filter=speed"))))
+        .WillOnce(Return(0));
+  }
   EXPECT_EQ(
       odrefresh_->Compile(*metrics_,
                           CompilationOptions{

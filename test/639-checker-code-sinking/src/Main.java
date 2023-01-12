@@ -27,6 +27,7 @@ public class Main {
     testPhiInput();
     testVolatileStore();
     testCatchBlock();
+    $noinline$testTwoThrowingPathsAndStringBuilderAppend();
     doThrow = true;
     try {
       testInstanceSideEffects();
@@ -392,43 +393,11 @@ public class Main {
   }
 
   private static void testCatchBlock() {
-    assertEquals(456, testSinkToCatchBlock());
     assertEquals(456, testDoNotSinkToTry());
-    assertEquals(456, testDoNotSinkToCatchInsideTry());
     assertEquals(456, testSinkWithinTryBlock());
     assertEquals(456, testSinkRightBeforeTryBlock());
-    assertEquals(456, testSinkToSecondCatch());
     assertEquals(456, testDoNotSinkToCatchInsideTryWithMoreThings(false, false));
-    assertEquals(456, testSinkToCatchBlockCustomClass());
     assertEquals(456, DoNotSinkWithOOMThrow());
-  }
-
-  /// CHECK-START: int Main.testSinkToCatchBlock() code_sinking (before)
-  /// CHECK: <<ObjLoadClass:l\d+>>   LoadClass class_name:java.lang.Object
-  /// CHECK:                         NewInstance [<<ObjLoadClass>>]
-  /// CHECK:                         TryBoundary kind:entry
-
-  /// CHECK-START: int Main.testSinkToCatchBlock() code_sinking (after)
-  /// CHECK:                         TryBoundary kind:entry
-  /// CHECK: <<ObjLoadClass:l\d+>>   LoadClass class_name:java.lang.Object
-  /// CHECK:                         NewInstance [<<ObjLoadClass>>]
-
-  // Consistency check to make sure there's only one entry TryBoundary.
-  /// CHECK-START: int Main.testSinkToCatchBlock() code_sinking (after)
-  /// CHECK:                         TryBoundary kind:entry
-  /// CHECK-NOT:                     TryBoundary kind:entry
-
-  // Tests that we can sink the Object creation to the catch block.
-  private static int testSinkToCatchBlock() {
-    Object o = new Object();
-    try {
-      if (doEarlyReturn) {
-        return 123;
-      }
-    } catch (Error e) {
-      throw new Error(o.toString());
-    }
-    return 456;
   }
 
   /// CHECK-START: int Main.testDoNotSinkToTry() code_sinking (before)
@@ -451,41 +420,6 @@ public class Main {
     Object o = new Object();
     try {
       if (doEarlyReturn) {
-        throw new Error(o.toString());
-      }
-    } catch (Error e) {
-      throw new Error();
-    }
-    return 456;
-  }
-
-  /// CHECK-START: int Main.testDoNotSinkToCatchInsideTry() code_sinking (before)
-  /// CHECK: <<ObjLoadClass:l\d+>>   LoadClass class_name:java.lang.Object
-  /// CHECK:                         NewInstance [<<ObjLoadClass>>]
-  /// CHECK:                         TryBoundary kind:entry
-  /// CHECK:                         TryBoundary kind:entry
-
-  /// CHECK-START: int Main.testDoNotSinkToCatchInsideTry() code_sinking (after)
-  /// CHECK: <<ObjLoadClass:l\d+>>   LoadClass class_name:java.lang.Object
-  /// CHECK:                         NewInstance [<<ObjLoadClass>>]
-  /// CHECK:                         TryBoundary kind:entry
-  /// CHECK:                         TryBoundary kind:entry
-
-  // Consistency check to make sure there's exactly two entry TryBoundary.
-  /// CHECK-START: int Main.testDoNotSinkToCatchInsideTry() code_sinking (after)
-  /// CHECK:                         TryBoundary kind:entry
-  /// CHECK:                         TryBoundary kind:entry
-  /// CHECK-NOT:                     TryBoundary kind:entry
-
-  // Tests that we don't sink the Object creation into a catch handler surrounded by try/catch.
-  private static int testDoNotSinkToCatchInsideTry() {
-    Object o = new Object();
-    try {
-      try {
-        if (doEarlyReturn) {
-          return 123;
-        }
-      } catch (Error e) {
         throw new Error(o.toString());
       }
     } catch (Error e) {
@@ -538,46 +472,6 @@ public class Main {
     return 456;
   }
 
-  /// CHECK-START: int Main.testSinkToSecondCatch() code_sinking (before)
-  /// CHECK: <<ObjLoadClass:l\d+>>   LoadClass class_name:java.lang.Object
-  /// CHECK:                         NewInstance [<<ObjLoadClass>>]
-  /// CHECK:                         TryBoundary kind:entry
-  /// CHECK:                         TryBoundary kind:entry
-
-  /// CHECK-START: int Main.testSinkToSecondCatch() code_sinking (after)
-  /// CHECK:                         TryBoundary kind:entry
-  /// CHECK:                         TryBoundary kind:entry
-  /// CHECK: <<ObjLoadClass:l\d+>>   LoadClass class_name:java.lang.Object
-  /// CHECK:                         NewInstance [<<ObjLoadClass>>]
-
-  // Consistency check to make sure there's exactly two entry TryBoundary.
-  /// CHECK-START: int Main.testSinkToSecondCatch() code_sinking (after)
-  /// CHECK:                         TryBoundary kind:entry
-  /// CHECK:                         TryBoundary kind:entry
-  /// CHECK-NOT:                     TryBoundary kind:entry
-  private static int testSinkToSecondCatch() {
-    Object o = new Object();
-    try {
-      if (doEarlyReturn) {
-        return 123;
-      }
-    } catch (Error e) {
-      throw new Error();
-    }
-
-    try {
-      // We need a different boolean to the one above, so that the compiler cannot optimize this
-      // return away.
-      if (doOtherEarlyReturn) {
-        return 789;
-      }
-    } catch (Error e) {
-      throw new Error(o.toString());
-    }
-
-    return 456;
-  }
-
   /// CHECK-START: int Main.testDoNotSinkToCatchInsideTryWithMoreThings(boolean, boolean) code_sinking (before)
   /// CHECK-NOT:                     TryBoundary kind:entry
   /// CHECK: <<ObjLoadClass:l\d+>>   LoadClass class_name:java.lang.Object
@@ -614,38 +508,6 @@ public class Main {
 
   private static class ObjectWithInt {
     int x;
-  }
-
-  /// CHECK-START: int Main.testSinkToCatchBlockCustomClass() code_sinking (before)
-  /// CHECK: <<LoadClass:l\d+>>      LoadClass class_name:Main$ObjectWithInt
-  /// CHECK: <<Clinit:l\d+>>         ClinitCheck [<<LoadClass>>]
-  /// CHECK:                         NewInstance [<<Clinit>>]
-  /// CHECK:                         TryBoundary kind:entry
-
-  /// CHECK-START: int Main.testSinkToCatchBlockCustomClass() code_sinking (after)
-  /// CHECK: <<LoadClass:l\d+>>      LoadClass class_name:Main$ObjectWithInt
-  /// CHECK: <<Clinit:l\d+>>         ClinitCheck [<<LoadClass>>]
-  /// CHECK:                         TryBoundary kind:entry
-  /// CHECK:                         NewInstance [<<Clinit>>]
-
-  // Consistency check to make sure there's only one entry TryBoundary.
-  /// CHECK-START: int Main.testSinkToCatchBlockCustomClass() code_sinking (after)
-  /// CHECK:                         TryBoundary kind:entry
-  /// CHECK-NOT:                     TryBoundary kind:entry
-
-  // Similar to testSinkToCatchBlock, but using a custom class. CLinit check is not an instruction
-  // that we sink since it can throw and it is not in the allow list. We can sink the NewInstance
-  // nevertheless.
-  private static int testSinkToCatchBlockCustomClass() {
-    ObjectWithInt obj = new ObjectWithInt();
-    try {
-      if (doEarlyReturn) {
-        return 123;
-      }
-    } catch (Error e) {
-      throw new Error(Integer.toString(obj.x));
-    }
-    return 456;
   }
 
   /// CHECK-START: int Main.DoNotSinkWithOOMThrow() code_sinking (before)
@@ -687,8 +549,73 @@ public class Main {
     return x;
   }
 
+  private static void $noinline$testTwoThrowingPathsAndStringBuilderAppend() {
+    try {
+      $noinline$twoThrowingPathsAndStringBuilderAppend(null);
+      throw new Error("Unreachable");
+    } catch (Error expected) {
+      assertEquals("Object is null", expected.getMessage());
+    }
+    try {
+      $noinline$twoThrowingPathsAndStringBuilderAppend(new Object());
+      throw new Error("Unreachable");
+    } catch (Error expected) {
+      assertEquals("s1s2", expected.getMessage());
+    }
+  }
+
+  // We currently do not inline the `StringBuilder` constructor.
+  // When we did, the `StringBuilderAppend` pattern recognition was looking for
+  // the inlined `NewArray` (and its associated `LoadClass`) and checked in
+  // debug build that the `StringBuilder` has an environment use from this
+  // `NewArray` (and maybe from `LoadClass`). However, code sinking was pruning
+  // the environment of the `NewArray`, leading to a crash when compiling the
+  // code below on the device (we do not inline `core-oj` on host). b/252799691
+
+  // We currently have a heuristic that disallows inlining methods if their basic blocks end with a
+  // throw. We could add code so that `requireNonNull`'s block doesn't end with a throw but that
+  // would mean that the string builder optimization wouldn't fire as it requires all uses to be in
+  // the same block. If `requireNonNull` is inlined at some point, we need to re-mark it as $inline$
+  // so that the test is operational again.
+
+  /// CHECK-START: void Main.$noinline$twoThrowingPathsAndStringBuilderAppend(java.lang.Object) inliner (before)
+  /// CHECK: InvokeStaticOrDirect method_name:Main.requireNonNull
+
+  /// CHECK-START: void Main.$noinline$twoThrowingPathsAndStringBuilderAppend(java.lang.Object) inliner (after)
+  /// CHECK: InvokeStaticOrDirect method_name:Main.requireNonNull
+  private static void $noinline$twoThrowingPathsAndStringBuilderAppend(Object o) {
+    String s1 = "s1";
+    String s2 = "s2";
+    StringBuilder sb = new StringBuilder();
+
+    // Before inlining, the environment use from this invoke prevents the
+    // `StringBuilderAppend` pattern recognition. After inlining, we end up
+    // with two paths ending with a `Throw` and we could sink the `sb`
+    // instructions from above down to those below, enabling the
+    // `StringBuilderAppend` pattern recognition.
+    // (But that does not happen when the `StringBuilder` constructor is
+    // not inlined, see above.)
+    requireNonNull(o);
+
+    String s1s2 = sb.append(s1).append(s2).toString();
+    sb = null;
+    throw new Error(s1s2);
+  }
+
+  private static void requireNonNull(Object o) {
+    if (o == null) {
+      throw new Error("Object is null");
+    }
+  }
+
   private static void assertEquals(int expected, int actual) {
     if (expected != actual) {
+      throw new AssertionError("Expected: " + expected + ", Actual: " + actual);
+    }
+  }
+
+  private static void assertEquals(String expected, String actual) {
+    if (!expected.equals(actual)) {
       throw new AssertionError("Expected: " + expected + ", Actual: " + actual);
     }
   }

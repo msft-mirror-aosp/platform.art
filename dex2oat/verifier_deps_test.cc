@@ -47,6 +47,7 @@ class VerifierDepsCompilerCallbacks : public CompilerCallbacks {
         deps_(nullptr) {}
 
   void AddUncompilableMethod(MethodReference ref ATTRIBUTE_UNUSED) override {}
+  void AddUncompilableClass(ClassReference ref ATTRIBUTE_UNUSED) override {}
   void ClassRejected(ClassReference ref ATTRIBUTE_UNUSED) override {}
 
   verifier::VerifierDeps* GetVerifierDeps() const override { return deps_; }
@@ -628,13 +629,6 @@ TEST_F(VerifierDepsTest, MultiDexVerification) {
   std::vector<uint8_t> buffer;
   verifier_deps_->Encode(dex_files_, &buffer);
   ASSERT_FALSE(buffer.empty());
-}
-
-TEST_F(VerifierDepsTest, Assignable_Arrays) {
-  ASSERT_TRUE(TestAssignabilityRecording(/* dst= */ "[LIface;",
-                                         /* src= */ "[LMyClassExtendingInterface;"));
-  ASSERT_FALSE(HasAssignable(
-      "LIface;", "LMyClassExtendingInterface;"));
 }
 
 }  // namespace verifier

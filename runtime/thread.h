@@ -38,6 +38,7 @@
 #include "handle.h"
 #include "handle_scope.h"
 #include "interpreter/interpreter_cache.h"
+#include "interpreter/shadow_frame.h"
 #include "javaheapprof/javaheapsampler.h"
 #include "jvalue.h"
 #include "managed_stack.h"
@@ -231,8 +232,11 @@ class Thread {
 
   // Attaches the calling native thread to the runtime, returning the new native peer.
   // Used to implement JNI AttachCurrentThread and AttachCurrentThreadAsDaemon calls.
-  static Thread* Attach(const char* thread_name, bool as_daemon, jobject thread_group,
-                        bool create_peer);
+  static Thread* Attach(const char* thread_name,
+                        bool as_daemon,
+                        jobject thread_group,
+                        bool create_peer,
+                        bool should_run_callbacks);
   // Attaches the calling native thread to the runtime, returning the new native peer.
   static Thread* Attach(const char* thread_name, bool as_daemon, jobject thread_peer);
 
@@ -243,6 +247,9 @@ class Thread {
   // high cost and so we favor passing self around when possible.
   // TODO: mark as PURE so the compiler may coalesce and remove?
   static Thread* Current();
+
+  // Get the thread from the JNI environment.
+  static Thread* ForEnv(JNIEnv* env);
 
   // On a runnable thread, check for pending thread suspension request and handle if pending.
   void AllowThreadSuspension() REQUIRES_SHARED(Locks::mutator_lock_);
@@ -269,20 +276,28 @@ class Thread {
   // Dumps a one-line summary of thread state (used for operator<<).
   void ShortDump(std::ostream& os) const;
 
+  // Order of threads for ANRs (ANRs can be trimmed, so we print important ones first).
+  enum class DumpOrder : uint8_t {
+    kMain,     // Always print the main thread first (there might not be one).
+    kBlocked,  // Then print all threads that are blocked due to waiting on lock.
+    kLocked,   // Then print all threads that are holding some lock already.
+    kDefault,  // Print all other threads which might not be interesting for ANR.
+  };
+
   // Dumps the detailed thread state and the thread stack (used for SIGQUIT).
-  void Dump(std::ostream& os,
-            bool dump_native_stack = true,
-            bool force_dump_stack = false) const
+  DumpOrder Dump(std::ostream& os,
+                 bool dump_native_stack = true,
+                 bool force_dump_stack = false) const
       REQUIRES_SHARED(Locks::mutator_lock_);
-  void Dump(std::ostream& os,
-            unwindstack::AndroidLocalUnwinder& unwinder,
-            bool dump_native_stack = true,
-            bool force_dump_stack = false) const
+  DumpOrder Dump(std::ostream& os,
+                 unwindstack::AndroidLocalUnwinder& unwinder,
+                 bool dump_native_stack = true,
+                 bool force_dump_stack = false) const
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  void DumpJavaStack(std::ostream& os,
-                     bool check_suspended = true,
-                     bool dump_locks = true) const
+  DumpOrder DumpJavaStack(std::ostream& os,
+                          bool check_suspended = true,
+                          bool dump_locks = true) const
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Dumps the SIGQUIT per-thread header. 'thread' can be null for a non-attached thread, in which
@@ -379,11 +394,11 @@ class Thread {
   void WaitForFlipFunction(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_);
 
   gc::accounting::AtomicStack<mirror::Object>* GetThreadLocalMarkStack() {
-    CHECK(kUseReadBarrier);
+    CHECK(gUseReadBarrier);
     return tlsPtr_.thread_local_mark_stack;
   }
   void SetThreadLocalMarkStack(gc::accounting::AtomicStack<mirror::Object>* stack) {
-    CHECK(kUseReadBarrier);
+    CHECK(gUseReadBarrier);
     tlsPtr_.thread_local_mark_stack = stack;
   }
 
@@ -735,6 +750,9 @@ class Thread {
     return tlsPtr_.frame_id_to_shadow_frame != nullptr;
   }
 
+  // This is done by GC using a checkpoint (or in a stop-the-world pause).
+  void SweepInterpreterCache(IsMarkedVisitor* visitor) REQUIRES_SHARED(Locks::mutator_lock_);
+
   void VisitRoots(RootVisitor* visitor, VisitRootFlags flags)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -756,6 +774,13 @@ class Thread {
     return ThreadOffset<pointer_size>(
         OFFSETOF_MEMBER(Thread, tls32_) +
         OFFSETOF_MEMBER(tls_32bit_sized_values, thin_lock_thread_id));
+  }
+
+  template<PointerSize pointer_size>
+  static constexpr ThreadOffset<pointer_size> TidOffset() {
+    return ThreadOffset<pointer_size>(
+        OFFSETOF_MEMBER(Thread, tls32_) +
+        OFFSETOF_MEMBER(tls_32bit_sized_values, tid));
   }
 
   template<PointerSize pointer_size>
@@ -1038,7 +1063,7 @@ class Thread {
   }
 
   bool GetIsGcMarking() const {
-    CHECK(kUseReadBarrier);
+    CHECK(gUseReadBarrier);
     return tls32_.is_gc_marking;
   }
 
@@ -1051,24 +1076,21 @@ class Thread {
   bool GetWeakRefAccessEnabled() const;  // Only safe for current thread.
 
   void SetWeakRefAccessEnabled(bool enabled) {
-    CHECK(kUseReadBarrier);
+    DCHECK(gUseReadBarrier);
     WeakRefAccessState new_state = enabled ?
         WeakRefAccessState::kEnabled : WeakRefAccessState::kDisabled;
     tls32_.weak_ref_access_enabled.store(new_state, std::memory_order_release);
   }
 
   uint32_t GetDisableThreadFlipCount() const {
-    CHECK(kUseReadBarrier);
     return tls32_.disable_thread_flip_count;
   }
 
   void IncrementDisableThreadFlipCount() {
-    CHECK(kUseReadBarrier);
     ++tls32_.disable_thread_flip_count;
   }
 
   void DecrementDisableThreadFlipCount() {
-    CHECK(kUseReadBarrier);
     DCHECK_GT(tls32_.disable_thread_flip_count, 0U);
     --tls32_.disable_thread_flip_count;
   }
@@ -1122,7 +1144,8 @@ class Thread {
   void AssertHasDeoptimizationContext()
       REQUIRES_SHARED(Locks::mutator_lock_);
   void PushStackedShadowFrame(ShadowFrame* sf, StackedShadowFrameType type);
-  ShadowFrame* PopStackedShadowFrame(StackedShadowFrameType type, bool must_be_present = true);
+  ShadowFrame* PopStackedShadowFrame();
+  ShadowFrame* MaybePopDeoptimizedStackedShadowFrame();
 
   // For debugger, find the shadow frame that corresponds to a frame id.
   // Or return null if there is none.
@@ -1183,6 +1206,22 @@ class Thread {
     tlsPtr_.deps_or_stack_trace_sample.verifier_deps = verifier_deps;
   }
 
+  uintptr_t* GetMethodTraceBuffer() { return tlsPtr_.method_trace_buffer; }
+
+  size_t* GetMethodTraceIndexPtr() { return &tlsPtr_.method_trace_buffer_index; }
+
+  uintptr_t* SetMethodTraceBuffer(uintptr_t* buffer) {
+    return tlsPtr_.method_trace_buffer = buffer;
+  }
+
+  void ResetMethodTraceBuffer() {
+    if (tlsPtr_.method_trace_buffer != nullptr) {
+      delete[] tlsPtr_.method_trace_buffer;
+    }
+    tlsPtr_.method_trace_buffer = nullptr;
+    tlsPtr_.method_trace_buffer_index = 0;
+  }
+
   uint64_t GetTraceClockBase() const {
     return tls64_.trace_clock_base;
   }
@@ -1236,6 +1275,10 @@ class Thread {
     tlsPtr_.thread_local_end += bytes;
     DCHECK_LE(tlsPtr_.thread_local_end, tlsPtr_.thread_local_limit);
   }
+
+  // Called from Concurrent mark-compact GC to slide the TLAB pointers backwards
+  // to adjust to post-compact addresses.
+  void AdjustTlab(size_t slide_bytes);
 
   // Doesn't check that there is room.
   mirror::Object* AllocTlab(size_t bytes);
@@ -1329,11 +1372,12 @@ class Thread {
 
   bool IncrementMakeVisiblyInitializedCounter() {
     tls32_.make_visibly_initialized_counter += 1u;
-    return tls32_.make_visibly_initialized_counter == kMakeVisiblyInitializedCounterTriggerCount;
-  }
-
-  void ClearMakeVisiblyInitializedCounter() {
-    tls32_.make_visibly_initialized_counter = 0u;
+    DCHECK_LE(tls32_.make_visibly_initialized_counter, kMakeVisiblyInitializedCounterTriggerCount);
+    if (tls32_.make_visibly_initialized_counter == kMakeVisiblyInitializedCounterTriggerCount) {
+      tls32_.make_visibly_initialized_counter = 0u;
+      return true;
+    }
+    return false;
   }
 
   void PushVerifier(verifier::MethodVerifier* verifier);
@@ -1378,10 +1422,9 @@ class Thread {
   // Set to the read barrier marking entrypoints to be non-null.
   void SetReadBarrierEntrypoints();
 
-  static jobject CreateCompileTimePeer(JNIEnv* env,
-                                       const char* name,
-                                       bool as_daemon,
-                                       jobject thread_group)
+  ObjPtr<mirror::Object> CreateCompileTimePeer(const char* name,
+                                               bool as_daemon,
+                                               jobject thread_group)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   ALWAYS_INLINE InterpreterCache* GetInterpreterCache() {
@@ -1444,7 +1487,7 @@ class Thread {
  private:
   explicit Thread(bool daemon);
   ~Thread() REQUIRES(!Locks::mutator_lock_, !Locks::thread_suspend_count_lock_);
-  void Destroy();
+  void Destroy(bool should_run_callbacks);
 
   // Deletes and clears the tlsPtr_.jpeer field. Done in a way so that both it and opeer cannot be
   // observed to be set at the same time by instrumentation.
@@ -1455,16 +1498,16 @@ class Thread {
   template <typename PeerAction>
   static Thread* Attach(const char* thread_name,
                         bool as_daemon,
-                        PeerAction p);
+                        PeerAction p,
+                        bool should_run_callbacks);
 
   void CreatePeer(const char* name, bool as_daemon, jobject thread_group);
 
   template<bool kTransactionActive>
-  static void InitPeer(ScopedObjectAccessAlreadyRunnable& soa,
-                       ObjPtr<mirror::Object> peer,
-                       jboolean thread_is_daemon,
-                       jobject thread_group,
-                       jobject thread_name,
+  static void InitPeer(ObjPtr<mirror::Object> peer,
+                       bool as_daemon,
+                       ObjPtr<mirror::Object> thread_group,
+                       ObjPtr<mirror::String> thread_name,
                        jint thread_priority)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -1510,14 +1553,14 @@ class Thread {
   void VerifyStackImpl() REQUIRES_SHARED(Locks::mutator_lock_);
 
   void DumpState(std::ostream& os) const REQUIRES_SHARED(Locks::mutator_lock_);
-  void DumpStack(std::ostream& os,
-                 bool dump_native_stack = true,
-                 bool force_dump_stack = false) const
+  DumpOrder DumpStack(std::ostream& os,
+                      bool dump_native_stack = true,
+                      bool force_dump_stack = false) const
       REQUIRES_SHARED(Locks::mutator_lock_);
-  void DumpStack(std::ostream& os,
-                 unwindstack::AndroidLocalUnwinder& unwinder,
-                 bool dump_native_stack = true,
-                 bool force_dump_stack = false) const
+  DumpOrder DumpStack(std::ostream& os,
+                      unwindstack::AndroidLocalUnwinder& unwinder,
+                      bool dump_native_stack = true,
+                      bool force_dump_stack = false) const
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Out-of-line conveniences for debugging in gdb.
@@ -1525,12 +1568,13 @@ class Thread {
   // Like Thread::Dump(std::cerr).
   void DumpFromGdb() const REQUIRES_SHARED(Locks::mutator_lock_);
 
+  // A wrapper around CreateCallback used when userfaultfd GC is used to
+  // identify the GC by stacktrace.
+  static NO_INLINE void* CreateCallbackWithUffdGc(void* arg);
   static void* CreateCallback(void* arg);
 
-  void HandleUncaughtExceptions(ScopedObjectAccessAlreadyRunnable& soa)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-  void RemoveFromThreadGroup(ScopedObjectAccessAlreadyRunnable& soa)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+  void HandleUncaughtExceptions() REQUIRES_SHARED(Locks::mutator_lock_);
+  void RemoveFromThreadGroup() REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Initialize a thread.
   //
@@ -1597,9 +1641,6 @@ class Thread {
 
   template <bool kPrecise>
   void VisitRoots(RootVisitor* visitor) REQUIRES_SHARED(Locks::mutator_lock_);
-
-  static void SweepInterpreterCaches(IsMarkedVisitor* visitor)
-      REQUIRES_SHARED(Locks::mutator_lock_);
 
   static bool IsAotCompiler();
 
@@ -1915,7 +1956,9 @@ class Thread {
                                method_verifier(nullptr),
                                thread_local_mark_stack(nullptr),
                                async_exception(nullptr),
-                               top_reflective_handle_scope(nullptr) {
+                               top_reflective_handle_scope(nullptr),
+                               method_trace_buffer(nullptr),
+                               method_trace_buffer_index(0) {
       std::fill(held_mutexes, held_mutexes + kLockLevelCount, nullptr);
     }
 
@@ -2078,6 +2121,12 @@ class Thread {
 
     // Top of the linked-list for reflective-handle scopes or null if none.
     BaseReflectiveHandleScope* top_reflective_handle_scope;
+
+    // Pointer to a thread-local buffer for method tracing.
+    uintptr_t* method_trace_buffer;
+
+    // The index of the next free entry in method_trace_buffer.
+    size_t method_trace_buffer_index;
   } tlsPtr_;
 
   // Small thread-local cache to be used from the interpreter.
@@ -2110,8 +2159,10 @@ class Thread {
   SafeMap<std::string, std::unique_ptr<TLSData>, std::less<>> custom_tls_
       GUARDED_BY(Locks::custom_tls_lock_);
 
-#ifndef __BIONIC__
-  __attribute__((tls_model("initial-exec")))
+#if !defined(__BIONIC__)
+#if !defined(ANDROID_HOST_MUSL)
+    __attribute__((tls_model("initial-exec")))
+#endif
   static thread_local Thread* self_tls_;
 #endif
 
@@ -2194,17 +2245,18 @@ class ScopedAllowThreadSuspension {
 
 class ScopedStackedShadowFramePusher {
  public:
-  ScopedStackedShadowFramePusher(Thread* self, ShadowFrame* sf, StackedShadowFrameType type)
-    : self_(self), type_(type) {
-    self_->PushStackedShadowFrame(sf, type);
+  ScopedStackedShadowFramePusher(Thread* self, ShadowFrame* sf) : self_(self), sf_(sf) {
+    DCHECK_EQ(sf->GetLink(), nullptr);
+    self_->PushStackedShadowFrame(sf, StackedShadowFrameType::kShadowFrameUnderConstruction);
   }
   ~ScopedStackedShadowFramePusher() {
-    self_->PopStackedShadowFrame(type_);
+    ShadowFrame* sf = self_->PopStackedShadowFrame();
+    DCHECK_EQ(sf, sf_);
   }
 
  private:
   Thread* const self_;
-  const StackedShadowFrameType type_;
+  ShadowFrame* const sf_;
 
   DISALLOW_COPY_AND_ASSIGN(ScopedStackedShadowFramePusher);
 };
@@ -2228,13 +2280,13 @@ class ScopedTransitioningToRunnable : public ValueObject {
   explicit ScopedTransitioningToRunnable(Thread* self)
       : self_(self) {
     DCHECK_EQ(self, Thread::Current());
-    if (kUseReadBarrier) {
+    if (gUseReadBarrier) {
       self_->SetIsTransitioningToRunnable(true);
     }
   }
 
   ~ScopedTransitioningToRunnable() {
-    if (kUseReadBarrier) {
+    if (gUseReadBarrier) {
       self_->SetIsTransitioningToRunnable(false);
     }
   }

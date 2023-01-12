@@ -47,6 +47,7 @@ template <typename T> class Handle;
 template <typename T> class MutableHandle;
 struct NthCallerVisitor;
 union JValue;
+class OatQuickMethodHeader;
 class SHARED_LOCKABLE ReaderWriterMutex;
 class ShadowFrame;
 class Thread;
@@ -200,13 +201,31 @@ class Instrumentation {
 
   Instrumentation();
 
-  static constexpr MemberOffset NeedsEntryExitHooksOffset() {
+  static constexpr MemberOffset NeedsExitHooksOffset() {
     // Assert that instrumentation_stubs_installed_ is 8bits wide. If the size changes
     // update the compare instructions in the code generator when generating checks for
     // MethodEntryExitHooks.
     static_assert(sizeof(instrumentation_stubs_installed_) == 1,
                   "instrumentation_stubs_installed_ isn't expected size");
     return MemberOffset(OFFSETOF_MEMBER(Instrumentation, instrumentation_stubs_installed_));
+  }
+
+  static constexpr MemberOffset HaveMethodEntryListenersOffset() {
+    // Assert that have_method_entry_listeners_ is 8bits wide. If the size changes
+    // update the compare instructions in the code generator when generating checks for
+    // MethodEntryExitHooks.
+    static_assert(sizeof(have_method_entry_listeners_) == 1,
+                  "have_method_entry_listeners_ isn't expected size");
+    return MemberOffset(OFFSETOF_MEMBER(Instrumentation, have_method_entry_listeners_));
+  }
+
+  static constexpr MemberOffset HaveMethodExitListenersOffset() {
+    // Assert that have_method_exit_listeners_ is 8bits wide. If the size changes
+    // update the compare instructions in the code generator when generating checks for
+    // MethodEntryExitHooks.
+    static_assert(sizeof(have_method_exit_listeners_) == 1,
+                  "have_method_exit_listeners_ isn't expected size");
+    return MemberOffset(OFFSETOF_MEMBER(Instrumentation, have_method_exit_listeners_));
   }
 
   // Add a listener to be notified of the masked together sent of instrumentation events. This
@@ -504,6 +523,14 @@ class Instrumentation {
   // method requires a deopt or if this particular frame needs a deopt because of a class
   // redefinition.
   bool ShouldDeoptimizeCaller(Thread* self, ArtMethod** sp) REQUIRES_SHARED(Locks::mutator_lock_);
+  bool ShouldDeoptimizeCaller(Thread* self, ArtMethod** sp, size_t frame_size)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+  // This is a helper function used by the two variants of ShouldDeoptimizeCaller.
+  // Remove this once ShouldDeoptimizeCaller is updated not to use NthCallerVisitor.
+  bool ShouldDeoptimizeCaller(Thread* self,
+                              ArtMethod* caller,
+                              uintptr_t caller_pc,
+                              uintptr_t caller_sp) REQUIRES_SHARED(Locks::mutator_lock_);
   // This returns if the specified method requires a deoptimization. This doesn't account if a stack
   // frame involving this method requires a deoptimization.
   bool NeedsSlowInterpreterForMethod(Thread* self, ArtMethod* method)
@@ -544,6 +571,8 @@ class Instrumentation {
 
   void InstallStubsForMethod(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_);
 
+  void UpdateEntrypointsForDebuggable() REQUIRES(art::Locks::mutator_lock_);
+
   // Install instrumentation exit stub on every method of the stack of the given thread.
   // This is used by:
   //  - the debugger to cause a deoptimization of the all frames in thread's stack (for
@@ -574,6 +603,9 @@ class Instrumentation {
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   InstrumentationLevel GetCurrentInstrumentationLevel() const;
+
+  bool MethodSupportsExitEvents(ArtMethod* method, const OatQuickMethodHeader* header)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
  private:
   // Returns true if moving to the given instrumentation level requires the installation of stubs.

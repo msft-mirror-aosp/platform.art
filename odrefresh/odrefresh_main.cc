@@ -26,6 +26,7 @@
 #include "arch/instruction_set.h"
 #include "base/file_utils.h"
 #include "base/globals.h"
+#include "base/stl_util.h"
 #include "odr_common.h"
 #include "odr_compilation_log.h"
 #include "odr_config.h"
@@ -40,7 +41,9 @@ using ::android::base::StartsWith;
 using ::art::odrefresh::CompilationOptions;
 using ::art::odrefresh::ExitCode;
 using ::art::odrefresh::kCheckedSystemPropertyPrefixes;
+using ::art::odrefresh::kIgnoredSystemProperties;
 using ::art::odrefresh::kSystemProperties;
+using ::art::odrefresh::kSystemPropertySystemServerCompilerFilterOverride;
 using ::art::odrefresh::OdrCompilationLog;
 using ::art::odrefresh::OdrConfig;
 using ::art::odrefresh::OdrMetrics;
@@ -175,6 +178,7 @@ int InitializeConfig(int argc, char** argv, OdrConfig* config) {
 
   if (config->GetSystemServerCompilerFilter().empty()) {
     std::string filter = GetProperty("dalvik.vm.systemservercompilerfilter", "");
+    filter = GetProperty(kSystemPropertySystemServerCompilerFilterOverride, filter);
     config->SetSystemServerCompilerFilter(filter);
   }
 
@@ -197,7 +201,7 @@ void GetSystemProperties(std::unordered_map<std::string, std::string>* system_pr
       return;
     }
     for (const char* prefix : kCheckedSystemPropertyPrefixes) {
-      if (StartsWith(name, prefix)) {
+      if (StartsWith(name, prefix) && !art::ContainsElement(kIgnoredSystemProperties, name)) {
         (*system_properties)[name] = value;
       }
     }
@@ -272,10 +276,17 @@ int main(int argc, char** argv) {
   CompilationOptions compilation_options;
   if (action == "--check") {
     // Fast determination of whether artifacts are up to date.
-    return odr.CheckArtifactsAreUpToDate(metrics, &compilation_options);
+    ExitCode exit_code = odr.CheckArtifactsAreUpToDate(metrics, &compilation_options);
+    // Normally, `--check` should not write metrics. If compilation is not required, there's no need
+    // to write metrics; if compilation is required, `--compile` will write metrics. Therefore,
+    // `--check` should only write metrics when things went wrong.
+    metrics.SetEnabled(exit_code != ExitCode::kOkay && exit_code != ExitCode::kCompilationRequired);
+    return exit_code;
   } else if (action == "--compile") {
-    const ExitCode exit_code = odr.CheckArtifactsAreUpToDate(metrics, &compilation_options);
+    ExitCode exit_code = odr.CheckArtifactsAreUpToDate(metrics, &compilation_options);
     if (exit_code != ExitCode::kCompilationRequired) {
+      // No compilation required, so only write metrics when things went wrong.
+      metrics.SetEnabled(exit_code != ExitCode::kOkay);
       return exit_code;
     }
     OdrCompilationLog compilation_log;
@@ -283,6 +294,8 @@ int main(int argc, char** argv) {
       LOG(INFO) << "Compilation skipped because it was attempted recently";
       return ExitCode::kOkay;
     }
+    // Compilation required, so always write metrics.
+    metrics.SetEnabled(true);
     ExitCode compile_result = odr.Compile(metrics, compilation_options);
     compilation_log.Log(metrics.GetArtApexVersion(),
                         metrics.GetArtApexLastUpdateMillis(),

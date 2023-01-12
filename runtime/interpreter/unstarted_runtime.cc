@@ -61,7 +61,7 @@
 #include "thread-inl.h"
 #include "transaction.h"
 #include "unstarted_runtime_list.h"
-#include "well_known_classes.h"
+#include "well_known_classes-inl.h"
 
 namespace art {
 namespace interpreter {
@@ -231,8 +231,7 @@ void UnstartedRuntime::UnstartedClassForNameCommon(Thread* self,
     class_loader = nullptr;
   }
 
-  ScopedObjectAccessUnchecked soa(self);
-  if (class_loader != nullptr && !ClassLinker::IsBootClassLoader(soa, class_loader)) {
+  if (class_loader != nullptr && !ClassLinker::IsBootClassLoader(class_loader)) {
     AbortTransactionOrFail(self,
                            "Only the boot classloader is supported: %s",
                            mirror::Object::PrettyTypeOf(class_loader).c_str());
@@ -659,8 +658,7 @@ void UnstartedRuntime::UnstartedClassLoaderGetResourceAsStream(
     StackHandleScope<1> hs(self);
     Handle<mirror::Class> this_classloader_class(hs.NewHandle(this_obj->GetClass()));
 
-    if (self->DecodeJObject(WellKnownClasses::java_lang_BootClassLoader) !=
-            this_classloader_class.Get()) {
+    if (WellKnownClasses::java_lang_BootClassLoader != this_classloader_class.Get()) {
       AbortTransactionOrFail(self,
                              "Unsupported classloader type %s for getResourceAsStream",
                              mirror::Class::PrettyClass(this_classloader_class.Get()).c_str());
@@ -1113,18 +1111,14 @@ void UnstartedRuntime::UnstartedThreadCurrentThread(
     // thread as unstarted to the ThreadGroup. A faked-up main thread peer is good enough for
     // these purposes.
     Runtime::Current()->InitThreadGroups(self);
-    jobject main_peer =
-        self->CreateCompileTimePeer(self->GetJniEnv(),
-                                    "main",
-                                    false,
-                                    Runtime::Current()->GetMainThreadGroup());
+    ObjPtr<mirror::Object> main_peer = self->CreateCompileTimePeer(
+        "main", /*as_daemon=*/ false, Runtime::Current()->GetMainThreadGroup());
     if (main_peer == nullptr) {
       AbortTransactionOrFail(self, "Failed allocating peer");
       return;
     }
 
-    result->SetL(self->DecodeJObject(main_peer));
-    self->GetJniEnv()->DeleteLocalRef(main_peer);
+    result->SetL(main_peer);
   } else {
     AbortTransactionOrFail(self,
                            "Thread.currentThread() does not support %s",
@@ -1367,6 +1361,22 @@ void UnstartedRuntime::UnstartedStringDoReplace(
 }
 
 // This allows creating the new style of String objects during compilation.
+void UnstartedRuntime::UnstartedStringFactoryNewStringFromBytes(
+    Thread* self, ShadowFrame* shadow_frame, JValue* result, size_t arg_offset) {
+  jint high = shadow_frame->GetVReg(arg_offset + 1);
+  jint offset = shadow_frame->GetVReg(arg_offset + 2);
+  jint byte_count = shadow_frame->GetVReg(arg_offset + 3);
+  DCHECK_GE(byte_count, 0);
+  StackHandleScope<1> hs(self);
+  Handle<mirror::ByteArray> h_byte_array(
+      hs.NewHandle(shadow_frame->GetVRegReference(arg_offset)->AsByteArray()));
+  Runtime* runtime = Runtime::Current();
+  gc::AllocatorType allocator = runtime->GetHeap()->GetCurrentAllocator();
+  result->SetL(
+      mirror::String::AllocFromByteArray(self, byte_count, h_byte_array, offset, high, allocator));
+}
+
+// This allows creating the new style of String objects during compilation.
 void UnstartedRuntime::UnstartedStringFactoryNewStringFromChars(
     Thread* self, ShadowFrame* shadow_frame, JValue* result, size_t arg_offset) {
   jint offset = shadow_frame->GetVReg(arg_offset);
@@ -1557,7 +1567,7 @@ void UnstartedRuntime::UnstartedJdkUnsafeCompareAndSwapObject(
   mirror::Object* new_value = shadow_frame->GetVRegReference(arg_offset + 5);
 
   // Must use non transactional mode.
-  if (kUseReadBarrier) {
+  if (gUseReadBarrier) {
     // Need to make sure the reference stored in the field is a to-space one before attempting the
     // CAS or the CAS could fail incorrectly.
     mirror::HeapReference<mirror::Object>* field_addr =
@@ -1919,6 +1929,30 @@ void UnstartedRuntime::UnstartedJNIStringCompareTo(Thread* self,
     return;
   }
   result->SetI(receiver->AsString()->CompareTo(rhs->AsString()));
+}
+
+void UnstartedRuntime::UnstartedJNIStringFillBytesLatin1(
+    Thread* self, ArtMethod* method ATTRIBUTE_UNUSED,
+    mirror::Object* receiver, uint32_t* args, JValue* ATTRIBUTE_UNUSED) {
+  StackHandleScope<2> hs(self);
+  Handle<mirror::String> h_receiver(hs.NewHandle(
+      reinterpret_cast<mirror::String*>(receiver)->AsString()));
+  Handle<mirror::ByteArray> h_buffer(hs.NewHandle(
+      reinterpret_cast<mirror::ByteArray*>(args[0])->AsByteArray()));
+  int32_t index = static_cast<int32_t>(args[1]);
+  h_receiver->FillBytesLatin1(h_buffer, index);
+}
+
+void UnstartedRuntime::UnstartedJNIStringFillBytesUTF16(
+    Thread* self, ArtMethod* method ATTRIBUTE_UNUSED,
+    mirror::Object* receiver, uint32_t* args, JValue* ATTRIBUTE_UNUSED) {
+  StackHandleScope<2> hs(self);
+  Handle<mirror::String> h_receiver(hs.NewHandle(
+      reinterpret_cast<mirror::String*>(receiver)->AsString()));
+  Handle<mirror::ByteArray> h_buffer(hs.NewHandle(
+      reinterpret_cast<mirror::ByteArray*>(args[0])->AsByteArray()));
+  int32_t index = static_cast<int32_t>(args[1]);
+  h_receiver->FillBytesUTF16(h_buffer, index);
 }
 
 void UnstartedRuntime::UnstartedJNIStringIntern(

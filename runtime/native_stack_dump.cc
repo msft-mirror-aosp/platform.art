@@ -18,6 +18,7 @@
 
 #include <memory>
 #include <ostream>
+#include <string_view>
 
 #include <stdio.h>
 
@@ -300,25 +301,20 @@ static bool RunCommand(const std::string& cmd) {
   }
 }
 
-static bool PcIsWithinQuickCode(ArtMethod* method, uintptr_t pc) NO_THREAD_SAFETY_ANALYSIS {
-  const void* entry_point = method->GetEntryPointFromQuickCompiledCode();
-  if (entry_point == nullptr) {
-    return pc == 0;
+// Remove method parameters by finding matching top-level parenthesis and removing them.
+// Since functions can be defined inside functions, this can remove multiple substrings.
+std::string StripParameters(std::string name) {
+  size_t end = name.size();
+  int nesting = 0;
+  for (ssize_t i = name.size() - 1; i > 0; i--) {
+    if (name[i] == ')' && nesting++ == 0) {
+      end = i + 1;
+    }
+    if (name[i] == '(' && --nesting == 0) {
+      name = name.erase(i, end - i);
+    }
   }
-  ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
-  if (class_linker->IsQuickGenericJniStub(entry_point) ||
-      class_linker->IsQuickResolutionStub(entry_point) ||
-      class_linker->IsQuickToInterpreterBridge(entry_point)) {
-    return false;
-  }
-  // The backtrace library might have heuristically subracted instruction
-  // size from the pc, to pretend the pc is at the calling instruction.
-  if (reinterpret_cast<uintptr_t>(GetQuickInstrumentationExitPc()) - pc <= 4) {
-    return false;
-  }
-  uintptr_t code = reinterpret_cast<uintptr_t>(EntryPointToCodePointer(entry_point));
-  uintptr_t code_size = reinterpret_cast<const OatQuickMethodHeader*>(code)[-1].GetCodeSize();
-  return code <= pc && pc <= (code + code_size);
+  return name;
 }
 
 void DumpNativeStack(std::ostream& os,
@@ -365,6 +361,7 @@ void DumpNativeStack(std::ostream& os,
 
   std::unique_ptr<Addr2linePipe> addr2line_state;
   data.DemangleFunctionNames();
+  bool holds_mutator_lock =  Locks::mutator_lock_->IsSharedHeld(Thread::Current());
   for (const unwindstack::FrameData& frame : data.frames) {
     // We produce output like this:
     // ]    #00 pc 000075bb8  /system/lib/libc.so (unwind_backtrace_thread+536)
@@ -377,13 +374,9 @@ void DumpNativeStack(std::ostream& os,
     os << prefix << StringPrintf("#%02zu pc ", frame.num);
     bool try_addr2line = false;
     if (frame.map_info == nullptr) {
-      os << StringPrintf(Is64BitInstructionSet(kRuntimeISA) ? "%016" PRIx64 "  ???"
-                                                            : "%08" PRIx64 "  ???",
-                         frame.pc);
+      os << StringPrintf("%08" PRIx64 "  ???", frame.pc);
     } else {
-      os << StringPrintf(Is64BitInstructionSet(kRuntimeISA) ? "%016" PRIx64 "  "
-                                                            : "%08" PRIx64 "  ",
-                         frame.rel_pc);
+      os << StringPrintf("%08" PRIx64 "  ", frame.rel_pc);
       const std::shared_ptr<unwindstack::MapInfo>& map_info = frame.map_info;
       if (map_info->name().empty()) {
         os << StringPrintf("<anonymous:%" PRIx64 ">", map_info->start());
@@ -395,7 +388,10 @@ void DumpNativeStack(std::ostream& os,
       }
       os << " (";
       if (!frame.function_name.empty()) {
-        os << frame.function_name.c_str();
+        // Remove parameters from the printed function name to improve signal/noise in the logs.
+        // Also, ANRs are often trimmed, so printing less means we get more useful data out.
+        // We can still symbolize the function based on the PC and build-id (including inlining).
+        os << StripParameters(frame.function_name.c_str());
         if (frame.function_offset != 0) {
           os << "+" << frame.function_offset;
         }
@@ -404,12 +400,15 @@ void DumpNativeStack(std::ostream& os,
         if (!map_info->name().empty()) {
           try_addr2line = true;
         }
-      } else if (current_method != nullptr &&
-          Locks::mutator_lock_->IsSharedHeld(Thread::Current()) &&
-          PcIsWithinQuickCode(current_method, frame.pc)) {
-        const void* start_of_code = current_method->GetEntryPointFromQuickCompiledCode();
-        os << current_method->JniLongName() << "+"
-           << (frame.pc - reinterpret_cast<uint64_t>(start_of_code));
+      } else if (current_method != nullptr && holds_mutator_lock) {
+        const OatQuickMethodHeader* header = current_method->GetOatQuickMethodHeader(frame.pc);
+        if (header != nullptr) {
+          const void* start_of_code = header->GetCode();
+          os << current_method->JniLongName() << "+"
+             << (frame.pc - reinterpret_cast<uint64_t>(start_of_code));
+        } else {
+          os << "???";
+        }
       } else {
         os << "???";
       }

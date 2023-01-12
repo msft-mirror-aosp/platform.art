@@ -32,7 +32,7 @@
 #include "scoped_thread_state_change-inl.h"
 #include "subtype_check.h"
 
-namespace art {
+namespace art HIDDEN {
 
 using android::base::StringPrintf;
 
@@ -155,6 +155,24 @@ void GraphChecker::VisitBasicBlock(HBasicBlock* block) {
         AddError(StringPrintf("Unexpected instruction %s:%d jumps into the exit block.",
                               last_instruction->DebugName(),
                               last_instruction->GetId()));
+      }
+    }
+  }
+
+  // Make sure the first instruction of a catch block is always a Nop that emits an environment.
+  if (block->IsCatchBlock()) {
+    if (!block->GetFirstInstruction()->IsNop()) {
+      AddError(StringPrintf("Block %d doesn't have a Nop as its first instruction.",
+                            current_block_->GetBlockId()));
+    } else {
+      HNop* nop = block->GetFirstInstruction()->AsNop();
+      if (!nop->NeedsEnvironment()) {
+        AddError(
+            StringPrintf("%s:%d is a Nop and the first instruction of block %d, but it doesn't "
+                         "need an environment.",
+                         nop->DebugName(),
+                         nop->GetId(),
+                         current_block_->GetBlockId()));
       }
     }
   }
@@ -291,27 +309,25 @@ void GraphChecker::VisitBasicBlock(HBasicBlock* block) {
 }
 
 void GraphChecker::VisitBoundsCheck(HBoundsCheck* check) {
+  VisitInstruction(check);
   if (!GetGraph()->HasBoundsChecks()) {
     AddError(StringPrintf("Instruction %s:%d is a HBoundsCheck, "
                           "but HasBoundsChecks() returns false",
                           check->DebugName(),
                           check->GetId()));
   }
-
-  // Perform the instruction base checks too.
-  VisitInstruction(check);
 }
 
 void GraphChecker::VisitDeoptimize(HDeoptimize* deopt) {
+  VisitInstruction(deopt);
   if (GetGraph()->IsCompilingOsr()) {
     AddError(StringPrintf("A graph compiled OSR cannot have a HDeoptimize instruction"));
   }
-
-  // Perform the instruction base checks too.
-  VisitInstruction(deopt);
 }
 
 void GraphChecker::VisitTryBoundary(HTryBoundary* try_boundary) {
+  VisitInstruction(try_boundary);
+
   ArrayRef<HBasicBlock* const> handlers = try_boundary->GetExceptionHandlers();
 
   // Ensure that all exception handlers are catch blocks.
@@ -338,21 +354,44 @@ void GraphChecker::VisitTryBoundary(HTryBoundary* try_boundary) {
     }
   }
 
-  VisitInstruction(try_boundary);
+  if (!GetGraph()->HasTryCatch()) {
+    AddError(
+        StringPrintf("The graph doesn't have the HasTryCatch bit set but we saw "
+                     "%s:%d in block %d.",
+                     try_boundary->DebugName(),
+                     try_boundary->GetId(),
+                     try_boundary->GetBlock()->GetBlockId()));
+  }
 }
 
 void GraphChecker::VisitLoadException(HLoadException* load) {
-  // Ensure that LoadException is the first instruction in a catch block.
+  VisitInstruction(load);
+
+  // Ensure that LoadException is the second instruction in a catch block. The first one should be a
+  // Nop (checked separately).
   if (!load->GetBlock()->IsCatchBlock()) {
     AddError(StringPrintf("%s:%d is in a non-catch block %d.",
                           load->DebugName(),
                           load->GetId(),
                           load->GetBlock()->GetBlockId()));
-  } else if (load->GetBlock()->GetFirstInstruction() != load) {
-    AddError(StringPrintf("%s:%d is not the first instruction in catch block %d.",
+  } else if (load->GetBlock()->GetFirstInstruction()->GetNext() != load) {
+    AddError(StringPrintf("%s:%d is not the second instruction in catch block %d.",
                           load->DebugName(),
                           load->GetId(),
                           load->GetBlock()->GetBlockId()));
+  }
+}
+
+void GraphChecker::VisitMonitorOperation(HMonitorOperation* monitor_op) {
+  VisitInstruction(monitor_op);
+
+  if (!GetGraph()->HasMonitorOperations()) {
+    AddError(
+        StringPrintf("The graph doesn't have the HasMonitorOperations bit set but we saw "
+                     "%s:%d in block %d.",
+                     monitor_op->DebugName(),
+                     monitor_op->GetId(),
+                     monitor_op->GetBlock()->GetBlockId()));
   }
 }
 
@@ -513,17 +552,10 @@ void GraphChecker::VisitInstruction(HInstruction* instruction) {
                           instruction->GetId(),
                           current_block_->GetBlockId()));
   } else if (instruction->CanThrowIntoCatchBlock()) {
-    // Find the top-level environment. This corresponds to the environment of
-    // the catch block since we do not inline methods with try/catch.
-    HEnvironment* environment = instruction->GetEnvironment();
-    while (environment->GetParent() != nullptr) {
-      environment = environment->GetParent();
-    }
-
-    // Find all catch blocks and test that `instruction` has an environment
-    // value for each one.
+    // Find all catch blocks and test that `instruction` has an environment value for each one.
     const HTryBoundary& entry = instruction->GetBlock()->GetTryCatchInformation()->GetTryEntry();
     for (HBasicBlock* catch_block : entry.GetExceptionHandlers()) {
+      const HEnvironment* environment = catch_block->GetFirstInstruction()->GetEnvironment();
       for (HInstructionIterator phi_it(catch_block->GetPhis()); !phi_it.Done(); phi_it.Advance()) {
         HPhi* catch_phi = phi_it.Current()->AsPhi();
         if (environment->GetInstructionAt(catch_phi->GetRegNumber()) == nullptr) {
@@ -1052,6 +1084,21 @@ void GraphChecker::VisitNeg(HNeg* instruction) {
   }
 }
 
+void GraphChecker::VisitArraySet(HArraySet* instruction) {
+  VisitInstruction(instruction);
+
+  if (instruction->NeedsTypeCheck() !=
+      instruction->GetSideEffects().Includes(SideEffects::CanTriggerGC())) {
+    AddError(StringPrintf(
+        "%s %d has a flag mismatch. An ArraySet instruction can trigger a GC iff it "
+        "needs a type check. Needs type check: %s, Can trigger GC: %s",
+        instruction->DebugName(),
+        instruction->GetId(),
+        instruction->NeedsTypeCheck() ? "true" : "false",
+        instruction->GetSideEffects().Includes(SideEffects::CanTriggerGC()) ? "true" : "false"));
+  }
+}
+
 void GraphChecker::VisitBinaryOperation(HBinaryOperation* op) {
   VisitInstruction(op);
   DataType::Type lhs_type = op->InputAt(0)->GetType();
@@ -1112,6 +1159,8 @@ void GraphChecker::VisitBinaryOperation(HBinaryOperation* op) {
 }
 
 void GraphChecker::VisitConstant(HConstant* instruction) {
+  VisitInstruction(instruction);
+
   HBasicBlock* block = instruction->GetBlock();
   if (!block->IsEntryBlock()) {
     AddError(StringPrintf(

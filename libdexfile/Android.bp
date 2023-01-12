@@ -288,13 +288,17 @@ art_cc_defaults {
         ":art-gtest-jars-GetMethodSignature",
         ":art-gtest-jars-Lookup",
         ":art-gtest-jars-Main",
+        ":art-gtest-jars-MainEmptyUncompressed",
         ":art-gtest-jars-MultiDex",
         ":art-gtest-jars-Nested",
     ],
     header_libs: ["jni_headers"],
+    static_libs: [
+        "libziparchive",
+    ],
     shared_libs: [
         "libunwindstack",
-        "libziparchive",
+        "libz", // libziparchive dependency; must be repeated here since it's a static lib.
     ],
 }
 

@@ -24,6 +24,7 @@
 #include "art_method-inl.h"
 #include "base/mutex.h"
 #include "class_linker.h"
+#include "class_table-inl.h"
 #include "dex/dex_file.h"
 #include "dex/dex_file_structs.h"
 #include "gc_root-inl.h"
@@ -475,6 +476,11 @@ inline ArtMethod* ClassLinker::ResolveMethod(uint32_t method_idx,
       DCHECK(Thread::Current()->IsExceptionPending());
       return nullptr;
     }
+    // Look for the method again in case the type resolution updated the cache.
+    resolved = dex_cache->GetResolvedMethod(method_idx);
+    if (kResolveMode == ResolveMode::kNoChecks && resolved != nullptr) {
+      return resolved;
+    }
   }
 
   // Check if the invoke type matches the class type.
@@ -583,6 +589,12 @@ inline ArtField* ClassLinker::ResolveField(uint32_t field_idx,
     return nullptr;
   }
 
+  // Look for the field again in case the type resolution updated the cache.
+  resolved = dex_cache->GetResolvedField(field_idx);
+  if (resolved != nullptr) {
+    return resolved;
+  }
+
   resolved = FindResolvedField(klass, dex_cache.Get(), class_loader.Get(), field_idx, is_static);
   if (resolved == nullptr) {
     const char* name = dex_file.GetFieldName(field_id);
@@ -590,6 +602,11 @@ inline ArtField* ClassLinker::ResolveField(uint32_t field_idx,
     ThrowNoSuchFieldError(is_static ? "static " : "instance ", klass, type, name);
   }
   return resolved;
+}
+
+template <typename Visitor>
+inline void ClassLinker::VisitBootClasses(Visitor* visitor) {
+  boot_class_table_->Visit(*visitor);
 }
 
 template <class Visitor>

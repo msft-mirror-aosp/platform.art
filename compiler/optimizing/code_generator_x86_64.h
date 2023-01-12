@@ -18,13 +18,14 @@
 #define ART_COMPILER_OPTIMIZING_CODE_GENERATOR_X86_64_H_
 
 #include "arch/x86_64/instruction_set_features_x86_64.h"
+#include "base/macros.h"
 #include "code_generator.h"
 #include "driver/compiler_options.h"
 #include "nodes.h"
 #include "parallel_move_resolver.h"
 #include "utils/x86_64/assembler_x86_64.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace x86_64 {
 
 // Use a local definition to prevent copying mistakes.
@@ -250,7 +251,8 @@ class InstructionCodeGeneratorX86_64 : public InstructionCodeGenerator {
                       bool is_volatile,
                       bool is_atomic,
                       bool value_can_be_null,
-                      bool byte_swap = false);
+                      bool byte_swap,
+                      WriteBarrierKind write_barrier_kind);
 
   void Bswap(Location value, DataType::Type type, CpuRegister* temp = nullptr);
 
@@ -273,7 +275,8 @@ class InstructionCodeGeneratorX86_64 : public InstructionCodeGenerator {
 
   void HandleFieldSet(HInstruction* instruction,
                       const FieldInfo& field_info,
-                      bool value_can_be_null);
+                      bool value_can_be_null,
+                      WriteBarrierKind write_barrier_kind);
   void HandleFieldGet(HInstruction* instruction, const FieldInfo& field_info);
 
   void GenerateMinMaxInt(LocationSummary* locations, bool is_min, DataType::Type type);
@@ -435,7 +438,7 @@ class CodeGeneratorX86_64 : public CodeGenerator {
                   CpuRegister card,
                   CpuRegister object,
                   CpuRegister value,
-                  bool value_can_be_null);
+                  bool emit_null_check);
 
   void GenerateMemoryBarrier(MemBarrierKind kind);
 

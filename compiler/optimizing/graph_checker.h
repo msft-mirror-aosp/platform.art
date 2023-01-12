@@ -21,10 +21,11 @@
 
 #include "base/arena_bit_vector.h"
 #include "base/bit_vector-inl.h"
+#include "base/macros.h"
 #include "base/scoped_arena_allocator.h"
 #include "nodes.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class CodeGenerator;
 
@@ -54,6 +55,7 @@ class GraphChecker : public HGraphDelegateVisitor {
   void VisitInstruction(HInstruction* instruction) override;
   void VisitPhi(HPhi* phi) override;
 
+  void VisitArraySet(HArraySet* instruction) override;
   void VisitBinaryOperation(HBinaryOperation* op) override;
   void VisitBooleanNot(HBooleanNot* instruction) override;
   void VisitBoundType(HBoundType* instruction) override;
@@ -66,6 +68,7 @@ class GraphChecker : public HGraphDelegateVisitor {
   void VisitInstanceOf(HInstanceOf* check) override;
   void VisitInvokeStaticOrDirect(HInvokeStaticOrDirect* invoke) override;
   void VisitLoadException(HLoadException* load) override;
+  void VisitMonitorOperation(HMonitorOperation* monitor_operation) override;
   void VisitNeg(HNeg* instruction) override;
   void VisitPackedSwitch(HPackedSwitch* instruction) override;
   void VisitReturn(HReturn* ret) override;

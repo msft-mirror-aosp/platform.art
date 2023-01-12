@@ -49,7 +49,7 @@
 
 #define __ jni_asm->
 
-namespace art {
+namespace art HIDDEN {
 
 constexpr size_t kIRTCookieSize = JniCallingConvention::SavedLocalReferenceCookieSize();
 
@@ -198,7 +198,7 @@ static JniCompiledMethod ArtJniCompileMethodInternal(const CompilerOptions& comp
   //      Skip this for @CriticalNative because we're not passing a `jclass` to the native method.
   std::unique_ptr<JNIMacroLabel> jclass_read_barrier_slow_path;
   std::unique_ptr<JNIMacroLabel> jclass_read_barrier_return;
-  if (kUseReadBarrier && is_static && LIKELY(!is_critical_native)) {
+  if (gUseReadBarrier && is_static && LIKELY(!is_critical_native)) {
     jclass_read_barrier_slow_path = __ CreateLabel();
     jclass_read_barrier_return = __ CreateLabel();
 
@@ -246,7 +246,7 @@ static JniCompiledMethod ArtJniCompileMethodInternal(const CompilerOptions& comp
   std::unique_ptr<JNIMacroLabel> method_entry_hook_return;
   if (UNLIKELY(needs_entry_exit_hooks)) {
     uint64_t address = reinterpret_cast64<uint64_t>(Runtime::Current()->GetInstrumentation());
-    int offset = instrumentation::Instrumentation::NeedsEntryExitHooksOffset().Int32Value();
+    int offset = instrumentation::Instrumentation::HaveMethodEntryListenersOffset().Int32Value();
     method_entry_hook_slow_path = __ CreateLabel();
     method_entry_hook_return = __ CreateLabel();
     __ TestByteAndJumpIfNotZero(address + offset, method_entry_hook_slow_path.get());
@@ -570,7 +570,7 @@ static JniCompiledMethod ArtJniCompileMethodInternal(const CompilerOptions& comp
   std::unique_ptr<JNIMacroLabel> method_exit_hook_return;
   if (UNLIKELY(needs_entry_exit_hooks)) {
     uint64_t address = reinterpret_cast64<uint64_t>(Runtime::Current()->GetInstrumentation());
-    int offset = instrumentation::Instrumentation::NeedsEntryExitHooksOffset().Int32Value();
+    int offset = instrumentation::Instrumentation::NeedsExitHooksOffset().Int32Value();
     method_exit_hook_slow_path = __ CreateLabel();
     method_exit_hook_return = __ CreateLabel();
     __ TestByteAndJumpIfNotZero(address + offset, method_exit_hook_slow_path.get());
@@ -592,7 +592,7 @@ static JniCompiledMethod ArtJniCompileMethodInternal(const CompilerOptions& comp
 
   // 8.1. Read barrier slow path for the declaring class in the method for a static call.
   //      Skip this for @CriticalNative because we're not passing a `jclass` to the native method.
-  if (kUseReadBarrier && is_static && !is_critical_native) {
+  if (gUseReadBarrier && is_static && !is_critical_native) {
     __ Bind(jclass_read_barrier_slow_path.get());
 
     // Construct slow path for read barrier:
@@ -689,6 +689,7 @@ static JniCompiledMethod ArtJniCompileMethodInternal(const CompilerOptions& comp
     // Method exit hooks is called just before tearing down the frame. So there are no live
     // registers and we can directly call the method exit hook and don't need a Jni specific
     // entrypoint.
+    __ Move(mr_conv->ArgumentRegisterForMethodExitHook(), managed_frame_size);
     __ CallFromThread(QUICK_ENTRYPOINT_OFFSET(kPointerSize, pMethodExitHook));
     __ Jump(method_exit_hook_return.get());
   }

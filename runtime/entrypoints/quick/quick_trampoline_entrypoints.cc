@@ -658,30 +658,27 @@ extern "C" uint64_t artQuickToInterpreterBridge(ArtMethod* method, Thread* self,
     return 0;
   }
 
-  JValue tmp_value;
-  ShadowFrame* deopt_frame = self->PopStackedShadowFrame(
-      StackedShadowFrameType::kDeoptimizationShadowFrame, false);
-  ManagedStack fragment;
-
   DCHECK(!method->IsNative()) << method->PrettyMethod();
-  uint32_t shorty_len = 0;
-  ArtMethod* non_proxy_method = method->GetInterfaceMethodIfProxy(kRuntimePointerSize);
-  DCHECK(non_proxy_method->GetCodeItem() != nullptr) << method->PrettyMethod();
-  CodeItemDataAccessor accessor(non_proxy_method->DexInstructionData());
-  const char* shorty = non_proxy_method->GetShorty(&shorty_len);
 
   JValue result;
-  bool force_frame_pop = false;
 
+  ArtMethod* non_proxy_method = method->GetInterfaceMethodIfProxy(kRuntimePointerSize);
+  DCHECK(non_proxy_method->GetCodeItem() != nullptr) << method->PrettyMethod();
+  uint32_t shorty_len = 0;
+  const char* shorty = non_proxy_method->GetShorty(&shorty_len);
+
+  ManagedStack fragment;
+  ShadowFrame* deopt_frame = self->MaybePopDeoptimizedStackedShadowFrame();
   if (UNLIKELY(deopt_frame != nullptr)) {
     HandleDeoptimization(&result, method, deopt_frame, &fragment);
   } else {
+    CodeItemDataAccessor accessor(non_proxy_method->DexInstructionData());
     const char* old_cause = self->StartAssertNoThreadSuspension(
         "Building interpreter shadow frame");
     uint16_t num_regs = accessor.RegistersSize();
     // No last shadow coming from quick.
     ShadowFrameAllocaUniquePtr shadow_frame_unique_ptr =
-        CREATE_SHADOW_FRAME(num_regs, /* link= */ nullptr, method, /* dex_pc= */ 0);
+        CREATE_SHADOW_FRAME(num_regs, method, /* dex_pc= */ 0);
     ShadowFrame* shadow_frame = shadow_frame_unique_ptr.get();
     size_t first_arg_reg = accessor.RegistersSize() - accessor.InsSize();
     BuildQuickShadowFrameVisitor shadow_frame_builder(sp, method->IsStatic(), shorty, shorty_len,
@@ -700,7 +697,6 @@ extern "C" uint64_t artQuickToInterpreterBridge(ArtMethod* method, Thread* self,
     self->PushManagedStackFragment(&fragment);
     self->PushShadowFrame(shadow_frame);
     result = interpreter::EnterInterpreterFromEntryPoint(self, accessor, shadow_frame);
-    force_frame_pop = shadow_frame->GetForcePopFrame();
   }
 
   // Pop transition.
@@ -716,19 +712,12 @@ extern "C" uint64_t artQuickToInterpreterBridge(ArtMethod* method, Thread* self,
     uintptr_t caller_pc = QuickArgumentVisitor::GetCallingPc(sp);
     DCHECK(Runtime::Current()->IsAsyncDeoptimizeable(caller, caller_pc));
     DCHECK(caller != nullptr);
-    VLOG(deopt) << "Forcing deoptimization on return from method " << method->PrettyMethod()
-                << " to " << caller->PrettyMethod() << (force_frame_pop ? " for frame-pop" : "");
-    DCHECK(!force_frame_pop || result.GetJ() == 0) << "Force frame pop should have no result.";
-    if (force_frame_pop && self->GetException() != nullptr) {
-      LOG(WARNING) << "Suppressing exception for instruction-retry: "
-                   << self->GetException()->Dump();
-    }
     DCHECK(self->GetException() != Thread::GetDeoptimizationException());
     // Push the context of the deoptimization stack so we can restore the return value and the
     // exception before executing the deoptimized frames.
     self->PushDeoptimizationContext(result,
                                     shorty[0] == 'L' || shorty[0] == '[', /* class or array */
-                                    force_frame_pop ? nullptr : self->GetException(),
+                                    self->GetException(),
                                     /* from_code= */ false,
                                     DeoptimizationMethodType::kDefault);
 
@@ -1038,10 +1027,10 @@ extern "C" const void* artInstrumentationMethodEntryFromCode(ArtMethod* method,
 
   StackHandleScope<2> hs(self);
   Handle<mirror::Object> h_object(hs.NewHandle(is_static ? nullptr : this_object));
-  Handle<mirror::Class> h_class(hs.NewHandle(method->GetDeclaringClass()));
 
   // Ensure that the called method's class is initialized.
-  if (NeedsClinitCheckBeforeCall(method) && !h_class->IsVisiblyInitialized()) {
+  if (method->StillNeedsClinitCheck()) {
+    Handle<mirror::Class> h_class = hs.NewHandle(method->GetDeclaringClass());
     if (!Runtime::Current()->GetClassLinker()->EnsureInitialized(self, h_class, true, true)) {
       visitor.FixupReferences();
       DCHECK(self->IsExceptionPending());
@@ -1100,7 +1089,7 @@ extern "C" TwoWordReturn artInstrumentationMethodExitFromCode(Thread* self,
 static std::string DumpInstruction(ArtMethod* method, uint32_t dex_pc)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   if (dex_pc == static_cast<uint32_t>(-1)) {
-    CHECK(method == jni::DecodeArtMethod(WellKnownClasses::java_lang_String_charAt));
+    CHECK(method == WellKnownClasses::java_lang_String_charAt);
     return "<native>";
   } else {
     CodeItemInstructionAccessor accessor = method->DexInstructions();
@@ -1178,7 +1167,7 @@ static void DumpB74410240DebugData(ArtMethod** sp) REQUIRES_SHARED(Locks::mutato
       if (dex_pc == static_cast<uint32_t>(-1)) {
         tag = "special ";
         CHECK(inline_info.Equals(inline_infos.back()));
-        caller = jni::DecodeArtMethod(WellKnownClasses::java_lang_String_charAt);
+        caller = WellKnownClasses::java_lang_String_charAt;
         CHECK_EQ(caller->GetDexMethodIndex(), method_index);
       } else {
         ObjPtr<mirror::DexCache> dex_cache = caller->GetDexCache();
@@ -1356,21 +1345,25 @@ extern "C" const void* artQuickResolutionTrampoline(
     // Static invokes need class initialization check but instance invokes can proceed even if
     // the class is erroneous, i.e. in the edge case of escaping instances of erroneous classes.
     bool success = true;
-    ObjPtr<mirror::Class> called_class = called->GetDeclaringClass();
-    if (NeedsClinitCheckBeforeCall(called) && !called_class->IsVisiblyInitialized()) {
+    if (called->StillNeedsClinitCheck()) {
       // Ensure that the called method's class is initialized.
       StackHandleScope<1> hs(soa.Self());
-      HandleWrapperObjPtr<mirror::Class> h_called_class(hs.NewHandleWrapper(&called_class));
+      Handle<mirror::Class> h_called_class = hs.NewHandle(called->GetDeclaringClass());
       success = linker->EnsureInitialized(soa.Self(), h_called_class, true, true);
     }
     if (success) {
+      // When the clinit check is at entry of the AOT/nterp code, we do the clinit check
+      // before doing the suspend check. To ensure the code sees the latest
+      // version of the class (the code doesn't do a read barrier to reduce
+      // size), do a suspend check now.
+      self->CheckSuspend();
       instrumentation::Instrumentation* instrumentation = Runtime::Current()->GetInstrumentation();
       // Check if we need instrumented code here. Since resolution stubs could suspend, it is
       // possible that we instrumented the entry points after we started executing the resolution
       // stub.
       code = instrumentation->GetMaybeInstrumentedCodeForInvoke(called);
     } else {
-      DCHECK(called_class->IsErroneous());
+      DCHECK(called->GetDeclaringClass()->IsErroneous());
       DCHECK(self->IsExceptionPending());
     }
   }
@@ -1780,7 +1773,7 @@ class ComputeGenericJniFrameSize final : public ComputeNativeCallFrameSize {
 
     // Add space for cookie.
     DCHECK_ALIGNED(managed_sp, sizeof(uintptr_t));
-    static_assert(sizeof(uintptr_t) >= sizeof(IRTSegmentState));
+    static_assert(sizeof(uintptr_t) >= sizeof(jni::LRTSegmentState));
     uint8_t* sp8 = reinterpret_cast<uint8_t*>(managed_sp) - sizeof(uintptr_t);
 
     // Layout stack arguments.
@@ -1929,7 +1922,7 @@ class BuildGenericJniFrameVisitor final : public QuickArgumentVisitor {
         // The declaring class must be marked.
         auto* declaring_class = reinterpret_cast<mirror::CompressedReference<mirror::Class>*>(
             method->GetDeclaringClassAddressWithoutBarrier());
-        if (kUseReadBarrier) {
+        if (gUseReadBarrier) {
           artJniReadBarrier(method);
         }
         sm_.AdvancePointer(declaring_class);
@@ -2089,16 +2082,13 @@ extern "C" const void* artQuickGenericJniTrampoline(Thread* self,
   // We can set the entrypoint of a native method to generic JNI even when the
   // class hasn't been initialized, so we need to do the initialization check
   // before invoking the native code.
-  if (NeedsClinitCheckBeforeCall(called)) {
-    ObjPtr<mirror::Class> declaring_class = called->GetDeclaringClass();
-    if (UNLIKELY(!declaring_class->IsVisiblyInitialized())) {
-      // Ensure static method's class is initialized.
-      StackHandleScope<1> hs(self);
-      Handle<mirror::Class> h_class(hs.NewHandle(declaring_class));
-      if (!runtime->GetClassLinker()->EnsureInitialized(self, h_class, true, true)) {
-        DCHECK(Thread::Current()->IsExceptionPending()) << called->PrettyMethod();
-        return nullptr;  // Report error.
-      }
+  if (called->StillNeedsClinitCheck()) {
+    // Ensure static method's class is initialized.
+    StackHandleScope<1> hs(self);
+    Handle<mirror::Class> h_class = hs.NewHandle(called->GetDeclaringClass());
+    if (!runtime->GetClassLinker()->EnsureInitialized(self, h_class, true, true)) {
+      DCHECK(Thread::Current()->IsExceptionPending()) << called->PrettyMethod();
+      return nullptr;  // Report error.
     }
   }
 
@@ -2267,12 +2257,18 @@ static TwoWordReturn artInvokeCommon(uint32_t method_idx,
     uint32_t shorty_len;
     const char* shorty = dex_file->GetMethodShorty(dex_file->GetMethodId(method_idx), &shorty_len);
     {
-      // Remember the args in case a GC happens in FindMethodFromCode.
+      // Remember the args in case a GC happens in FindMethodToCall.
       ScopedObjectAccessUnchecked soa(self->GetJniEnv());
       RememberForGcArgumentVisitor visitor(sp, type == kStatic, shorty, shorty_len, &soa);
       visitor.VisitArguments();
-      method = FindMethodFromCode<type, /*access_check=*/true>(
-          method_idx, &this_object, caller_method, self);
+
+      uint32_t dex_pc = QuickArgumentVisitor::GetCallingDexPc(sp);
+      CodeItemInstructionAccessor accessor(caller_method->DexInstructions());
+      CHECK_LT(dex_pc, accessor.InsnsSizeInCodeUnits());
+      const Instruction& instr = accessor.InstructionAt(dex_pc);
+      bool string_init = false;
+      method = FindMethodToCall<type>(self, caller_method, &this_object, instr, &string_init);
+
       visitor.FixupReferences();
     }
 
@@ -2520,10 +2516,9 @@ extern "C" uint64_t artInvokePolymorphic(mirror::Object* raw_receiver, Thread* s
   const size_t num_vregs = is_range ? inst.VRegA_4rcc() : inst.VRegA_45cc();
   const size_t first_arg = 0;
   ShadowFrameAllocaUniquePtr shadow_frame_unique_ptr =
-      CREATE_SHADOW_FRAME(num_vregs, /* link= */ nullptr, resolved_method, dex_pc);
+      CREATE_SHADOW_FRAME(num_vregs, resolved_method, dex_pc);
   ShadowFrame* shadow_frame = shadow_frame_unique_ptr.get();
-  ScopedStackedShadowFramePusher
-      frame_pusher(self, shadow_frame, StackedShadowFrameType::kShadowFrameUnderConstruction);
+  ScopedStackedShadowFramePusher frame_pusher(self, shadow_frame);
   BuildQuickShadowFrameVisitor shadow_frame_builder(sp,
                                                     kMethodIsStatic,
                                                     shorty,
@@ -2617,10 +2612,9 @@ extern "C" uint64_t artInvokeCustom(uint32_t call_site_idx, Thread* self, ArtMet
   const size_t first_arg = 0;
   const size_t num_vregs = ArtMethod::NumArgRegisters(shorty);
   ShadowFrameAllocaUniquePtr shadow_frame_unique_ptr =
-      CREATE_SHADOW_FRAME(num_vregs, /* link= */ nullptr, caller_method, dex_pc);
+      CREATE_SHADOW_FRAME(num_vregs, caller_method, dex_pc);
   ShadowFrame* shadow_frame = shadow_frame_unique_ptr.get();
-  ScopedStackedShadowFramePusher
-      frame_pusher(self, shadow_frame, StackedShadowFrameType::kShadowFrameUnderConstruction);
+  ScopedStackedShadowFramePusher frame_pusher(self, shadow_frame);
   BuildQuickShadowFrameVisitor shadow_frame_builder(sp,
                                                     kMethodIsStatic,
                                                     shorty,
@@ -2661,20 +2655,27 @@ extern "C" void artJniMethodEntryHook(Thread* self)
 extern "C" void artMethodEntryHook(ArtMethod* method, Thread* self, ArtMethod** sp ATTRIBUTE_UNUSED)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   instrumentation::Instrumentation* instr = Runtime::Current()->GetInstrumentation();
-  instr->MethodEnterEvent(self, method);
-  if (instr->IsDeoptimized(method)) {
-    // Instrumentation can request deoptimizing only a particular method (for
-    // ex: when there are break points on the method). In such cases deoptimize
-    // only this method. FullFrame deoptimizations are handled on method exits.
-    artDeoptimizeFromCompiledCode(DeoptimizationKind::kDebugging, self);
+  if (instr->HasMethodEntryListeners()) {
+    instr->MethodEnterEvent(self, method);
+    // MethodEnter callback could have requested a deopt for ex: by setting a breakpoint, so
+    // check if we need a deopt here.
+    if (instr->IsDeoptimized(method)) {
+      // Instrumentation can request deoptimizing only a particular method (for ex: when
+      // there are break points on the method). In such cases deoptimize only this method.
+      // FullFrame deoptimizations are handled on method exits.
+      artDeoptimizeFromCompiledCode(DeoptimizationKind::kDebugging, self);
+    }
+  } else {
+    DCHECK(!instr->IsDeoptimized(method));
   }
 }
 
 extern "C" void artMethodExitHook(Thread* self,
-                                 ArtMethod* method,
-                                 uint64_t* gpr_result,
-                                 uint64_t* fpr_result)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
+                                  ArtMethod** sp,
+                                  uint64_t* gpr_result,
+                                  uint64_t* fpr_result,
+                                  uint32_t frame_size)
+  REQUIRES_SHARED(Locks::mutator_lock_) {
   // For GenericJniTrampolines we call artMethodExitHook even for non debuggable runtimes though we
   // still install instrumentation stubs. So just return early here so we don't call method exit
   // twice. In all other cases (JITed JNI stubs / JITed code) we only call this for debuggable
@@ -2684,31 +2685,29 @@ extern "C" void artMethodExitHook(Thread* self,
   }
 
   DCHECK_EQ(reinterpret_cast<uintptr_t>(self), reinterpret_cast<uintptr_t>(Thread::Current()));
-  CHECK(gpr_result != nullptr);
-  CHECK(fpr_result != nullptr);
   // Instrumentation exit stub must not be entered with a pending exception.
   CHECK(!self->IsExceptionPending())
       << "Enter instrumentation exit stub with pending exception " << self->GetException()->Dump();
 
   instrumentation::Instrumentation* instr = Runtime::Current()->GetInstrumentation();
-  DCHECK(instr->AreExitStubsInstalled());
-  bool is_ref;
-  JValue return_value = instr->GetReturnValue(method, &is_ref, gpr_result, fpr_result);
-  bool deoptimize = false;
-  {
+  JValue return_value;
+  bool is_ref = false;
+  ArtMethod* method = *sp;
+  bool deoptimize = instr->ShouldDeoptimizeCaller(self, sp, frame_size);
+  if (instr->HasMethodExitListeners()) {
     StackHandleScope<1> hs(self);
+
+    CHECK(gpr_result != nullptr);
+    CHECK(fpr_result != nullptr);
+    DCHECK(instr->AreExitStubsInstalled());
+
+    return_value = instr->GetReturnValue(method, &is_ref, gpr_result, fpr_result);
     MutableHandle<mirror::Object> res(hs.NewHandle<mirror::Object>(nullptr));
     if (is_ref) {
       // Take a handle to the return value so we won't lose it if we suspend.
       res.Assign(return_value.GetL());
     }
     DCHECK(!method->IsRuntimeMethod());
-
-    // Deoptimize if the caller needs to continue execution in the interpreter. Do nothing if we get
-    // back to an upcall.
-    NthCallerVisitor visitor(self, 1, /*include_runtime_and_upcalls=*/false);
-    visitor.WalkStack(true);
-    deoptimize = instr->ShouldDeoptimizeCaller(self, visitor);
 
     // If we need a deoptimization MethodExitEvent will be called by the interpreter when it
     // re-executes the return instruction. For native methods we have to process method exit
@@ -2725,6 +2724,8 @@ extern "C" void artMethodExitHook(Thread* self,
       *reinterpret_cast<mirror::Object**>(gpr_result) = res.Get();
       return_value.SetL(res.Get());
     }
+  } else if (deoptimize) {
+    return_value = instr->GetReturnValue(method, &is_ref, gpr_result, fpr_result);
   }
 
   if (self->IsExceptionPending() || self->ObserveAsyncException()) {

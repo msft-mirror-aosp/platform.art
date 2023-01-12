@@ -112,7 +112,7 @@ class OnDeviceRefresh final {
 
   // Removes files that are not in the list.
   android::base::Result<void> CleanupArtifactDirectory(
-      const std::vector<std::string>& artifacts_to_keep) const;
+      OdrMetrics& metrics, const std::vector<std::string>& artifacts_to_keep) const;
 
   // Loads artifacts to memory and writes them back. This is a workaround for old versions of
   // odsign, which encounters "file exists" error when it adds existing artifacts to fs-verity. This
@@ -149,6 +149,9 @@ class OnDeviceRefresh final {
   // the last compilation. This function is usually called when cache-info.xml exists.
   WARN_UNUSED bool CheckSystemPropertiesHaveNotChanged(
       const com::android::art::CacheInfo& cache_info) const;
+
+  // Returns true if the system image is built with the right userfaultfd GC flag.
+  WARN_UNUSED bool CheckBuildUserfaultFdGc() const;
 
   // Returns true if boot classpath artifacts on /system are usable if they exist. Note that this
   // function does not check file existence.

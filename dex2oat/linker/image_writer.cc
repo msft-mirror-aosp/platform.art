@@ -35,7 +35,6 @@
 #include "base/unix_file/fd_file.h"
 #include "class_linker-inl.h"
 #include "class_root-inl.h"
-#include "compiled_method.h"
 #include "dex/dex_file-inl.h"
 #include "dex/dex_file_types.h"
 #include "driver/compiler_options.h"
@@ -83,7 +82,7 @@
 #include "runtime.h"
 #include "scoped_thread_state_change-inl.h"
 #include "subtype_check.h"
-#include "well_known_classes.h"
+#include "well_known_classes-inl.h"
 
 using ::art::mirror::Class;
 using ::art::mirror::DexCache;
@@ -101,7 +100,7 @@ constexpr double kImageClassTableMinLoadFactor = 0.5;
 // to make them full. We never insert additional elements to them, so we do not want to waste
 // extra memory. And unlike runtime class tables, we do not want this to depend on runtime
 // properties (see `Runtime::GetHashTableMaxLoadFactor()` checking for low memory mode).
-constexpr double kImageClassTableMaxLoadFactor = 0.7;
+constexpr double kImageClassTableMaxLoadFactor = 0.6;
 
 // The actual value of `kImageInternTableMinLoadFactor` is irrelevant because image intern tables
 // are never resized, but we still need to pass a reasonable value to the constructor.
@@ -110,7 +109,7 @@ constexpr double kImageInternTableMinLoadFactor = 0.5;
 // to make them full. We never insert additional elements to them, so we do not want to waste
 // extra memory. And unlike runtime intern tables, we do not want this to depend on runtime
 // properties (see `Runtime::GetHashTableMaxLoadFactor()` checking for low memory mode).
-constexpr double kImageInternTableMaxLoadFactor = 0.7;
+constexpr double kImageInternTableMaxLoadFactor = 0.6;
 
 static ArrayRef<const uint8_t> MaybeCompressData(ArrayRef<const uint8_t> source,
                                                  ImageHeader::StorageMode image_storage_mode,
@@ -155,11 +154,19 @@ static ArrayRef<const uint8_t> MaybeCompressData(ArrayRef<const uint8_t> source,
                  << PrettyDuration(NanoTime() - compress_start_time);
   if (kIsDebugBuild) {
     dchecked_vector<uint8_t> decompressed(source.size());
-    const size_t decompressed_size = LZ4_decompress_safe(
+    size_t decompressed_size;
+    std::string error_msg;
+    bool ok = LZ4_decompress_safe_checked(
         reinterpret_cast<char*>(storage->data()),
         reinterpret_cast<char*>(decompressed.data()),
         storage->size(),
-        decompressed.size());
+        decompressed.size(),
+        &decompressed_size,
+        &error_msg);
+    if (!ok) {
+      LOG(FATAL) << error_msg;
+      UNREACHABLE();
+    }
     CHECK_EQ(decompressed_size, decompressed.size());
     CHECK_EQ(memcmp(source.data(), decompressed.data(), source.size()), 0) << image_storage_mode;
   }
@@ -265,8 +272,8 @@ static void ClearDexFileCookies() REQUIRES_SHARED(Locks::mutator_lock_) {
   auto visitor = [](Object* obj) REQUIRES_SHARED(Locks::mutator_lock_) {
     DCHECK(obj != nullptr);
     Class* klass = obj->GetClass();
-    if (klass == WellKnownClasses::ToClass(WellKnownClasses::dalvik_system_DexFile)) {
-      ArtField* field = jni::DecodeArtField(WellKnownClasses::dalvik_system_DexFile_cookie);
+    if (klass == WellKnownClasses::dalvik_system_DexFile) {
+      ArtField* field = WellKnownClasses::dalvik_system_DexFile_cookie;
       // Null out the cookie to enable determinism. b/34090128
       field->SetObject</*kTransactionActive*/false>(obj, nullptr);
     }
@@ -2217,12 +2224,11 @@ void ImageWriter::LayoutHelper::VerifyImageBinSlotsAssigned() {
           CHECK(ref != nullptr);
           CHECK(image_writer_->IsImageBinSlotAssigned(ref.Ptr()));
           ObjPtr<mirror::Class> ref_klass = ref->GetClass<kVerifyNone, kWithoutReadBarrier>();
-          CHECK(ref_klass ==
-                DecodeGlobalWithoutRB<mirror::Class>(vm, WellKnownClasses::dalvik_system_DexFile));
+          CHECK(ref_klass == WellKnownClasses::dalvik_system_DexFile.Get<kWithoutReadBarrier>());
           // Note: The app class loader is used only for checking against the runtime
           // class loader, the dex file cookie is cleared and therefore we do not need
           // to run the finalizer even if we implement app image objects collection.
-          ArtField* field = jni::DecodeArtField(WellKnownClasses::dalvik_system_DexFile_cookie);
+          ArtField* field = WellKnownClasses::dalvik_system_DexFile_cookie;
           CHECK(field->GetObject<kWithoutReadBarrier>(ref) == nullptr);
           return;
         }
@@ -3336,8 +3342,7 @@ const uint8_t* ImageWriter::GetQuickCode(ArtMethod* method, const ImageInfo& ima
     quick_code = GetOatAddressForOffset(quick_oat_code_offset, image_info);
   }
 
-  bool needs_clinit_check = NeedsClinitCheckBeforeCall(method) &&
-      !method->GetDeclaringClass<kWithoutReadBarrier>()->IsVisiblyInitialized();
+  bool still_needs_clinit_check = method->StillNeedsClinitCheck<kWithoutReadBarrier>();
 
   if (quick_code == nullptr) {
     // If we don't have code, use generic jni / interpreter.
@@ -3347,7 +3352,7 @@ const uint8_t* ImageWriter::GetQuickCode(ArtMethod* method, const ImageInfo& ima
     } else if (CanMethodUseNterp(method, compiler_options_.GetInstructionSet())) {
       // The nterp trampoline doesn't do initialization checks, so install the
       // resolution stub if needed.
-      if (needs_clinit_check) {
+      if (still_needs_clinit_check) {
         quick_code = GetOatAddress(StubType::kQuickResolutionTrampoline);
       } else {
         quick_code = GetOatAddress(StubType::kNterpTrampoline);
@@ -3356,7 +3361,7 @@ const uint8_t* ImageWriter::GetQuickCode(ArtMethod* method, const ImageInfo& ima
       // The interpreter brige performs class initialization check if needed.
       quick_code = GetOatAddress(StubType::kQuickToInterpreterBridge);
     }
-  } else if (needs_clinit_check) {
+  } else if (still_needs_clinit_check && !compiler_options_.ShouldCompileWithClinitCheck(method)) {
     // If we do have code but the method needs a class initialization check before calling
     // that code, install the resolution stub that will perform the check.
     quick_code = GetOatAddress(StubType::kQuickResolutionTrampoline);

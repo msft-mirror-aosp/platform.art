@@ -22,6 +22,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <variant>
 
 #include "arch/instruction_set.h"
 #include "base/compiler_filter.h"
@@ -30,6 +31,7 @@
 #include "base/unix_file/fd_file.h"
 #include "class_loader_context.h"
 #include "oat_file.h"
+#include "oat_file_assistant_context.h"
 
 namespace art {
 
@@ -90,28 +92,6 @@ class OatFileAssistant {
     kOatUpToDate,
   };
 
-  // Options that a runtime would take if the OAT file were going to be loaded by the runtime.
-  // Note that the struct only keeps references, so the caller must keep the objects alive during
-  // the lifetime of OatFileAssistant.
-  struct RuntimeOptions {
-    // Required. See `-Ximage`.
-    const std::vector<std::string>& image_locations;
-    // Required. See `-Xbootclasspath`.
-    const std::vector<std::string>& boot_class_path;
-    // Required. See `-Xbootclasspath-locations`.
-    const std::vector<std::string>& boot_class_path_locations;
-    // Optional. See `-Xbootclasspathfds`.
-    const std::vector<int>* const boot_class_path_fds = nullptr;
-    // Optional. See `-Xforcejitzygote`.
-    const bool use_jit_zygote = false;
-    // Optional. See `-Xdeny-art-apex-data-files`.
-    const bool deny_art_apex_data_files = false;
-    // Required. A string that represents the apex versions of boot classpath jars. See
-    // `Runtime::apex_versions_` for the encoding format. Can be obtained from
-    // `Runtime::GetApexVersions(boot_class_path_locations)`.
-    const std::string& apex_versions;
-  };
-
   // A bit field to represent the conditions where dexopt should be performed.
   struct DexOptTrigger {
     // Dexopt should be performed if the target compiler filter is better than the current compiler
@@ -166,6 +146,8 @@ class OatFileAssistant {
   // device. For example, on an arm device, use arm or arm64. An oat file can
   // be loaded executable only if the ISA matches the current runtime.
   //
+  // context should be the class loader context to check against, or null to skip the check.
+  //
   // load_executable should be true if the caller intends to try and load
   // executable code for this dex location.
   //
@@ -180,7 +162,7 @@ class OatFileAssistant {
                    ClassLoaderContext* context,
                    bool load_executable,
                    bool only_load_trusted_executable = false,
-                   std::unique_ptr<RuntimeOptions> runtime_options = nullptr);
+                   OatFileAssistantContext* ofa_context = nullptr);
 
   // Similar to this(const char*, const InstructionSet, bool), however, if a valid zip_fd is
   // provided, vdex, oat, and zip files will be read from vdex_fd, oat_fd and zip_fd respectively.
@@ -190,7 +172,7 @@ class OatFileAssistant {
                    ClassLoaderContext* context,
                    bool load_executable,
                    bool only_load_trusted_executable,
-                   std::unique_ptr<RuntimeOptions> runtime_options,
+                   OatFileAssistantContext* ofa_context,
                    int vdex_fd,
                    int oat_fd,
                    int zip_fd);
@@ -202,10 +184,10 @@ class OatFileAssistant {
   static std::unique_ptr<OatFileAssistant> Create(
       const std::string& filename,
       const std::string& isa_str,
-      const std::string& context_str,
+      const std::optional<std::string>& context_str,
       bool load_executable,
       bool only_load_trusted_executable,
-      std::unique_ptr<RuntimeOptions> runtime_options,
+      OatFileAssistantContext* ofa_context,
       /*out*/ std::unique_ptr<ClassLoaderContext>* context,
       /*out*/ std::string* error_msg);
 
@@ -279,7 +261,7 @@ class OatFileAssistant {
                                     InstructionSet isa,
                                     std::string* out_compilation_filter,
                                     std::string* out_compilation_reason,
-                                    std::unique_ptr<RuntimeOptions> runtime_options = nullptr);
+                                    OatFileAssistantContext* ofa_context = nullptr);
 
   // Open and returns an image space associated with the oat file.
   static std::unique_ptr<gc::space::ImageSpace> OpenImageSpace(const OatFile* oat_file);
@@ -302,8 +284,8 @@ class OatFileAssistant {
                            const std::string& dex_location,
                            std::vector<std::unique_ptr<const DexFile>>* out_dex_files);
 
-  // Returns whether this is an apk/zip wit a classes.dex entry.
-  bool HasDexFiles();
+  // Returns whether this is an apk/zip wit a classes.dex entry, or nullopt if an error occurred.
+  std::optional<bool> HasDexFiles(std::string* error_msg);
 
   // If the dex file has been installed with a compiled oat file alongside
   // it, the compiled oat file will have the extension .odex, and is referred
@@ -375,6 +357,16 @@ class OatFileAssistant {
   static bool IsAnonymousVdexBasename(const std::string& basename);
 
   bool ClassLoaderContextIsOkay(const OatFile& oat_file) const;
+
+  // Validates the boot class path checksum of an OatFile.
+  bool ValidateBootClassPathChecksums(const OatFile& oat_file);
+
+  // Validates the given bootclasspath and bootclasspath checksums found in an oat header.
+  static bool ValidateBootClassPathChecksums(OatFileAssistantContext* ofa_context,
+                                             InstructionSet isa,
+                                             std::string_view oat_checksums,
+                                             std::string_view oat_boot_class_path,
+                                             /*out*/ std::string* error_msg);
 
  private:
   class OatFileInfo {
@@ -482,11 +474,6 @@ class OatFileAssistant {
   // files are being read.
   bool UseFdToReadFiles();
 
-  // Returns true if the dex checksums in the given vdex file are up to date
-  // with respect to the dex location. If the dex checksums are not up to
-  // date, error_msg is updated with a message describing the problem.
-  bool DexChecksumUpToDate(const VdexFile& file, std::string* error_msg);
-
   // Returns true if the dex checksums in the given oat file are up to date
   // with respect to the dex location. If the dex checksums are not up to
   // date, error_msg is updated with a message describing the problem.
@@ -497,15 +484,10 @@ class OatFileAssistant {
   OatStatus GivenOatFileStatus(const OatFile& file);
 
   // Gets the dex checksums required for an up-to-date oat file.
-  // Returns cached_required_dex_checksums if the required checksums were
-  // located. Returns null if the required checksums were not found.  The
-  // caller shouldn't clean up or free the returned pointer.  This sets the
-  // has_original_dex_files_ field to true if the checksums were found for the
-  // dex_location_ dex file.
-  const std::vector<uint32_t>* GetRequiredDexChecksums();
-
-  // Validates the boot class path checksum of an OatFile.
-  bool ValidateBootClassPathChecksums(const OatFile& oat_file);
+  // Returns cached_required_dex_checksums if the required checksums were located. Returns an empty
+  // list if `dex_location_` refers to a zip and there is no dex file in it. Returns nullptr if an
+  // error occurred. The caller shouldn't clean up or free the returned pointer.
+  const std::vector<uint32_t>* GetRequiredDexChecksums(std::string* error_msg);
 
   // Returns whether there is at least one boot image usable.
   bool IsPrimaryBootImageUsable();
@@ -517,8 +499,27 @@ class OatFileAssistant {
                                  bool profile_changed,
                                  bool downgrade);
 
+  // Returns the pointer to the owned or unowned instance of OatFileAssistantContext.
+  OatFileAssistantContext* GetOatFileAssistantContext() {
+    if (std::holds_alternative<OatFileAssistantContext*>(ofa_context_)) {
+      return std::get<OatFileAssistantContext*>(ofa_context_);
+    } else {
+      return std::get<std::unique_ptr<OatFileAssistantContext>>(ofa_context_).get();
+    }
+  }
+
+  // The runtime options taken from the active runtime or the input.
+  //
+  // All member functions should get runtime options from this variable rather than referencing the
+  // active runtime. This is to allow OatFileAssistant to function without an active runtime.
+  const OatFileAssistantContext::RuntimeOptions& GetRuntimeOptions() {
+    return GetOatFileAssistantContext()->GetRuntimeOptions();
+  }
+
   std::string dex_location_;
 
+  // The class loader context to check against, or null representing that the check should be
+  // skipped.
   ClassLoaderContext* context_;
 
   // Whether or not the parent directory of the dex file is writable.
@@ -537,18 +538,11 @@ class OatFileAssistant {
   // Will be set during GetRequiredDexChecksums.
   bool zip_file_only_contains_uncompressed_dex_ = true;
 
-  // The runtime options taken from the active runtime or the input.
-  //
-  // All member functions should get runtime options from this variable rather than referencing the
-  // active runtime. This is to allow OatFileAssistant to function without an active runtime.
-  std::unique_ptr<RuntimeOptions> runtime_options_;
-
   // Cached value of the required dex checksums.
   // This should be accessed only by the GetRequiredDexChecksums() method.
-  std::vector<uint32_t> cached_required_dex_checksums_;
+  std::optional<std::vector<uint32_t>> cached_required_dex_checksums_;
+  std::string cached_required_dex_checksums_error_;
   bool required_dex_checksums_attempted_ = false;
-  bool required_dex_checksums_found_;
-  bool has_original_dex_files_;
 
   // The AOT-compiled file of an app when the APK of the app is in /data.
   OatFileInfo odex_;
@@ -570,9 +564,8 @@ class OatFileAssistant {
   // File descriptor corresponding to apk, dex file, or zip.
   int zip_fd_;
 
-  std::string cached_boot_class_path_;
-  std::string cached_boot_class_path_checksums_;
-  std::optional<bool> cached_is_boot_image_usable_ = std::nullopt;
+  // Owned or unowned instance of OatFileAssistantContext.
+  std::variant<std::unique_ptr<OatFileAssistantContext>, OatFileAssistantContext*> ofa_context_;
 
   friend class OatFileAssistantTest;
 
