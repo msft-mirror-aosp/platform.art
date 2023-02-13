@@ -82,6 +82,7 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
   DCHECK_EQ(hiddenapi_policy_valuemap.size(),
             static_cast<size_t>(hiddenapi::EnforcementPolicy::kMax) + 1);
 
+  // clang-format off
   parser_builder->
        SetCategory("standard")
       .Define({"-classpath _", "-cp _"})
@@ -183,6 +184,10 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
           .IntoKey(M::Image)
       .Define("-Xforcejitzygote")
           .IntoKey(M::ForceJitZygote)
+      .Define("-Xallowinmemorycompilation")
+          .WithHelp("Allows compiling the boot classpath in memory when the given boot image is"
+              "unusable. This option is set by default for Zygote.")
+          .IntoKey(M::AllowInMemoryCompilation)
       .Define("-Xprimaryzygote")
           .IntoKey(M::PrimaryZygote)
       .Define("-Xbootclasspath-locations:_")
@@ -351,6 +356,12 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
           .IntoKey(M::MethodTraceFileSize)
       .Define("-Xmethod-trace-stream")
           .IntoKey(M::MethodTraceStreaming)
+      .Define("-Xmethod-trace-clock:_")
+          .WithType<TraceClockSource>()
+          .WithValueMap({{"threadcpuclock", TraceClockSource::kThreadCpu},
+                         {"wallclock",      TraceClockSource::kWall},
+                         {"dualclock",      TraceClockSource::kDual}})
+          .IntoKey(M::MethodTraceClock)
       .Define("-Xcompiler:_")
           .WithType<std::string>()
           .IntoKey(M::Compiler)
@@ -464,18 +475,44 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
           .WithType<bool>()
           .WithValueMap({{"false", false}, {"true", true}})
           .IntoKey(M::PerfettoJavaHeapStackProf);
+  // clang-format on
 
-      FlagBase::AddFlagsToCmdlineParser(parser_builder.get());
+  FlagBase::AddFlagsToCmdlineParser(parser_builder.get());
 
-      parser_builder->Ignore({
-          "-ea", "-da", "-enableassertions", "-disableassertions", "--runtime-arg", "-esa",
-          "-dsa", "-enablesystemassertions", "-disablesystemassertions", "-Xrs", "-Xint:_",
-          "-Xdexopt:_", "-Xnoquithandler", "-Xjnigreflimit:_", "-Xgenregmap", "-Xnogenregmap",
-          "-Xverifyopt:_", "-Xcheckdexsum", "-Xincludeselectedop", "-Xjitop:_",
-          "-Xincludeselectedmethod",
-          "-Xjitblocking", "-Xjitmethod:_", "-Xjitclass:_", "-Xjitoffset:_",
-          "-Xjitosrthreshold:_", "-Xjitconfig:_", "-Xjitcheckcg", "-Xjitverbose", "-Xjitprofile",
-          "-Xjitdisableopt", "-Xjitsuspendpoll", "-XX:mainThreadStackSize=_"})
+  parser_builder
+      ->Ignore({"-ea",
+                "-da",
+                "-enableassertions",
+                "-disableassertions",
+                "--runtime-arg",
+                "-esa",
+                "-dsa",
+                "-enablesystemassertions",
+                "-disablesystemassertions",
+                "-Xrs",
+                "-Xint:_",
+                "-Xdexopt:_",
+                "-Xnoquithandler",
+                "-Xjnigreflimit:_",
+                "-Xgenregmap",
+                "-Xnogenregmap",
+                "-Xverifyopt:_",
+                "-Xcheckdexsum",
+                "-Xincludeselectedop",
+                "-Xjitop:_",
+                "-Xincludeselectedmethod",
+                "-Xjitblocking",
+                "-Xjitmethod:_",
+                "-Xjitclass:_",
+                "-Xjitoffset:_",
+                "-Xjitosrthreshold:_",
+                "-Xjitconfig:_",
+                "-Xjitcheckcg",
+                "-Xjitverbose",
+                "-Xjitprofile",
+                "-Xjitdisableopt",
+                "-Xjitsuspendpoll",
+                "-XX:mainThreadStackSize=_"})
       .IgnoreUnrecognized(ignore_unrecognized)
       .OrderCategories({"standard", "extended", "Dalvik", "ART"});
 
@@ -733,6 +770,10 @@ bool ParsedOptions::DoParse(const RuntimeOptions& options,
     }
     // If `boot.art` exists in the ART APEX, it will be used. Otherwise, Everything will be JITed.
     args.Set(M::Image, ParseStringList<':'>::Split(GetJitZygoteBootImageLocation()));
+  }
+
+  if (args.Exists(M::Zygote)) {
+    args.Set(M::AllowInMemoryCompilation, Unit());
   }
 
   if (!args.Exists(M::CompilerCallbacksPtr) && !args.Exists(M::Image)) {

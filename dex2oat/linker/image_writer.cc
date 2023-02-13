@@ -21,10 +21,12 @@
 #include <sys/stat.h>
 #include <zlib.h>
 
+#include <charconv>
 #include <memory>
 #include <numeric>
 #include <vector>
 
+#include "android-base/strings.h"
 #include "art_field-inl.h"
 #include "art_method-inl.h"
 #include "base/callee_save_type.h"
@@ -35,7 +37,6 @@
 #include "base/unix_file/fd_file.h"
 #include "class_linker-inl.h"
 #include "class_root-inl.h"
-#include "compiled_method.h"
 #include "dex/dex_file-inl.h"
 #include "dex/dex_file_types.h"
 #include "driver/compiler_options.h"
@@ -83,7 +84,7 @@
 #include "runtime.h"
 #include "scoped_thread_state_change-inl.h"
 #include "subtype_check.h"
-#include "well_known_classes.h"
+#include "well_known_classes-inl.h"
 
 using ::art::mirror::Class;
 using ::art::mirror::DexCache;
@@ -101,7 +102,7 @@ constexpr double kImageClassTableMinLoadFactor = 0.5;
 // to make them full. We never insert additional elements to them, so we do not want to waste
 // extra memory. And unlike runtime class tables, we do not want this to depend on runtime
 // properties (see `Runtime::GetHashTableMaxLoadFactor()` checking for low memory mode).
-constexpr double kImageClassTableMaxLoadFactor = 0.7;
+constexpr double kImageClassTableMaxLoadFactor = 0.6;
 
 // The actual value of `kImageInternTableMinLoadFactor` is irrelevant because image intern tables
 // are never resized, but we still need to pass a reasonable value to the constructor.
@@ -110,7 +111,7 @@ constexpr double kImageInternTableMinLoadFactor = 0.5;
 // to make them full. We never insert additional elements to them, so we do not want to waste
 // extra memory. And unlike runtime intern tables, we do not want this to depend on runtime
 // properties (see `Runtime::GetHashTableMaxLoadFactor()` checking for low memory mode).
-constexpr double kImageInternTableMaxLoadFactor = 0.7;
+constexpr double kImageInternTableMaxLoadFactor = 0.6;
 
 static ArrayRef<const uint8_t> MaybeCompressData(ArrayRef<const uint8_t> source,
                                                  ImageHeader::StorageMode image_storage_mode,
@@ -155,11 +156,19 @@ static ArrayRef<const uint8_t> MaybeCompressData(ArrayRef<const uint8_t> source,
                  << PrettyDuration(NanoTime() - compress_start_time);
   if (kIsDebugBuild) {
     dchecked_vector<uint8_t> decompressed(source.size());
-    const size_t decompressed_size = LZ4_decompress_safe(
+    size_t decompressed_size;
+    std::string error_msg;
+    bool ok = LZ4_decompress_safe_checked(
         reinterpret_cast<char*>(storage->data()),
         reinterpret_cast<char*>(decompressed.data()),
         storage->size(),
-        decompressed.size());
+        decompressed.size(),
+        &decompressed_size,
+        &error_msg);
+    if (!ok) {
+      LOG(FATAL) << error_msg;
+      UNREACHABLE();
+    }
     CHECK_EQ(decompressed_size, decompressed.size());
     CHECK_EQ(memcmp(source.data(), decompressed.data(), source.size()), 0) << image_storage_mode;
   }
@@ -265,8 +274,8 @@ static void ClearDexFileCookies() REQUIRES_SHARED(Locks::mutator_lock_) {
   auto visitor = [](Object* obj) REQUIRES_SHARED(Locks::mutator_lock_) {
     DCHECK(obj != nullptr);
     Class* klass = obj->GetClass();
-    if (klass == WellKnownClasses::ToClass(WellKnownClasses::dalvik_system_DexFile)) {
-      ArtField* field = jni::DecodeArtField(WellKnownClasses::dalvik_system_DexFile_cookie);
+    if (klass == WellKnownClasses::dalvik_system_DexFile) {
+      ArtField* field = WellKnownClasses::dalvik_system_DexFile_cookie;
       // Null out the cookie to enable determinism. b/34090128
       field->SetObject</*kTransactionActive*/false>(obj, nullptr);
     }
@@ -327,6 +336,13 @@ bool ImageWriter::PrepareImageAddressSpace(TimingLogger* timings) {
     TimingLogger::ScopedTiming t("CalculateNewObjectOffsets", timings);
     ScopedObjectAccess soa(self);
     CalculateNewObjectOffsets();
+
+    // If dirty_image_objects_ is present - try optimizing object layout.
+    // It can only be done after the first CalculateNewObjectOffsets,
+    // because calculated offsets are used to match dirty objects between imgdiag and dex2oat.
+    if (compiler_options_.IsBootImage() && dirty_image_objects_ != nullptr) {
+      TryRecalculateOffsetsWithDirtyObjects();
+    }
   }
 
   // This needs to happen after CalculateNewObjectOffsets since it relies on intern_table_bytes_ and
@@ -722,7 +738,13 @@ ImageWriter::Bin ImageWriter::AssignImageBinSlot(mirror::Object* object, size_t 
     // so packing them together will not result in a noticeably tighter dirty-to-clean ratio.
     //
     ObjPtr<mirror::Class> klass = object->GetClass<kVerifyNone, kWithoutReadBarrier>();
-    if (klass->IsClassClass()) {
+    if (klass->IsStringClass<kVerifyNone>()) {
+      // Assign strings to their bin before checking dirty objects, because
+      // string intern processing expects strings to be in Bin::kString.
+      bin = Bin::kString;  // Strings are almost always immutable (except for object header).
+    } else if (dirty_objects_.find(object) != dirty_objects_.end()) {
+      bin = Bin::kKnownDirty;
+    } else if (klass->IsClassClass()) {
       bin = Bin::kClassVerified;
       ObjPtr<mirror::Class> as_klass = object->AsClass<kVerifyNone>();
 
@@ -759,8 +781,6 @@ ImageWriter::Bin ImageWriter::AssignImageBinSlot(mirror::Object* object, size_t 
           }
         }
       }
-    } else if (klass->IsStringClass<kVerifyNone>()) {
-      bin = Bin::kString;  // Strings are almost always immutable (except for object header).
     } else if (!klass->HasSuperClass()) {
       // Only `j.l.Object` and primitive classes lack the superclass and
       // there are no instances of primitive classes.
@@ -2217,12 +2237,11 @@ void ImageWriter::LayoutHelper::VerifyImageBinSlotsAssigned() {
           CHECK(ref != nullptr);
           CHECK(image_writer_->IsImageBinSlotAssigned(ref.Ptr()));
           ObjPtr<mirror::Class> ref_klass = ref->GetClass<kVerifyNone, kWithoutReadBarrier>();
-          CHECK(ref_klass ==
-                DecodeGlobalWithoutRB<mirror::Class>(vm, WellKnownClasses::dalvik_system_DexFile));
+          CHECK(ref_klass == WellKnownClasses::dalvik_system_DexFile.Get<kWithoutReadBarrier>());
           // Note: The app class loader is used only for checking against the runtime
           // class loader, the dex file cookie is cleared and therefore we do not need
           // to run the finalizer even if we implement app image objects collection.
-          ArtField* field = jni::DecodeArtField(WellKnownClasses::dalvik_system_DexFile_cookie);
+          ArtField* field = WellKnownClasses::dalvik_system_DexFile_cookie;
           CHECK(field->GetObject<kWithoutReadBarrier>(ref) == nullptr);
           return;
         }
@@ -2525,6 +2544,142 @@ void ImageWriter::CalculateNewObjectOffsets() {
     ImageInfo& image_info = GetImageInfo(relocation.oat_index);
     relocation.offset += image_info.GetBinSlotOffset(bin_type);
   }
+}
+
+std::optional<HashSet<mirror::Object*>> ImageWriter::MatchDirtyObjectOffsets(
+    const HashMap<uint32_t, DirtyEntry>& dirty_entries) REQUIRES_SHARED(Locks::mutator_lock_) {
+  HashSet<mirror::Object*> dirty_objects;
+  bool mismatch_found = false;
+
+  auto visitor = [&](Object* obj) REQUIRES_SHARED(Locks::mutator_lock_) {
+    DCHECK(obj != nullptr);
+    if (mismatch_found) {
+      return;
+    }
+    if (!IsImageBinSlotAssigned(obj)) {
+      return;
+    }
+
+    uint8_t* image_address = reinterpret_cast<uint8_t*>(GetImageAddress(obj));
+    uint32_t offset = static_cast<uint32_t>(image_address - global_image_begin_);
+
+    auto entry_it = dirty_entries.find(offset);
+    if (entry_it == dirty_entries.end()) {
+      return;
+    }
+
+    const DirtyEntry& entry = entry_it->second;
+
+    const bool is_class = obj->IsClass();
+    const uint32_t descriptor_hash =
+        is_class ? obj->AsClass()->DescriptorHash() : obj->GetClass()->DescriptorHash();
+
+    if (is_class != entry.is_class || descriptor_hash != entry.descriptor_hash) {
+      LOG(WARNING) << "Dirty image objects offset mismatch (outdated file?)";
+      mismatch_found = true;
+      return;
+    }
+
+    dirty_objects.insert(obj);
+  };
+  Runtime::Current()->GetHeap()->VisitObjects(visitor);
+
+  // A single mismatch indicates that dirty-image-objects layout differs from
+  // current ImageWriter layout. In this case any "valid" matches are likely to be accidental,
+  // so there's no point in optimizing the layout with such data.
+  if (mismatch_found) {
+    return {};
+  }
+  if (dirty_objects.size() != dirty_entries.size()) {
+    LOG(WARNING) << "Dirty image objects missing offsets (outdated file?)";
+    return {};
+  }
+  return dirty_objects;
+}
+
+void ImageWriter::ResetObjectOffsets() {
+  const size_t image_infos_size = image_infos_.size();
+  image_infos_.clear();
+  image_infos_.resize(image_infos_size);
+
+  native_object_relocations_.clear();
+
+  // CalculateNewObjectOffsets stores image offsets of the objects in lock words,
+  // while original lock words are preserved in saved_hashcode_map.
+  // Restore original lock words.
+  auto visitor = [&](Object* obj) REQUIRES_SHARED(Locks::mutator_lock_) {
+    DCHECK(obj != nullptr);
+    const auto it = saved_hashcode_map_.find(obj);
+    obj->SetLockWord(it != saved_hashcode_map_.end() ? LockWord::FromHashCode(it->second, 0u) :
+                                                       LockWord::Default(),
+                     false);
+  };
+  Runtime::Current()->GetHeap()->VisitObjects(visitor);
+
+  saved_hashcode_map_.clear();
+}
+
+void ImageWriter::TryRecalculateOffsetsWithDirtyObjects() {
+  const std::optional<HashMap<uint32_t, ImageWriter::DirtyEntry>> dirty_entries =
+      ParseDirtyObjectOffsets(*dirty_image_objects_);
+  if (!dirty_entries || dirty_entries->empty()) {
+    return;
+  }
+
+  std::optional<HashSet<mirror::Object*>> dirty_objects = MatchDirtyObjectOffsets(*dirty_entries);
+  if (!dirty_objects || dirty_objects->empty()) {
+    return;
+  }
+  // Calculate offsets again, now with dirty object offsets.
+  LOG(INFO) << "Recalculating object offsets using dirty-image-objects";
+  dirty_objects_ = std::move(*dirty_objects);
+  ResetObjectOffsets();
+  CalculateNewObjectOffsets();
+}
+
+std::optional<HashMap<uint32_t, ImageWriter::DirtyEntry>> ImageWriter::ParseDirtyObjectOffsets(
+    const HashSet<std::string>& dirty_image_objects) REQUIRES_SHARED(Locks::mutator_lock_) {
+  HashMap<uint32_t, DirtyEntry> dirty_entries;
+
+  // Go through each dirty-image-object line, parse only lines of the format:
+  // "dirty_obj: <offset> <type> <descriptor_hash>"
+  // <offset> -- decimal uint32.
+  // <type> -- "class" or "instance" (defines if descriptor is referring to a class or an instance).
+  // <descriptor_hash> -- decimal uint32 (from DescriptorHash() method).
+  const std::string prefix = "dirty_obj:";
+  for (const std::string& entry_str : dirty_image_objects) {
+    // Skip the lines of old dirty-image-object format.
+    if (std::strncmp(entry_str.data(), prefix.data(), prefix.size()) != 0) {
+      continue;
+    }
+
+    const std::vector<std::string> tokens = android::base::Split(entry_str, " ");
+    if (tokens.size() != 4) {
+      LOG(WARNING) << "Invalid dirty image objects format: \"" << entry_str << "\"";
+      return {};
+    }
+
+    uint32_t offset = 0;
+    std::from_chars_result res =
+        std::from_chars(tokens[1].data(), tokens[1].data() + tokens[1].size(), offset);
+    if (res.ec != std::errc()) {
+      LOG(WARNING) << "Couldn't parse dirty object offset: \"" << entry_str << "\"";
+      return {};
+    }
+
+    DirtyEntry entry;
+    entry.is_class = (tokens[2] == "class");
+    res = std::from_chars(
+        tokens[3].data(), tokens[3].data() + tokens[3].size(), entry.descriptor_hash);
+    if (res.ec != std::errc()) {
+      LOG(WARNING) << "Couldn't parse dirty object descriptor hash: \"" << entry_str << "\"";
+      return {};
+    }
+
+    dirty_entries.insert(std::make_pair(offset, entry));
+  }
+
+  return dirty_entries;
 }
 
 std::pair<size_t, dchecked_vector<ImageSection>>
@@ -3288,25 +3443,7 @@ const uint8_t* ImageWriter::GetOatAddress(StubType type) const {
     const OatFile* oat_file = image_spaces[0]->GetOatFile();
     CHECK(oat_file != nullptr);
     const OatHeader& header = oat_file->GetOatHeader();
-    switch (type) {
-      // TODO: We could maybe clean this up if we stored them in an array in the oat header.
-      case StubType::kQuickGenericJNITrampoline:
-        return static_cast<const uint8_t*>(header.GetQuickGenericJniTrampoline());
-      case StubType::kJNIDlsymLookupTrampoline:
-        return static_cast<const uint8_t*>(header.GetJniDlsymLookupTrampoline());
-      case StubType::kJNIDlsymLookupCriticalTrampoline:
-        return static_cast<const uint8_t*>(header.GetJniDlsymLookupCriticalTrampoline());
-      case StubType::kQuickIMTConflictTrampoline:
-        return static_cast<const uint8_t*>(header.GetQuickImtConflictTrampoline());
-      case StubType::kQuickResolutionTrampoline:
-        return static_cast<const uint8_t*>(header.GetQuickResolutionTrampoline());
-      case StubType::kQuickToInterpreterBridge:
-        return static_cast<const uint8_t*>(header.GetQuickToInterpreterBridge());
-      case StubType::kNterpTrampoline:
-        return static_cast<const uint8_t*>(header.GetNterpTrampoline());
-      default:
-        UNREACHABLE();
-    }
+    return header.GetOatAddress(type);
   }
   const ImageInfo& primary_image_info = GetImageInfo(0);
   return GetOatAddressForOffset(primary_image_info.GetStubOffset(type), primary_image_info);
@@ -3336,8 +3473,7 @@ const uint8_t* ImageWriter::GetQuickCode(ArtMethod* method, const ImageInfo& ima
     quick_code = GetOatAddressForOffset(quick_oat_code_offset, image_info);
   }
 
-  bool needs_clinit_check = NeedsClinitCheckBeforeCall(method) &&
-      !method->GetDeclaringClass<kWithoutReadBarrier>()->IsVisiblyInitialized();
+  bool still_needs_clinit_check = method->StillNeedsClinitCheck<kWithoutReadBarrier>();
 
   if (quick_code == nullptr) {
     // If we don't have code, use generic jni / interpreter.
@@ -3347,7 +3483,7 @@ const uint8_t* ImageWriter::GetQuickCode(ArtMethod* method, const ImageInfo& ima
     } else if (CanMethodUseNterp(method, compiler_options_.GetInstructionSet())) {
       // The nterp trampoline doesn't do initialization checks, so install the
       // resolution stub if needed.
-      if (needs_clinit_check) {
+      if (still_needs_clinit_check) {
         quick_code = GetOatAddress(StubType::kQuickResolutionTrampoline);
       } else {
         quick_code = GetOatAddress(StubType::kNterpTrampoline);
@@ -3356,7 +3492,7 @@ const uint8_t* ImageWriter::GetQuickCode(ArtMethod* method, const ImageInfo& ima
       // The interpreter brige performs class initialization check if needed.
       quick_code = GetOatAddress(StubType::kQuickToInterpreterBridge);
     }
-  } else if (needs_clinit_check) {
+  } else if (still_needs_clinit_check && !compiler_options_.ShouldCompileWithClinitCheck(method)) {
     // If we do have code but the method needs a class initialization check before calling
     // that code, install the resolution stub that will perform the check.
     quick_code = GetOatAddress(StubType::kQuickResolutionTrampoline);

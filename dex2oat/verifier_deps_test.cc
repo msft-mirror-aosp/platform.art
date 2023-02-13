@@ -47,6 +47,7 @@ class VerifierDepsCompilerCallbacks : public CompilerCallbacks {
         deps_(nullptr) {}
 
   void AddUncompilableMethod(MethodReference ref ATTRIBUTE_UNUSED) override {}
+  void AddUncompilableClass(ClassReference ref ATTRIBUTE_UNUSED) override {}
   void ClassRejected(ClassReference ref ATTRIBUTE_UNUSED) override {}
 
   verifier::VerifierDeps* GetVerifierDeps() const override { return deps_; }
@@ -501,6 +502,7 @@ TEST_F(VerifierDepsTest, EncodeDecodeMulti) {
   std::vector<std::unique_ptr<const DexFile>> first_dex_files = OpenTestDexFiles("VerifierDeps");
   std::vector<std::unique_ptr<const DexFile>> second_dex_files = OpenTestDexFiles("MultiDex");
   std::vector<const DexFile*> dex_files;
+  dex_files.reserve(first_dex_files.size() + second_dex_files.size());
   for (auto& dex_file : first_dex_files) {
     dex_files.push_back(dex_file.get());
   }

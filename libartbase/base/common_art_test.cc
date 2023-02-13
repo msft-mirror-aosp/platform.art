@@ -73,15 +73,7 @@ ScratchDir::ScratchDir(bool keep_files) : keep_files_(keep_files) {
 
 ScratchDir::~ScratchDir() {
   if (!keep_files_) {
-    // Recursively delete the directory and all its content.
-    nftw(path_.c_str(), [](const char* name, const struct stat*, int type, struct FTW *) {
-      if (type == FTW_F) {
-        unlink(name);
-      } else if (type == FTW_DP) {
-        rmdir(name);
-      }
-      return 0;
-    }, 256 /* max open file descriptors */, FTW_DEPTH);
+    std::filesystem::remove_all(path_);
   }
 }
 
@@ -340,7 +332,7 @@ void CommonArtTestImpl::SetUp() {
   android_system_ext_.append("/system_ext");
   int mkdir_result = mkdir(android_system_ext_.c_str(), 0700);
   ASSERT_EQ(mkdir_result, 0);
-  setenv("ANDROID_SYSTEM_EXT", android_system_ext_.c_str(), 1);
+  setenv("SYSTEM_EXT_ROOT", android_system_ext_.c_str(), 1);
 
   std::string system_ext_framework = android_system_ext_ + "/framework";
   mkdir_result = mkdir(system_ext_framework.c_str(), 0700);
@@ -534,7 +526,6 @@ std::vector<std::unique_ptr<const DexFile>> CommonArtTestImpl::OpenDexFiles(cons
                                       &dex_files);
   CHECK(success) << "Failed to open '" << filename << "': " << error_msg;
   for (auto& dex_file : dex_files) {
-    CHECK_EQ(PROT_READ, dex_file->GetPermissions());
     CHECK(dex_file->IsReadOnly());
   }
   return dex_files;
@@ -619,6 +610,7 @@ CommonArtTestImpl::ForkAndExecResult CommonArtTestImpl::ForkAndExec(
   result.stage = ForkAndExecResult::kLink;
 
   std::vector<const char*> c_args;
+  c_args.reserve(argv.size() + 1);
   for (const std::string& str : argv) {
     c_args.push_back(str.c_str());
   }

@@ -148,7 +148,7 @@ class ProfileCompilationInfoTest : public CommonArtTest, public ProfileTestHelpe
 
     // Zip the profile content.
     ScratchFile zip;
-    FILE* file = fopen(zip.GetFile()->GetPath().c_str(), "wb");
+    FILE* file = fopen(zip.GetFile()->GetPath().c_str(), "wbe");
     ZipWriter writer(file);
     writer.StartEntry(zip_entry, zip_flags);
     writer.WriteBytes(data.data(), data.size());
@@ -932,7 +932,7 @@ TEST_F(ProfileCompilationInfoTest, LoadFromZipFailBadProfile) {
 
   // Zip the profile content.
   ScratchFile zip;
-  FILE* file = fopen(zip.GetFile()->GetPath().c_str(), "wb");
+  FILE* file = fopen(zip.GetFile()->GetPath().c_str(), "wbe");
   ZipWriter writer(file);
   writer.StartEntry("primary.prof", ZipWriter::kAlign32);
   writer.WriteBytes(data.data(), data.size());
@@ -956,9 +956,9 @@ TEST_F(ProfileCompilationInfoTest, UpdateProfileKeyOk) {
   AddMethod(&info, dex2, /*method_idx=*/ 0);
 
   // Update the profile keys based on the original dex files
-  bool updated = false;
-  ASSERT_TRUE(info.UpdateProfileKeys(dex_files, &updated));
-  ASSERT_TRUE(updated);
+  bool matched = false;
+  ASSERT_TRUE(info.UpdateProfileKeys(dex_files, &matched));
+  ASSERT_TRUE(matched);
 
   // Verify that we find the methods when searched with the original dex files.
   for (const std::unique_ptr<const DexFile>& dex : dex_files) {
@@ -984,9 +984,9 @@ TEST_F(ProfileCompilationInfoTest, UpdateProfileKeyOkWithAnnotation) {
   AddMethod(&info, dex2, /*method_idx=*/ 0, Hotness::kFlagHot, annotation);
 
   // Update the profile keys based on the original dex files
-  bool updated = false;
-  ASSERT_TRUE(info.UpdateProfileKeys(dex_files, &updated));
-  ASSERT_TRUE(updated);
+  bool matched = false;
+  ASSERT_TRUE(info.UpdateProfileKeys(dex_files, &matched));
+  ASSERT_TRUE(matched);
 
   // Verify that we find the methods when searched with the original dex files.
   for (const std::unique_ptr<const DexFile>& dex : dex_files) {
@@ -1001,7 +1001,33 @@ TEST_F(ProfileCompilationInfoTest, UpdateProfileKeyOkWithAnnotation) {
   }
 }
 
-TEST_F(ProfileCompilationInfoTest, UpdateProfileKeyOkButNoUpdate) {
+TEST_F(ProfileCompilationInfoTest, UpdateProfileKeyOkMatchedButNoUpdate) {
+  std::vector<std::unique_ptr<const DexFile>> dex_files;
+  dex_files.push_back(std::unique_ptr<const DexFile>(dex1));
+
+  // Both the checksum and the location match the original dex file.
+  ProfileCompilationInfo info;
+  AddMethod(&info, dex1, /*method_idx=*/0);
+
+  // No update should happen, but this should be considered as a happy case.
+  bool matched = false;
+  ASSERT_TRUE(info.UpdateProfileKeys(dex_files, &matched));
+  ASSERT_TRUE(matched);
+
+  // Verify that we find the methods when searched with the original dex files.
+  for (const std::unique_ptr<const DexFile>& dex : dex_files) {
+    ProfileCompilationInfo::MethodHotness loaded_hotness =
+        GetMethod(info, dex.get(), /*method_idx=*/ 0);
+    ASSERT_TRUE(loaded_hotness.IsHot());
+  }
+
+  // Release the ownership as this is held by the test class;
+  for (std::unique_ptr<const DexFile>& dex : dex_files) {
+    UNUSED(dex.release());
+  }
+}
+
+TEST_F(ProfileCompilationInfoTest, UpdateProfileKeyOkButNoMatch) {
   std::vector<std::unique_ptr<const DexFile>> dex_files;
   dex_files.push_back(std::unique_ptr<const DexFile>(dex1));
 
@@ -1009,9 +1035,9 @@ TEST_F(ProfileCompilationInfoTest, UpdateProfileKeyOkButNoUpdate) {
   AddMethod(&info, dex2, /*method_idx=*/ 0);
 
   // Update the profile keys based on the original dex files.
-  bool updated = false;
-  ASSERT_TRUE(info.UpdateProfileKeys(dex_files, &updated));
-  ASSERT_FALSE(updated);
+  bool matched = false;
+  ASSERT_TRUE(info.UpdateProfileKeys(dex_files, &matched));
+  ASSERT_FALSE(matched);
 
   // Verify that we did not perform any update and that we cannot find anything with the new
   // location.
@@ -1043,9 +1069,9 @@ TEST_F(ProfileCompilationInfoTest, UpdateProfileKeyFail) {
   // This will cause the rename to fail because an existing entry would already have that name.
   AddMethod(&info, dex1_renamed, /*method_idx=*/ 0);
 
-  bool updated = false;
-  ASSERT_FALSE(info.UpdateProfileKeys(dex_files, &updated));
-  ASSERT_FALSE(updated);
+  bool matched = false;
+  ASSERT_FALSE(info.UpdateProfileKeys(dex_files, &matched));
+  ASSERT_FALSE(matched);
 
   // Release the ownership as this is held by the test class;
   for (std::unique_ptr<const DexFile>& dex : dex_files) {

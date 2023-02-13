@@ -49,10 +49,6 @@ namespace art {
 
 using android::base::StringPrintf;
 
-constexpr uint8_t VdexFile::VdexFileHeader::kVdexInvalidMagic[4];
-constexpr uint8_t VdexFile::VdexFileHeader::kVdexMagic[4];
-constexpr uint8_t VdexFile::VdexFileHeader::kVdexVersion[4];
-
 bool VdexFile::VdexFileHeader::IsMagicValid() const {
   return (memcmp(magic_, kVdexMagic, sizeof(kVdexMagic)) == 0);
 }
@@ -228,17 +224,14 @@ bool VdexFile::OpenAllDexFiles(std::vector<std::unique_ptr<const DexFile>>* dex_
     // TODO: Supply the location information for a vdex file.
     static constexpr char kVdexLocation[] = "";
     std::string location = DexFileLoader::GetMultiDexLocation(i, kVdexLocation);
-    std::unique_ptr<const DexFile> dex(dex_file_loader.OpenWithDataSection(
-        dex_file_start,
-        size,
-        /*data_base=*/ nullptr,
-        /*data_size=*/ 0u,
-        location,
-        GetLocationChecksum(i),
-        /*oat_dex_file=*/ nullptr,
-        /*verify=*/ false,
-        /*verify_checksum=*/ false,
-        error_msg));
+    std::unique_ptr<const DexFile> dex(dex_file_loader.Open(dex_file_start,
+                                                            size,
+                                                            location,
+                                                            GetLocationChecksum(i),
+                                                            /*oat_dex_file=*/nullptr,
+                                                            /*verify=*/false,
+                                                            /*verify_checksum=*/false,
+                                                            error_msg));
     if (dex == nullptr) {
       return false;
     }

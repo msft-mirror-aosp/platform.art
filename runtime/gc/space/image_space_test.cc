@@ -145,6 +145,7 @@ TEST_F(ImageSpaceTest, StringDeduplication) {
                                      /*relocate=*/ false,
                                      /*executable=*/ true,
                                      /*extra_reservation_size=*/ 0u,
+                                     /*allow_in_memory_compilation=*/ false,
                                      &boot_image_spaces,
                                      &extra_reservation);
   };
@@ -321,57 +322,6 @@ TEST_F(DexoptTest, ValidateOatFile) {
   EXPECT_FALSE(ImageSpace::ValidateOatFile(*oat, &error_msg));
 }
 
-TEST_F(DexoptTest, Checksums) {
-  Runtime* runtime = Runtime::Current();
-  ASSERT_TRUE(runtime != nullptr);
-  ASSERT_FALSE(runtime->GetHeap()->GetBootImageSpaces().empty());
-
-  std::vector<std::string> bcp = runtime->GetBootClassPath();
-  std::vector<std::string> bcp_locations = runtime->GetBootClassPathLocations();
-  std::vector<const DexFile*> dex_files = runtime->GetClassLinker()->GetBootClassPath();
-
-  std::string error_msg;
-  auto create_and_verify = [&]() {
-    std::string checksums = gc::space::ImageSpace::GetBootClassPathChecksums(
-        ArrayRef<gc::space::ImageSpace* const>(runtime->GetHeap()->GetBootImageSpaces()),
-        ArrayRef<const DexFile* const>(dex_files));
-    return gc::space::ImageSpace::VerifyBootClassPathChecksums(
-        checksums,
-        android::base::Join(bcp_locations, ':'),
-        ArrayRef<const std::string>(runtime->GetImageLocations()),
-        ArrayRef<const std::string>(bcp_locations),
-        ArrayRef<const std::string>(bcp),
-        /*boot_class_path_fds=*/ ArrayRef<const int>(),
-        kRuntimeISA,
-        runtime->GetApexVersions(),
-        &error_msg);
-  };
-
-  ASSERT_TRUE(create_and_verify()) << error_msg;
-
-  std::vector<std::unique_ptr<const DexFile>> opened_dex_files;
-  for (const std::string& src : { GetDexSrc1(), GetDexSrc2() }) {
-    std::vector<std::unique_ptr<const DexFile>> new_dex_files;
-    const ArtDexFileLoader dex_file_loader;
-    ASSERT_TRUE(dex_file_loader.Open(src.c_str(),
-                                     src,
-                                     /*verify=*/ true,
-                                     /*verify_checksum=*/ false,
-                                     &error_msg,
-                                     &new_dex_files))
-        << error_msg;
-
-    bcp.push_back(src);
-    bcp_locations.push_back(src);
-    for (std::unique_ptr<const DexFile>& df : new_dex_files) {
-      dex_files.push_back(df.get());
-      opened_dex_files.push_back(std::move(df));
-    }
-
-    ASSERT_TRUE(create_and_verify()) << error_msg;
-  }
-}
-
 template <bool kImage, bool kRelocate>
 class ImageSpaceLoadingTest : public CommonRuntimeTest {
  protected:
@@ -381,6 +331,7 @@ class ImageSpaceLoadingTest : public CommonRuntimeTest {
     options->emplace_back(android::base::StringPrintf("-Ximage:%s", image_location.c_str()),
                           nullptr);
     options->emplace_back(kRelocate ? "-Xrelocate" : "-Xnorelocate", nullptr);
+    options->emplace_back("-Xallowinmemorycompilation", nullptr);
 
     // We want to test the relocation behavior of ImageSpace. As such, don't pretend we're a
     // compiler.

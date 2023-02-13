@@ -480,8 +480,11 @@ class ProfileCompilationInfo {
   // Save the profile data to the given file descriptor.
   bool Save(int fd);
 
-  // Save the current profile into the given file. The file will be cleared before saving.
+  // Save the current profile into the given file. Overwrites any existing data.
   bool Save(const std::string& filename, uint64_t* bytes_written);
+
+  // A fallback implementation of `Save` that uses a flock.
+  bool SaveFallback(const std::string& filename, uint64_t* bytes_written);
 
   // Return the number of dex files referenced in the profile.
   size_t GetNumberOfDexFiles() const {
@@ -646,9 +649,9 @@ class ProfileCompilationInfo {
   // If the new profile key would collide with an existing key (for a different dex)
   // the method returns false. Otherwise it returns true.
   //
-  // `updated` is set to true if any profile key has been updated by this method.
+  // `matched` is set to true if any profile has matched any input dex file.
   bool UpdateProfileKeys(const std::vector<std::unique_ptr<const DexFile>>& dex_files,
-                         /*out*/ bool* updated);
+                         /*out*/ bool* matched);
 
   // Checks if the profile is empty.
   bool IsEmpty() const;

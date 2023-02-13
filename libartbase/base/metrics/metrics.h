@@ -36,35 +36,61 @@
 #pragma clang diagnostic error "-Wconversion"
 
 // See README.md in this directory for how to define metrics.
-#define ART_METRICS(METRIC)                                             \
-  METRIC(ClassLoadingTotalTime, MetricsCounter)                         \
-  METRIC(ClassVerificationTotalTime, MetricsCounter)                    \
-  METRIC(ClassVerificationCount, MetricsCounter)                        \
-  METRIC(WorldStopTimeDuringGCAvg, MetricsAverage)                      \
-  METRIC(YoungGcCount, MetricsCounter)                                  \
-  METRIC(FullGcCount, MetricsCounter)                                   \
-  METRIC(TotalBytesAllocated, MetricsCounter)                           \
-  METRIC(TotalGcCollectionTime, MetricsCounter)                         \
-  METRIC(YoungGcThroughputAvg, MetricsAverage)                          \
-  METRIC(FullGcThroughputAvg, MetricsAverage)                           \
-  METRIC(YoungGcTracingThroughputAvg, MetricsAverage)                   \
-  METRIC(FullGcTracingThroughputAvg, MetricsAverage)                    \
-  METRIC(JitMethodCompileTotalTime, MetricsCounter)                     \
-  METRIC(JitMethodCompileCount, MetricsCounter)                         \
-  METRIC(YoungGcCollectionTime, MetricsHistogram, 15, 0, 60'000)        \
-  METRIC(FullGcCollectionTime, MetricsHistogram, 15, 0, 60'000)         \
-  METRIC(YoungGcThroughput, MetricsHistogram, 15, 0, 10'000)            \
-  METRIC(FullGcThroughput, MetricsHistogram, 15, 0, 10'000)             \
-  METRIC(YoungGcTracingThroughput, MetricsHistogram, 15, 0, 10'000)     \
-  METRIC(FullGcTracingThroughput, MetricsHistogram, 15, 0, 10'000)      \
-  METRIC(GcWorldStopTime, MetricsCounter)                               \
-  METRIC(GcWorldStopCount, MetricsCounter)                              \
-  METRIC(YoungGcScannedBytes, MetricsCounter)                           \
-  METRIC(YoungGcFreedBytes, MetricsCounter)                             \
-  METRIC(YoungGcDuration, MetricsCounter)                               \
-  METRIC(FullGcScannedBytes, MetricsCounter)                            \
-  METRIC(FullGcFreedBytes, MetricsCounter)                              \
+
+// Metrics reported as Event Metrics.
+#define ART_EVENT_METRICS(METRIC)                                   \
+  METRIC(ClassLoadingTotalTime, MetricsCounter)                     \
+  METRIC(ClassVerificationTotalTime, MetricsCounter)                \
+  METRIC(ClassVerificationCount, MetricsCounter)                    \
+  METRIC(WorldStopTimeDuringGCAvg, MetricsAverage)                  \
+  METRIC(YoungGcCount, MetricsCounter)                              \
+  METRIC(FullGcCount, MetricsCounter)                               \
+  METRIC(TotalBytesAllocated, MetricsCounter)                       \
+  METRIC(TotalGcCollectionTime, MetricsCounter)                     \
+  METRIC(YoungGcThroughputAvg, MetricsAverage)                      \
+  METRIC(FullGcThroughputAvg, MetricsAverage)                       \
+  METRIC(YoungGcTracingThroughputAvg, MetricsAverage)               \
+  METRIC(FullGcTracingThroughputAvg, MetricsAverage)                \
+  METRIC(JitMethodCompileTotalTime, MetricsCounter)                 \
+  METRIC(JitMethodCompileCount, MetricsCounter)                     \
+  METRIC(YoungGcCollectionTime, MetricsHistogram, 15, 0, 60'000)    \
+  METRIC(FullGcCollectionTime, MetricsHistogram, 15, 0, 60'000)     \
+  METRIC(YoungGcThroughput, MetricsHistogram, 15, 0, 10'000)        \
+  METRIC(FullGcThroughput, MetricsHistogram, 15, 0, 10'000)         \
+  METRIC(YoungGcTracingThroughput, MetricsHistogram, 15, 0, 10'000) \
+  METRIC(FullGcTracingThroughput, MetricsHistogram, 15, 0, 10'000)  \
+  METRIC(GcWorldStopTime, MetricsCounter)                           \
+  METRIC(GcWorldStopCount, MetricsCounter)                          \
+  METRIC(YoungGcScannedBytes, MetricsCounter)                       \
+  METRIC(YoungGcFreedBytes, MetricsCounter)                         \
+  METRIC(YoungGcDuration, MetricsCounter)                           \
+  METRIC(FullGcScannedBytes, MetricsCounter)                        \
+  METRIC(FullGcFreedBytes, MetricsCounter)                          \
   METRIC(FullGcDuration, MetricsCounter)
+
+// Increasing counter metrics, reported as Value Metrics in delta increments.
+#define ART_VALUE_METRICS(METRIC)                              \
+  METRIC(GcWorldStopTimeDelta, MetricsDeltaCounter)            \
+  METRIC(GcWorldStopCountDelta, MetricsDeltaCounter)           \
+  METRIC(YoungGcScannedBytesDelta, MetricsDeltaCounter)        \
+  METRIC(YoungGcFreedBytesDelta, MetricsDeltaCounter)          \
+  METRIC(YoungGcDurationDelta, MetricsDeltaCounter)            \
+  METRIC(FullGcScannedBytesDelta, MetricsDeltaCounter)         \
+  METRIC(FullGcFreedBytesDelta, MetricsDeltaCounter)           \
+  METRIC(FullGcDurationDelta, MetricsDeltaCounter)             \
+  METRIC(JitMethodCompileTotalTimeDelta, MetricsDeltaCounter)  \
+  METRIC(JitMethodCompileCountDelta, MetricsDeltaCounter)      \
+  METRIC(ClassVerificationTotalTimeDelta, MetricsDeltaCounter) \
+  METRIC(ClassVerificationCountDelta, MetricsDeltaCounter)     \
+  METRIC(ClassLoadingTotalTimeDelta, MetricsDeltaCounter)      \
+  METRIC(TotalBytesAllocatedDelta, MetricsDeltaCounter)        \
+  METRIC(TotalGcCollectionTimeDelta, MetricsDeltaCounter)      \
+  METRIC(YoungGcCountDelta, MetricsDeltaCounter)               \
+  METRIC(FullGcCountDelta, MetricsDeltaCounter)
+
+#define ART_METRICS(METRIC) \
+  ART_EVENT_METRICS(METRIC) \
+  ART_VALUE_METRICS(METRIC)
 
 // A lot of the metrics implementation code is generated by passing one-off macros into ART_COUNTERS
 // and ART_HISTOGRAMS. This means metrics.h and metrics.cc are very #define-heavy, which can be
@@ -91,26 +117,27 @@ enum class DatumId {
 };
 
 // Names come from PackageManagerServiceCompilerMapping.java
-#define REASON_NAME_LIST(V) \
-  V(kError, "error") \
-  V(kUnknown, "unknown") \
-  V(kFirstBoot, "first-boot") \
-  V(kBootAfterOTA, "boot-after-ota") \
-  V(kPostBoot, "post-boot") \
-  V(kInstall, "install") \
-  V(kInstallFast, "install-fast") \
-  V(kInstallBulk, "install-bulk") \
-  V(kInstallBulkSecondary, "install-bulk-secondary") \
-  V(kInstallBulkDowngraded, "install-bulk-downgraded") \
+#define REASON_NAME_LIST(V)                                               \
+  V(kError, "error")                                                      \
+  V(kUnknown, "unknown")                                                  \
+  V(kFirstBoot, "first-boot")                                             \
+  V(kBootAfterOTA, "boot-after-ota")                                      \
+  V(kPostBoot, "post-boot")                                               \
+  V(kInstall, "install")                                                  \
+  V(kInstallFast, "install-fast")                                         \
+  V(kInstallBulk, "install-bulk")                                         \
+  V(kInstallBulkSecondary, "install-bulk-secondary")                      \
+  V(kInstallBulkDowngraded, "install-bulk-downgraded")                    \
   V(kInstallBulkSecondaryDowngraded, "install-bulk-secondary-downgraded") \
-  V(kBgDexopt, "bg-dexopt") \
-  V(kABOTA, "ab-ota") \
-  V(kInactive, "inactive") \
-  V(kShared, "shared") \
-  V(kInstallWithDexMetadata, "install-with-dex-metadata") \
-  V(kPrebuilt, "prebuilt") \
-  V(kCmdLine, "cmdline") \
-  V(kVdex, "vdex")
+  V(kBgDexopt, "bg-dexopt")                                               \
+  V(kABOTA, "ab-ota")                                                     \
+  V(kInactive, "inactive")                                                \
+  V(kShared, "shared")                                                    \
+  V(kInstallWithDexMetadata, "install-with-dex-metadata")                 \
+  V(kPrebuilt, "prebuilt")                                                \
+  V(kCmdLine, "cmdline")                                                  \
+  V(kVdex, "vdex")                                                        \
+  V(kBootAfterMainlineUpdate, "boot-after-mainline-update")
 
 // We log compilation reasons as part of the metadata we report. Since elsewhere compilation reasons
 // are specified as a string, we define them as an enum here which indicates the reasons that we
@@ -243,6 +270,8 @@ class MetricsBackend {
 
   template <DatumId counter_type, typename T>
   friend class MetricsCounter;
+  template <DatumId counter_type, typename T>
+  friend class MetricsDeltaCounter;
   template <DatumId histogram_type, size_t num_buckets, int64_t low_value, int64_t high_value>
   friend class MetricsHistogram;
   template <DatumId datum_id, typename T, const T& AccumulatorFunction(const T&, const T&)>
@@ -274,13 +303,14 @@ class MetricsCounter : public MetricsBase<T> {
   void AddOne() { Add(1u); }
   void Add(value_t value) { value_.fetch_add(value, std::memory_order::memory_order_relaxed); }
 
-  void Report(MetricsBackend* backend) const { backend->ReportCounter(counter_type, Value()); }
-
- protected:
-  void Reset() {
-    value_ = 0;
+  void Report(const std::vector<MetricsBackend*>& backends) const {
+    for (MetricsBackend* backend : backends) {
+      backend->ReportCounter(counter_type, Value());
+    }
   }
 
+ protected:
+  void Reset() { value_ = 0; }
   value_t Value() const { return value_.load(std::memory_order::memory_order_relaxed); }
 
  private:
@@ -317,11 +347,14 @@ class MetricsAverage final : public MetricsCounter<datum_id, T> {
     count_.fetch_add(1, std::memory_order::memory_order_release);
   }
 
-  void Report(MetricsBackend* backend) const {
+  void Report(const std::vector<MetricsBackend*>& backends) const {
+    count_t value = MetricsCounter<datum_id, value_t>::Value();
     count_t count = count_.load(std::memory_order::memory_order_acquire);
-    backend->ReportCounter(datum_id,
-                           // Avoid divide-by-0.
-                           count != 0 ? MetricsCounter<datum_id, value_t>::Value() / count : 0);
+    // Avoid divide-by-0.
+    count_t average_value = count != 0 ? value / count : 0;
+    for (MetricsBackend* backend : backends) {
+      backend->ReportCounter(datum_id, average_value);
+    }
   }
 
  protected:
@@ -333,6 +366,40 @@ class MetricsAverage final : public MetricsCounter<datum_id, T> {
  private:
   std::atomic<count_t> count_;
   static_assert(std::atomic<count_t>::is_always_lock_free);
+
+  friend class ArtMetrics;
+};
+
+template <DatumId datum_id, typename T = uint64_t>
+class MetricsDeltaCounter : public MetricsBase<T> {
+ public:
+  using value_t = T;
+
+  explicit constexpr MetricsDeltaCounter(uint64_t value = 0) : value_{value} {
+    // Ensure we do not have any unnecessary data in this class.
+    // Adding intptr_t to accommodate vtable, and rounding up to incorporate
+    // padding.
+    static_assert(RoundUp(sizeof(*this), sizeof(uint64_t)) ==
+                  RoundUp(sizeof(intptr_t) + sizeof(value_t), sizeof(uint64_t)));
+  }
+
+  void Add(value_t value) override {
+    value_.fetch_add(value, std::memory_order::memory_order_relaxed);
+  }
+  void AddOne() { Add(1u); }
+
+  void ReportAndReset(const std::vector<MetricsBackend*>& backends) {
+    value_t value = value_.exchange(0, std::memory_order::memory_order_relaxed);
+    for (MetricsBackend* backend : backends) {
+      backend->ReportCounter(datum_id, value);
+    }
+  }
+
+  void Reset() { value_ = 0; }
+
+ private:
+  std::atomic<value_t> value_;
+  static_assert(std::atomic<value_t>::is_always_lock_free);
 
   friend class ArtMetrics;
 };
@@ -361,8 +428,10 @@ class MetricsHistogram final : public MetricsBase<int64_t> {
     buckets_[i].fetch_add(1u, std::memory_order::memory_order_relaxed);
   }
 
-  void Report(MetricsBackend* backend) const {
-    backend->ReportHistogram(histogram_type_, minimum_value_, maximum_value_, GetBuckets());
+  void Report(const std::vector<MetricsBackend*>& backends) const {
+    for (MetricsBackend* backend : backends) {
+      backend->ReportHistogram(histogram_type_, minimum_value_, maximum_value_, GetBuckets());
+    }
   }
 
  protected:
@@ -639,8 +708,8 @@ class ArtMetrics {
  public:
   ArtMetrics();
 
-  void ReportAllMetrics(MetricsBackend* backend) const;
-  void DumpForSigQuit(std::ostream& os) const;
+  void ReportAllMetricsAndResetValueMetrics(const std::vector<MetricsBackend*>& backends);
+  void DumpForSigQuit(std::ostream& os);
 
   // Resets all metrics to their initial value. This is intended to be used after forking from the
   // zygote so we don't attribute parent values to the child process.

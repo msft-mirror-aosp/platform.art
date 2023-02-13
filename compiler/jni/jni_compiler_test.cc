@@ -22,6 +22,7 @@
 #include "art_method-inl.h"
 #include "base/bit_utils.h"
 #include "base/casts.h"
+#include "base/macros.h"
 #include "base/mem_map.h"
 #include "class_linker.h"
 #include "common_compiler_test.h"
@@ -43,7 +44,7 @@
 #include "oat_quick_method_header.h"
 #include "runtime.h"
 #include "scoped_thread_state_change-inl.h"
-#include "thread.h"
+#include "thread-inl.h"
 
 extern "C" JNIEXPORT jint JNICALL Java_MyClassNatives_bar(JNIEnv*, jobject, jint count) {
   return count + 1;
@@ -71,7 +72,7 @@ extern "C" JNIEXPORT jint JNICALL Java_MyClassNatives_sbar_1Critical(jint count)
 // TODO: In the Baker read barrier configuration, add checks to ensure
 // the Marking Register's value is correct.
 
-namespace art {
+namespace art HIDDEN {
 
 enum class JniKind {
   kNormal,      // Regular kind of un-annotated natives.
@@ -236,13 +237,14 @@ class JniCompilerTest : public CommonCompilerTest {
                       bool direct,
                       const char* method_name,
                       const char* method_sig) {
-    ScopedObjectAccess soa(Thread::Current());
-    StackHandleScope<2> hs(soa.Self());
+    Thread* self = Thread::Current();
+    ScopedObjectAccess soa(self);
+    StackHandleScope<2> hs(self);
     Handle<mirror::ClassLoader> loader(
         hs.NewHandle(soa.Decode<mirror::ClassLoader>(class_loader)));
     // Compile the native method before starting the runtime
     Handle<mirror::Class> c =
-        hs.NewHandle(class_linker_->FindClass(soa.Self(), "LMyClassNatives;", loader));
+        hs.NewHandle(class_linker_->FindClass(self, "LMyClassNatives;", loader));
     const auto pointer_size = class_linker_->GetImagePointerSize();
     ArtMethod* method = c->FindClassMethod(method_name, method_sig, pointer_size);
     ASSERT_TRUE(method != nullptr) << method_name << " " << method_sig;
@@ -251,8 +253,11 @@ class JniCompilerTest : public CommonCompilerTest {
       // Class initialization could replace the entrypoint, so force
       // the initialization before we set up the entrypoint below.
       class_linker_->EnsureInitialized(
-          soa.Self(), c, /*can_init_fields=*/ true, /*can_init_parents=*/ true);
-      class_linker_->MakeInitializedClassesVisiblyInitialized(soa.Self(), /*wait=*/ true);
+          self, c, /*can_init_fields=*/ true, /*can_init_parents=*/ true);
+      {
+        ScopedThreadSuspension sts(self, ThreadState::kNative);
+        class_linker_->MakeInitializedClassesVisiblyInitialized(self, /*wait=*/ true);
+      }
     }
     if (check_generic_jni_) {
       method->SetEntryPointFromQuickCompiledCode(class_linker_->GetRuntimeQuickGenericJniStub());
@@ -402,7 +407,7 @@ jobject JniCompilerTest::jobj_;
 jobject JniCompilerTest::class_loader_;
 
 void JniCompilerTest::AssertCallerObjectLocked(JNIEnv* env) {
-  Thread* self = down_cast<JNIEnvExt*>(env)->GetSelf();
+  Thread* self = Thread::ForEnv(env);
   CHECK_EQ(self, Thread::Current());
   ScopedObjectAccess soa(self);
   ArtMethod** caller_frame = self->GetManagedStack()->GetTopQuickFrame();
@@ -845,6 +850,7 @@ jlong Java_MyClassNatives_fooJJ_synchronized(JNIEnv* env, jobject, jlong x, jlon
   return x | y;
 }
 
+EXPORT  // Defined in `libart.so`.
 void InitEntryPoints(JniEntryPoints* jpoints,
                      QuickEntryPoints* qpoints,
                      bool monitor_jni_entry_exit);
@@ -1307,7 +1313,7 @@ void JniCompilerTest::ExceptionHandlingImpl() {
       CompileForTestWithCurrentJni(class_loader_, false, "synchronizedThrowException", "()V");
     }
   }
-  // Start runtime to avoid re-initialization in SetupForTest.
+  // Start runtime to avoid re-initialization in SetUpForTest.
   Thread::Current()->TransitionFromSuspendedToRunnable();
   bool started = runtime_->Start();
   CHECK(started);

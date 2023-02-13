@@ -29,7 +29,7 @@
 #include "runtime.h"
 #include "scoped_thread_state_change-inl.h"
 #include "thread-current-inl.h"
-#include "well_known_classes.h"
+#include "well_known_classes-inl.h"
 
 namespace art {
 
@@ -63,12 +63,10 @@ std::string DescribeSpace(ObjPtr<mirror::Class> klass) {
 std::string DescribeLoaders(ObjPtr<mirror::ClassLoader> loader, const char* class_descriptor) {
   std::ostringstream oss;
   uint32_t hash = ComputeModifiedUtf8Hash(class_descriptor);
-  ObjPtr<mirror::Class> path_class_loader =
-      WellKnownClasses::ToClass(WellKnownClasses::dalvik_system_PathClassLoader);
-  ObjPtr<mirror::Class> dex_class_loader =
-      WellKnownClasses::ToClass(WellKnownClasses::dalvik_system_DexClassLoader);
+  ObjPtr<mirror::Class> path_class_loader = WellKnownClasses::dalvik_system_PathClassLoader.Get();
+  ObjPtr<mirror::Class> dex_class_loader = WellKnownClasses::dalvik_system_DexClassLoader.Get();
   ObjPtr<mirror::Class> delegate_last_class_loader =
-      WellKnownClasses::ToClass(WellKnownClasses::dalvik_system_DelegateLastClassLoader);
+      WellKnownClasses::dalvik_system_DelegateLastClassLoader.Get();
 
   // Print the class loader chain.
   bool found_class = false;
@@ -97,13 +95,13 @@ std::string DescribeLoaders(ObjPtr<mirror::ClassLoader> loader, const char* clas
         loader->GetClass() == dex_class_loader ||
         loader->GetClass() == delegate_last_class_loader) {
       oss << "(";
-      ScopedObjectAccessUnchecked soa(Thread::Current());
-      StackHandleScope<1> hs(soa.Self());
+      Thread* self = Thread::Current();
+      StackHandleScope<1> hs(self);
       Handle<mirror::ClassLoader> handle(hs.NewHandle(loader));
       const char* path_separator = "";
       const DexFile* base_dex_file = nullptr;
       VisitClassLoaderDexFiles(
-          soa,
+          self,
           handle,
           [&](const DexFile* dex_file) {
               oss << path_separator;

@@ -28,11 +28,14 @@ bootstrap_go_package {
 }
 
 art_clang_tidy_errors = [
+    "android-cloexec-dup",
+    "android-cloexec-fopen",
     "android-cloexec-open",
     "bugprone-argument-comment",
     "bugprone-lambda-function-name",
     "bugprone-macro-parentheses",
     "bugprone-unused-raii", // Protect scoped things like MutexLock.
+    "bugprone-unused-return-value",
     "bugprone-virtual-near-miss",
     "misc-unused-using-decls",
     "modernize-use-bool-literals",
@@ -40,17 +43,11 @@ art_clang_tidy_errors = [
     "performance-faster-string-find",
     "performance-for-range-copy",
     "performance-implicit-conversion-in-loop",
+    "performance-inefficient-vector-operation",
+    "performance-no-automatic-move",
+    "performance-noexcept-move-constructor",
     "performance-unnecessary-copy-initialization",
     "performance-unnecessary-value-param",
-    "performance-noexcept-move-constructor",
-]
-
-art_clang_tidy_allowed = [
-    // Many files have these warnings. Move them to art_clang_tidy_errors
-    // when all files are free of these warnings.
-    "android-cloexec-dup",
-    "bugprone-unused-return-value",
-    "modernize-use-using", // TODO: move to art_clang_tidy_errors after b/236243696 is done
 ]
 
 art_clang_tidy_disabled = [
@@ -67,6 +64,9 @@ art_clang_tidy_disabled = [
     "-modernize-return-braced-init-list",
     "-modernize-use-default-member-init",
     "-modernize-pass-by-value",
+    // The only two remaining offenders are art/openjdkjvmti/include/jvmti.h and
+    // libcore/ojluni/src/main/native/jvm.h, which are both external files by Oracle
+    "-modernize-use-using",
 ]
 
 soong_config_module_type_import {
@@ -186,6 +186,10 @@ art_module_art_global_defaults {
                 // Apple, it's a pain.
                 "-Wmissing-noreturn",
             ],
+            // Don't export symbols of statically linked libziparchive.
+            // Workaround to fix ODR violations (b/264235288) in gtests.
+            // `--exclude-libs` flag is not supported on windows/darwin.
+            ldflags: ["-Wl,--exclude-libs=libziparchive.a"],
         },
         linux_bionic: {
             strip: {
@@ -247,7 +251,7 @@ art_module_art_global_defaults {
         },
     },
 
-    tidy_checks: art_clang_tidy_errors + art_clang_tidy_allowed + art_clang_tidy_disabled,
+    tidy_checks: art_clang_tidy_errors + art_clang_tidy_disabled,
 
     tidy_checks_as_errors: art_clang_tidy_errors,
 

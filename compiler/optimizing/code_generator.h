@@ -26,6 +26,7 @@
 #include "base/bit_utils.h"
 #include "base/enums.h"
 #include "base/globals.h"
+#include "base/macros.h"
 #include "base/memory_region.h"
 #include "class_root.h"
 #include "dex/string_reference.h"
@@ -37,10 +38,11 @@
 #include "optimizing_compiler_stats.h"
 #include "read_barrier_option.h"
 #include "stack.h"
+#include "subtype_check.h"
 #include "utils/assembler.h"
 #include "utils/label.h"
 
-namespace art {
+namespace art HIDDEN {
 
 // Binary encoding of 2^32 for type double.
 static int64_t constexpr k2Pow32EncodingForDouble = INT64_C(0x41F0000000000000);
@@ -57,8 +59,18 @@ static int32_t constexpr kPrimIntMax = 0x7fffffff;
 // Maximum value for a primitive long.
 static int64_t constexpr kPrimLongMax = INT64_C(0x7fffffffffffffff);
 
-static constexpr ReadBarrierOption kCompilerReadBarrierOption =
-    kEmitCompilerReadBarrier ? kWithReadBarrier : kWithoutReadBarrier;
+static const ReadBarrierOption gCompilerReadBarrierOption =
+    gUseReadBarrier ? kWithReadBarrier : kWithoutReadBarrier;
+
+constexpr size_t status_lsb_position = SubtypeCheckBits::BitStructSizeOf();
+constexpr size_t status_byte_offset =
+    mirror::Class::StatusOffset().SizeValue() + (status_lsb_position / kBitsPerByte);
+constexpr uint32_t shifted_visibly_initialized_value =
+    enum_cast<uint32_t>(ClassStatus::kVisiblyInitialized) << (status_lsb_position % kBitsPerByte);
+constexpr uint32_t shifted_initializing_value =
+    enum_cast<uint32_t>(ClassStatus::kInitializing) << (status_lsb_position % kBitsPerByte);
+constexpr uint32_t shifted_initialized_value =
+    enum_cast<uint32_t>(ClassStatus::kInitialized) << (status_lsb_position % kBitsPerByte);
 
 class Assembler;
 class CodeGenerator;
@@ -461,7 +473,7 @@ class CodeGenerator : public DeletableArenaObject<kArenaAllocCodeGenerator> {
     // If the target class is in the boot image, it's non-moveable and it doesn't matter
     // if we compare it with a from-space or to-space reference, the result is the same.
     // It's OK to traverse a class hierarchy jumping between from-space and to-space.
-    return kEmitCompilerReadBarrier && !instance_of->GetTargetClass()->IsInBootImage();
+    return gUseReadBarrier && !instance_of->GetTargetClass()->IsInBootImage();
   }
 
   static ReadBarrierOption ReadBarrierOptionForInstanceOf(HInstanceOf* instance_of) {
@@ -476,7 +488,7 @@ class CodeGenerator : public DeletableArenaObject<kArenaAllocCodeGenerator> {
       case TypeCheckKind::kArrayObjectCheck:
       case TypeCheckKind::kInterfaceCheck: {
         bool needs_read_barrier =
-            kEmitCompilerReadBarrier && !check_cast->GetTargetClass()->IsInBootImage();
+            gUseReadBarrier && !check_cast->GetTargetClass()->IsInBootImage();
         // We do not emit read barriers for HCheckCast, so we can get false negatives
         // and the slow path shall re-check and simply return if the cast is actually OK.
         return !needs_read_barrier;
@@ -679,7 +691,7 @@ class CodeGenerator : public DeletableArenaObject<kArenaAllocCodeGenerator> {
         return LocationSummary::kCallOnMainOnly;
       case HLoadString::LoadKind::kJitTableAddress:
         DCHECK(!load->NeedsEnvironment());
-        return kEmitCompilerReadBarrier
+        return gUseReadBarrier
             ? LocationSummary::kCallOnSlowPath
             : LocationSummary::kNoCall;
         break;
@@ -837,8 +849,11 @@ class CodeGenerator : public DeletableArenaObject<kArenaAllocCodeGenerator> {
   void BlockIfInRegister(Location location, bool is_out = false) const;
   void EmitEnvironment(HEnvironment* environment,
                        SlowPathCode* slow_path,
-                       bool needs_vreg_info = true);
-  void EmitVRegInfo(HEnvironment* environment, SlowPathCode* slow_path);
+                       bool needs_vreg_info = true,
+                       bool is_for_catch_handler = false,
+                       bool innermost_environment = true);
+  void EmitVRegInfo(HEnvironment* environment, SlowPathCode* slow_path, bool is_for_catch_handler);
+  void EmitVRegInfoOnlyCatchPhis(HEnvironment* environment);
 
   static void PrepareCriticalNativeArgumentMoves(
       HInvokeStaticOrDirect* invoke,

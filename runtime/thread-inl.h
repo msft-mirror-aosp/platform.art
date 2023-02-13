@@ -34,7 +34,7 @@
 namespace art {
 
 // Quickly access the current thread from a JNIEnv.
-static inline Thread* ThreadForEnv(JNIEnv* env) {
+inline Thread* Thread::ForEnv(JNIEnv* env) {
   JNIEnvExt* full_env(down_cast<JNIEnvExt*>(env));
   return full_env->GetSelf();
 }
@@ -373,7 +373,7 @@ inline bool Thread::PushOnThreadLocalAllocationStack(mirror::Object* obj) {
 }
 
 inline bool Thread::GetWeakRefAccessEnabled() const {
-  CHECK(kUseReadBarrier);
+  DCHECK(gUseReadBarrier);
   DCHECK(this == Thread::Current());
   WeakRefAccessState s = tls32_.weak_ref_access_enabled.load(std::memory_order_relaxed);
   if (LIKELY(s == WeakRefAccessState::kVisiblyEnabled)) {
@@ -428,7 +428,7 @@ inline bool Thread::ModifySuspendCount(Thread* self,
                                        int delta,
                                        AtomicInteger* suspend_barrier,
                                        SuspendReason reason) {
-  if (delta > 0 && ((kUseReadBarrier && this != self) || suspend_barrier != nullptr)) {
+  if (delta > 0 && ((gUseReadBarrier && this != self) || suspend_barrier != nullptr)) {
     // When delta > 0 (requesting a suspend), ModifySuspendCountInternal() may fail either if
     // active_suspend_barriers is full or we are in the middle of a thread flip. Retry in a loop.
     while (true) {

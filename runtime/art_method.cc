@@ -111,34 +111,62 @@ ArtMethod* ArtMethod::FromReflectedMethod(const ScopedObjectAccessAlreadyRunnabl
   return executable->GetArtMethod();
 }
 
+template <ReadBarrierOption kReadBarrierOption>
 ObjPtr<mirror::DexCache> ArtMethod::GetObsoleteDexCache() {
+  // Note: The class redefinition happens with GC disabled, so at the point where we
+  // create obsolete methods, the `ClassExt` and its obsolete methods and dex caches
+  // members are reachable without a read barrier. If we start a GC later, and we
+  // look at these objects without read barriers (`kWithoutReadBarrier`), the method
+  // pointers shall be the same in from-space array as in to-space array (if these
+  // arrays are different) and the dex cache array entry can point to from-space or
+  // to-space `DexCache` but either is a valid result for `kWithoutReadBarrier`.
+  ScopedAssertNoThreadSuspension ants(__FUNCTION__);
+  std::optional<ScopedDebugDisallowReadBarriers> sddrb(std::nullopt);
+  if (kIsDebugBuild && kReadBarrierOption == kWithoutReadBarrier) {
+    sddrb.emplace(Thread::Current());
+  }
   PointerSize pointer_size = kRuntimePointerSize;
   DCHECK(!Runtime::Current()->IsAotCompiler()) << PrettyMethod();
   DCHECK(IsObsolete());
-  ObjPtr<mirror::ClassExt> ext(GetDeclaringClass()->GetExtData());
-  ObjPtr<mirror::PointerArray> obsolete_methods(ext.IsNull() ? nullptr : ext->GetObsoleteMethods());
-  int32_t len = (obsolete_methods.IsNull() ? 0 : obsolete_methods->GetLength());
-  DCHECK(len == 0 || len == ext->GetObsoleteDexCaches()->GetLength())
-      << "len=" << len << " ext->GetObsoleteDexCaches()=" << ext->GetObsoleteDexCaches();
+  ObjPtr<mirror::Class> declaring_class = GetDeclaringClass<kReadBarrierOption>();
+  ObjPtr<mirror::ClassExt> ext =
+      declaring_class->GetExtData<kDefaultVerifyFlags, kReadBarrierOption>();
+  ObjPtr<mirror::PointerArray> obsolete_methods(
+      ext.IsNull() ? nullptr : ext->GetObsoleteMethods<kDefaultVerifyFlags, kReadBarrierOption>());
+  int32_t len = 0;
+  ObjPtr<mirror::ObjectArray<mirror::DexCache>> obsolete_dex_caches = nullptr;
+  if (!obsolete_methods.IsNull()) {
+    len = obsolete_methods->GetLength();
+    obsolete_dex_caches = ext->GetObsoleteDexCaches<kDefaultVerifyFlags, kReadBarrierOption>();
+    // FIXME: `ClassExt::SetObsoleteArrays()` is not atomic, so one of the arrays we see here
+    // could be extended for a new class redefinition while the other may be shorter.
+    // Furthermore, there is no synchronization to ensure that copied contents of an old
+    // obsolete array are visible to a thread reading the new array.
+    DCHECK_EQ(len, obsolete_dex_caches->GetLength())
+        << " ext->GetObsoleteDexCaches()=" << obsolete_dex_caches;
+  }
   // Using kRuntimePointerSize (instead of using the image's pointer size) is fine since images
   // should never have obsolete methods in them so they should always be the same.
   DCHECK_EQ(pointer_size, Runtime::Current()->GetClassLinker()->GetImagePointerSize());
   for (int32_t i = 0; i < len; i++) {
     if (this == obsolete_methods->GetElementPtrSize<ArtMethod*>(i, pointer_size)) {
-      return ext->GetObsoleteDexCaches()->Get(i);
+      return obsolete_dex_caches->GetWithoutChecks<kDefaultVerifyFlags, kReadBarrierOption>(i);
     }
   }
-  CHECK(GetDeclaringClass()->IsObsoleteObject())
+  CHECK(declaring_class->IsObsoleteObject())
       << "This non-structurally obsolete method does not appear in the obsolete map of its class: "
-      << GetDeclaringClass()->PrettyClass() << " Searched " << len << " caches.";
+      << declaring_class->PrettyClass() << " Searched " << len << " caches.";
   CHECK_EQ(this,
            std::clamp(this,
-                      &(*GetDeclaringClass()->GetMethods(pointer_size).begin()),
-                      &(*GetDeclaringClass()->GetMethods(pointer_size).end())))
+                      &(*declaring_class->GetMethods(pointer_size).begin()),
+                      &(*declaring_class->GetMethods(pointer_size).end())))
       << "class is marked as structurally obsolete method but not found in normal obsolete-map "
       << "despite not being the original method pointer for " << GetDeclaringClass()->PrettyClass();
-  return GetDeclaringClass()->GetDexCache();
+  return declaring_class->template GetDexCache<kDefaultVerifyFlags, kReadBarrierOption>();
 }
+
+template ObjPtr<mirror::DexCache> ArtMethod::GetObsoleteDexCache<kWithReadBarrier>();
+template ObjPtr<mirror::DexCache> ArtMethod::GetObsoleteDexCache<kWithoutReadBarrier>();
 
 uint16_t ArtMethod::FindObsoleteDexClassDefIndex() {
   DCHECK(!Runtime::Current()->IsAotCompiler()) << PrettyMethod();
@@ -557,10 +585,6 @@ bool ArtMethod::EqualParameters(Handle<mirror::ObjectArray<mirror::Class>> param
 }
 
 const OatQuickMethodHeader* ArtMethod::GetOatQuickMethodHeader(uintptr_t pc) {
-  // Our callers should make sure they don't pass the instrumentation exit pc,
-  // as this method does not look at the side instrumentation stack.
-  DCHECK_NE(pc, reinterpret_cast<uintptr_t>(GetQuickInstrumentationExitPc()));
-
   if (IsRuntimeMethod()) {
     return nullptr;
   }
@@ -586,7 +610,6 @@ const OatQuickMethodHeader* ArtMethod::GetOatQuickMethodHeader(uintptr_t pc) {
   if (!class_linker->IsQuickGenericJniStub(existing_entry_point) &&
       !class_linker->IsQuickResolutionStub(existing_entry_point) &&
       !class_linker->IsQuickToInterpreterBridge(existing_entry_point) &&
-      existing_entry_point != GetQuickInstrumentationEntryPoint() &&
       existing_entry_point != GetInvokeObsoleteMethodStub()) {
     OatQuickMethodHeader* method_header =
         OatQuickMethodHeader::FromEntryPoint(existing_entry_point);
@@ -628,7 +651,6 @@ const OatQuickMethodHeader* ArtMethod::GetOatQuickMethodHeader(uintptr_t pc) {
     // to different entrypoints or to a JIT-compiled JNI stub.
     DCHECK(class_linker->IsQuickGenericJniStub(existing_entry_point) ||
            class_linker->IsQuickResolutionStub(existing_entry_point) ||
-           existing_entry_point == GetQuickInstrumentationEntryPoint() ||
            (jit != nullptr && jit->GetCodeCache()->ContainsPc(existing_entry_point)))
         << " entrypoint: " << existing_entry_point
         << " size: " << OatQuickMethodHeader::FromEntryPoint(existing_entry_point)->GetCodeSize()

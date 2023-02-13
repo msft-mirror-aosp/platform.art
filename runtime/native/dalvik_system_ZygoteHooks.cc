@@ -205,7 +205,7 @@ static uint32_t EnableDebugFeatures(uint32_t runtime_flags) {
   if ((runtime_flags & DEBUG_JAVA_DEBUGGABLE) != 0) {
     runtime->AddCompilerOption("--debuggable");
     runtime_flags |= DEBUG_GENERATE_MINI_DEBUG_INFO;
-    runtime->SetJavaDebuggable(true);
+    runtime->SetRuntimeDebugState(Runtime::RuntimeDebugState::kJavaDebuggableAtInit);
     {
       // Deoptimize the boot image as it may be non-debuggable.
       ScopedSuspendAll ssa(__FUNCTION__);
@@ -257,7 +257,7 @@ static jlong ZygoteHooks_nativePreFork(JNIEnv* env, jclass) {
   runtime->PreZygoteFork();
 
   // Grab thread before fork potentially makes Thread::pthread_key_self_ unusable.
-  return reinterpret_cast<jlong>(ThreadForEnv(env));
+  return reinterpret_cast<jlong>(Thread::ForEnv(env));
 }
 
 static void ZygoteHooks_nativePostZygoteFork(JNIEnv*, jclass) {
@@ -359,6 +359,8 @@ static void ZygoteHooks_nativePostForkChild(JNIEnv* env,
     Trace::TraceOutputMode output_mode = Trace::GetOutputMode();
     Trace::TraceMode trace_mode = Trace::GetMode();
     size_t buffer_size = Trace::GetBufferSize();
+    int flags = Trace::GetFlags();
+    int interval = Trace::GetIntervalInMillis();
 
     // Just drop it.
     Trace::Abort();
@@ -382,13 +384,14 @@ static void ZygoteHooks_nativePostForkChild(JNIEnv* env,
         proc_name = StringPrintf("%u", static_cast<uint32_t>(pid));
       }
 
-      std::string trace_file = StringPrintf("/data/misc/trace/%s.trace.bin", proc_name.c_str());
+      const char* path = kIsTargetBuild ? "/data/misc/trace" : "/tmp";
+      std::string trace_file = StringPrintf("%s/%s.trace.bin", path, proc_name.c_str());
       Trace::Start(trace_file.c_str(),
                    buffer_size,
-                   0,   // TODO: Expose flags.
+                   flags,
                    output_mode,
                    trace_mode,
-                   0);  // TODO: Expose interval.
+                   interval);
       if (thread->IsExceptionPending()) {
         ScopedObjectAccess soa(env);
         thread->ClearException();

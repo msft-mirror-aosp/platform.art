@@ -230,6 +230,10 @@ class PACKED(8) ImageHeader {
     // Aliases.
     kAppImageClassLoader = kSpecialRoots,   // The class loader used to build the app image.
     kBootImageLiveObjects = kSpecialRoots,  // Array of boot image objects that must be kept live.
+    kAppImageContextAndDexChecksums = kSpecialRoots,  // Array of size 2, containing the class
+                                                      // loader context in first entry, and an array
+                                                      // of dex checksums for app images generated
+                                                      // by the runtime.
   };
 
   enum BootImageLiveObjects {
@@ -502,6 +506,7 @@ class PACKED(8) ImageHeader {
   uint32_t blocks_count_ = 0u;
 
   friend class linker::ImageWriter;
+  friend class RuntimeImageHelper;
 };
 
 /*
@@ -519,6 +524,14 @@ std::ostream& operator<<(std::ostream& os, ImageHeader::ImageSections section);
 std::ostream& operator<<(std::ostream& os, ImageHeader::StorageMode mode);
 
 std::ostream& operator<<(std::ostream& os, const ImageSection& section);
+
+// Wrapper over LZ4_decompress_safe() that checks if return value is negative. See b/242914915.
+bool LZ4_decompress_safe_checked(const char* source,
+                                 char* dest,
+                                 int compressed_size,
+                                 int max_decompressed_size,
+                                 /*out*/ size_t* decompressed_size_checked,
+                                 /*out*/ std::string* error_msg);
 
 }  // namespace art
 

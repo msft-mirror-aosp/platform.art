@@ -42,6 +42,7 @@ def parse_args():
                       help='Enable GC stress configuration (device|host only).')
   parser.add_argument('tests', nargs="*",
                       help='Name(s) of the test(s) to run')
+  parser.add_argument('--verbose', action='store_true', help='Print verbose output from vogar.')
   return parser.parse_args()
 
 ART_TEST_ANDROID_ROOT = os.environ.get("ART_TEST_ANDROID_ROOT", "/system")
@@ -91,7 +92,10 @@ LIBCORE_TEST_NAMES = [
   "libcore.sun.util",
   "libcore.xml",
   "org.apache.harmony.annotation",
-  "org.apache.harmony.luni",
+  "org.apache.harmony.luni.tests.internal.net.www.protocol.http.HttpURLConnection",
+  "org.apache.harmony.luni.tests.internal.net.www.protocol.https.HttpsURLConnection",
+  "org.apache.harmony.luni.tests.java.io",
+  "org.apache.harmony.luni.tests.java.net",
   "org.apache.harmony.nio",
   "org.apache.harmony.regex",
   "org.apache.harmony.testframework",
@@ -120,10 +124,10 @@ LIBCORE_TEST_NAMES = [
   "test.java.lang.Float",
   "test.java.lang.Integer",
   "test.java.lang.Long",
-  "test.java.lang.StackWalker",
   # Sharded test.java.lang.StrictMath
   "test.java.lang.StrictMath.CubeRootTests",
-  "test.java.lang.StrictMath.ExactArithTests",
+  # TODO: disable the test until b/248208762 is fixed.
+  # "test.java.lang.StrictMath.ExactArithTests",
   "test.java.lang.StrictMath.Expm1Tests",
   "test.java.lang.StrictMath.ExpTests",
   "test.java.lang.StrictMath.HyperbolicTests",
@@ -263,6 +267,8 @@ DISABLED_GCSTRESS_DEBUG_TESTS = {
 }
 
 DISABLED_FUGU_TESTS = {
+  "org.apache.harmony.luni.tests.internal.net.www.protocol.http.HttpURLConnection",
+  "org.apache.harmony.luni.tests.internal.net.www.protocol.https.HttpsURLConnection",
   "test.java.awt",
   "test.java.io.ByteArrayInputStream",
   "test.java.io.ByteArrayOutputStream",
@@ -395,7 +401,9 @@ def get_test_names():
   if args.gcstress and args.debug:
     test_names = list(filter(lambda x: x not in DISABLED_GCSTRESS_DEBUG_TESTS, test_names))
   if not args.getrandom:
-    test_names = list(filter(lambda x: x not in DISABLED_FUGU_TESTS, test_names))
+    # Disable libcore.highmemorytest due to limited ram on fugu. http://b/258173036
+    test_names = list(filter(lambda x: x not in DISABLED_FUGU_TESTS and
+                                       not x.startswith("libcore.highmemorytest"), test_names))
   return test_names
 
 def get_vogar_command(test_name):
@@ -403,6 +411,7 @@ def get_vogar_command(test_name):
   if args.mode == "device":
     cmd.append("--mode=device --vm-arg -Ximage:/system/framework/art_boot_images/boot.art")
     cmd.append("--vm-arg -Xbootclasspath:" + ":".join(BOOT_CLASSPATH))
+
   if args.mode == "host":
     # We explicitly give a wrong path for the image, to ensure vogar
     # will create a boot image with the default compiler. Note that
@@ -419,6 +428,11 @@ def get_vogar_command(test_name):
   if args.debug:
     cmd.append("--vm-arg -XXlib:libartd.so --vm-arg -XX:SlowDebug=true")
 
+  # The only device in go/art-buildbot without getrandom is fugu. We limit the amount of memory
+  # per runtime for fugu to avoid low memory killer, fugu has 4-cores 1GB RAM (b/258171768).
+  if not args.getrandom:
+    cmd.append("--vm-arg -Xmx128M")
+
   if args.mode == "device":
     if ART_TEST_CHROOT:
       cmd.append(f"--chroot {ART_TEST_CHROOT} --device-dir=/tmp/vogar/test-{test_name}")
@@ -434,6 +448,9 @@ def get_vogar_command(test_name):
     if args.jit:
       cmd.append("--vm-arg -Xcompiler-option --vm-arg --compiler-filter=quicken")
     cmd.append("--vm-arg -Xusejit:{}".format(str(args.jit).lower()))
+
+  if args.verbose:
+    cmd.append("--verbose")
 
   # Suppress color codes if not attached to a terminal
   if not sys.stdout.isatty():
@@ -491,7 +508,7 @@ def main():
     print(f"Running {len(futures)} tasks on {args.jobs} core(s)...\n")
     for i, future in enumerate(concurrent.futures.as_completed(futures)):
       test_name, cmd, stdout, exit_code = future.result()
-      if exit_code != 0 or args.dry_run:
+      if exit_code != 0 or args.dry_run or args.verbose:
         print(cmd)
         print(stdout.strip())
       else:

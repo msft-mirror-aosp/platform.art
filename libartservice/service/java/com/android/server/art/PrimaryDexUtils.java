@@ -18,14 +18,17 @@ package com.android.server.art;
 
 import android.annotation.NonNull;
 import android.annotation.Nullable;
-import android.content.pm.ApplicationInfo;
+import android.os.UserHandle;
+import android.os.UserManager;
 import android.text.TextUtils;
-import android.util.SparseArray;
 
 import com.android.internal.annotations.Immutable;
-import com.android.server.art.wrapper.AndroidPackageApi;
-import com.android.server.art.wrapper.PackageState;
-import com.android.server.art.wrapper.SharedLibraryInfo;
+import com.android.server.art.model.DetailedDexInfo;
+import com.android.server.pm.pkg.AndroidPackage;
+import com.android.server.pm.pkg.AndroidPackageSplit;
+import com.android.server.pm.pkg.PackageState;
+import com.android.server.pm.pkg.PackageUserState;
+import com.android.server.pm.pkg.SharedLibrary;
 
 import dalvik.system.DelegateLastClassLoader;
 import dalvik.system.DexClassLoader;
@@ -34,10 +37,12 @@ import dalvik.system.PathClassLoader;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 /** @hide */
 public class PrimaryDexUtils {
+    public static final String PROFILE_PRIMARY = "primary";
     private static final String SHARED_LIBRARY_LOADER_TYPE = PathClassLoader.class.getName();
 
     /**
@@ -46,7 +51,7 @@ public class PrimaryDexUtils {
      * the entry at index i is the information about the (i-1)-th split APK.
      */
     @NonNull
-    public static List<PrimaryDexInfo> getDexInfo(@NonNull AndroidPackageApi pkg) {
+    public static List<PrimaryDexInfo> getDexInfo(@NonNull AndroidPackage pkg) {
         return getDexInfoImpl(pkg)
                 .stream()
                 .map(builder -> builder.build())
@@ -59,33 +64,37 @@ public class PrimaryDexUtils {
      */
     @NonNull
     public static List<DetailedPrimaryDexInfo> getDetailedDexInfo(
-            @NonNull PackageState pkgState, @NonNull AndroidPackageApi pkg) {
+            @NonNull PackageState pkgState, @NonNull AndroidPackage pkg) {
         return getDetailedDexInfoImpl(pkgState, pkg)
                 .stream()
                 .map(builder -> builder.buildDetailed())
                 .collect(Collectors.toList());
     }
 
+    /** Returns the basic information about a dex file specified by {@code splitName}. */
     @NonNull
-    private static List<PrimaryDexInfoBuilder> getDexInfoImpl(@NonNull AndroidPackageApi pkg) {
+    public static PrimaryDexInfo getDexInfoBySplitName(
+            @NonNull AndroidPackage pkg, @Nullable String splitName) {
+        if (splitName == null) {
+            return getDexInfo(pkg).get(0);
+        } else {
+            return getDexInfo(pkg)
+                    .stream()
+                    .filter(info -> splitName.equals(info.splitName()))
+                    .findFirst()
+                    .orElseThrow(() -> {
+                        return new IllegalArgumentException(
+                                String.format("Split '%s' not found", splitName));
+                    });
+        }
+    }
+
+    @NonNull
+    private static List<PrimaryDexInfoBuilder> getDexInfoImpl(@NonNull AndroidPackage pkg) {
         List<PrimaryDexInfoBuilder> dexInfos = new ArrayList<>();
 
-        PrimaryDexInfoBuilder baseInfo = new PrimaryDexInfoBuilder(pkg.getBaseApkPath());
-        baseInfo.mHasCode = pkg.isHasCode();
-        baseInfo.mIsBaseApk = true;
-        dexInfos.add(baseInfo);
-
-        String[] splitNames = pkg.getSplitNames();
-        String[] splitCodePaths = pkg.getSplitCodePaths();
-        int[] splitFlags = pkg.getSplitFlags();
-
-        for (int i = 0; i < splitNames.length; i++) {
-            PrimaryDexInfoBuilder splitInfo = new PrimaryDexInfoBuilder(splitCodePaths[i]);
-            splitInfo.mHasCode =
-                    splitFlags != null && (splitFlags[i] & ApplicationInfo.FLAG_HAS_CODE) != 0;
-            splitInfo.mSplitIndex = i;
-            splitInfo.mSplitName = splitNames[i];
-            dexInfos.add(splitInfo);
+        for (var split : pkg.getSplits()) {
+            dexInfos.add(new PrimaryDexInfoBuilder(split));
         }
 
         return dexInfos;
@@ -93,43 +102,48 @@ public class PrimaryDexUtils {
 
     @NonNull
     private static List<PrimaryDexInfoBuilder> getDetailedDexInfoImpl(
-            @NonNull PackageState pkgState, @NonNull AndroidPackageApi pkg) {
+            @NonNull PackageState pkgState, @NonNull AndroidPackage pkg) {
         List<PrimaryDexInfoBuilder> dexInfos = getDexInfoImpl(pkg);
 
         PrimaryDexInfoBuilder baseApk = dexInfos.get(0);
-        assert baseApk.mIsBaseApk;
-        baseApk.mClassLoaderName = pkg.getClassLoaderName();
-        File baseDexFile = new File(baseApk.mDexPath);
+        baseApk.mClassLoaderName = baseApk.mSplit.getClassLoaderName();
+        File baseDexFile = new File(baseApk.mSplit.getPath());
         baseApk.mRelativeDexPath = baseDexFile.getName();
 
         // Shared libraries are the dependencies of the base APK.
-        baseApk.mSharedLibrariesContext = encodeSharedLibraries(pkgState.getUsesLibraryInfos());
+        baseApk.mSharedLibrariesContext =
+                encodeSharedLibraries(pkgState.getSharedLibraryDependencies());
 
-        String[] splitClassLoaderNames = pkg.getSplitClassLoaderNames();
-        SparseArray<int[]> splitDependencies = pkg.getSplitDependencies();
-        boolean isIsolatedSplitLoading =
-                pkg.isIsolatedSplitLoading() && !Utils.isEmpty(splitDependencies);
+        boolean isIsolatedSplitLoading = isIsolatedSplitLoading(pkg);
 
         for (int i = 1; i < dexInfos.size(); i++) {
-            assert dexInfos.get(i).mSplitIndex == i - 1;
-            File splitDexFile = new File(dexInfos.get(i).mDexPath);
+            var dexInfoBuilder = dexInfos.get(i);
+            File splitDexFile = new File(dexInfoBuilder.mSplit.getPath());
             if (!splitDexFile.getParent().equals(baseDexFile.getParent())) {
                 throw new IllegalStateException(
                         "Split APK and base APK are in different directories: "
                         + splitDexFile.getParent() + " != " + baseDexFile.getParent());
             }
-            dexInfos.get(i).mRelativeDexPath = splitDexFile.getName();
-            if (isIsolatedSplitLoading && dexInfos.get(i).mHasCode) {
-                dexInfos.get(i).mClassLoaderName =
-                        splitClassLoaderNames[dexInfos.get(i).mSplitIndex];
+            dexInfoBuilder.mRelativeDexPath = splitDexFile.getName();
+            if (isIsolatedSplitLoading && dexInfoBuilder.mSplit.isHasCode()) {
+                dexInfoBuilder.mClassLoaderName = dexInfoBuilder.mSplit.getClassLoaderName();
 
-                // Keys and values of `splitDependencies` are `split index + 1` for split APK or 0
-                // for base APK, so they can be regarded as indices to `dexInfos`.
-                int[] dependencies = splitDependencies.get(i);
+                List<AndroidPackageSplit> dependencies = dexInfoBuilder.mSplit.getDependencies();
                 if (!Utils.isEmpty(dependencies)) {
                     // We only care about the first dependency because it is the parent split. The
                     // rest are configuration splits, which we don't care.
-                    dexInfos.get(i).mSplitDependency = dexInfos.get(dependencies[0]);
+                    AndroidPackageSplit dependency = dependencies.get(0);
+                    for (var dexInfo : dexInfos) {
+                        if (Objects.equals(dexInfo.mSplit, dependency)) {
+                            dexInfoBuilder.mSplitDependency = dexInfo;
+                            break;
+                        }
+                    }
+
+                    if (dexInfoBuilder.mSplitDependency == null) {
+                        throw new IllegalStateException(
+                                "Split dependency not found for " + splitDexFile);
+                    }
                 }
             }
         }
@@ -159,7 +173,7 @@ public class PrimaryDexUtils {
         String sharedLibrariesContext = dexInfos.get(0).mSharedLibrariesContext;
         List<String> classpath = new ArrayList<>();
         for (PrimaryDexInfoBuilder dexInfo : dexInfos) {
-            if (dexInfo.mHasCode) {
+            if (dexInfo.mSplit.isHasCode()) {
                 dexInfo.mClassLoaderContext = encodeClassLoader(baseClassLoaderName, classpath,
                         null /* parentContext */, sharedLibrariesContext);
             }
@@ -192,7 +206,7 @@ public class PrimaryDexUtils {
     private static void computeClassLoaderContextsIsolated(
             @NonNull List<PrimaryDexInfoBuilder> dexInfos) {
         for (PrimaryDexInfoBuilder dexInfo : dexInfos) {
-            if (dexInfo.mHasCode) {
+            if (dexInfo.mSplit.isHasCode()) {
                 dexInfo.mClassLoaderContext = encodeClassLoader(dexInfo.mClassLoaderName,
                         null /* classpath */, getParentContextRecursive(dexInfo),
                         dexInfo.mSharedLibrariesContext);
@@ -265,7 +279,7 @@ public class PrimaryDexUtils {
      *     library_1_dex_2.jar:library_2_dex_2.jar:...]{library_2-dependencies}#...}`.
      */
     @Nullable
-    private static String encodeSharedLibraries(@Nullable List<SharedLibraryInfo> sharedLibraries) {
+    private static String encodeSharedLibraries(@Nullable List<SharedLibrary> sharedLibraries) {
         if (Utils.isEmpty(sharedLibraries)) {
             return null;
         }
@@ -277,47 +291,67 @@ public class PrimaryDexUtils {
                 .collect(Collectors.joining("#", "{", "}"));
     }
 
+    public static boolean isIsolatedSplitLoading(@NonNull AndroidPackage pkg) {
+        return pkg.isIsolatedSplitLoading() && pkg.getSplits().size() > 1;
+    }
+
+    @NonNull
+    public static ProfilePath buildRefProfilePath(
+            @NonNull PackageState pkgState, @NonNull PrimaryDexInfo dexInfo) {
+        String profileName = getProfileName(dexInfo.splitName());
+        return AidlUtils.buildProfilePathForPrimaryRef(pkgState.getPackageName(), profileName);
+    }
+
+    @NonNull
+    public static OutputProfile buildOutputProfile(@NonNull PackageState pkgState,
+            @NonNull PrimaryDexInfo dexInfo, int uid, int gid, boolean isPublic) {
+        String profileName = getProfileName(dexInfo.splitName());
+        return AidlUtils.buildOutputProfileForPrimary(
+                pkgState.getPackageName(), profileName, uid, gid, isPublic);
+    }
+
+    @NonNull
+    public static List<ProfilePath> getCurProfiles(@NonNull UserManager userManager,
+            @NonNull PackageState pkgState, @NonNull PrimaryDexInfo dexInfo) {
+        List<ProfilePath> profiles = new ArrayList<>();
+        for (UserHandle handle : userManager.getUserHandles(true /* excludeDying */)) {
+            int userId = handle.getIdentifier();
+            PackageUserState userState = pkgState.getStateForUser(handle);
+            if (userState.isInstalled()) {
+                profiles.add(AidlUtils.buildProfilePathForPrimaryCur(
+                        userId, pkgState.getPackageName(), getProfileName(dexInfo.splitName())));
+            }
+        }
+        return profiles;
+    }
+
+    @NonNull
+    public static String getProfileName(@Nullable String splitName) {
+        return splitName == null ? PROFILE_PRIMARY : splitName + ".split";
+    }
+
     /** Basic information about a primary dex file (either the base APK or a split APK). */
     @Immutable
     public static class PrimaryDexInfo {
-        private final @NonNull String mDexPath;
-        private final boolean mHasCode;
-        private final boolean mIsBaseApk;
-        private final int mSplitIndex;
-        private final @Nullable String mSplitName;
+        private final @NonNull AndroidPackageSplit mSplit;
 
-        PrimaryDexInfo(@NonNull String dexPath, boolean hasCode, boolean isBaseApk, int splitIndex,
-                @Nullable String splitName) {
-            mDexPath = dexPath;
-            mHasCode = hasCode;
-            mIsBaseApk = isBaseApk;
-            mSplitIndex = splitIndex;
-            mSplitName = splitName;
+        PrimaryDexInfo(@NonNull AndroidPackageSplit split) {
+            mSplit = split;
         }
 
         /** The path to the dex file. */
         public @NonNull String dexPath() {
-            return mDexPath;
+            return mSplit.getPath();
         }
 
         /** True if the dex file has code. */
         public boolean hasCode() {
-            return mHasCode;
-        }
-
-        /** True if the dex file is the base APK. */
-        public boolean isBaseApk() {
-            return mIsBaseApk;
-        }
-
-        /** The index to {@link AndroidPackageApi#getSplitNames()}, or -1 for base APK. */
-        public int splitIndex() {
-            return mSplitIndex;
+            return mSplit.isHasCode();
         }
 
         /** The name of the split, or null for base APK. */
         public @Nullable String splitName() {
-            return mSplitName;
+            return mSplit.getName();
         }
     }
 
@@ -327,12 +361,12 @@ public class PrimaryDexUtils {
      * producing it requires {@link PackageState}.
      */
     @Immutable
-    public static class DetailedPrimaryDexInfo extends PrimaryDexInfo {
+    public static class DetailedPrimaryDexInfo extends PrimaryDexInfo implements DetailedDexInfo {
         private final @Nullable String mClassLoaderContext;
 
-        DetailedPrimaryDexInfo(@NonNull String dexPath, boolean hasCode, boolean isBaseApk,
-                int splitIndex, @Nullable String splitName, @Nullable String classLoaderContext) {
-            super(dexPath, hasCode, isBaseApk, splitIndex, splitName);
+        DetailedPrimaryDexInfo(
+                @NonNull AndroidPackageSplit split, @Nullable String classLoaderContext) {
+            super(split);
             mClassLoaderContext = classLoaderContext;
         }
 
@@ -345,11 +379,7 @@ public class PrimaryDexUtils {
     }
 
     private static class PrimaryDexInfoBuilder {
-        @NonNull String mDexPath;
-        boolean mHasCode = false;
-        boolean mIsBaseApk = false;
-        int mSplitIndex = -1;
-        @Nullable String mSplitName = null;
+        @NonNull AndroidPackageSplit mSplit;
         @Nullable String mRelativeDexPath = null;
         @Nullable String mClassLoaderContext = null;
         @Nullable String mClassLoaderName = null;
@@ -359,17 +389,16 @@ public class PrimaryDexUtils {
         /** The class loader context for children to use when this dex file is used as a parent. */
         @Nullable String mContextForChildren = null;
 
-        PrimaryDexInfoBuilder(@NonNull String dexPath) {
-            mDexPath = dexPath;
+        PrimaryDexInfoBuilder(@NonNull AndroidPackageSplit split) {
+            mSplit = split;
         }
 
         PrimaryDexInfo build() {
-            return new PrimaryDexInfo(mDexPath, mHasCode, mIsBaseApk, mSplitIndex, mSplitName);
+            return new PrimaryDexInfo(mSplit);
         }
 
         DetailedPrimaryDexInfo buildDetailed() {
-            return new DetailedPrimaryDexInfo(
-                    mDexPath, mHasCode, mIsBaseApk, mSplitIndex, mSplitName, mClassLoaderContext);
+            return new DetailedPrimaryDexInfo(mSplit, mClassLoaderContext);
         }
     }
 }

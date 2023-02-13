@@ -50,6 +50,7 @@
 #include "base/systrace.h"
 #include "base/unix_file/fd_file.h"
 #include "base/utils.h"
+#include "class_loader_context.h"
 #include "dex/art_dex_file_loader.h"
 #include "dex/dex_file.h"
 #include "dex/dex_file_loader.h"
@@ -282,7 +283,7 @@ bool OatFileBase::LoadVdex(const std::string& vdex_filename,
                            std::string* error_msg) {
   vdex_ = VdexFile::OpenAtAddress(vdex_begin_,
                                   vdex_end_ - vdex_begin_,
-                                  /*mmap_reuse=*/ vdex_begin_ != nullptr,
+                                  /*mmap_reuse=*/vdex_begin_ != nullptr,
                                   vdex_filename,
                                   writable,
                                   low_4gb,
@@ -307,16 +308,15 @@ bool OatFileBase::LoadVdex(int vdex_fd,
     if (rc == -1) {
       PLOG(WARNING) << "Failed getting length of vdex file";
     } else {
-      vdex_ = VdexFile::OpenAtAddress(
-          vdex_begin_,
-          vdex_end_ - vdex_begin_,
-          /*mmap_reuse=*/ vdex_begin_ != nullptr,
-          vdex_fd,
-          s.st_size,
-          vdex_filename,
-          writable,
-          low_4gb,
-          error_msg);
+      vdex_ = VdexFile::OpenAtAddress(vdex_begin_,
+                                      vdex_end_ - vdex_begin_,
+                                      /*mmap_reuse=*/vdex_begin_ != nullptr,
+                                      vdex_fd,
+                                      s.st_size,
+                                      vdex_filename,
+                                      writable,
+                                      low_4gb,
+                                      error_msg);
       if (vdex_.get() == nullptr) {
         *error_msg = "Failed opening vdex file.";
         return false;
@@ -445,7 +445,7 @@ static bool ReadIndexBssMapping(OatFile* oat_file,
           UNLIKELY(oat_file->Size() - index_bss_mapping_offset <
                    IndexBssMapping::ComputeSize(index_bss_mapping->size())))) {
     *error_msg = StringPrintf("In oat file '%s' found OatDexFile #%zu for '%s' with unaligned or "
-                                  " truncated %s bss mapping, offset %u of %zu, length %zu",
+                                  "truncated %s bss mapping, offset %u of %zu, length %zu",
                               oat_file->GetLocation().c_str(),
                               dex_file_index,
                               dex_file_location.c_str(),
@@ -465,15 +465,25 @@ static bool ComputeAndCheckTypeLookupTableData(const DexFile::Header& header,
                                                const VdexFile* vdex_file,
                                                const uint8_t** type_lookup_table_data,
                                                std::string* error_msg) {
-  if (type_lookup_table_start == nullptr ||
-      reinterpret_cast<const uint32_t*>(type_lookup_table_start)[0] == 0) {
+  if (type_lookup_table_start == nullptr) {
     *type_lookup_table_data = nullptr;
     return true;
   }
 
-  *type_lookup_table_data = type_lookup_table_start + sizeof(uint32_t);
-  size_t expected_table_size = TypeLookupTable::RawDataLength(header.class_defs_size_);
+  if (UNLIKELY(!vdex_file->Contains(type_lookup_table_start, sizeof(uint32_t)))) {
+    *error_msg =
+        StringPrintf("In vdex file '%s' found invalid type lookup table start %p of size %zu "
+                         "not in [%p, %p]",
+                     vdex_file->GetName().c_str(),
+                     type_lookup_table_start,
+                     sizeof(uint32_t),
+                     vdex_file->Begin(),
+                     vdex_file->End());
+    return false;
+  }
+
   size_t found_size = reinterpret_cast<const uint32_t*>(type_lookup_table_start)[0];
+  size_t expected_table_size = TypeLookupTable::RawDataLength(header.class_defs_size_);
   if (UNLIKELY(found_size != expected_table_size)) {
     *error_msg =
         StringPrintf("In vdex file '%s' unexpected type lookup table size: found %zu, expected %zu",
@@ -482,20 +492,20 @@ static bool ComputeAndCheckTypeLookupTableData(const DexFile::Header& header,
                      expected_table_size);
     return false;
   }
-  if (UNLIKELY(!vdex_file->Contains(*type_lookup_table_data))) {
+
+  if (found_size == 0) {
+    *type_lookup_table_data = nullptr;
+    return true;
+  }
+
+  *type_lookup_table_data = type_lookup_table_start + sizeof(uint32_t);
+  if (UNLIKELY(!vdex_file->Contains(*type_lookup_table_data, found_size))) {
     *error_msg =
-        StringPrintf("In vdex file '%s' found invalid type lookup table pointer %p not in [%p, %p]",
+        StringPrintf("In vdex file '%s' found invalid type lookup table data %p of size %zu "
+                         "not in [%p, %p]",
                      vdex_file->GetName().c_str(),
                      type_lookup_table_data,
-                     vdex_file->Begin(),
-                     vdex_file->End());
-    return false;
-  }
-  if (UNLIKELY(!vdex_file->Contains(*type_lookup_table_data + expected_table_size - 1))) {
-    *error_msg =
-        StringPrintf("In vdex file '%s' found overflowing type lookup table %p not in [%p, %p]",
-                     vdex_file->GetName().c_str(),
-                     type_lookup_table_data + expected_table_size,
+                     found_size,
                      vdex_file->Begin(),
                      vdex_file->End());
     return false;
@@ -514,6 +524,16 @@ bool OatFileBase::Setup(const std::vector<const DexFile*>& dex_files, std::strin
   uint32_t i = 0;
   const uint8_t* type_lookup_table_start = nullptr;
   for (const DexFile* dex_file : dex_files) {
+    // Defensively verify external dex file checksum. `OatFileAssistant`
+    // expects this check to happen during oat file setup when the oat file
+    // does not contain dex code.
+    if (dex_file->GetLocationChecksum() != vdex_->GetLocationChecksum(i)) {
+      *error_msg = StringPrintf("Dex checksum does not match for %s, dex has %d, vdex has %d",
+                                dex_file->GetLocation().c_str(),
+                                dex_file->GetLocationChecksum(),
+                                vdex_->GetLocationChecksum(i));
+      return false;
+    }
     std::string dex_location = dex_file->GetLocation();
     std::string canonical_location = DexFileLoader::GetDexCanonicalLocation(dex_location.c_str());
 
@@ -773,23 +793,25 @@ bool OatFileBase::Setup(int zip_fd,
         if (zip_fd != -1) {
           loaded = dex_file_loader.OpenZip(zip_fd,
                                            dex_file_location,
-                                           /*verify=*/ false,
-                                           /*verify_checksum=*/ false,
+                                           /*verify=*/false,
+                                           /*verify_checksum=*/false,
+                                           /*allow_no_dex_files=*/false,
                                            error_msg,
                                            &new_dex_files);
         } else if (dex_fd != -1) {
           // Note that we assume dex_fds are backing by jars.
           loaded = dex_file_loader.OpenZipFromOwnedFd(dex_fd,
                                                       dex_file_location,
-                                                      /*verify=*/ false,
-                                                      /*verify_checksum=*/ false,
+                                                      /*verify=*/false,
+                                                      /*verify_checksum=*/false,
+                                                      /*allow_no_dex_files=*/false,
                                                       error_msg,
                                                       &new_dex_files);
         } else {
           loaded = dex_file_loader.Open(dex_file_name.c_str(),
                                         dex_file_location,
-                                        /*verify=*/ false,
-                                        /*verify_checksum=*/ false,
+                                        /*verify=*/false,
+                                        /*verify_checksum=*/false,
                                         error_msg,
                                         &new_dex_files);
         }
@@ -828,7 +850,9 @@ bool OatFileBase::Setup(int zip_fd,
           external_dex_files_.push_back(std::move(dex_file));
         }
       }
-      // Defensively verify external dex file checksum.
+      // Defensively verify external dex file checksum. `OatFileAssistant`
+      // expects this check to happen during oat file setup when the oat file
+      // does not contain dex code.
       if (dex_file_checksum != external_dex_files_[i]->GetLocationChecksum()) {
         *error_msg = StringPrintf("In oat file '%s', dex file checksum 0x%08x does not match"
                                       " checksum 0x%08x of external dex file '%s'",
@@ -1672,7 +1696,7 @@ bool ElfOatFile::ElfFileOpen(File* file,
   ScopedTrace trace(__PRETTY_FUNCTION__);
   elf_file_.reset(ElfFile::Open(file,
                                 writable,
-                                /*program_header_only=*/ true,
+                                /*program_header_only=*/true,
                                 low_4gb,
                                 error_msg));
   if (elf_file_ == nullptr) {
@@ -1687,15 +1711,16 @@ bool ElfOatFile::ElfFileOpen(File* file,
 class OatFileBackedByVdex final : public OatFileBase {
  public:
   explicit OatFileBackedByVdex(const std::string& filename)
-      : OatFileBase(filename, /*executable=*/ false) {}
+      : OatFileBase(filename, /*executable=*/false) {}
 
   static OatFileBackedByVdex* Open(const std::vector<const DexFile*>& dex_files,
                                    std::unique_ptr<VdexFile>&& vdex_file,
-                                   const std::string& location) {
+                                   const std::string& location,
+                                   ClassLoaderContext* context) {
     std::unique_ptr<OatFileBackedByVdex> oat_file(new OatFileBackedByVdex(location));
     // SetVdex will take ownership of the VdexFile.
     oat_file->SetVdex(vdex_file.release());
-    oat_file->SetupHeader(dex_files.size());
+    oat_file->SetupHeader(dex_files.size(), context);
     // Initialize OatDexFiles.
     std::string error_msg;
     if (!oat_file->Setup(dex_files, &error_msg)) {
@@ -1708,6 +1733,7 @@ class OatFileBackedByVdex final : public OatFileBase {
   static OatFileBackedByVdex* Open(int zip_fd,
                                    std::unique_ptr<VdexFile>&& unique_vdex_file,
                                    const std::string& dex_location,
+                                   ClassLoaderContext* context,
                                    std::string* error_msg) {
     VdexFile* vdex_file = unique_vdex_file.get();
     std::unique_ptr<OatFileBackedByVdex> oat_file(new OatFileBackedByVdex(vdex_file->GetName()));
@@ -1719,21 +1745,25 @@ class OatFileBackedByVdex final : public OatFileBase {
       for (const uint8_t* dex_file_start = vdex_file->GetNextDexFileData(nullptr, i);
            dex_file_start != nullptr;
            dex_file_start = vdex_file->GetNextDexFileData(dex_file_start, ++i)) {
-        const DexFile::Header* header = reinterpret_cast<const DexFile::Header*>(dex_file_start);
-        if (UNLIKELY(!vdex_file->Contains(dex_file_start))) {
+        if (UNLIKELY(!vdex_file->Contains(dex_file_start, sizeof(DexFile::Header)))) {
           *error_msg =
-              StringPrintf("In vdex file '%s' found invalid dex file pointer %p not in [%p, %p]",
+              StringPrintf("In vdex file '%s' found invalid dex header %p of size %zu "
+                               "not in [%p, %p]",
                            dex_location.c_str(),
                            dex_file_start,
+                           sizeof(DexFile::Header),
                            vdex_file->Begin(),
                            vdex_file->End());
           return nullptr;
         }
-        if (UNLIKELY(!vdex_file->Contains(dex_file_start + header->file_size_ - 1))) {
+        const DexFile::Header* header = reinterpret_cast<const DexFile::Header*>(dex_file_start);
+        if (UNLIKELY(!vdex_file->Contains(dex_file_start, header->file_size_))) {
           *error_msg =
-              StringPrintf("In vdex file '%s' found overflowing dex file %p not in [%p, %p]",
+              StringPrintf("In vdex file '%s' found invalid dex file pointer %p of size %d "
+                               "not in [%p, %p]",
                            dex_location.c_str(),
-                           dex_file_start + header->file_size_,
+                           dex_file_start,
+                           header->file_size_,
                            vdex_file->Begin(),
                            vdex_file->End());
           return nullptr;
@@ -1772,7 +1802,7 @@ class OatFileBackedByVdex final : public OatFileBase {
           oat_file->oat_dex_files_.Put(canonical_key, oat_dex_file);
         }
       }
-      oat_file->SetupHeader(oat_file->oat_dex_files_storage_.size());
+      oat_file->SetupHeader(oat_file->oat_dex_files_storage_.size(), context);
     } else {
       // No need for any verification when loading dex files as we already have
       // a vdex file.
@@ -1781,22 +1811,23 @@ class OatFileBackedByVdex final : public OatFileBase {
       if (zip_fd != -1) {
         loaded = dex_file_loader.OpenZip(zip_fd,
                                          dex_location,
-                                         /*verify=*/ false,
-                                         /*verify_checksum=*/ false,
+                                         /*verify=*/false,
+                                         /*verify_checksum=*/false,
+                                         /*allow_no_dex_files=*/false,
                                          error_msg,
                                          &oat_file->external_dex_files_);
       } else {
         loaded = dex_file_loader.Open(dex_location.c_str(),
                                       dex_location,
-                                      /*verify=*/ false,
-                                      /*verify_checksum=*/ false,
+                                      /*verify=*/false,
+                                      /*verify_checksum=*/false,
                                       error_msg,
                                       &oat_file->external_dex_files_);
       }
       if (!loaded) {
         return nullptr;
       }
-      oat_file->SetupHeader(oat_file->external_dex_files_.size());
+      oat_file->SetupHeader(oat_file->external_dex_files_.size(), context);
       if (!oat_file->Setup(MakeNonOwningPointerVector(oat_file->external_dex_files_), error_msg)) {
         return nullptr;
       }
@@ -1805,7 +1836,7 @@ class OatFileBackedByVdex final : public OatFileBase {
     return oat_file.release();
   }
 
-  void SetupHeader(size_t number_of_dex_files) {
+  void SetupHeader(size_t number_of_dex_files, ClassLoaderContext* context) {
     DCHECK(!IsExecutable());
 
     // Create a fake OatHeader with a key store to help debugging.
@@ -1815,7 +1846,11 @@ class OatFileBackedByVdex final : public OatFileBase {
     store.Put(OatHeader::kCompilerFilter, CompilerFilter::NameOfFilter(CompilerFilter::kVerify));
     store.Put(OatHeader::kCompilationReasonKey, "vdex");
     store.Put(OatHeader::kConcurrentCopying,
-              kUseReadBarrier ? OatHeader::kTrueValue : OatHeader::kFalseValue);
+              gUseReadBarrier ? OatHeader::kTrueValue : OatHeader::kFalseValue);
+    if (context != nullptr) {
+      store.Put(OatHeader::kClassPathKey, context->EncodeContextForOatFile(""));
+    }
+
     oat_header_.reset(OatHeader::Create(kRuntimeISA,
                                         isa_features.get(),
                                         number_of_dex_files,
@@ -1899,7 +1934,7 @@ OatFile* OatFile::Open(int zip_fd,
                                                                  vdex_filename,
                                                                  oat_filename,
                                                                  oat_location,
-                                                                 /*writable=*/ false,
+                                                                 /*writable=*/false,
                                                                  executable,
                                                                  low_4gb,
                                                                  dex_filenames,
@@ -1929,7 +1964,7 @@ OatFile* OatFile::Open(int zip_fd,
                                                                 vdex_filename,
                                                                 oat_filename,
                                                                 oat_location,
-                                                                /*writable=*/ false,
+                                                                /*writable=*/false,
                                                                 executable,
                                                                 low_4gb,
                                                                 dex_filenames,
@@ -1958,7 +1993,7 @@ OatFile* OatFile::Open(int zip_fd,
                                                                 oat_fd,
                                                                 vdex_location,
                                                                 oat_location,
-                                                                /*writable=*/ false,
+                                                                /*writable=*/false,
                                                                 executable,
                                                                 low_4gb,
                                                                 dex_filenames,
@@ -1970,17 +2005,19 @@ OatFile* OatFile::Open(int zip_fd,
 
 OatFile* OatFile::OpenFromVdex(const std::vector<const DexFile*>& dex_files,
                                std::unique_ptr<VdexFile>&& vdex_file,
-                               const std::string& location) {
+                               const std::string& location,
+                               ClassLoaderContext* context) {
   CheckLocation(location);
-  return OatFileBackedByVdex::Open(dex_files, std::move(vdex_file), location);
+  return OatFileBackedByVdex::Open(dex_files, std::move(vdex_file), location, context);
 }
 
 OatFile* OatFile::OpenFromVdex(int zip_fd,
                                std::unique_ptr<VdexFile>&& vdex_file,
                                const std::string& location,
+                               ClassLoaderContext* context,
                                std::string* error_msg) {
   CheckLocation(location);
-  return OatFileBackedByVdex::Open(zip_fd, std::move(vdex_file), location, error_msg);
+  return OatFileBackedByVdex::Open(zip_fd, std::move(vdex_file), location, context, error_msg);
 }
 
 OatFile::OatFile(const std::string& location, bool is_executable)
@@ -2437,7 +2474,8 @@ CompilerFilter::Filter OatFile::GetCompilerFilter() const {
 }
 
 std::string OatFile::GetClassLoaderContext() const {
-  return GetOatHeader().GetStoreValueByKey(OatHeader::kClassPathKey);
+  const char* value = GetOatHeader().GetStoreValueByKey(OatHeader::kClassPathKey);
+  return (value == nullptr) ? "" : value;
 }
 
 const char* OatFile::GetCompilationReason() const {

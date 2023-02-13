@@ -66,6 +66,7 @@ target = target_config[options.build_target]
 n_threads = options.n_threads
 custom_env = target.get('env', {})
 custom_env['SOONG_ALLOW_MISSING_DEPENDENCIES'] = 'true'
+custom_env['BUILD_BROKEN_DISABLE_BAZEL'] = 'true'
 # Switch the build system to unbundled mode in the reduced manifest branch.
 if not os.path.isdir(env.ANDROID_BUILD_TOP + '/frameworks/base'):
   custom_env['TARGET_BUILD_UNBUNDLED'] = 'true'
@@ -125,7 +126,8 @@ if 'golem' in target:
     sys.exit(1)
 
 if 'run-test' in target:
-  run_test_command = [os.path.join(env.ANDROID_BUILD_TOP,
+  run_test_command = [sys.executable, # Use the same python as we are using now.
+                      os.path.join(env.ANDROID_BUILD_TOP,
                                    'art/test/testrunner/testrunner.py')]
   test_flags = target.get('run-test', [])
   out_dir = pathlib.PurePath(env.SOONG_OUT_DIR)

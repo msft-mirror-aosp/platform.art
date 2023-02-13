@@ -19,7 +19,7 @@
 #include <iostream>
 
 #include "art_field-inl.h"
-#include "art_method-inl.h"
+#include "art_method-alloc-inl.h"
 #include "base/enums.h"
 #include "class_linker-inl.h"
 #include "class_root-inl.h"
@@ -54,7 +54,7 @@
 #include "reflective_handle_scope-inl.h"
 #include "scoped_fast_native_object_access-inl.h"
 #include "scoped_thread_state_change-inl.h"
-#include "well_known_classes.h"
+#include "well_known_classes-inl.h"
 
 namespace art {
 
@@ -90,14 +90,17 @@ ALWAYS_INLINE static inline ObjPtr<mirror::Class> DecodeClass(
 static jclass Class_classForName(JNIEnv* env, jclass, jstring javaName, jboolean initialize,
                                  jobject javaLoader) {
   ScopedFastNativeObjectAccess soa(env);
-  ScopedUtfChars name(env, javaName);
-  if (name.c_str() == nullptr) {
+  StackHandleScope<3> hs(soa.Self());
+  Handle<mirror::String> mirror_name = hs.NewHandle(soa.Decode<mirror::String>(javaName));
+  if (mirror_name == nullptr) {
+    soa.Self()->ThrowNewWrappedException("Ljava/lang/NullPointerException;", /*msg=*/ nullptr);
     return nullptr;
   }
 
   // We need to validate and convert the name (from x.y.z to x/y/z).  This
   // is especially handy for array types, since we want to avoid
   // auto-generating bogus array classes.
+  std::string name = mirror_name->ToModifiedUtf8();
   if (!IsValidBinaryClassName(name.c_str())) {
     soa.Self()->ThrowNewExceptionF("Ljava/lang/ClassNotFoundException;",
                                    "Invalid name: %s", name.c_str());
@@ -105,29 +108,41 @@ static jclass Class_classForName(JNIEnv* env, jclass, jstring javaName, jboolean
   }
 
   std::string descriptor(DotToDescriptor(name.c_str()));
-  StackHandleScope<2> hs(soa.Self());
   Handle<mirror::ClassLoader> class_loader(
       hs.NewHandle(soa.Decode<mirror::ClassLoader>(javaLoader)));
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
   Handle<mirror::Class> c(
       hs.NewHandle(class_linker->FindClass(soa.Self(), descriptor.c_str(), class_loader)));
-  if (c == nullptr) {
-    ScopedLocalRef<jthrowable> cause(env, env->ExceptionOccurred());
-    env->ExceptionClear();
-    jthrowable cnfe = reinterpret_cast<jthrowable>(
-        env->NewObject(WellKnownClasses::java_lang_ClassNotFoundException,
-                       WellKnownClasses::java_lang_ClassNotFoundException_init,
-                       javaName,
-                       cause.get()));
+  if (UNLIKELY(c == nullptr)) {
+    StackHandleScope<2> hs2(soa.Self());
+    Handle<mirror::Object> cause = hs2.NewHandle(soa.Self()->GetException());
+    soa.Self()->ClearException();
+    Handle<mirror::Object> cnfe =
+        WellKnownClasses::java_lang_ClassNotFoundException_init->NewObject<'L', 'L'>(
+            hs2, soa.Self(), mirror_name, cause);
     if (cnfe != nullptr) {
       // Make sure allocation didn't fail with an OOME.
-      env->Throw(cnfe);
+      soa.Self()->SetException(ObjPtr<mirror::Throwable>::DownCast(cnfe.Get()));
     }
     return nullptr;
   }
   if (initialize) {
     class_linker->EnsureInitialized(soa.Self(), c, true, true);
   }
+
+  // java.lang.ClassValue was added in Android U, and proguarding tools
+  // used that as justification to remove computeValue method implementation.
+  // Usual pattern was to check that Class.forName("java.lang.ClassValue")
+  // call does not throw and use ClassValue-based implementation or fallback
+  // to other solution if it does throw.
+  // So far ClassValue is the only class with such a problem and hence this
+  // ad-hoc check.
+  // See b/259501764.
+  if (!c->CheckIsVisibleWithTargetSdk(soa.Self())) {
+    DCHECK(soa.Self()->IsExceptionPending());
+    return nullptr;
+  }
+
   return soa.AddLocalReference<jclass>(c.Get());
 }
 
@@ -564,7 +579,7 @@ static jobjectArray Class_getDeclaredAnnotations(JNIEnv* env, jobject javaThis) 
   if (klass->IsProxyClass() || klass->GetDexCache() == nullptr) {
     // Return an empty array instead of a null pointer.
     ObjPtr<mirror::Class>  annotation_array_class =
-        soa.Decode<mirror::Class>(WellKnownClasses::java_lang_annotation_Annotation__array);
+        WellKnownClasses::ToClass(WellKnownClasses::java_lang_annotation_Annotation__array);
     ObjPtr<mirror::ObjectArray<mirror::Object>> empty_array =
         mirror::ObjectArray<mirror::Object>::Alloc(soa.Self(),
                                                    annotation_array_class,

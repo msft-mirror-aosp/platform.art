@@ -231,27 +231,18 @@ static void InterpreterJni(Thread* self,
   }
 }
 
+NO_STACK_PROTECTOR
 static JValue ExecuteSwitch(Thread* self,
                             const CodeItemDataAccessor& accessor,
                             ShadowFrame& shadow_frame,
                             JValue result_register,
                             bool interpret_one_instruction) REQUIRES_SHARED(Locks::mutator_lock_) {
   if (Runtime::Current()->IsActiveTransaction()) {
-    if (shadow_frame.GetMethod()->SkipAccessChecks()) {
-      return ExecuteSwitchImpl<false, true>(
-          self, accessor, shadow_frame, result_register, interpret_one_instruction);
-    } else {
-      return ExecuteSwitchImpl<true, true>(
-          self, accessor, shadow_frame, result_register, interpret_one_instruction);
-    }
+    return ExecuteSwitchImpl<true>(
+        self, accessor, shadow_frame, result_register, interpret_one_instruction);
   } else {
-    if (shadow_frame.GetMethod()->SkipAccessChecks()) {
-      return ExecuteSwitchImpl<false, false>(
-          self, accessor, shadow_frame, result_register, interpret_one_instruction);
-    } else {
-      return ExecuteSwitchImpl<true, false>(
-          self, accessor, shadow_frame, result_register, interpret_one_instruction);
-    }
+    return ExecuteSwitchImpl<false>(
+        self, accessor, shadow_frame, result_register, interpret_one_instruction);
   }
 }
 
@@ -311,8 +302,12 @@ static inline JValue Execute(
         // any value.
         DCHECK(Runtime::Current()->AreNonStandardExitsEnabled());
         JValue ret = JValue();
-        PerformNonStandardReturn<MonitorState::kNoMonitorsLocked>(
-            self, shadow_frame, ret, instrumentation, accessor.InsSize());
+        PerformNonStandardReturn(self,
+                                 shadow_frame,
+                                 ret,
+                                 instrumentation,
+                                 accessor.InsSize(),
+                                 /* unlock_monitors= */ false);
         return ret;
       }
       if (UNLIKELY(self->IsExceptionPending())) {
@@ -322,8 +317,12 @@ static inline JValue Execute(
         JValue ret = JValue();
         if (UNLIKELY(shadow_frame.GetForcePopFrame())) {
           DCHECK(Runtime::Current()->AreNonStandardExitsEnabled());
-          PerformNonStandardReturn<MonitorState::kNoMonitorsLocked>(
-              self, shadow_frame, ret, instrumentation, accessor.InsSize());
+          PerformNonStandardReturn(self,
+                                   shadow_frame,
+                                   ret,
+                                   instrumentation,
+                                   accessor.InsSize(),
+                                   /* unlock_monitors= */ false);
         }
         return ret;
       }
@@ -385,11 +384,9 @@ void EnterInterpreterFromInvoke(Thread* self,
     }
   }
   // Set up shadow frame with matching number of reference slots to vregs.
-  ShadowFrame* last_shadow_frame = self->GetManagedStack()->GetTopShadowFrame();
   ShadowFrameAllocaUniquePtr shadow_frame_unique_ptr =
-      CREATE_SHADOW_FRAME(num_regs, last_shadow_frame, method, /* dex pc */ 0);
+      CREATE_SHADOW_FRAME(num_regs, method, /* dex pc */ 0);
   ShadowFrame* shadow_frame = shadow_frame_unique_ptr.get();
-  self->PushShadowFrame(shadow_frame);
 
   size_t cur_reg = num_regs - num_ins;
   if (!method->IsStatic()) {
@@ -421,21 +418,10 @@ void EnterInterpreterFromInvoke(Thread* self,
     }
   }
   self->EndAssertNoThreadSuspension(old_cause);
-  // Do this after populating the shadow frame in case EnsureInitialized causes a GC.
-  if (method->IsStatic()) {
-    ObjPtr<mirror::Class> declaring_class = method->GetDeclaringClass();
-    if (UNLIKELY(!declaring_class->IsVisiblyInitialized())) {
-      StackHandleScope<1> hs(self);
-      Handle<mirror::Class> h_class(hs.NewHandle(declaring_class));
-      if (UNLIKELY(!Runtime::Current()->GetClassLinker()->EnsureInitialized(
-                        self, h_class, /*can_init_fields=*/ true, /*can_init_parents=*/ true))) {
-        CHECK(self->IsExceptionPending());
-        self->PopShadowFrame();
-        return;
-      }
-      DCHECK(h_class->IsInitializing());
-    }
+  if (!EnsureInitialized(self, shadow_frame)) {
+    return;
   }
+  self->PushShadowFrame(shadow_frame);
   if (LIKELY(!method->IsNative())) {
     JValue r = Execute(self, accessor, *shadow_frame, JValue(), stay_in_interpreter);
     if (result != nullptr) {
@@ -523,7 +509,7 @@ void EnterInterpreterFromDeoptimize(Thread* self,
         new_dex_pc = dex_pc + instr->SizeInCodeUnits();
       } else if (instr->IsInvoke()) {
         DCHECK(deopt_method_type == DeoptimizationMethodType::kDefault);
-        if (IsStringInit(instr, shadow_frame->GetMethod())) {
+        if (IsStringInit(*instr, shadow_frame->GetMethod())) {
           uint16_t this_obj_vreg = GetReceiverRegisterForStringInit(instr);
           // Move the StringFactory.newStringFromChars() result into the register representing
           // "this object" when invoking the string constructor in the original dex instruction.
@@ -607,23 +593,6 @@ void ArtInterpreterToInterpreterBridge(Thread* self,
   }
 
   self->PushShadowFrame(shadow_frame);
-  ArtMethod* method = shadow_frame->GetMethod();
-  // Ensure static methods are initialized.
-  const bool is_static = method->IsStatic();
-  if (is_static) {
-    ObjPtr<mirror::Class> declaring_class = method->GetDeclaringClass();
-    if (UNLIKELY(!declaring_class->IsVisiblyInitialized())) {
-      StackHandleScope<1> hs(self);
-      Handle<mirror::Class> h_class(hs.NewHandle(declaring_class));
-      if (UNLIKELY(!Runtime::Current()->GetClassLinker()->EnsureInitialized(
-                        self, h_class, /*can_init_fields=*/ true, /*can_init_parents=*/ true))) {
-        DCHECK(self->IsExceptionPending());
-        self->PopShadowFrame();
-        return;
-      }
-      DCHECK(h_class->IsInitializing());
-    }
-  }
 
   if (LIKELY(!shadow_frame->GetMethod()->IsNative())) {
     result->SetJ(Execute(self, accessor, *shadow_frame, JValue()).GetJ());
@@ -631,6 +600,7 @@ void ArtInterpreterToInterpreterBridge(Thread* self,
     // We don't expect to be asked to interpret native code (which is entered via a JNI compiler
     // generated stub) except during testing and image writing.
     CHECK(!Runtime::Current()->IsStarted());
+    bool is_static = shadow_frame->GetMethod()->IsStatic();
     ObjPtr<mirror::Object> receiver = is_static ? nullptr : shadow_frame->GetVRegReference(0);
     uint32_t* args = shadow_frame->GetVRegArgs(is_static ? 0 : 1);
     UnstartedRuntime::Jni(self, shadow_frame->GetMethod(), receiver.Ptr(), args, result);

@@ -19,6 +19,8 @@
 #include <lz4.h>
 #include <sstream>
 
+#include "android-base/stringprintf.h"
+
 #include "base/bit_utils.h"
 #include "base/length_prefixed_array.h"
 #include "base/utils.h"
@@ -29,8 +31,8 @@
 namespace art {
 
 const uint8_t ImageHeader::kImageMagic[] = { 'a', 'r', 't', '\n' };
-// Last change: Math.fma(double, double, double) intrinsic.
-const uint8_t ImageHeader::kImageVersion[] = { '1', '0', '6', '\0' };
+// Last change: StringBuilderAppend for float/double.
+const uint8_t ImageHeader::kImageVersion[] = { '1', '0', '7', '\0' };
 
 ImageHeader::ImageHeader(uint32_t image_reservation_size,
                          uint32_t component_count,
@@ -65,12 +67,14 @@ ImageHeader::ImageHeader(uint32_t image_reservation_size,
     image_roots_(image_roots),
     pointer_size_(pointer_size) {
   CHECK_EQ(image_begin, RoundUp(image_begin, kPageSize));
-  CHECK_EQ(oat_file_begin, RoundUp(oat_file_begin, kPageSize));
-  CHECK_EQ(oat_data_begin, RoundUp(oat_data_begin, kPageSize));
-  CHECK_LT(image_roots, oat_file_begin);
-  CHECK_LE(oat_file_begin, oat_data_begin);
-  CHECK_LT(oat_data_begin, oat_data_end);
-  CHECK_LE(oat_data_end, oat_file_end);
+  if (oat_checksum != 0u) {
+    CHECK_EQ(oat_file_begin, RoundUp(oat_file_begin, kPageSize));
+    CHECK_EQ(oat_data_begin, RoundUp(oat_data_begin, kPageSize));
+    CHECK_LT(image_roots, oat_file_begin);
+    CHECK_LE(oat_file_begin, oat_data_begin);
+    CHECK_LT(oat_data_begin, oat_data_end);
+    CHECK_LE(oat_data_end, oat_file_end);
+  }
   CHECK(ValidPointerSize(pointer_size_)) << pointer_size_;
   memcpy(magic_, kImageMagic, sizeof(kImageMagic));
   memcpy(version_, kImageVersion, sizeof(kImageVersion));
@@ -127,14 +131,16 @@ bool ImageHeader::IsValid() const {
   if (image_begin_ >= image_begin_ + image_size_) {
     return false;
   }
-  if (oat_file_begin_ > oat_file_end_) {
-    return false;
-  }
-  if (oat_data_begin_ > oat_data_end_) {
-    return false;
-  }
-  if (oat_file_begin_ >= oat_data_begin_) {
-    return false;
+  if (oat_checksum_ != 0u) {
+    if (oat_file_begin_ > oat_file_end_) {
+      return false;
+    }
+    if (oat_data_begin_ > oat_data_end_) {
+      return false;
+    }
+    if (oat_file_begin_ >= oat_data_begin_) {
+      return false;
+    }
   }
   return true;
 }
@@ -170,6 +176,23 @@ PointerSize ImageHeader::GetPointerSize() const {
   return ConvertToPointerSize(pointer_size_);
 }
 
+bool LZ4_decompress_safe_checked(const char* source,
+                                 char* dest,
+                                 int compressed_size,
+                                 int max_decompressed_size,
+                                 /*out*/ size_t* decompressed_size_checked,
+                                 /*out*/ std::string* error_msg) {
+  int decompressed_size = LZ4_decompress_safe(source, dest, compressed_size, max_decompressed_size);
+  if (UNLIKELY(decompressed_size < 0)) {
+    *error_msg = android::base::StringPrintf("LZ4_decompress_safe() returned negative size: %d",
+                                             decompressed_size);
+    return false;
+  } else {
+    *decompressed_size_checked = static_cast<size_t>(decompressed_size);
+    return true;
+  }
+}
+
 bool ImageHeader::Block::Decompress(uint8_t* out_ptr,
                                     const uint8_t* in_ptr,
                                     std::string* error_msg) const {
@@ -182,11 +205,17 @@ bool ImageHeader::Block::Decompress(uint8_t* out_ptr,
     case kStorageModeLZ4:
     case kStorageModeLZ4HC: {
       // LZ4HC and LZ4 have same internal format, both use LZ4_decompress.
-      const size_t decompressed_size = LZ4_decompress_safe(
+      size_t decompressed_size;
+      bool ok = LZ4_decompress_safe_checked(
           reinterpret_cast<const char*>(in_ptr) + data_offset_,
           reinterpret_cast<char*>(out_ptr) + image_offset_,
           data_size_,
-          image_size_);
+          image_size_,
+          &decompressed_size,
+          error_msg);
+      if (!ok) {
+        return false;
+      }
       CHECK_EQ(decompressed_size, image_size_);
       break;
     }
