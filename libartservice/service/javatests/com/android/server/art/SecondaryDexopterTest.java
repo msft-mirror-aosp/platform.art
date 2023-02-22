@@ -128,6 +128,7 @@ public class SecondaryDexopterTest {
 
         lenient().when(mInjector.getArtd()).thenReturn(mArtd);
         lenient().when(mInjector.isSystemUiPackage(any())).thenReturn(false);
+        lenient().when(mInjector.isLauncherPackage(any())).thenReturn(false);
         lenient().when(mInjector.getDexUseManager()).thenReturn(mDexUseManager);
 
         List<DetailedSecondaryDexInfo> secondaryDexInfo = createSecondaryDexInfo();
@@ -231,7 +232,7 @@ public class SecondaryDexopterTest {
         lenient().when(pkg.isDebuggable()).thenReturn(false);
         lenient().when(pkg.getTargetSdkVersion()).thenReturn(123);
         lenient().when(pkg.isSignedWithPlatformKey()).thenReturn(false);
-        lenient().when(pkg.isUsesNonSdkApi()).thenReturn(false);
+        lenient().when(pkg.isNonSdkApiRequested()).thenReturn(false);
         return pkg;
     }
 
