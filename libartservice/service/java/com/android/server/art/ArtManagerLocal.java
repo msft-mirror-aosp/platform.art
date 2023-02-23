@@ -16,6 +16,7 @@
 
 package com.android.server.art;
 
+import static com.android.server.art.DexUseManagerLocal.DetailedSecondaryDexInfo;
 import static com.android.server.art.DexUseManagerLocal.SecondaryDexInfo;
 import static com.android.server.art.PrimaryDexUtils.DetailedPrimaryDexInfo;
 import static com.android.server.art.PrimaryDexUtils.PrimaryDexInfo;
@@ -56,6 +57,7 @@ import com.android.server.art.model.ArtFlags;
 import com.android.server.art.model.BatchDexoptParams;
 import com.android.server.art.model.Config;
 import com.android.server.art.model.DeleteResult;
+import com.android.server.art.model.DetailedDexInfo;
 import com.android.server.art.model.DexoptParams;
 import com.android.server.art.model.DexoptResult;
 import com.android.server.art.model.DexoptStatus;
@@ -64,6 +66,8 @@ import com.android.server.pm.PackageManagerLocal;
 import com.android.server.pm.pkg.AndroidPackage;
 import com.android.server.pm.pkg.AndroidPackageSplit;
 import com.android.server.pm.pkg.PackageState;
+
+import dalvik.system.DexFile;
 
 import java.io.File;
 import java.io.FileNotFoundException;
@@ -77,6 +81,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -285,10 +290,9 @@ public final class ArtManagerLocal {
     }
 
     /**
-     * Clears the profiles of the given app that are collected locally, including the profiles for
-     * primary dex files and the ones for secondary dex files. More specifically, it clears
-     * reference profiles and current profiles. External profiles (e.g., cloud profiles) will be
-     * kept.
+     * Clear the profiles that are collected locally for the given package, including the profiles
+     * for primary and secondary dex files. More specifically, it clears reference profiles and
+     * current profiles. External profiles (e.g., cloud profiles) will be kept.
      *
      * @throws IllegalArgumentException if the package is not found or the flags are illegal
      * @throws IllegalStateException if the operation encounters an error that should never happen
@@ -608,6 +612,26 @@ public final class ArtManagerLocal {
     }
 
     /**
+     * Same as above, but also returns a {@link CompletableFuture}.
+     *
+     * @hide
+     */
+    @NonNull
+    public CompletableFuture<BackgroundDexoptJob.Result> startBackgroundDexoptJobAndReturnFuture() {
+        return mInjector.getBackgroundDexoptJob().start();
+    }
+
+    /**
+     * Returns the running background dexopt job, or null of no background dexopt job is running.
+     *
+     * @hide
+     */
+    @Nullable
+    public CompletableFuture<BackgroundDexoptJob.Result> getRunningBackgroundDexoptJob() {
+        return mInjector.getBackgroundDexoptJob().get();
+    }
+
+    /**
      * Cancels the running background dexopt job started by the job scheduler or by {@link
      * #startBackgroundDexoptJob()}. Does nothing if the job is not running. This method is not
      * blocking.
@@ -812,6 +836,106 @@ public final class ArtManagerLocal {
             @NonNull PackageManagerLocal.FilteredSnapshot snapshot, @NonNull String packageName) {
         new DumpHelper(this).dumpPackage(
                 pw, snapshot, Utils.getPackageStateOrThrow(snapshot, packageName));
+    }
+
+    /**
+     * Cleans up obsolete profiles and artifacts.
+     *
+     * This is done in a mark-and-sweep approach.
+     *
+     * @hide
+     */
+    public long cleanup(@NonNull PackageManagerLocal.FilteredSnapshot snapshot) {
+        try {
+            // For every primary dex container file or secondary dex container file of every app, if
+            // it has code, we keep the following types of files:
+            // - The reference profile and the current profiles, regardless of the hibernation state
+            //   of the app.
+            // - The dexopt artifacts, if they are up-to-date and the app is not hibernating.
+            // - Only the VDEX part of the dexopt artifacts, if the dexopt artifacts are outdated
+            //   but the VDEX part is still usable and the app is not hibernating.
+            List<ProfilePath> profilesToKeep = new ArrayList<>();
+            List<ArtifactsPath> artifactsToKeep = new ArrayList<>();
+            List<VdexPath> vdexFilesToKeep = new ArrayList<>();
+
+            for (PackageState pkgState : snapshot.getPackageStates().values()) {
+                if (!Utils.canDexoptPackage(pkgState, null /* appHibernationManager */)) {
+                    continue;
+                }
+                AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
+                boolean isInDalvikCache = Utils.isInDalvikCache(pkgState);
+                boolean keepArtifacts = !Utils.shouldSkipDexoptDueToHibernation(
+                        pkgState, mInjector.getAppHibernationManager());
+                for (DetailedPrimaryDexInfo dexInfo :
+                        PrimaryDexUtils.getDetailedDexInfo(pkgState, pkg)) {
+                    if (!dexInfo.hasCode()) {
+                        continue;
+                    }
+                    profilesToKeep.add(PrimaryDexUtils.buildRefProfilePath(pkgState, dexInfo));
+                    profilesToKeep.addAll(PrimaryDexUtils.getCurProfiles(
+                            mInjector.getUserManager(), pkgState, dexInfo));
+                    if (keepArtifacts) {
+                        for (Abi abi : Utils.getAllAbis(pkgState)) {
+                            maybeKeepArtifacts(artifactsToKeep, vdexFilesToKeep, pkgState, dexInfo,
+                                    abi, isInDalvikCache);
+                        }
+                    }
+                }
+                for (DetailedSecondaryDexInfo dexInfo :
+                        mInjector.getDexUseManager().getFilteredDetailedSecondaryDexInfo(
+                                pkgState.getPackageName())) {
+                    profilesToKeep.add(
+                            AidlUtils.buildProfilePathForSecondaryRef(dexInfo.dexPath()));
+                    profilesToKeep.add(
+                            AidlUtils.buildProfilePathForSecondaryCur(dexInfo.dexPath()));
+                    if (keepArtifacts) {
+                        for (Abi abi : Utils.getAllAbisForNames(dexInfo.abiNames(), pkgState)) {
+                            maybeKeepArtifacts(artifactsToKeep, vdexFilesToKeep, pkgState, dexInfo,
+                                    abi, false /* isInDalvikCache */);
+                        }
+                    }
+                }
+            }
+            return mInjector.getArtd().cleanup(profilesToKeep, artifactsToKeep, vdexFilesToKeep);
+        } catch (RemoteException e) {
+            throw new IllegalStateException("An error occurred when calling artd", e);
+        }
+    }
+
+    /**
+     * Checks if the artifacts are up-to-date, and maybe adds them to {@code artifactsToKeep} or
+     * {@code vdexFilesToKeep} based on the result.
+     */
+    private void maybeKeepArtifacts(@NonNull List<ArtifactsPath> artifactsToKeep,
+            @NonNull List<VdexPath> vdexFilesToKeep, @NonNull PackageState pkgState,
+            @NonNull DetailedDexInfo dexInfo, @NonNull Abi abi, boolean isInDalvikCache)
+            throws RemoteException {
+        try {
+            GetDexoptStatusResult result = mInjector.getArtd().getDexoptStatus(
+                    dexInfo.dexPath(), abi.isa(), dexInfo.classLoaderContext());
+            if (DexFile.isValidCompilerFilter(result.compilerFilter)) {
+                // TODO(b/263579377): This is a bit inaccurate. We may be keeping the artifacts in
+                // dalvik-cache while OatFileAssistant actually picks the ones not in dalvik-cache.
+                // However, this isn't a big problem because it is an edge case and it only causes
+                // us to delete less rather than deleting more.
+                ArtifactsPath artifacts =
+                        AidlUtils.buildArtifactsPath(dexInfo.dexPath(), abi.isa(), isInDalvikCache);
+                if (result.compilationReason.equals(ArtConstants.REASON_VDEX)) {
+                    // Only the VDEX file is usable.
+                    vdexFilesToKeep.add(VdexPath.artifactsPath(artifacts));
+                } else {
+                    artifactsToKeep.add(artifacts);
+                }
+            }
+        } catch (ServiceSpecificException e) {
+            // Don't add the artifacts to the lists. They should be cleaned up.
+            Log.e(TAG,
+                    String.format("Failed to get dexopt status [packageName = %s, dexPath = %s, "
+                                    + "isa = %s, classLoaderContext = %s]",
+                            pkgState.getPackageName(), dexInfo.dexPath(), abi.isa(),
+                            dexInfo.classLoaderContext()),
+                    e);
+        }
     }
 
     /**
