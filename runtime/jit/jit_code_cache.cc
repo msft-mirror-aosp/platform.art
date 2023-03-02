@@ -422,7 +422,6 @@ void JitCodeCache::SweepRootTables(IsMarkedVisitor* visitor) {
         // TODO: Do not use IsMarked for j.l.Class, and adjust once we move this method
         // out of the weak access/creation pause. b/32167580
         if (new_object != nullptr && new_object != object) {
-          DCHECK(new_object->IsString());
           roots[i] = GcRoot<mirror::Object>(new_object);
         }
       } else {
@@ -560,7 +559,7 @@ void JitCodeCache::RemoveMethodsIn(Thread* self, const LinearAlloc& alloc) {
 }
 
 bool JitCodeCache::IsWeakAccessEnabled(Thread* self) const {
-  return kUseReadBarrier
+  return gUseReadBarrier
       ? self->GetWeakRefAccessEnabled()
       : is_weak_access_enabled_.load(std::memory_order_seq_cst);
 }
@@ -583,13 +582,13 @@ void JitCodeCache::BroadcastForInlineCacheAccess() {
 }
 
 void JitCodeCache::AllowInlineCacheAccess() {
-  DCHECK(!kUseReadBarrier);
+  DCHECK(!gUseReadBarrier);
   is_weak_access_enabled_.store(true, std::memory_order_seq_cst);
   BroadcastForInlineCacheAccess();
 }
 
 void JitCodeCache::DisallowInlineCacheAccess() {
-  DCHECK(!kUseReadBarrier);
+  DCHECK(!gUseReadBarrier);
   is_weak_access_enabled_.store(false, std::memory_order_seq_cst);
 }
 
@@ -1594,10 +1593,35 @@ bool JitCodeCache::IsOsrCompiled(ArtMethod* method) {
   return osr_code_map_.find(method) != osr_code_map_.end();
 }
 
+void JitCodeCache::VisitRoots(RootVisitor* visitor) {
+  Thread* self = Thread::Current();
+  gc::Heap* const heap = Runtime::Current()->GetHeap();
+  if (heap->CurrentCollectorType() != gc::CollectorType::kCollectorTypeCMC
+      || !heap->MarkCompactCollector()->IsCompacting(self)) {
+    MutexLock mu(self, *Locks::jit_lock_);
+    UnbufferedRootVisitor root_visitor(visitor, RootInfo(kRootStickyClass));
+    for (ArtMethod* method : current_optimized_compilations_) {
+      method->VisitRoots(root_visitor, kRuntimePointerSize);
+    }
+    for (ArtMethod* method : current_baseline_compilations_) {
+      method->VisitRoots(root_visitor, kRuntimePointerSize);
+    }
+    for (ArtMethod* method : current_osr_compilations_) {
+      method->VisitRoots(root_visitor, kRuntimePointerSize);
+    }
+  }
+}
+
 bool JitCodeCache::NotifyCompilationOf(ArtMethod* method,
                                        Thread* self,
                                        CompilationKind compilation_kind,
                                        bool prejit) {
+  if (kIsDebugBuild) {
+    MutexLock mu(self, *Locks::jit_lock_);
+    // Note: the compilation kind may have been adjusted after what was passed initially.
+    // We really just want to check that the method is indeed being compiled.
+    CHECK(IsMethodBeingCompiled(method));
+  }
   const void* existing_entry_point = method->GetEntryPointFromQuickCompiledCode();
   if (compilation_kind != CompilationKind::kOsr && ContainsPc(existing_entry_point)) {
     OatQuickMethodHeader* method_header =
@@ -1686,13 +1710,8 @@ bool JitCodeCache::NotifyCompilationOf(ArtMethod* method,
         }
       }
     }
-    MutexLock mu(self, *Locks::jit_lock_);
-    if (IsMethodBeingCompiled(method, compilation_kind)) {
-      return false;
-    }
-    AddMethodBeingCompiled(method, compilation_kind);
-    return true;
   }
+  return true;
 }
 
 ProfilingInfo* JitCodeCache::NotifyCompilerUse(ArtMethod* method, Thread* self) {
@@ -1715,9 +1734,7 @@ void JitCodeCache::DoneCompilerUse(ArtMethod* method, Thread* self) {
   it->second->DecrementInlineUse();
 }
 
-void JitCodeCache::DoneCompiling(ArtMethod* method,
-                                 Thread* self,
-                                 CompilationKind compilation_kind) {
+void JitCodeCache::DoneCompiling(ArtMethod* method, Thread* self) {
   DCHECK_EQ(Thread::Current(), self);
   MutexLock mu(self, *Locks::jit_lock_);
   if (UNLIKELY(method->IsNative())) {
@@ -1729,8 +1746,6 @@ void JitCodeCache::DoneCompiling(ArtMethod* method,
       // Failed to compile; the JNI compiler never fails, but the cache may be full.
       jni_stubs_map_.erase(it);  // Remove the entry added in NotifyCompilationOf().
     }  // else Commit() updated entrypoints of all methods in the JniStubData.
-  } else {
-    RemoveMethodBeingCompiled(method, compilation_kind);
   }
 }
 

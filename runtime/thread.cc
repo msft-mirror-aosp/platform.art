@@ -166,7 +166,7 @@ void InitEntryPoints(JniEntryPoints* jpoints,
 void UpdateReadBarrierEntrypoints(QuickEntryPoints* qpoints, bool is_active);
 
 void Thread::SetIsGcMarkingAndUpdateEntrypoints(bool is_marking) {
-  CHECK(kUseReadBarrier);
+  CHECK(gUseReadBarrier);
   tls32_.is_gc_marking = is_marking;
   UpdateReadBarrierEntrypoints(&tlsPtr_.quick_entrypoints, /* is_active= */ is_marking);
 }
@@ -601,6 +601,10 @@ void Thread::DeleteJPeer(JNIEnv* env) {
   env->DeleteGlobalRef(old_jpeer);
 }
 
+void* Thread::CreateCallbackWithUffdGc(void* arg) {
+  return Thread::CreateCallback(arg);
+}
+
 void* Thread::CreateCallback(void* arg) {
   Thread* self = reinterpret_cast<Thread*>(arg);
   Runtime* runtime = Runtime::Current();
@@ -662,7 +666,7 @@ void* Thread::CreateCallback(void* arg) {
     InvokeVirtualOrInterfaceWithJValues(soa, ref.get(), mid, nullptr);
   }
   // Detach and delete self.
-  Runtime::Current()->GetThreadList()->Unregister(self);
+  Runtime::Current()->GetThreadList()->Unregister(self, /* should_run_callbacks= */ true);
 
   return nullptr;
 }
@@ -893,7 +897,8 @@ void Thread::CreateNativeThread(JNIEnv* env, jobject java_peer, size_t stack_siz
     CHECK_PTHREAD_CALL(pthread_attr_setstacksize, (&attr, stack_size), stack_size);
     pthread_create_result = pthread_create(&new_pthread,
                                            &attr,
-                                           Thread::CreateCallback,
+                                           gUseUserfaultfd ? Thread::CreateCallbackWithUffdGc
+                                                           : Thread::CreateCallback,
                                            child_thread);
     CHECK_PTHREAD_CALL(pthread_attr_destroy, (&attr), "new thread");
 
@@ -982,7 +987,10 @@ bool Thread::Init(ThreadList* thread_list, JavaVMExt* java_vm, JNIEnvExt* jni_en
 }
 
 template <typename PeerAction>
-Thread* Thread::Attach(const char* thread_name, bool as_daemon, PeerAction peer_action) {
+Thread* Thread::Attach(const char* thread_name,
+                       bool as_daemon,
+                       PeerAction peer_action,
+                       bool should_run_callbacks) {
   Runtime* runtime = Runtime::Current();
   ScopedTrace trace("Thread::Attach");
   if (runtime == nullptr) {
@@ -1017,7 +1025,7 @@ Thread* Thread::Attach(const char* thread_name, bool as_daemon, PeerAction peer_
 
   // Run the action that is acting on the peer.
   if (!peer_action(self)) {
-    runtime->GetThreadList()->Unregister(self);
+    runtime->GetThreadList()->Unregister(self, should_run_callbacks);
     // Unregister deletes self, no need to do this here.
     return nullptr;
   }
@@ -1032,7 +1040,7 @@ Thread* Thread::Attach(const char* thread_name, bool as_daemon, PeerAction peer_
     self->Dump(LOG_STREAM(INFO));
   }
 
-  {
+  if (should_run_callbacks) {
     ScopedObjectAccess soa(self);
     runtime->GetRuntimeCallbacks()->ThreadStart(self);
   }
@@ -1043,7 +1051,8 @@ Thread* Thread::Attach(const char* thread_name, bool as_daemon, PeerAction peer_
 Thread* Thread::Attach(const char* thread_name,
                        bool as_daemon,
                        jobject thread_group,
-                       bool create_peer) {
+                       bool create_peer,
+                       bool should_run_callbacks) {
   auto create_peer_action = [&](Thread* self) {
     // If we're the main thread, ClassLinker won't be created until after we're attached,
     // so that thread needs a two-stage attach. Regular threads don't need this hack.
@@ -1076,7 +1085,7 @@ Thread* Thread::Attach(const char* thread_name,
     }
     return true;
   };
-  return Attach(thread_name, as_daemon, create_peer_action);
+  return Attach(thread_name, as_daemon, create_peer_action, should_run_callbacks);
 }
 
 Thread* Thread::Attach(const char* thread_name, bool as_daemon, jobject thread_peer) {
@@ -1092,7 +1101,7 @@ Thread* Thread::Attach(const char* thread_name, bool as_daemon, jobject thread_p
                                     reinterpret_cast64<jlong>(self));
     return true;
   };
-  return Attach(thread_name, as_daemon, set_peer_action);
+  return Attach(thread_name, as_daemon, set_peer_action, /* should_run_callbacks= */ true);
 }
 
 void Thread::CreatePeer(const char* name, bool as_daemon, jobject thread_group) {
@@ -1473,7 +1482,7 @@ bool Thread::ModifySuspendCountInternal(Thread* self,
     return false;
   }
 
-  if (kUseReadBarrier && delta > 0 && this != self && tlsPtr_.flip_function != nullptr) {
+  if (gUseReadBarrier && delta > 0 && this != self && tlsPtr_.flip_function != nullptr) {
     // Force retry of a suspend request if it's in the middle of a thread flip to avoid a
     // deadlock. b/31683379.
     return false;
@@ -2497,7 +2506,7 @@ class MonitorExitVisitor : public SingleRootVisitor {
   Thread* const self_;
 };
 
-void Thread::Destroy() {
+void Thread::Destroy(bool should_run_callbacks) {
   Thread* self = this;
   DCHECK_EQ(self, Thread::Current());
 
@@ -2526,7 +2535,7 @@ void Thread::Destroy() {
     HandleUncaughtExceptions(soa);
     RemoveFromThreadGroup(soa);
     Runtime* runtime = Runtime::Current();
-    if (runtime != nullptr) {
+    if (runtime != nullptr && should_run_callbacks) {
       runtime->GetRuntimeCallbacks()->ThreadDeath(self);
     }
 
@@ -2559,7 +2568,7 @@ void Thread::Destroy() {
   }
   // Mark-stack revocation must be performed at the very end. No
   // checkpoint/flip-function or read-barrier should be called after this.
-  if (kUseReadBarrier) {
+  if (gUseReadBarrier) {
     Runtime::Current()->GetHeap()->ConcurrentCopyingCollector()->RevokeThreadLocalMarkStack(this);
   }
 }
@@ -3851,7 +3860,11 @@ class ReferenceMapVisitor : public StackVisitor {
         // We are visiting the references in compiled frames, so we do not need
         // to know the inlined frames.
       : StackVisitor(thread, context, StackVisitor::StackWalkKind::kSkipInlinedFrames),
-        visitor_(visitor) {}
+        visitor_(visitor) {
+    gc::Heap* const heap = Runtime::Current()->GetHeap();
+    visit_declaring_class_ = heap->CurrentCollectorType() != gc::CollectorType::kCollectorTypeCMC
+                             || !heap->MarkCompactCollector()->IsCompacting(Thread::Current());
+  }
 
   bool VisitFrame() override REQUIRES_SHARED(Locks::mutator_lock_) {
     if (false) {
@@ -3896,6 +3909,9 @@ class ReferenceMapVisitor : public StackVisitor {
   void VisitDeclaringClass(ArtMethod* method)
       REQUIRES_SHARED(Locks::mutator_lock_)
       NO_THREAD_SAFETY_ANALYSIS {
+    if (!visit_declaring_class_) {
+      return;
+    }
     ObjPtr<mirror::Class> klass = method->GetDeclaringClassUnchecked<kWithoutReadBarrier>();
     // klass can be null for runtime methods.
     if (klass != nullptr) {
@@ -4189,6 +4205,7 @@ class ReferenceMapVisitor : public StackVisitor {
 
   // Visitor for when we visit a root.
   RootVisitor& visitor_;
+  bool visit_declaring_class_;
 };
 
 class RootCallbackVisitor {
@@ -4282,9 +4299,6 @@ void Thread::VisitRoots(RootVisitor* visitor) {
 
 static void SweepCacheEntry(IsMarkedVisitor* visitor, const Instruction* inst, size_t* value)
     REQUIRES_SHARED(Locks::mutator_lock_) {
-  // WARNING: The interpreter will not modify the cache while this method is running in GC.
-  //          However, ClearAllInterpreterCaches can still run if any dex file is closed.
-  //          Therefore the cache entry can be nulled at any point through this method.
   if (inst == nullptr) {
     return;
   }
@@ -4333,16 +4347,12 @@ static void SweepCacheEntry(IsMarkedVisitor* visitor, const Instruction* inst, s
       // New opcode is using the cache. We need to explicitly handle it in this method.
       DCHECK(false) << "Unhandled opcode " << inst->Opcode();
   }
-};
+}
 
-void Thread::SweepInterpreterCaches(IsMarkedVisitor* visitor) {
-  MutexLock mu(Thread::Current(), *Locks::thread_list_lock_);
-  Runtime::Current()->GetThreadList()->ForEach([visitor](Thread* thread) {
-    Locks::mutator_lock_->AssertSharedHeld(Thread::Current());
-    for (InterpreterCache::Entry& entry : thread->GetInterpreterCache()->GetArray()) {
-      SweepCacheEntry(visitor, reinterpret_cast<const Instruction*>(entry.first), &entry.second);
-    }
-  });
+void Thread::SweepInterpreterCache(IsMarkedVisitor* visitor) {
+  for (InterpreterCache::Entry& entry : GetInterpreterCache()->GetArray()) {
+    SweepCacheEntry(visitor, reinterpret_cast<const Instruction*>(entry.first), &entry.second);
+  }
 }
 
 // FIXME: clang-r433403 reports the below function exceeds frame size limit.
@@ -4429,6 +4439,15 @@ bool Thread::HasTlab() const {
     DCHECK(tlsPtr_.thread_local_start == nullptr && tlsPtr_.thread_local_end == nullptr);
   }
   return has_tlab;
+}
+
+void Thread::AdjustTlab(size_t slide_bytes) {
+  if (HasTlab()) {
+    tlsPtr_.thread_local_start -= slide_bytes;
+    tlsPtr_.thread_local_pos -= slide_bytes;
+    tlsPtr_.thread_local_end -= slide_bytes;
+    tlsPtr_.thread_local_limit -= slide_bytes;
+  }
 }
 
 std::ostream& operator<<(std::ostream& os, const Thread& thread) {
@@ -4540,7 +4559,7 @@ bool Thread::IsAotCompiler() {
 mirror::Object* Thread::GetPeerFromOtherThread() const {
   DCHECK(tlsPtr_.jpeer == nullptr);
   mirror::Object* peer = tlsPtr_.opeer;
-  if (kUseReadBarrier && Current()->GetIsGcMarking()) {
+  if (gUseReadBarrier && Current()->GetIsGcMarking()) {
     // We may call Thread::Dump() in the middle of the CC thread flip and this thread's stack
     // may have not been flipped yet and peer may be a from-space (stale) ref. So explicitly
     // mark/forward it here.

@@ -49,6 +49,7 @@ template<class T> class Handle;
 class ImtConflictTable;
 enum InvokeType : uint32_t;
 union JValue;
+template<typename T> class LengthPrefixedArray;
 class OatQuickMethodHeader;
 class ProfilingInfo;
 class ScopedObjectAccessAlreadyRunnable;
@@ -85,6 +86,23 @@ class ArtMethod final {
 
   static ArtMethod* FromReflectedMethod(const ScopedObjectAccessAlreadyRunnable& soa,
                                         jobject jlr_method)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // Visit the declaring class in 'method' if it is within [start_boundary, end_boundary).
+  template<typename RootVisitorType>
+  static void VisitRoots(RootVisitorType& visitor,
+                         uint8_t* start_boundary,
+                         uint8_t* end_boundary,
+                         ArtMethod* method)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // Visit declaring classes of all the art-methods in 'array' that reside
+  // in [start_boundary, end_boundary).
+  template<PointerSize kPointerSize, typename RootVisitorType>
+  static void VisitArrayRoots(RootVisitorType& visitor,
+                              uint8_t* start_boundary,
+                              uint8_t* end_boundary,
+                              LengthPrefixedArray<ArtMethod>* array)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   template <ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
@@ -635,7 +653,9 @@ class ArtMethod final {
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // NO_THREAD_SAFETY_ANALYSIS since we don't know what the callback requires.
-  template<ReadBarrierOption kReadBarrierOption = kWithReadBarrier, typename RootVisitorType>
+  template<ReadBarrierOption kReadBarrierOption = kWithReadBarrier,
+           bool kVisitProxyMethod = true,
+           typename RootVisitorType>
   void VisitRoots(RootVisitorType& visitor, PointerSize pointer_size) NO_THREAD_SAFETY_ANALYSIS;
 
   const DexFile* GetDexFile() REQUIRES_SHARED(Locks::mutator_lock_);

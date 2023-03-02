@@ -271,13 +271,16 @@ class Runtime {
   jobject GetSystemClassLoader() const;
 
   // Attaches the calling native thread to the runtime.
-  bool AttachCurrentThread(const char* thread_name, bool as_daemon, jobject thread_group,
-                           bool create_peer);
+  bool AttachCurrentThread(const char* thread_name,
+                           bool as_daemon,
+                           jobject thread_group,
+                           bool create_peer,
+                           bool should_run_callbacks = true);
 
   void CallExitHook(jint status);
 
   // Detaches the current native thread from the runtime.
-  void DetachCurrentThread() REQUIRES(!Locks::mutator_lock_);
+  void DetachCurrentThread(bool should_run_callbacks = true) REQUIRES(!Locks::mutator_lock_);
 
   void DumpDeoptimizations(std::ostream& os);
   void DumpForSigQuit(std::ostream& os);
@@ -430,8 +433,7 @@ class Runtime {
 
   // Sweep system weaks, the system weak is deleted if the visitor return null. Otherwise, the
   // system weak is updated to be the visitor's returned value.
-  void SweepSystemWeaks(IsMarkedVisitor* visitor)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+  void SweepSystemWeaks(IsMarkedVisitor* visitor) REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Walk all reflective objects and visit their targets as well as any method/fields held by the
   // runtime threads that are marked as being reflective.
@@ -752,6 +754,9 @@ class Runtime {
   // Create the JIT and instrumentation and code cache.
   void CreateJit();
 
+  ArenaPool* GetLinearAllocArenaPool() {
+    return linear_alloc_arena_pool_.get();
+  }
   ArenaPool* GetArenaPool() {
     return arena_pool_.get();
   }
@@ -850,6 +855,11 @@ class Runtime {
 
   // Create a normal LinearAlloc or low 4gb version if we are 64 bit AOT compiler.
   LinearAlloc* CreateLinearAlloc();
+  // Setup linear-alloc allocators to stop using the current arena so that the
+  // next allocations, which would be after zygote fork, happens in userfaultfd
+  // visited space.
+  void SetupLinearAllocForPostZygoteFork(Thread* self)
+      REQUIRES(!Locks::mutator_lock_, !Locks::classlinker_classes_lock_);
 
   OatFileManager& GetOatFileManager() const {
     DCHECK(oat_file_manager_ != nullptr);
@@ -1073,6 +1083,10 @@ class Runtime {
   // image rather that an image loaded from disk.
   bool HasImageWithProfile() const;
 
+  bool GetNoSigChain() const {
+    return no_sig_chain_;
+  }
+
   // Trigger a flag reload from system properties or device congfigs.
   //
   // Should only be called from runtime init and zygote post fork as
@@ -1194,10 +1208,13 @@ class Runtime {
 
   std::unique_ptr<ArenaPool> jit_arena_pool_;
   std::unique_ptr<ArenaPool> arena_pool_;
-  // Special low 4gb pool for compiler linear alloc. We need ArtFields to be in low 4gb if we are
-  // compiling using a 32 bit image on a 64 bit compiler in case we resolve things in the image
-  // since the field arrays are int arrays in this case.
-  std::unique_ptr<ArenaPool> low_4gb_arena_pool_;
+  // This pool is used for linear alloc if we are using userfaultfd GC, or if
+  // low 4gb pool is required for compiler linear alloc. Otherwise, use
+  // arena_pool_.
+  // We need ArtFields to be in low 4gb if we are compiling using a 32 bit image
+  // on a 64 bit compiler in case we resolve things in the image since the field
+  // arrays are int arrays in this case.
+  std::unique_ptr<ArenaPool> linear_alloc_arena_pool_;
 
   // Shared linear alloc for now.
   std::unique_ptr<LinearAlloc> linear_alloc_;
@@ -1493,6 +1510,7 @@ class Runtime {
   friend class ScopedThreadPoolUsage;
   friend class OatFileAssistantTest;
   class NotifyStartupCompletedTask;
+  class SetupLinearAllocForZygoteFork;
 
   DISALLOW_COPY_AND_ASSIGN(Runtime);
 };
