@@ -254,6 +254,9 @@ MarkCompact::MarkCompact(Heap* heap)
       uffd_minor_fault_supported_(false),
       minor_fault_initialized_(false),
       map_linear_alloc_shared_(false) {
+  if (kIsDebugBuild) {
+    updated_roots_.reset(new std::unordered_set<void*>());
+  }
   // TODO: Depending on how the bump-pointer space move is implemented. If we
   // switch between two virtual memories each time, then we will have to
   // initialize live_words_bitmap_ accordingly.
@@ -350,6 +353,24 @@ MarkCompact::MarkCompact(Heap* heap)
   CHECK_EQ(*conc_compaction_termination_page_, 0);
   // In most of the cases, we don't expect more than one LinearAlloc space.
   linear_alloc_spaces_data_.reserve(1);
+
+  // Initialize GC metrics.
+  metrics::ArtMetrics* metrics = GetMetrics();
+  // The mark-compact collector supports only full-heap collections at the moment.
+  gc_time_histogram_ = metrics->FullGcCollectionTime();
+  metrics_gc_count_ = metrics->FullGcCount();
+  metrics_gc_count_delta_ = metrics->FullGcCountDelta();
+  gc_throughput_histogram_ = metrics->FullGcThroughput();
+  gc_tracing_throughput_hist_ = metrics->FullGcTracingThroughput();
+  gc_throughput_avg_ = metrics->FullGcThroughputAvg();
+  gc_tracing_throughput_avg_ = metrics->FullGcTracingThroughputAvg();
+  gc_scanned_bytes_ = metrics->FullGcScannedBytes();
+  gc_scanned_bytes_delta_ = metrics->FullGcScannedBytesDelta();
+  gc_freed_bytes_ = metrics->FullGcFreedBytes();
+  gc_freed_bytes_delta_ = metrics->FullGcFreedBytesDelta();
+  gc_duration_ = metrics->FullGcDuration();
+  gc_duration_delta_ = metrics->FullGcDurationDelta();
+  are_metrics_initialized_ = true;
 }
 
 void MarkCompact::AddLinearAllocSpaceData(uint8_t* begin, size_t len) {
@@ -442,6 +463,28 @@ void MarkCompact::BindAndResetBitmaps() {
         non_moving_space_bitmap_ = space->GetMarkBitmap();
       }
     }
+  }
+}
+
+void MarkCompact::MarkZygoteLargeObjects() {
+  Thread* self = thread_running_gc_;
+  DCHECK_EQ(self, Thread::Current());
+  space::LargeObjectSpace* const los = heap_->GetLargeObjectsSpace();
+  if (los != nullptr) {
+    // Pick the current live bitmap (mark bitmap if swapped).
+    accounting::LargeObjectBitmap* const live_bitmap = los->GetLiveBitmap();
+    accounting::LargeObjectBitmap* const mark_bitmap = los->GetMarkBitmap();
+    // Walk through all of the objects and explicitly mark the zygote ones so they don't get swept.
+    std::pair<uint8_t*, uint8_t*> range = los->GetBeginEndAtomic();
+    live_bitmap->VisitMarkedRange(reinterpret_cast<uintptr_t>(range.first),
+                                  reinterpret_cast<uintptr_t>(range.second),
+                                  [mark_bitmap, los, self](mirror::Object* obj)
+                                      REQUIRES(Locks::heap_bitmap_lock_)
+                                          REQUIRES_SHARED(Locks::mutator_lock_) {
+                                            if (los->IsZygoteLargeObject(self, obj)) {
+                                              mark_bitmap->Set(obj);
+                                            }
+                                          });
   }
 }
 
@@ -3452,6 +3495,7 @@ void MarkCompact::MarkingPhase() {
   DCHECK_EQ(thread_running_gc_, Thread::Current());
   WriterMutexLock mu(thread_running_gc_, *Locks::heap_bitmap_lock_);
   BindAndResetBitmaps();
+  MarkZygoteLargeObjects();
   MarkRoots(
         static_cast<VisitRootFlags>(kVisitRootFlagAllRoots | kVisitRootFlagStartLoggingNewRoots));
   MarkReachableObjects();
@@ -3622,8 +3666,15 @@ inline bool MarkCompact::MarkObjectNonNullNoPush(mirror::Object* obj,
         << " doesn't belong to any of the spaces and large object space doesn't exist";
     accounting::LargeObjectBitmap* los_bitmap = heap_->GetLargeObjectsSpace()->GetMarkBitmap();
     DCHECK(los_bitmap->HasAddress(obj));
-    return kParallel ? !los_bitmap->AtomicTestAndSet(obj)
-                     : !los_bitmap->Set(obj);
+    if (kParallel) {
+      los_bitmap->AtomicTestAndSet(obj);
+    } else {
+      los_bitmap->Set(obj);
+    }
+    // We only have primitive arrays in large object space. So there is no
+    // reason to push into mark-stack.
+    DCHECK(obj->IsString() || (obj->IsArrayInstance() && !obj->IsObjectArray()));
+    return false;
   }
 }
 
@@ -3763,7 +3814,9 @@ void MarkCompact::FinishPhase() {
   }
   CHECK(mark_stack_->IsEmpty());  // Ensure that the mark stack is empty.
   mark_stack_->Reset();
-  updated_roots_.clear();
+  if (kIsDebugBuild && updated_roots_.get() != nullptr) {
+    updated_roots_->clear();
+  }
   class_after_obj_ordered_map_.clear();
   delete[] moving_pages_status_;
   linear_alloc_arenas_.clear();

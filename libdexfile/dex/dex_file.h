@@ -17,16 +17,18 @@
 #ifndef ART_LIBDEXFILE_DEX_DEX_FILE_H_
 #define ART_LIBDEXFILE_DEX_DEX_FILE_H_
 
+#include <android-base/logging.h>
+
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include <android-base/logging.h>
-
+#include "base/array_ref.h"
 #include "base/globals.h"
 #include "base/macros.h"
+#include "base/mman.h"  // For the PROT_* and MAP_* constants.
 #include "base/value_object.h"
 #include "dex_file_structs.h"
 #include "dex_file_types.h"
@@ -56,14 +58,45 @@ enum class Domain : char;
 class DexFileContainer {
  public:
   DexFileContainer() { }
-  virtual ~DexFileContainer() { }
-  virtual int GetPermissions() = 0;
-  virtual bool IsReadOnly() = 0;
+  virtual ~DexFileContainer() {}
+
+  virtual bool IsReadOnly() const = 0;
+
+  // Make the underlying writeable. Return true on success (memory can be written).
   virtual bool EnableWrite() = 0;
+  // Make the underlying read-only. Return true on success (memory is read-only now).
   virtual bool DisableWrite() = 0;
 
+  virtual const uint8_t* Begin() const = 0;
+  virtual const uint8_t* End() const = 0;
+  size_t Size() const { return End() - Begin(); }
+
+  // TODO: Remove. This is only used by dexlayout to override the data section of the dex header,
+  //       and redirect it to intermediate memory buffer at completely unrelated memory location.
+  virtual ArrayRef<const uint8_t> Data() const { return {}; }
+
+  bool IsZip() const { return is_zip_; }
+  void SetIsZip() { is_zip_ = true; }
+  virtual bool IsFileMap() const { return false; }
+
  private:
+  bool is_zip_ = false;
   DISALLOW_COPY_AND_ASSIGN(DexFileContainer);
+};
+
+class MemoryDexFileContainer : public DexFileContainer {
+ public:
+  MemoryDexFileContainer(const uint8_t* begin, const uint8_t* end) : begin_(begin), end_(end) {}
+  bool IsReadOnly() const override { return true; }
+  bool EnableWrite() override { return false; }
+  bool DisableWrite() override { return false; }
+  const uint8_t* Begin() const override { return begin_; }
+  const uint8_t* End() const override { return end_; }
+
+ private:
+  const uint8_t* const begin_;
+  const uint8_t* const end_;
+  DISALLOW_COPY_AND_ASSIGN(MemoryDexFileContainer);
 };
 
 // Dex file is the API that exposes native dex files (ordinary dex files) and CompactDex.
@@ -542,9 +575,8 @@ class DexFile {
     // Check that the offset is in bounds.
     // Note that although the specification says that 0 should be used if there
     // is no debug information, some applications incorrectly use 0xFFFFFFFF.
-    return (debug_info_off == 0 || debug_info_off >= data_size_)
-        ? nullptr
-        : DataBegin() + debug_info_off;
+    return (debug_info_off == 0 || debug_info_off >= DataSize()) ? nullptr :
+                                                                   DataBegin() + debug_info_off;
   }
 
   struct PositionInfo {
@@ -709,8 +741,6 @@ class DexFile {
     }
   }
 
-  int GetPermissions() const;
-
   bool IsReadOnly() const;
 
   bool EnableWrite() const;
@@ -725,13 +755,13 @@ class DexFile {
     return size_;
   }
 
-  const uint8_t* DataBegin() const {
-    return data_begin_;
-  }
+  static ArrayRef<const uint8_t> GetDataRange(const uint8_t* data,
+                                              size_t size,
+                                              DexFileContainer* container);
 
-  size_t DataSize() const {
-    return data_size_;
-  }
+  const uint8_t* DataBegin() const { return data_.data(); }
+
+  size_t DataSize() const { return data_.size(); }
 
   template <typename T>
   const T* DataPointer(size_t offset) const {
@@ -821,12 +851,11 @@ class DexFile {
 
   DexFile(const uint8_t* base,
           size_t size,
-          const uint8_t* data_begin,
-          size_t data_size,
           const std::string& location,
           uint32_t location_checksum,
           const OatDexFile* oat_dex_file,
-          std::unique_ptr<DexFileContainer> container,
+          // Shared since several dex files may be stored in the same logical container.
+          std::shared_ptr<DexFileContainer> container,
           bool is_compact_dex);
 
   // Top-level initializer that calls other Init methods.
@@ -844,11 +873,12 @@ class DexFile {
   // The size of the underlying memory allocation in bytes.
   const size_t size_;
 
-  // The base address of the data section (same as Begin() for standard dex).
-  const uint8_t* const data_begin_;
-
-  // The size of the data section.
-  const size_t data_size_;
+  // Data memory range: Most dex offsets are relative to this memory range.
+  // Standard dex: same as (begin_, size_).
+  // Compact: shared data which is located after all non-shared data.
+  //
+  // This is different to the "data section" in the standard dex header.
+  ArrayRef<const uint8_t> const data_;
 
   // Typically the dex file name when available, alternatively some identifying string.
   //
@@ -901,7 +931,7 @@ class DexFile {
   mutable const OatDexFile* oat_dex_file_;
 
   // Manages the underlying memory allocation.
-  std::unique_ptr<DexFileContainer> container_;
+  std::shared_ptr<DexFileContainer> container_;
 
   // If the dex file is a compact dex file. If false then the dex file is a standard dex file.
   const bool is_compact_dex_;

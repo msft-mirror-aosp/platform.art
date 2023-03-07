@@ -155,4 +155,25 @@ interface IArtd {
      * Returns a cancellation signal which can be used to cancel {@code dexopt} calls.
      */
     com.android.server.art.IArtdCancellationSignal createCancellationSignal();
+
+    /**
+     * Deletes all files that are managed by artd, except those specified in the arguments. Returns
+     * the size of the freed space, in bytes.
+     *
+     * For each entry in `artifactsToKeep`, all three kinds of artifacts (ODEX, VDEX, ART) are
+     * kept. For each entry in `vdexFilesToKeep`, only the VDEX file will be kept. Note that VDEX
+     * files included in `artifactsToKeep` don't have to be listed in `vdexFilesToKeep`.
+     *
+     * Throws fatal errors. Logs and ignores non-fatal errors.
+     */
+    long cleanup(in List<com.android.server.art.ProfilePath> profilesToKeep,
+            in List<com.android.server.art.ArtifactsPath> artifactsToKeep,
+            in List<com.android.server.art.VdexPath> vdexFilesToKeep);
+
+    /**
+     * Returns whether the dex file is in Incremental FS.
+     *
+     * Throws fatal errors. On non-fatal errors, logs the error and returns false.
+     */
+    boolean isIncrementalFsPath(@utf8InCpp String dexFile);
 }

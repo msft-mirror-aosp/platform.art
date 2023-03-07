@@ -356,6 +356,12 @@ std::unique_ptr<RuntimeParser> ParsedOptions::MakeParser(bool ignore_unrecognize
           .IntoKey(M::MethodTraceFileSize)
       .Define("-Xmethod-trace-stream")
           .IntoKey(M::MethodTraceStreaming)
+      .Define("-Xmethod-trace-clock:_")
+          .WithType<TraceClockSource>()
+          .WithValueMap({{"threadcpuclock", TraceClockSource::kThreadCpu},
+                         {"wallclock",      TraceClockSource::kWall},
+                         {"dualclock",      TraceClockSource::kDual}})
+          .IntoKey(M::MethodTraceClock)
       .Define("-Xcompiler:_")
           .WithType<std::string>()
           .IntoKey(M::Compiler)
@@ -668,6 +674,7 @@ bool ParsedOptions::DoParse(const RuntimeOptions& options,
 
   using M = RuntimeArgumentMap;
   RuntimeArgumentMap args = parser->ReleaseArgumentsMap();
+  bool use_default_bootclasspath = true;
 
   // -help, -showversion, etc.
   if (args.Exists(M::Help)) {
@@ -681,6 +688,7 @@ bool ParsedOptions::DoParse(const RuntimeOptions& options,
     Exit(0);
   } else if (args.Exists(M::BootClassPath)) {
     LOG(INFO) << "setting boot class path to " << args.Get(M::BootClassPath)->Join();
+    use_default_bootclasspath = false;
   }
 
   if (args.GetOrDefault(M::Interpret)) {
@@ -770,7 +778,8 @@ bool ParsedOptions::DoParse(const RuntimeOptions& options,
     args.Set(M::AllowInMemoryCompilation, Unit());
   }
 
-  if (!args.Exists(M::CompilerCallbacksPtr) && !args.Exists(M::Image)) {
+  if (!args.Exists(M::CompilerCallbacksPtr) && !args.Exists(M::Image) &&
+      use_default_bootclasspath) {
     const bool deny_art_apex_data_files = args.Exists(M::DenyArtApexDataFiles);
     std::string image_locations =
         GetDefaultBootImageLocation(GetAndroidRoot(), deny_art_apex_data_files);
