@@ -18,7 +18,6 @@ package com.android.tests.odsign;
 
 import static com.android.tradefed.testtype.DeviceJUnit4ClassRunner.TestLogData;
 
-import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.Truth.assertWithMessage;
 
 import static org.junit.Assert.assertNotNull;
@@ -37,13 +36,7 @@ import com.android.tradefed.result.FileInputStreamSource;
 import com.android.tradefed.result.LogDataType;
 import com.android.tradefed.util.CommandResult;
 
-import com.google.common.io.ByteStreams;
-
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.time.Duration;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
@@ -371,13 +364,4 @@ public class OdsignTestUtils {
         }
     }
 
-    public File copyResourceToFile(String resourceName) throws Exception {
-        File file = File.createTempFile("odsign_e2e_tests", ".tmp");
-        file.deleteOnExit();
-        try (OutputStream outputStream = new FileOutputStream(file);
-                InputStream inputStream = getClass().getResourceAsStream(resourceName)) {
-            assertThat(ByteStreams.copy(inputStream, outputStream)).isGreaterThan(0);
-        }
-        return file;
-    }
 }
