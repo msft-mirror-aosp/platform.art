@@ -1488,6 +1488,8 @@ void Heap::ThrowOutOfMemoryError(Thread* self, size_t byte_count, AllocatorType 
         Runtime::Current()->GetPreAllocatedOutOfMemoryErrorWhenHandlingStackOverflow());
     return;
   }
+  // Allow plugins to intercept out of memory errors.
+  Runtime::Current()->OutOfMemoryErrorHook();
 
   std::ostringstream oss;
   size_t total_bytes_free = GetFreeMemory();
@@ -1541,15 +1543,15 @@ void Heap::DoPendingCollectorTransition() {
     } else {
       VLOG(gc) << "Homogeneous compaction ignored due to jank perceptible process state";
     }
-  } else if (desired_collector_type == kCollectorTypeCCBackground) {
-    DCHECK(gUseReadBarrier);
+  } else if (desired_collector_type == kCollectorTypeCCBackground ||
+             desired_collector_type == kCollectorTypeCMC) {
     if (!CareAboutPauseTimes()) {
-      // Invoke CC full compaction.
+      // Invoke full compaction.
       CollectGarbageInternal(collector::kGcTypeFull,
                              kGcCauseCollectorTransition,
                              /*clear_soft_references=*/false, GC_NUM_ANY);
     } else {
-      VLOG(gc) << "CC background compaction ignored due to jank perceptible process state";
+      VLOG(gc) << "background compaction ignored due to jank perceptible process state";
     }
   } else {
     CHECK_EQ(desired_collector_type, collector_type_) << "Unsupported collector transition";

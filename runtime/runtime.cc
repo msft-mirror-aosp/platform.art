@@ -308,7 +308,8 @@ Runtime::Runtime()
       verifier_logging_threshold_ms_(100),
       verifier_missing_kthrow_fatal_(false),
       perfetto_hprof_enabled_(false),
-      perfetto_javaheapprof_enabled_(false) {
+      perfetto_javaheapprof_enabled_(false),
+      out_of_memory_error_hook_(nullptr) {
   static_assert(Runtime::kCalleeSaveSize ==
                     static_cast<uint32_t>(CalleeSaveType::kLastCalleeSaveType), "Unexpected size");
   CheckConstants();
@@ -1747,11 +1748,10 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
       break;
   }
 
+  fault_manager.Init(!no_sig_chain_);
   if (!no_sig_chain_) {
     // Dex2Oat's Runtime does not need the signal chain or the fault handler.
     if (implicit_null_checks_ || implicit_so_checks_ || implicit_suspend_checks_) {
-      fault_manager.Init();
-
       // These need to be in a specific order.  The null point check handler must be
       // after the suspend check and stack overflow check handlers.
       //
@@ -2529,17 +2529,20 @@ void Runtime::VisitReflectiveTargets(ReflectiveValueVisitor *visitor) {
 }
 
 void Runtime::VisitImageRoots(RootVisitor* visitor) {
-  for (auto* space : GetHeap()->GetContinuousSpaces()) {
-    if (space->IsImageSpace()) {
-      auto* image_space = space->AsImageSpace();
-      const auto& image_header = image_space->GetImageHeader();
-      for (int32_t i = 0, size = image_header.GetImageRoots()->GetLength(); i != size; ++i) {
-        mirror::Object* obj =
-            image_header.GetImageRoot(static_cast<ImageHeader::ImageRoot>(i)).Ptr();
-        if (obj != nullptr) {
-          mirror::Object* after_obj = obj;
-          visitor->VisitRoot(&after_obj, RootInfo(kRootStickyClass));
-          CHECK_EQ(after_obj, obj);
+  // We only confirm that image roots are unchanged.
+  if (kIsDebugBuild) {
+    for (auto* space : GetHeap()->GetContinuousSpaces()) {
+      if (space->IsImageSpace()) {
+        auto* image_space = space->AsImageSpace();
+        const auto& image_header = image_space->GetImageHeader();
+        for (int32_t i = 0, size = image_header.GetImageRoots()->GetLength(); i != size; ++i) {
+          mirror::Object* obj =
+              image_header.GetImageRoot(static_cast<ImageHeader::ImageRoot>(i)).Ptr();
+          if (obj != nullptr) {
+            mirror::Object* after_obj = obj;
+            visitor->VisitRoot(&after_obj, RootInfo(kRootStickyClass));
+            CHECK_EQ(after_obj, obj);
+          }
         }
       }
     }
@@ -3386,7 +3389,7 @@ bool Runtime::GetOatFilesExecutable() const {
 void Runtime::ProcessWeakClass(GcRoot<mirror::Class>* root_ptr,
                                IsMarkedVisitor* visitor,
                                mirror::Class* update) {
-    // This does not need a read barrier because this is called by GC.
+  // This does not need a read barrier because this is called by GC.
   mirror::Class* cls = root_ptr->Read<kWithoutReadBarrier>();
   if (cls != nullptr && cls != GetWeakClassSentinel()) {
     DCHECK((cls->IsClass<kDefaultVerifyFlags>()));
