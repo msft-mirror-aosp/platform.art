@@ -16,8 +16,6 @@
 
 #include "descriptors_names.h"
 
-#include <algorithm>
-
 #include "android-base/stringprintf.h"
 #include "android-base/strings.h"
 
