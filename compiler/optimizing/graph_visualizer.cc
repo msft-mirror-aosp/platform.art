@@ -490,6 +490,10 @@ class HGraphVisualizerPrinter : public HGraphDelegateVisitor {
     StartAttributeStream("bias") << compare->GetBias();
   }
 
+  void VisitCondition(HCondition* condition) override {
+    StartAttributeStream("bias") << condition->GetBias();
+  }
+
   void VisitInvoke(HInvoke* invoke) override {
     StartAttributeStream("dex_file_index") << invoke->GetMethodReference().index;
     ArtMethod* method = invoke->GetResolvedMethod();
@@ -764,15 +768,7 @@ class HGraphVisualizerPrinter : public HGraphDelegateVisitor {
                  instruction->IsCheckCast()) {
         StartAttributeStream("klass") << "unresolved";
       } else {
-        // The NullConstant may be added to the graph during other passes that happen between
-        // ReferenceTypePropagation and Inliner (e.g. InstructionSimplifier). If the inliner
-        // doesn't run or doesn't inline anything, the NullConstant remains untyped.
-        // So we should check NullConstants for validity only after reference type propagation.
-        DCHECK(graph_in_bad_state_ ||
-               IsDebugDump() ||
-               (!is_after_pass_ && IsPass(HGraphBuilder::kBuilderPassName)))
-            << instruction->DebugName() << instruction->GetId() << " has invalid rti "
-            << (is_after_pass_ ? "after" : "before") << " pass " << pass_name_;
+        StartAttributeStream("klass") << "invalid";
       }
     }
     if (disasm_info_ != nullptr) {

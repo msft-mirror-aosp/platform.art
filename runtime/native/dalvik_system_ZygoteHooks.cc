@@ -40,6 +40,7 @@
 #include "oat_file_manager.h"
 #include "scoped_thread_state_change-inl.h"
 #include "stack.h"
+#include "startup_completed_task.h"
 #include "thread-current-inl.h"
 #include "thread_list.h"
 #include "trace.h"
@@ -167,8 +168,9 @@ static uint32_t EnableDebugFeatures(uint32_t runtime_flags) {
     if (!vm->IsCheckJniEnabled()) {
       LOG(INFO) << "Late-enabling -Xcheck:jni";
       vm->SetCheckJniEnabled(true);
-      // There's only one thread running at this point, so only one JNIEnv to fix up.
-      Thread::Current()->GetJniEnv()->SetCheckJniEnabled(true);
+      // This is the only thread that's running at this point and the above call sets
+      // the CheckJNI flag in the corresponding `JniEnvExt`.
+      DCHECK(Thread::Current()->GetJniEnv()->IsCheckJniEnabled());
     } else {
       LOG(INFO) << "Not late-enabling -Xcheck:jni (already on)";
     }
@@ -344,6 +346,12 @@ static void ZygoteHooks_nativePostForkChild(JNIEnv* env,
   }
 
   runtime->GetHeap()->PostForkChildAction(thread);
+
+  // Setup an app startup complete task in case the app doesn't notify it
+  // through VMRuntime::notifyStartupCompleted.
+  static constexpr uint64_t kMaxAppStartupTimeNs = MsToNs(5000);  // 5 seconds
+  runtime->GetHeap()->AddHeapTask(new StartupCompletedTask(NanoTime() + kMaxAppStartupTimeNs));
+
   if (runtime->GetJit() != nullptr) {
     if (!is_system_server) {
       // System server already called the JIT cache post fork action in `nativePostForkSystemServer`.
@@ -359,6 +367,8 @@ static void ZygoteHooks_nativePostForkChild(JNIEnv* env,
     Trace::TraceOutputMode output_mode = Trace::GetOutputMode();
     Trace::TraceMode trace_mode = Trace::GetMode();
     size_t buffer_size = Trace::GetBufferSize();
+    int flags = Trace::GetFlags();
+    int interval = Trace::GetIntervalInMillis();
 
     // Just drop it.
     Trace::Abort();
@@ -386,10 +396,10 @@ static void ZygoteHooks_nativePostForkChild(JNIEnv* env,
       std::string trace_file = StringPrintf("%s/%s.trace.bin", path, proc_name.c_str());
       Trace::Start(trace_file.c_str(),
                    buffer_size,
-                   0,   // TODO: Expose flags.
+                   flags,
                    output_mode,
                    trace_mode,
-                   0);  // TODO: Expose interval.
+                   interval);
       if (thread->IsExceptionPending()) {
         ScopedObjectAccess soa(env);
         thread->ClearException();

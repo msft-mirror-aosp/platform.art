@@ -283,9 +283,10 @@ class ClassLinkerTest : public CommonRuntimeTest {
                                                klass->GetDescriptor(&temp2)));
     if (klass->IsInterface()) {
       EXPECT_TRUE(klass->IsAbstract());
-      // Check that all direct methods are static (either <clinit> or a regular static method).
+      // Check that all methods are direct and either static (<clinit> or a regular static method),
+      // or private.
       for (ArtMethod& m : klass->GetDirectMethods(kRuntimePointerSize)) {
-        EXPECT_TRUE(m.IsStatic());
+        EXPECT_TRUE(m.IsStatic() || m.IsPrivate());
         EXPECT_TRUE(m.IsDirect());
       }
     } else {
@@ -1542,12 +1543,14 @@ TEST_F(ClassLinkerTest, RegisterDexFileName) {
                                                                               data)));
   const DexFile* old_dex_file = dex_cache->GetDexFile();
 
+  auto container =
+      std::make_shared<MemoryDexFileContainer>(old_dex_file->Begin(), old_dex_file->Size());
   std::unique_ptr<DexFile> dex_file(new StandardDexFile(old_dex_file->Begin(),
                                                         old_dex_file->Size(),
                                                         location->ToModifiedUtf8(),
                                                         0u,
                                                         nullptr,
-                                                        nullptr));
+                                                        std::move(container)));
   // Make a copy of the dex cache with changed name.
   dex_cache.Assign(class_linker->AllocAndInitializeDexCache(Thread::Current(),
                                                             *dex_file,

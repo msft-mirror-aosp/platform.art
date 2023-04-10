@@ -906,12 +906,6 @@ class Runtime {
     return reinterpret_cast<mirror::Class*>(0xebadbeef);
   }
 
-  // Helper for the GC to process a weak class in a table.
-  static void ProcessWeakClass(GcRoot<mirror::Class>* root_ptr,
-                               IsMarkedVisitor* visitor,
-                               mirror::Class* update)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-
   // Create a normal LinearAlloc or low 4gb version if we are 64 bit AOT compiler.
   LinearAlloc* CreateLinearAlloc();
   // Setup linear-alloc allocators to stop using the current arena so that the
@@ -1091,8 +1085,8 @@ class Runtime {
   void ResetStartupCompleted();
 
   // Notify the runtime that application startup is considered completed. Only has effect for the
-  // first call.
-  void NotifyStartupCompleted();
+  // first call. Returns whether this was the first call.
+  bool NotifyStartupCompleted();
 
   // Notify the runtime that the application finished loading some dex/odex files. This is
   // called everytime we load a set of dex files in a class loader.
@@ -1614,7 +1608,6 @@ class Runtime {
   friend class Dex2oatImageTest;
   friend class ScopedThreadPoolUsage;
   friend class OatFileAssistantTest;
-  class NotifyStartupCompletedTask;
   class SetupLinearAllocForZygoteFork;
 
   DISALLOW_COPY_AND_ASSIGN(Runtime);

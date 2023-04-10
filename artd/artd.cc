@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -37,6 +38,7 @@
 #include <string_view>
 #include <system_error>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -56,7 +58,9 @@
 #include "base/compiler_filter.h"
 #include "base/file_utils.h"
 #include "base/globals.h"
+#include "base/logging.h"
 #include "base/os.h"
+#include "cmdline_types.h"
 #include "exec_utils.h"
 #include "file_utils.h"
 #include "fmt/format.h"
@@ -67,6 +71,10 @@
 #include "selinux/android.h"
 #include "tools/cmdline_builder.h"
 #include "tools/tools.h"
+
+#ifdef __BIONIC__
+#include <linux/incrementalfs.h>
+#endif
 
 namespace art {
 namespace artd {
@@ -192,6 +200,9 @@ OatFileAssistant::DexOptTrigger DexOptTriggerFromAidl(int32_t aidl_value) {
   }
   if ((aidl_value & static_cast<int32_t>(DexoptTrigger::PRIMARY_BOOT_IMAGE_BECOMES_USABLE)) != 0) {
     trigger.primaryBootImageBecomesUsable = true;
+  }
+  if ((aidl_value & static_cast<int32_t>(DexoptTrigger::NEED_EXTRACTION)) != 0) {
+    trigger.needExtraction = true;
   }
   return trigger;
 }
@@ -322,6 +333,22 @@ Result<void> CopyFile(const std::string& src_path, const NewFile& dst_file) {
   return {};
 }
 
+Result<void> SetLogVerbosity() {
+  std::string options = android::base::GetProperty("dalvik.vm.artd-verbose", /*default_value=*/"");
+  if (options.empty()) {
+    return {};
+  }
+
+  CmdlineType<LogVerbosity> parser;
+  CmdlineParseResult<LogVerbosity> result = parser.Parse(options);
+  if (!result.IsSuccess()) {
+    return Error() << result.GetMessage();
+  }
+
+  gLogVerbosity = result.ReleaseValue();
+  return {};
+}
+
 class FdLogger {
  public:
   void Add(const NewFile& file) { fd_mapping_.emplace_back(file.Fd(), file.TempPath()); }
@@ -329,6 +356,7 @@ class FdLogger {
 
   std::string GetFds() {
     std::vector<int> fds;
+    fds.reserve(fd_mapping_.size());
     for (const auto& [fd, path] : fd_mapping_) {
       fds.push_back(fd);
     }
@@ -380,7 +408,7 @@ ScopedAStatus Artd::deleteArtifacts(const ArtifactsPath& in_artifactsPath, int64
 
 ScopedAStatus Artd::getDexoptStatus(const std::string& in_dexFile,
                                     const std::string& in_instructionSet,
-                                    const std::string& in_classLoaderContext,
+                                    const std::optional<std::string>& in_classLoaderContext,
                                     GetDexoptStatusResult* _aidl_return) {
   Result<OatFileAssistantContext*> ofa_context = GetOatFileAssistantContext();
   if (!ofa_context.ok()) {
@@ -389,9 +417,9 @@ ScopedAStatus Artd::getDexoptStatus(const std::string& in_dexFile,
 
   std::unique_ptr<ClassLoaderContext> context;
   std::string error_msg;
-  auto oat_file_assistant = OatFileAssistant::Create(in_dexFile.c_str(),
-                                                     in_instructionSet.c_str(),
-                                                     in_classLoaderContext.c_str(),
+  auto oat_file_assistant = OatFileAssistant::Create(in_dexFile,
+                                                     in_instructionSet,
+                                                     in_classLoaderContext,
                                                      /*load_executable=*/false,
                                                      /*only_load_trusted_executable=*/true,
                                                      ofa_context.value(),
@@ -550,7 +578,8 @@ ndk::ScopedAStatus Artd::deleteProfile(const ProfilePath& in_profile) {
   std::string profile_path = OR_RETURN_FATAL(BuildProfileOrDmPath(in_profile));
 
   std::error_code ec;
-  if (!std::filesystem::remove(profile_path, ec) && ec.value() != ENOENT) {
+  std::filesystem::remove(profile_path, ec);
+  if (ec) {
     LOG(ERROR) << "Failed to remove '{}': {}"_format(profile_path, ec.message());
   }
 
@@ -926,6 +955,9 @@ ndk::ScopedAStatus Artd::dexopt(
       in_instructionSet, in_compilerFilter, in_priorityClass, in_dexoptOptions, args);
   AddPerfConfigFlags(in_priorityClass, art_exec_args, args);
 
+  // For being surfaced in crash reports on crashes.
+  args.Add("--comments=%s", in_dexoptOptions.comments);
+
   art_exec_args.Add("--keep-fds=%s", fd_logger.GetFds()).Add("--").Concat(std::move(args));
 
   LOG(INFO) << "Running dex2oat: " << Join(art_exec_args.Get(), /*separator=*/" ")
@@ -1008,7 +1040,54 @@ ScopedAStatus Artd::createCancellationSignal(
   return ScopedAStatus::ok();
 }
 
+ScopedAStatus Artd::cleanup(const std::vector<ProfilePath>& in_profilesToKeep,
+                            const std::vector<ArtifactsPath>& in_artifactsToKeep,
+                            const std::vector<VdexPath>& in_vdexFilesToKeep,
+                            int64_t* _aidl_return) {
+  std::unordered_set<std::string> files_to_keep;
+  for (const ProfilePath& profile : in_profilesToKeep) {
+    files_to_keep.insert(OR_RETURN_FATAL(BuildProfileOrDmPath(profile)));
+  }
+  for (const ArtifactsPath& artifacts : in_artifactsToKeep) {
+    std::string oat_path = OR_RETURN_FATAL(BuildOatPath(artifacts));
+    files_to_keep.insert(OatPathToVdexPath(oat_path));
+    files_to_keep.insert(OatPathToArtPath(oat_path));
+    files_to_keep.insert(std::move(oat_path));
+  }
+  for (const VdexPath& vdex : in_vdexFilesToKeep) {
+    files_to_keep.insert(OR_RETURN_FATAL(BuildVdexPath(vdex)));
+  }
+  *_aidl_return = 0;
+  for (const std::string& file : OR_RETURN_NON_FATAL(ListManagedFiles())) {
+    if (files_to_keep.find(file) == files_to_keep.end()) {
+      LOG(INFO) << "Cleaning up obsolete file '{}'"_format(file);
+      *_aidl_return += GetSizeAndDeleteFile(file);
+    }
+  }
+  return ScopedAStatus::ok();
+}
+
+ScopedAStatus Artd::isIncrementalFsPath(const std::string& in_dexFile [[maybe_unused]],
+                                        bool* _aidl_return) {
+#ifdef __BIONIC__
+  OR_RETURN_FATAL(ValidateDexPath(in_dexFile));
+  struct statfs st;
+  if (statfs(in_dexFile.c_str(), &st) != 0) {
+    PLOG(ERROR) << "Failed to statfs '{}'"_format(in_dexFile);
+    *_aidl_return = false;
+    return ScopedAStatus::ok();
+  }
+  *_aidl_return = st.f_type == INCFS_MAGIC_NUMBER;
+  return ScopedAStatus::ok();
+#else
+  *_aidl_return = false;
+  return ScopedAStatus::ok();
+#endif
+}
+
 Result<void> Artd::Start() {
+  OR_RETURN(SetLogVerbosity());
+
   ScopedAStatus status = ScopedAStatus::fromStatus(
       AServiceManager_registerLazyService(this->asBinder().get(), kServiceName));
   if (!status.isOk()) {

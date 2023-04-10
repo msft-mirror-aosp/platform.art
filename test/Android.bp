@@ -94,6 +94,9 @@ art_module_cc_defaults {
         android_arm64: {
             relative_install_path: "art/arm64",
         },
+        android_riscv64: {
+            relative_install_path: "art/riscv64",
+        },
         android_x86: {
             relative_install_path: "art/x86",
         },
@@ -123,6 +126,9 @@ art_cc_defaults {
             relative_install_path: "com.android.art/lib",
         },
         android_arm64: {
+            relative_install_path: "com.android.art/lib64",
+        },
+        android_riscv64: {
             relative_install_path: "com.android.art/lib64",
         },
         android_x86: {
@@ -381,6 +387,7 @@ art_cc_defaults {
         // apex_available lists need to be the same for internal libs to avoid
         // stubs, and this depends on libdexfiled and others.
         "com.android.art",
+        "test_broken_com.android.art",
     ],
 }
 
@@ -447,6 +454,7 @@ art_cc_defaults {
         // apex_available lists need to be the same for internal libs to avoid
         // stubs, and this depends on libdexfiled and others.
         "com.android.art",
+        "test_broken_com.android.art",
     ],
 }
 

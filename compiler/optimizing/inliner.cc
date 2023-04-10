@@ -182,7 +182,7 @@ bool HInliner::Run() {
       HInstruction* next = instruction->GetNext();
       HInvoke* call = instruction->AsInvoke();
       // As long as the call is not intrinsified, it is worth trying to inline.
-      if (call != nullptr && call->GetIntrinsic() == Intrinsics::kNone) {
+      if (call != nullptr && !codegen_->IsImplementedIntrinsic(call)) {
         if (honor_noinline_directives) {
           // Debugging case: directives in method names control or assert on inlining.
           std::string callee_name =
@@ -1272,6 +1272,13 @@ bool HInliner::TryDevirtualize(HInvoke* invoke_instruction,
     return false;
   }
 
+  // Don't try to devirtualize intrinsics as it breaks pattern matching from later phases.
+  // TODO(solanes): This `if` could be removed if we update optimizations like
+  // TryReplaceStringBuilderAppend.
+  if (invoke_instruction->IsIntrinsic()) {
+    return false;
+  }
+
   // Don't bother trying to call directly a default conflict method. It
   // doesn't have a proper MethodReference, but also `GetCanonicalMethod`
   // will return an actual default implementation.
@@ -1327,7 +1334,7 @@ bool HInliner::TryDevirtualize(HInvoke* invoke_instruction,
   invoke_instruction->GetBlock()->InsertInstructionBefore(new_invoke, invoke_instruction);
   new_invoke->CopyEnvironmentFrom(invoke_instruction->GetEnvironment());
   if (invoke_instruction->GetType() == DataType::Type::kReference) {
-    new_invoke->SetReferenceTypeInfo(invoke_instruction->GetReferenceTypeInfo());
+    new_invoke->SetReferenceTypeInfoIfValid(invoke_instruction->GetReferenceTypeInfo());
   }
   *replacement = new_invoke;
 
@@ -1344,7 +1351,7 @@ bool HInliner::TryInlineAndReplace(HInvoke* invoke_instruction,
                                    ReferenceTypeInfo receiver_type,
                                    bool do_rtp,
                                    bool is_speculative) {
-  DCHECK(!invoke_instruction->IsIntrinsic());
+  DCHECK(!codegen_->IsImplementedIntrinsic(invoke_instruction));
   HInstruction* return_replacement = nullptr;
 
   if (!TryBuildAndInline(
@@ -1529,7 +1536,7 @@ bool HInliner::TryBuildAndInline(HInvoke* invoke_instruction,
     invoke_instruction->GetBlock()->InsertInstructionBefore(new_invoke, invoke_instruction);
     new_invoke->CopyEnvironmentFrom(invoke_instruction->GetEnvironment());
     if (invoke_instruction->GetType() == DataType::Type::kReference) {
-      new_invoke->SetReferenceTypeInfo(invoke_instruction->GetReferenceTypeInfo());
+      new_invoke->SetReferenceTypeInfoIfValid(invoke_instruction->GetReferenceTypeInfo());
     }
     *return_replacement = new_invoke;
     return true;
@@ -1688,7 +1695,7 @@ bool HInliner::TryPatternSubstitution(HInvoke* invoke_instruction,
       bool needs_constructor_barrier = false;
       for (size_t i = 0; i != number_of_iputs; ++i) {
         HInstruction* value = GetInvokeInputForArgVRegIndex(invoke_instruction, iput_args[i]);
-        if (!value->IsConstant() || !value->AsConstant()->IsZeroBitPattern()) {
+        if (!IsZeroBitPattern(value)) {
           uint16_t field_index = iput_field_indexes[i];
           bool is_final;
           HInstanceFieldSet* iput =
@@ -1855,7 +1862,7 @@ void HInliner::SubstituteArguments(HGraph* callee_graph,
           run_rtp = true;
           current->SetReferenceTypeInfo(receiver_type);
         } else {
-          current->SetReferenceTypeInfo(argument->GetReferenceTypeInfo());
+          current->SetReferenceTypeInfoIfValid(argument->GetReferenceTypeInfo());
         }
         current->AsParameterValue()->SetCanBeNull(argument->CanBeNull());
       }
@@ -2251,6 +2258,10 @@ static bool IsReferenceTypeRefinement(ObjPtr<mirror::Class> declared_class,
   }
 
   ReferenceTypeInfo actual_rti = actual_obj->GetReferenceTypeInfo();
+  if (!actual_rti.IsValid()) {
+    return false;
+  }
+
   ObjPtr<mirror::Class> actual_class = actual_rti.GetTypeHandle().Get();
   return (actual_rti.IsExact() && !declared_is_exact) ||
          (declared_class != actual_class && declared_class->IsAssignableFrom(actual_class));

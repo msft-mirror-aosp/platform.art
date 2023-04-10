@@ -77,6 +77,7 @@
 #include "handle_scope-inl.h"
 #include "indirect_reference_table-inl.h"
 #include "instrumentation.h"
+#include "intern_table.h"
 #include "interpreter/interpreter.h"
 #include "interpreter/shadow_frame-inl.h"
 #include "java_frame_root_info.h"
@@ -214,7 +215,9 @@ class DeoptimizationContextRecord {
   JValue GetReturnValue() const { return ret_val_; }
   bool IsReference() const { return is_reference_; }
   bool GetFromCode() const { return from_code_; }
-  ObjPtr<mirror::Throwable> GetPendingException() const { return pending_exception_; }
+  ObjPtr<mirror::Throwable> GetPendingException() const REQUIRES_SHARED(Locks::mutator_lock_) {
+    return pending_exception_;
+  }
   DeoptimizationContextRecord* GetLink() const { return link_; }
   mirror::Object** GetReturnValueAsGCRoot() {
     DCHECK(is_reference_);
@@ -1497,7 +1500,7 @@ bool Thread::ModifySuspendCountInternal(Thread* self,
     return false;
   }
 
-  if (gUseReadBarrier && delta > 0 && this != self && tlsPtr_.flip_function != nullptr) {
+  if (delta > 0 && this != self && tlsPtr_.flip_function != nullptr) {
     // Force retry of a suspend request if it's in the middle of a thread flip to avoid a
     // deadlock. b/31683379.
     return false;
@@ -1970,9 +1973,11 @@ void Thread::DumpState(std::ostream& os, const Thread* thread, pid_t tid) {
         WellKnownClasses::java_lang_Thread_group->GetObject(thread->tlsPtr_.opeer);
 
     if (thread_group != nullptr) {
-      ObjPtr<mirror::String> group_name_string =
-          WellKnownClasses::java_lang_ThreadGroup_name->GetObject(thread_group)->AsString();
-      group_name = (group_name_string != nullptr) ? group_name_string->ToModifiedUtf8() : "<null>";
+      ObjPtr<mirror::Object> group_name_object =
+          WellKnownClasses::java_lang_ThreadGroup_name->GetObject(thread_group);
+      group_name = (group_name_object != nullptr)
+          ? group_name_object->AsString()->ToModifiedUtf8()
+          : "<null>";
     }
   } else if (thread != nullptr) {
     priority = thread->GetNativePriority();
@@ -2764,27 +2769,15 @@ void Thread::HandleScopeVisitRoots(RootVisitor* visitor, uint32_t thread_id) {
   }
 }
 
-ObjPtr<mirror::Object> Thread::DecodeJObject(jobject obj) const {
-  if (obj == nullptr) {
-    return nullptr;
-  }
+ObjPtr<mirror::Object> Thread::DecodeGlobalJObject(jobject obj) const {
+  DCHECK(obj != nullptr);
   IndirectRef ref = reinterpret_cast<IndirectRef>(obj);
   IndirectRefKind kind = IndirectReferenceTable::GetIndirectRefKind(ref);
+  DCHECK_NE(kind, kJniTransition);
+  DCHECK_NE(kind, kLocal);
   ObjPtr<mirror::Object> result;
   bool expect_null = false;
-  // The "kinds" below are sorted by the frequency we expect to encounter them.
-  if (kind == kLocal) {
-    jni::LocalReferenceTable& locals = tlsPtr_.jni_env->locals_;
-    // Local references do not need a read barrier.
-    result = locals.Get(ref);
-  } else if (kind == kJniTransition) {
-    // The `jclass` for a static method points to the CompressedReference<> in the
-    // `ArtMethod::declaring_class_`. Other `jobject` arguments point to spilled stack
-    // references but a StackReference<> is just a subclass of CompressedReference<>.
-    DCHECK(IsJniTransitionReference(obj));
-    result = reinterpret_cast<mirror::CompressedReference<mirror::Object>*>(obj)->AsMirrorPtr();
-    VerifyObject(result);
-  } else if (kind == kGlobal) {
+  if (kind == kGlobal) {
     result = tlsPtr_.jni_env->vm_->DecodeGlobal(ref);
   } else {
     DCHECK_EQ(kind, kWeakGlobal);
@@ -4016,14 +4009,11 @@ class ReferenceMapVisitor : public StackVisitor {
  public:
   ReferenceMapVisitor(Thread* thread, Context* context, RootVisitor& visitor)
       REQUIRES_SHARED(Locks::mutator_lock_)
-        // We are visiting the references in compiled frames, so we do not need
-        // to know the inlined frames.
+      // We are visiting the references in compiled frames, so we do not need
+      // to know the inlined frames.
       : StackVisitor(thread, context, StackVisitor::StackWalkKind::kSkipInlinedFrames),
-        visitor_(visitor) {
-    gc::Heap* const heap = Runtime::Current()->GetHeap();
-    visit_declaring_class_ = heap->CurrentCollectorType() != gc::CollectorType::kCollectorTypeCMC
-                             || !heap->MarkCompactCollector()->IsCompacting(Thread::Current());
-  }
+        visitor_(visitor),
+        visit_declaring_class_(!Runtime::Current()->GetHeap()->IsPerformingUffdCompaction()) {}
 
   bool VisitFrame() override REQUIRES_SHARED(Locks::mutator_lock_) {
     if (false) {
@@ -4466,15 +4456,16 @@ static void SweepCacheEntry(IsMarkedVisitor* visitor, const Instruction* inst, s
     case Opcode::INSTANCE_OF:
     case Opcode::NEW_ARRAY:
     case Opcode::CONST_CLASS: {
-      mirror::Class* cls = reinterpret_cast<mirror::Class*>(*value);
-      if (cls == nullptr || cls == Runtime::GetWeakClassSentinel()) {
-        // Entry got deleted in a previous sweep.
+      mirror::Class* klass = reinterpret_cast<mirror::Class*>(*value);
+      if (klass == nullptr || klass == Runtime::GetWeakClassSentinel()) {
         return;
       }
-      Runtime::ProcessWeakClass(
-          reinterpret_cast<GcRoot<mirror::Class>*>(value),
-          visitor,
-          Runtime::GetWeakClassSentinel());
+      mirror::Class* new_klass = down_cast<mirror::Class*>(visitor->IsMarked(klass));
+      if (new_klass == nullptr) {
+        *value = reinterpret_cast<size_t>(Runtime::GetWeakClassSentinel());
+      } else if (new_klass != klass) {
+        *value = reinterpret_cast<size_t>(new_klass);
+      }
       return;
     }
     case Opcode::CONST_STRING:
@@ -4486,10 +4477,25 @@ static void SweepCacheEntry(IsMarkedVisitor* visitor, const Instruction* inst, s
       mirror::Object* new_object = visitor->IsMarked(object);
       // We know the string is marked because it's a strongly-interned string that
       // is always alive (see b/117621117 for trying to make those strings weak).
-      // The IsMarked implementation of the CMS collector returns
-      // null for newly allocated objects, but we know those haven't moved. Therefore,
-      // only update the entry if we get a different non-null string.
-      if (new_object != nullptr && new_object != object) {
+      if (kIsDebugBuild && new_object == nullptr) {
+        // (b/275005060) Currently the problem is reported only on CC GC.
+        // Therefore we log it with more information. But since the failure rate
+        // is quite high, sampling it.
+        if (gUseReadBarrier) {
+          Runtime* runtime = Runtime::Current();
+          gc::collector::ConcurrentCopying* cc = runtime->GetHeap()->ConcurrentCopyingCollector();
+          CHECK_NE(cc, nullptr);
+          LOG(FATAL) << cc->DumpReferenceInfo(object, "string")
+                     << " string interned: " << std::boolalpha
+                     << runtime->GetInternTable()->LookupStrong(Thread::Current(),
+                                                                down_cast<mirror::String*>(object))
+                     << std::noboolalpha;
+        } else {
+          // Other GCs
+          LOG(FATAL) << __FUNCTION__
+                     << ": IsMarked returned null for a strongly interned string: " << object;
+        }
+      } else if (new_object != object) {
         *value = reinterpret_cast<size_t>(new_object);
       }
       return;

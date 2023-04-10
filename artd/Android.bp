@@ -31,17 +31,17 @@ cc_defaults {
         "path_utils.cc",
     ],
     header_libs: [
+        "art_cmdlineparser_headers",
         "profman_headers",
     ],
     shared_libs: [
-        "libarttools",
+        "libarttools", // Contains "libc++fs".
         "libbase",
         "libbinder_ndk",
         "libselinux",
     ],
     static_libs: [
         "artd-aidl-ndk",
-        "libc++fs",
     ],
 }
 

@@ -39,6 +39,7 @@ cc_defaults {
                 "libz",
             ],
             static_libs: [
+                "libmodules-utils-build",
                 // ZipArchive support, the order matters here to get all symbols.
                 "libziparchive",
             ],
@@ -133,6 +134,7 @@ art_cc_library {
     apex_available: [
         "com.android.art",
         "com.android.art.debug",
+        "test_broken_com.android.art",
     ],
 }
 
@@ -168,6 +170,7 @@ art_cc_library {
         // apex_available lists need to be the same for internal libs to avoid
         // stubs, and libartd depends on this.
         "com.android.art",
+        "test_broken_com.android.art",
     ],
 }
 
