@@ -23,15 +23,12 @@
 #include "quick/quick_method_frame_info.h"
 #include "thread-current-inl.h"
 
-#if __has_feature(hwaddress_sanitizer)
-#include <sanitizer/hwasan_interface.h>
-#else
-#define __hwasan_handle_longjmp(sp)
-#endif
 
 #if defined(__aarch64__) && defined(__BIONIC__)
 #include <bionic/malloc.h>
 #endif
+
+extern "C" __attribute__((weak)) void __hwasan_handle_longjmp(const void* sp_dst);
 
 namespace art {
 namespace arm64 {
@@ -45,8 +42,8 @@ void Arm64Context::Reset() {
   gprs_[kPC] = &pc_;
   gprs_[X0] = &arg0_;
   // Initialize registers with easy to spot debug values.
-  sp_ = Arm64Context::kBadGprBase + SP;
-  pc_ = Arm64Context::kBadGprBase + kPC;
+  sp_ = kBadGprBase + SP;
+  pc_ = kBadGprBase + kPC;
   arg0_ = 0;
 }
 
@@ -156,10 +153,10 @@ __attribute__((no_sanitize("memtag"))) void Arm64Context::DoLongJump() {
   DCHECK_EQ(SP, 31);
 
   for (size_t i = 0; i < arraysize(gprs_); ++i) {
-    gprs[i] = gprs_[i] != nullptr ? *gprs_[i] : Arm64Context::kBadGprBase + i;
+    gprs[i] = gprs_[i] != nullptr ? *gprs_[i] : kBadGprBase + i;
   }
   for (size_t i = 0; i < kNumberOfDRegisters; ++i) {
-    fprs[i] = fprs_[i] != nullptr ? *fprs_[i] : Arm64Context::kBadFprBase + i;
+    fprs[i] = fprs_[i] != nullptr ? *fprs_[i] : kBadFprBase + i;
   }
   // Ensure the Thread Register contains the address of the current thread.
   DCHECK_EQ(reinterpret_cast<uintptr_t>(Thread::Current()), gprs[TR]);
@@ -171,7 +168,8 @@ __attribute__((no_sanitize("memtag"))) void Arm64Context::DoLongJump() {
     untag_memory(__builtin_frame_address(0), reinterpret_cast<void*>(gprs[SP]));
 #endif
   // Tell HWASan about the new stack top.
-  __hwasan_handle_longjmp(reinterpret_cast<void*>(gprs[SP]));
+  if (__hwasan_handle_longjmp != nullptr)
+    __hwasan_handle_longjmp(reinterpret_cast<void*>(gprs[SP]));
   // The Marking Register will be updated by art_quick_do_long_jump.
   art_quick_do_long_jump(gprs, fprs);
 }

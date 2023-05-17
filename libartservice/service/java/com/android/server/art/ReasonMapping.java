@@ -21,17 +21,20 @@ import static com.android.server.art.model.ArtFlags.PriorityClassApi;
 import android.annotation.NonNull;
 import android.annotation.StringDef;
 import android.annotation.SystemApi;
+import android.os.Build;
 import android.os.SystemProperties;
 import android.text.TextUtils;
+
+import androidx.annotation.RequiresApi;
 
 import com.android.server.art.model.ArtFlags;
 import com.android.server.pm.PackageManagerLocal;
 
 import dalvik.system.DexFile;
 
-import java.util.Set;
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
+import java.util.Set;
 
 /**
  * Maps a compilation reason to a compiler filter and a priority class.
@@ -39,8 +42,11 @@ import java.lang.annotation.RetentionPolicy;
  * @hide
  */
 @SystemApi(client = SystemApi.Client.SYSTEM_SERVER)
+@RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
 public class ReasonMapping {
     private ReasonMapping() {}
+
+    // Keep this in sync with `ArtShellCommand.printHelp` except for 'inactive'.
 
     /** Dexopting apps on the first boot after flashing or factory resetting the device. */
     public static final String REASON_FIRST_BOOT = "first-boot";
@@ -69,6 +75,11 @@ public class ReasonMapping {
     public static final Set<String> REASONS_FOR_INSTALL = Set.of(REASON_INSTALL,
             REASON_INSTALL_FAST, REASON_INSTALL_BULK, REASON_INSTALL_BULK_SECONDARY,
             REASON_INSTALL_BULK_DOWNGRADED, REASON_INSTALL_BULK_SECONDARY_DOWNGRADED);
+
+    // Keep this in sync with `ArtShellCommand.printHelp`.
+    /** @hide */
+    public static final Set<String> BATCH_DEXOPT_REASONS = Set.of(REASON_FIRST_BOOT,
+            REASON_BOOT_AFTER_OTA, REASON_BOOT_AFTER_MAINLINE_UPDATE, REASON_BG_DEXOPT);
 
     /**
      * Reasons for {@link ArtManagerLocal#dexoptPackages}.

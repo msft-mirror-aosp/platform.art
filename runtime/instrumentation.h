@@ -289,10 +289,10 @@ class Instrumentation {
 
   // Enable method tracing by installing instrumentation entry/exit stubs or interpreter.
   void EnableMethodTracing(const char* key,
+                           InstrumentationListener* listener,
                            bool needs_interpreter = kDeoptimizeForAccurateMethodEntryExitListeners)
       REQUIRES(Locks::mutator_lock_, Roles::uninterruptible_)
-      REQUIRES(!Locks::thread_list_lock_,
-               !Locks::classlinker_classes_lock_);
+          REQUIRES(!Locks::thread_list_lock_, !Locks::classlinker_classes_lock_);
 
   // Disable method tracing by uninstalling instrumentation entry/exit stubs or interpreter.
   void DisableMethodTracing(const char* key)
@@ -523,23 +523,12 @@ class Instrumentation {
                           DeoptimizationMethodType type,
                           JValue result,
                           bool is_ref) REQUIRES_SHARED(Locks::mutator_lock_);
-  // TODO(mythria): Update uses of ShouldDeoptimizeCaller that takes a visitor by a method that
-  // doesn't need to walk the stack. This is used on method exits to check if the caller needs a
-  // deoptimization.
-  bool ShouldDeoptimizeCaller(Thread* self, const NthCallerVisitor& visitor)
-      REQUIRES_SHARED(Locks::mutator_lock_);
   // This returns if the caller of runtime method requires a deoptimization. This checks both if the
   // method requires a deopt or if this particular frame needs a deopt because of a class
   // redefinition.
   bool ShouldDeoptimizeCaller(Thread* self, ArtMethod** sp) REQUIRES_SHARED(Locks::mutator_lock_);
   bool ShouldDeoptimizeCaller(Thread* self, ArtMethod** sp, size_t frame_size)
       REQUIRES_SHARED(Locks::mutator_lock_);
-  // This is a helper function used by the two variants of ShouldDeoptimizeCaller.
-  // Remove this once ShouldDeoptimizeCaller is updated not to use NthCallerVisitor.
-  bool ShouldDeoptimizeCaller(Thread* self,
-                              ArtMethod* caller,
-                              uintptr_t caller_pc,
-                              uintptr_t caller_sp) REQUIRES_SHARED(Locks::mutator_lock_);
   // This returns if the specified method requires a deoptimization. This doesn't account if a stack
   // frame involving this method requires a deoptimization.
   bool NeedsSlowInterpreterForMethod(Thread* self, ArtMethod* method)
@@ -769,7 +758,7 @@ class Instrumentation {
 
   friend class InstrumentationTest;  // For GetCurrentInstrumentationLevel and ConfigureStubs.
   friend class InstrumentationStackPopper;  // For popping instrumentation frames.
-  friend void InstrumentationInstallStack(Thread*, void*, bool);
+  friend void InstrumentationInstallStack(Thread*, bool);
 
   DISALLOW_COPY_AND_ASSIGN(Instrumentation);
 };

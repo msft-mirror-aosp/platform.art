@@ -82,13 +82,14 @@ public class PrimaryDexopterTest extends PrimaryDexopterTestBase {
             AidlUtils.buildProfilePathForPrimaryRef(PKG_NAME, "split_0.split");
 
     private final int mDefaultDexoptTrigger = DexoptTrigger.COMPILER_FILTER_IS_BETTER
-            | DexoptTrigger.PRIMARY_BOOT_IMAGE_BECOMES_USABLE;
+            | DexoptTrigger.PRIMARY_BOOT_IMAGE_BECOMES_USABLE | DexoptTrigger.NEED_EXTRACTION;
     private final int mBetterOrSameDexoptTrigger = DexoptTrigger.COMPILER_FILTER_IS_BETTER
             | DexoptTrigger.COMPILER_FILTER_IS_SAME
-            | DexoptTrigger.PRIMARY_BOOT_IMAGE_BECOMES_USABLE;
+            | DexoptTrigger.PRIMARY_BOOT_IMAGE_BECOMES_USABLE | DexoptTrigger.NEED_EXTRACTION;
     private final int mForceDexoptTrigger = DexoptTrigger.COMPILER_FILTER_IS_BETTER
             | DexoptTrigger.PRIMARY_BOOT_IMAGE_BECOMES_USABLE
-            | DexoptTrigger.COMPILER_FILTER_IS_SAME | DexoptTrigger.COMPILER_FILTER_IS_WORSE;
+            | DexoptTrigger.COMPILER_FILTER_IS_SAME | DexoptTrigger.COMPILER_FILTER_IS_WORSE
+            | DexoptTrigger.NEED_EXTRACTION;
 
     private final MergeProfileOptions mMergeProfileOptions = new MergeProfileOptions();
 
@@ -512,7 +513,7 @@ public class PrimaryDexopterTest extends PrimaryDexopterTestBase {
     public void testDexoptCancelledDuringDexopt() throws Exception {
         Semaphore dexoptStarted = new Semaphore(0);
         Semaphore dexoptCancelled = new Semaphore(0);
-        final long TIMEOUT_SEC = 1;
+        final long TIMEOUT_SEC = 10;
 
         var artdCancellationSignal = mock(IArtdCancellationSignal.class);
         when(mArtd.createCancellationSignal()).thenReturn(artdCancellationSignal);

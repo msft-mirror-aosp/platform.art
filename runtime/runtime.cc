@@ -212,6 +212,7 @@ struct TraceConfig {
   Trace::TraceOutputMode trace_output_mode;
   std::string trace_file;
   size_t trace_file_size;
+  TraceClockSource clock_source;
 };
 
 namespace {
@@ -713,35 +714,20 @@ void Runtime::Abort(const char* msg) {
 }
 
 /**
- * Update entrypoints (native and Java) of methods before the first fork. This
+ * Update entrypoints of methods before the first fork. This
  * helps sharing pages where ArtMethods are allocated between the zygote and
  * forked apps.
  */
 class UpdateMethodsPreFirstForkVisitor : public ClassVisitor {
  public:
-  UpdateMethodsPreFirstForkVisitor(Thread* self, ClassLinker* class_linker)
-      : vm_(down_cast<JNIEnvExt*>(self->GetJniEnv())->GetVm()),
-        self_(self),
-        class_linker_(class_linker),
+  explicit UpdateMethodsPreFirstForkVisitor(ClassLinker* class_linker)
+      : class_linker_(class_linker),
         can_use_nterp_(interpreter::CanRuntimeUseNterp()) {}
 
   bool operator()(ObjPtr<mirror::Class> klass) override REQUIRES_SHARED(Locks::mutator_lock_) {
     bool is_initialized = klass->IsVisiblyInitialized();
     for (ArtMethod& method : klass->GetDeclaredMethods(kRuntimePointerSize)) {
-      if (is_initialized || !method.NeedsClinitCheckBeforeCall()) {
-        if (method.IsNative()) {
-          const void* existing = method.GetEntryPointFromJni();
-          if (method.IsCriticalNative()
-                  ? class_linker_->IsJniDlsymLookupCriticalStub(existing)
-                  : class_linker_->IsJniDlsymLookupStub(existing)) {
-            const void* native_code =
-                vm_->FindCodeForNativeMethod(&method, /*error_msg=*/ nullptr, /*can_suspend=*/ false);
-            if (native_code != nullptr) {
-              class_linker_->RegisterNative(self_, &method, native_code);
-            }
-          }
-        }
-      } else if (can_use_nterp_) {
+      if (!is_initialized && method.NeedsClinitCheckBeforeCall() && can_use_nterp_) {
         const void* existing = method.GetEntryPointFromQuickCompiledCode();
         if (class_linker_->IsQuickResolutionStub(existing) && CanMethodUseNterp(&method)) {
           method.SetEntryPointFromQuickCompiledCode(interpreter::GetNterpWithClinitEntryPoint());
@@ -752,8 +738,6 @@ class UpdateMethodsPreFirstForkVisitor : public ClassVisitor {
   }
 
  private:
-  JavaVMExt* const vm_;
-  Thread* const self_;
   ClassLinker* const class_linker_;
   const bool can_use_nterp_;
 
@@ -774,7 +758,7 @@ void Runtime::PreZygoteFork() {
     class_linker_->MakeInitializedClassesVisiblyInitialized(self, /*wait=*/ true);
 
     ScopedObjectAccess soa(self);
-    UpdateMethodsPreFirstForkVisitor visitor(self, class_linker_);
+    UpdateMethodsPreFirstForkVisitor visitor(class_linker_);
     class_linker_->VisitClasses(&visitor);
   }
   heap_->PreZygoteFork();
@@ -810,7 +794,9 @@ void Runtime::SweepSystemWeaks(IsMarkedVisitor* visitor) {
   GetMonitorList()->SweepMonitorList(visitor);
   GetJavaVM()->SweepJniWeakGlobals(visitor);
   GetHeap()->SweepAllocationRecords(visitor);
-  if (GetJit() != nullptr) {
+  // Sweep JIT tables only if the GC is moving as in other cases the entries are
+  // not updated.
+  if (GetJit() != nullptr && GetHeap()->IsMovingGc()) {
     // Visit JIT literal tables. Objects in these tables are classes and strings
     // and only classes can be affected by class unloading. The strings always
     // stay alive as they are strongly interned.
@@ -968,6 +954,9 @@ bool Runtime::Start() {
 
   started_ = true;
 
+  // Before running any clinit, set up the native methods provided by the runtime itself.
+  RegisterRuntimeNativeMethods(self->GetJniEnv());
+
   class_linker_->RunEarlyRootClinits(self);
   InitializeIntrinsics();
 
@@ -1060,9 +1049,20 @@ bool Runtime::Start() {
 
   if (trace_config_.get() != nullptr && trace_config_->trace_file != "") {
     ScopedThreadStateChange tsc(self, ThreadState::kWaitingForMethodTracingStart);
+    int flags = 0;
+    if (trace_config_->clock_source == TraceClockSource::kDual) {
+      flags = Trace::TraceFlag::kTraceClockSourceWallClock |
+              Trace::TraceFlag::kTraceClockSourceThreadCpu;
+    } else if (trace_config_->clock_source == TraceClockSource::kWall) {
+      flags = Trace::TraceFlag::kTraceClockSourceWallClock;
+    } else if (TraceClockSource::kThreadCpu == trace_config_->clock_source) {
+      flags = Trace::TraceFlag::kTraceClockSourceThreadCpu;
+    } else {
+      LOG(ERROR) << "Unexpected clock source";
+    }
     Trace::Start(trace_config_->trace_file.c_str(),
                  static_cast<int>(trace_config_->trace_file_size),
-                 0,
+                 flags,
                  trace_config_->trace_output_mode,
                  trace_config_->trace_mode,
                  0);
@@ -1279,7 +1279,6 @@ static size_t OpenBootDexFiles(ArrayRef<const std::string> dex_filenames,
                                std::vector<std::unique_ptr<const DexFile>>* dex_files) {
   DCHECK(dex_files != nullptr) << "OpenDexFiles: out-param is nullptr";
   size_t failure_count = 0;
-  const ArtDexFileLoader dex_file_loader;
   for (size_t i = 0; i < dex_filenames.size(); i++) {
     const char* dex_filename = dex_filenames[i].c_str();
     const char* dex_location = dex_locations[i].c_str();
@@ -1291,13 +1290,8 @@ static size_t OpenBootDexFiles(ArrayRef<const std::string> dex_filenames,
       continue;
     }
     bool verify = Runtime::Current()->IsVerificationEnabled();
-    if (!dex_file_loader.Open(dex_filename,
-                              dex_fd,
-                              dex_location,
-                              verify,
-                              kVerifyChecksum,
-                              &error_msg,
-                              dex_files)) {
+    ArtDexFileLoader dex_file_loader(dex_filename, dex_fd, dex_location);
+    if (!dex_file_loader.Open(verify, kVerifyChecksum, &error_msg, dex_files)) {
       LOG(WARNING) << "Failed to open .dex from file '" << dex_filename << "' / fd " << dex_fd
                    << ": " << error_msg;
       ++failure_count;
@@ -1766,9 +1760,8 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
       break;
   }
 
+  fault_manager.Init(!no_sig_chain_);
   if (!no_sig_chain_) {
-    fault_manager.Init();
-
     if (HandlesSignalsInCompiledCode()) {
       // These need to be in a specific order.  The null point check handler must be
       // after the suspend check and stack overflow check handlers.
@@ -1928,9 +1921,10 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
     trace_config_->trace_output_mode = runtime_options.Exists(Opt::MethodTraceStreaming) ?
         Trace::TraceOutputMode::kStreaming :
         Trace::TraceOutputMode::kFile;
+    trace_config_->clock_source = runtime_options.GetOrDefault(Opt::MethodTraceClock);
   }
 
-  // TODO: move this to just be an Trace::Start argument
+  // TODO: Remove this in a follow up CL. This isn't used anywhere.
   Trace::SetDefaultClockSource(runtime_options.GetOrDefault(Opt::ProfileClock));
 
   if (GetHeap()->HasBootImageSpace()) {
@@ -2174,9 +2168,6 @@ void Runtime::InitNativeMethods() {
   // Must be in the kNative state for calling native methods (JNI_OnLoad code).
   CHECK_EQ(self->GetState(), ThreadState::kNative);
 
-  // Set up the native methods provided by the runtime itself.
-  RegisterRuntimeNativeMethods(env);
-
   // Then set up libjavacore / libopenjdk / libicu_jni ,which are just
   // a regular JNI libraries with a regular JNI_OnLoad. Most JNI libraries can
   // just use System.loadLibrary, but libcore can't because it's the library
@@ -2187,6 +2178,9 @@ void Runtime::InitNativeMethods() {
   // com_android_art linker namespace.
   jclass java_lang_Object;
   {
+    // Use global JNI reference to keep the local references empty. If we allocated a
+    // local reference here, the `PushLocalFrame(128)` that these internal libraries do
+    // in their `JNI_OnLoad()` would reserve a lot of unnecessary space due to rounding.
     ScopedObjectAccess soa(self);
     java_lang_Object = reinterpret_cast<jclass>(
         GetJavaVM()->AddGlobalRef(self, GetClassRoot<mirror::Object>(GetClassLinker())));
@@ -2570,17 +2564,20 @@ void Runtime::VisitReflectiveTargets(ReflectiveValueVisitor *visitor) {
 }
 
 void Runtime::VisitImageRoots(RootVisitor* visitor) {
-  for (auto* space : GetHeap()->GetContinuousSpaces()) {
-    if (space->IsImageSpace()) {
-      auto* image_space = space->AsImageSpace();
-      const auto& image_header = image_space->GetImageHeader();
-      for (int32_t i = 0, size = image_header.GetImageRoots()->GetLength(); i != size; ++i) {
-        mirror::Object* obj =
-            image_header.GetImageRoot(static_cast<ImageHeader::ImageRoot>(i)).Ptr();
-        if (obj != nullptr) {
-          mirror::Object* after_obj = obj;
-          visitor->VisitRoot(&after_obj, RootInfo(kRootStickyClass));
-          CHECK_EQ(after_obj, obj);
+  // We only confirm that image roots are unchanged.
+  if (kIsDebugBuild) {
+    for (auto* space : GetHeap()->GetContinuousSpaces()) {
+      if (space->IsImageSpace()) {
+        auto* image_space = space->AsImageSpace();
+        const auto& image_header = image_space->GetImageHeader();
+        for (int32_t i = 0, size = image_header.GetImageRoots()->GetLength(); i != size; ++i) {
+          mirror::Object* obj =
+              image_header.GetImageRoot(static_cast<ImageHeader::ImageRoot>(i)).Ptr();
+          if (obj != nullptr) {
+            mirror::Object* after_obj = obj;
+            visitor->VisitRoot(&after_obj, RootInfo(kRootStickyClass));
+            CHECK_EQ(after_obj, obj);
+          }
         }
       }
     }
@@ -2707,6 +2704,7 @@ void Runtime::SetInstructionSet(InstructionSet instruction_set) {
       break;
     case InstructionSet::kArm:
     case InstructionSet::kArm64:
+    case InstructionSet::kRiscv64:
     case InstructionSet::kX86:
     case InstructionSet::kX86_64:
       break;
@@ -2759,11 +2757,6 @@ void Runtime::RegisterAppInfo(const std::string& package_name,
 
   if (profile_output_filename.empty()) {
     LOG(WARNING) << "JIT profile information will not be recorded: profile filename is empty.";
-    return;
-  }
-  if (!OS::FileExists(profile_output_filename.c_str(), /*check_file_type=*/ false)) {
-    LOG(WARNING) << "JIT profile information will not be recorded: profile file does not exist: "
-                 << profile_output_filename;
     return;
   }
   if (code_paths.empty()) {
@@ -3349,136 +3342,22 @@ void Runtime::ResetStartupCompleted() {
   startup_completed_.store(false, std::memory_order_seq_cst);
 }
 
-class CollectStartupDexCacheVisitor : public DexCacheVisitor {
- public:
-  explicit CollectStartupDexCacheVisitor(VariableSizedHandleScope& handles) : handles_(handles) {}
-
-  void Visit(ObjPtr<mirror::DexCache> dex_cache)
-      REQUIRES_SHARED(Locks::dex_lock_, Locks::mutator_lock_) override {
-    handles_.NewHandle(dex_cache);
-  }
-
- private:
-  VariableSizedHandleScope& handles_;
-};
-
-class UnlinkVisitor {
- public:
-  UnlinkVisitor() {}
-
-  void VisitRootIfNonNull(StackReference<mirror::Object>* ref)
-      REQUIRES_SHARED(Locks::mutator_lock_) {
-    if (!ref->IsNull()) {
-      ref->AsMirrorPtr()->AsDexCache()->UnlinkStartupCaches();
-    }
-  }
-};
-
-class Runtime::NotifyStartupCompletedTask : public gc::HeapTask {
- public:
-  NotifyStartupCompletedTask() : gc::HeapTask(/*target_run_time=*/ NanoTime()) {}
-
-  void Run(Thread* self) override {
-    VLOG(startup) << "NotifyStartupCompletedTask running";
-    Runtime* const runtime = Runtime::Current();
-    {
-      std::string compiler_filter;
-      std::string compilation_reason;
-      runtime->GetAppInfo()->GetPrimaryApkOptimizationStatus(&compiler_filter, &compilation_reason);
-      CompilerFilter::Filter filter;
-      if (CompilerFilter::ParseCompilerFilter(compiler_filter.c_str(), &filter) &&
-          !CompilerFilter::IsAotCompilationEnabled(filter)) {
-        std::string error_msg;
-        if (!RuntimeImage::WriteImageToDisk(&error_msg)) {
-          LOG(DEBUG) << "Could not write temporary image to disk " << error_msg;
-        }
-      }
-    }
-    // Fetch the startup linear alloc before the checkpoint to play nice with
-    // 1002-notify-startup test which resets the startup state.
-    std::unique_ptr<LinearAlloc> startup_linear_alloc(runtime->ReleaseStartupLinearAlloc());
-    {
-      ScopedTrace trace("Releasing dex caches and app image spaces metadata");
-      ScopedObjectAccess soa(Thread::Current());
-
-      // Collect dex caches that were allocated with the startup linear alloc.
-      VariableSizedHandleScope handles(soa.Self());
-      {
-        CollectStartupDexCacheVisitor visitor(handles);
-        ReaderMutexLock mu(self, *Locks::dex_lock_);
-        runtime->GetClassLinker()->VisitDexCaches(&visitor);
-      }
-
-      // Request empty checkpoints to make sure no threads are:
-      // - accessing the image space metadata section when we madvise it
-      // - accessing dex caches when we free them
-      //
-      // Use GC exclusion to prevent deadlocks that may happen if
-      // multiple threads are attempting to run empty checkpoints at the same time.
-      {
-        // Avoid using ScopedGCCriticalSection since that does not allow thread suspension. This is
-        // not allowed to prevent allocations, but it's still safe to suspend temporarily for the
-        // checkpoint.
-        gc::ScopedInterruptibleGCCriticalSection sigcs(self,
-                                                       gc::kGcCauseRunEmptyCheckpoint,
-                                                       gc::kCollectorTypeCriticalSection);
-        // Do the unlinking of dex cache arrays in the GC critical section to
-        // avoid GC not seeing these arrays. We do it before the checkpoint so
-        // we know after the checkpoint, no thread is holding onto the array.
-        UnlinkVisitor visitor;
-        handles.VisitRoots(visitor);
-
-        runtime->GetThreadList()->RunEmptyCheckpoint();
-      }
-
-      for (gc::space::ContinuousSpace* space : runtime->GetHeap()->GetContinuousSpaces()) {
-        if (space->IsImageSpace()) {
-          gc::space::ImageSpace* image_space = space->AsImageSpace();
-          if (image_space->GetImageHeader().IsAppImage()) {
-            image_space->ReleaseMetadata();
-          }
-        }
-      }
-    }
-
-    {
-      // Delete the thread pool used for app image loading since startup is assumed to be completed.
-      ScopedTrace trace2("Delete thread pool");
-      runtime->DeleteThreadPool();
-    }
-
-    {
-      // We know that after the checkpoint, there is no thread that can hold
-      // the startup linear alloc, so it's safe to delete it now.
-      ScopedTrace trace2("Delete startup linear alloc");
-      startup_linear_alloc.reset();
-    }
-  }
-};
-
-void Runtime::NotifyStartupCompleted() {
+bool Runtime::NotifyStartupCompleted() {
   bool expected = false;
   if (!startup_completed_.compare_exchange_strong(expected, true, std::memory_order_seq_cst)) {
     // Right now NotifyStartupCompleted will be called up to twice, once from profiler and up to
     // once externally. For this reason there are no asserts.
-    return;
+    return false;
   }
 
   VLOG(startup) << app_info_;
 
-  VLOG(startup) << "Adding NotifyStartupCompleted task";
-  // Use the heap task processor since we want to be exclusive with the GC and we don't want to
-  // block the caller if the GC is running.
-  if (!GetHeap()->AddHeapTask(new NotifyStartupCompletedTask)) {
-    VLOG(startup) << "Failed to add NotifyStartupCompletedTask";
-  }
-
-  // Notify the profiler saver that startup is now completed.
   ProfileSaver::NotifyStartupCompleted();
 
   if (metrics_reporter_ != nullptr) {
     metrics_reporter_->NotifyStartupCompleted();
   }
+  return true;
 }
 
 void Runtime::NotifyDexFileLoaded() {
@@ -3511,31 +3390,6 @@ bool Runtime::IsSystemServerProfiled() const {
 
 bool Runtime::GetOatFilesExecutable() const {
   return !IsAotCompiler() && !IsSystemServerProfiled();
-}
-
-void Runtime::ProcessWeakClass(GcRoot<mirror::Class>* root_ptr,
-                               IsMarkedVisitor* visitor,
-                               mirror::Class* update) {
-    // This does not need a read barrier because this is called by GC.
-  mirror::Class* cls = root_ptr->Read<kWithoutReadBarrier>();
-  if (cls != nullptr && cls != GetWeakClassSentinel()) {
-    DCHECK((cls->IsClass<kDefaultVerifyFlags>()));
-    // Look at the classloader of the class to know if it has been unloaded.
-    // This does not need a read barrier because this is called by GC.
-    ObjPtr<mirror::Object> class_loader =
-        cls->GetClassLoader<kDefaultVerifyFlags, kWithoutReadBarrier>();
-    if (class_loader == nullptr || visitor->IsMarked(class_loader.Ptr()) != nullptr) {
-      // The class loader is live, update the entry if the class has moved.
-      mirror::Class* new_cls = down_cast<mirror::Class*>(visitor->IsMarked(cls));
-      // Note that new_object can be null for CMS and newly allocated objects.
-      if (new_cls != nullptr && new_cls != cls) {
-        *root_ptr = GcRoot<mirror::Class>(new_cls);
-      }
-    } else {
-      // The class loader is not live, clear the entry.
-      *root_ptr = GcRoot<mirror::Class>(update);
-    }
-  }
 }
 
 void Runtime::MadviseFileForRange(size_t madvise_size_limit_bytes,

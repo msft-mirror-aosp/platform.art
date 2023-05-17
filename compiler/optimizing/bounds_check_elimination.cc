@@ -490,7 +490,7 @@ class MonotonicValueRange : public ValueRange {
   DISALLOW_COPY_AND_ASSIGN(MonotonicValueRange);
 };
 
-class BCEVisitor : public HGraphVisitor {
+class BCEVisitor final : public HGraphVisitor {
  public:
   // The least number of bounds checks that should be eliminated by triggering
   // the deoptimization technique.
@@ -2011,7 +2011,7 @@ class BCEVisitor : public HGraphVisitor {
     phi->SetRawInputAt(0, instruction);
     phi->SetRawInputAt(1, zero);
     if (type == DataType::Type::kReference) {
-      phi->SetReferenceTypeInfo(instruction->GetReferenceTypeInfo());
+      phi->SetReferenceTypeInfoIfValid(instruction->GetReferenceTypeInfo());
     }
     new_preheader->AddPhi(phi);
     return phi;

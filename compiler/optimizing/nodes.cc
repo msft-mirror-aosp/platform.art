@@ -688,7 +688,7 @@ void HGraph::TransformLoopToSinglePreheaderFormat(HBasicBlock* header) {
                                                     0,
                                                     header_phi->GetType());
     if (header_phi->GetType() == DataType::Type::kReference) {
-      preheader_phi->SetReferenceTypeInfo(header_phi->GetReferenceTypeInfo());
+      preheader_phi->SetReferenceTypeInfoIfValid(header_phi->GetReferenceTypeInfo());
     }
     preheader->AddPhi(preheader_phi);
 
@@ -3215,6 +3215,12 @@ void HInstruction::SetReferenceTypeInfo(ReferenceTypeInfo rti) {
   SetPackedFlag<kFlagReferenceTypeIsExact>(rti.IsExact());
 }
 
+void HInstruction::SetReferenceTypeInfoIfValid(ReferenceTypeInfo rti) {
+  if (rti.IsValid()) {
+    SetReferenceTypeInfo(rti);
+  }
+}
+
 bool HBoundType::InstructionDataEquals(const HInstruction* other) const {
   const HBoundType* other_bt = other->AsBoundType();
   ScopedObjectAccess soa(Thread::Current());
@@ -3565,8 +3571,8 @@ static inline IntrinsicExceptions GetExceptionsIntrinsic(Intrinsics i) {
   return kCanThrow;
 }
 
-void HInvoke::SetResolvedMethod(ArtMethod* method) {
-  if (method != nullptr && method->IsIntrinsic()) {
+void HInvoke::SetResolvedMethod(ArtMethod* method, bool enable_intrinsic_opt) {
+  if (method != nullptr && method->IsIntrinsic() && enable_intrinsic_opt) {
     Intrinsics intrinsic = static_cast<Intrinsics>(method->GetIntrinsic());
     SetIntrinsic(intrinsic,
                  NeedsEnvironmentIntrinsic(intrinsic),

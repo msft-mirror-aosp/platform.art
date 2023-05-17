@@ -77,6 +77,7 @@ const char* OptimizationPassName(OptimizationPass pass) {
       return BoundsCheckElimination::kBoundsCheckEliminationPassName;
     case OptimizationPass::kLoadStoreElimination:
       return LoadStoreElimination::kLoadStoreEliminationPassName;
+    case OptimizationPass::kAggressiveConstantFolding:
     case OptimizationPass::kConstantFolding:
       return HConstantFolding::kConstantFoldingPassName;
     case OptimizationPass::kDeadCodeElimination:
@@ -197,7 +198,8 @@ ArenaVector<HOptimization*> ConstructOptimizations(
         opt = most_recent_side_effects = new (allocator) SideEffectsAnalysis(graph, pass_name);
         break;
       case OptimizationPass::kInductionVarAnalysis:
-        opt = most_recent_induction = new (allocator) HInductionVarAnalysis(graph, pass_name);
+        opt = most_recent_induction =
+            new (allocator) HInductionVarAnalysis(graph, stats, pass_name);
         break;
       //
       // Passes that need prior analysis.
@@ -225,6 +227,10 @@ ArenaVector<HOptimization*> ConstructOptimizations(
       //
       case OptimizationPass::kConstantFolding:
         opt = new (allocator) HConstantFolding(graph, stats, pass_name);
+        break;
+      case OptimizationPass::kAggressiveConstantFolding:
+        opt = new (allocator)
+            HConstantFolding(graph, stats, pass_name, /* use_all_optimizations_ = */ true);
         break;
       case OptimizationPass::kDeadCodeElimination:
         opt = new (allocator) HDeadCodeElimination(graph, stats, pass_name);

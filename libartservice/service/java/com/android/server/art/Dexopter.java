@@ -26,8 +26,10 @@ import static com.android.server.art.model.DexoptResult.DexContainerFileDexoptRe
 import android.R;
 import android.annotation.NonNull;
 import android.annotation.Nullable;
+import android.app.role.RoleManager;
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
+import android.os.Build;
 import android.os.CancellationSignal;
 import android.os.RemoteException;
 import android.os.ServiceSpecificException;
@@ -38,12 +40,15 @@ import android.text.TextUtils;
 import android.util.Log;
 import android.util.Pair;
 
+import androidx.annotation.RequiresApi;
+
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.server.LocalManagerRegistry;
 import com.android.server.art.model.ArtFlags;
 import com.android.server.art.model.DetailedDexInfo;
 import com.android.server.art.model.DexoptParams;
 import com.android.server.art.model.DexoptResult;
+import com.android.server.pm.PackageManagerLocal;
 import com.android.server.pm.pkg.AndroidPackage;
 import com.android.server.pm.pkg.PackageState;
 
@@ -54,11 +59,15 @@ import com.google.auto.value.AutoValue;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /** @hide */
+@RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
 public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
-    private static final String TAG = "Dexopter";
+    private static final String TAG = ArtManagerLocal.TAG;
+    private static final List<String> ART_PACKAGE_NAMES =
+            List.of("com.google.android.art", "com.android.art", "com.google.android.go.art");
 
     @NonNull protected final Injector mInjector;
     @NonNull protected final PackageState mPkgState;
@@ -89,6 +98,8 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
     @NonNull
     public final List<DexContainerFileDexoptResult> dexopt() throws RemoteException {
         List<DexContainerFileDexoptResult> results = new ArrayList<>();
+
+        boolean isInDalvikCache = isInDalvikCache();
 
         for (DexInfoType dexInfo : getDexInfoList()) {
             ProfilePath profile = null;
@@ -159,7 +170,7 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
                         var target = DexoptTarget.<DexInfoType>builder()
                                              .setDexInfo(dexInfo)
                                              .setIsa(abi.isa())
-                                             .setIsInDalvikCache(isInDalvikCache())
+                                             .setIsInDalvikCache(isInDalvikCache)
                                              .setCompilerFilter(compilerFilter)
                                              .build();
                         var options = GetDexoptNeededOptions.builder()
@@ -226,9 +237,13 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
                                 e);
                         status = DexoptResult.DEXOPT_FAILED;
                     } finally {
-                        results.add(DexContainerFileDexoptResult.create(dexInfo.dexPath(),
+                        var result = DexContainerFileDexoptResult.create(dexInfo.dexPath(),
                                 abi.isPrimaryAbi(), abi.name(), compilerFilter, status, wallTimeMs,
-                                cpuTimeMs, sizeBytes, sizeBeforeBytes, isSkippedDueToStorageLow));
+                                cpuTimeMs, sizeBytes, sizeBeforeBytes, isSkippedDueToStorageLow);
+                        Log.i(TAG,
+                                String.format("Dexopt result: [packageName = %s] %s",
+                                        mPkgState.getPackageName(), result));
+                        results.add(result);
                         if (status != DexoptResult.DEXOPT_SKIPPED
                                 && status != DexoptResult.DEXOPT_PERFORMED) {
                             succeeded = false;
@@ -279,6 +294,10 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
             }
         }
 
+        if (mInjector.isLauncherPackage(mPkgState.getPackageName())) {
+            return "speed-profile";
+        }
+
         // We force vmSafeMode on debuggable apps as well:
         //  - the runtime ignores their compiled code
         //  - they generally have lots of methods that could make the compiler used run out of
@@ -319,33 +338,19 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
         return compilerFilter;
     }
 
-    /**
-     * Gets the existing reference profile if exists, or initializes a reference profile from an
-     * external profile.
-     *
-     * @return A pair where the first element is the found or initialized profile, and the second
-     *         element is true if the profile is readable by others. Or null if there is no
-     *         reference profile or external profile to use.
-     */
+    /** @see Utils#getOrInitReferenceProfile */
     @Nullable
     private Pair<ProfilePath, Boolean> getOrInitReferenceProfile(@NonNull DexInfoType dexInfo)
             throws RemoteException {
-        ProfilePath refProfile = buildRefProfilePath(dexInfo);
-        try {
-            if (mInjector.getArtd().isProfileUsable(refProfile, dexInfo.dexPath())) {
-                boolean isOtherReadable = mInjector.getArtd().getProfileVisibility(refProfile)
-                        == FileVisibility.OTHER_READABLE;
-                return Pair.create(refProfile, isOtherReadable);
-            }
-        } catch (ServiceSpecificException e) {
-            Log.e(TAG,
-                    "Failed to use the existing reference profile "
-                            + AidlUtils.toString(refProfile),
-                    e);
-        }
+        return Utils.getOrInitReferenceProfile(mInjector.getArtd(), dexInfo.dexPath(),
+                buildRefProfilePath(dexInfo), getExternalProfiles(dexInfo),
+                buildOutputProfile(dexInfo, true /* isPublic */));
+    }
 
-        ProfilePath initializedProfile = initReferenceProfile(dexInfo);
-        return initializedProfile != null ? Pair.create(initializedProfile, true) : null;
+    @Nullable
+    private ProfilePath initReferenceProfile(@NonNull DexInfoType dexInfo) throws RemoteException {
+        return Utils.initReferenceProfile(mInjector.getArtd(), dexInfo.dexPath(),
+                getExternalProfiles(dexInfo), buildOutputProfile(dexInfo, true /* isPublic */));
     }
 
     @NonNull
@@ -360,6 +365,9 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
         dexoptOptions.generateAppImage =
                 isProfileGuidedFilter && isAppImageAllowed(dexInfo) && isAppImageEnabled();
         dexoptOptions.hiddenApiPolicyEnabled = isHiddenApiPolicyEnabled();
+        dexoptOptions.comments = String.format(
+                "app-version-name:%s,app-version-code:%d,art-version:%d", mPkg.getVersionName(),
+                mPkg.getLongVersionCode(), mInjector.getArtVersion());
         return dexoptOptions;
     }
 
@@ -398,7 +406,8 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
         if ((options.flags() & ArtFlags.FLAG_FORCE) != 0) {
             return DexoptTrigger.COMPILER_FILTER_IS_BETTER | DexoptTrigger.COMPILER_FILTER_IS_SAME
                     | DexoptTrigger.COMPILER_FILTER_IS_WORSE
-                    | DexoptTrigger.PRIMARY_BOOT_IMAGE_BECOMES_USABLE;
+                    | DexoptTrigger.PRIMARY_BOOT_IMAGE_BECOMES_USABLE
+                    | DexoptTrigger.NEED_EXTRACTION;
         }
 
         if ((options.flags() & ArtFlags.FLAG_SHOULD_DOWNGRADE) != 0) {
@@ -406,7 +415,7 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
         }
 
         int dexoptTrigger = DexoptTrigger.COMPILER_FILTER_IS_BETTER
-                | DexoptTrigger.PRIMARY_BOOT_IMAGE_BECOMES_USABLE;
+                | DexoptTrigger.PRIMARY_BOOT_IMAGE_BECOMES_USABLE | DexoptTrigger.NEED_EXTRACTION;
         if (options.profileMerged()) {
             dexoptTrigger |= DexoptTrigger.COMPILER_FILTER_IS_SAME;
         }
@@ -537,7 +546,7 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
     // Methods to be implemented by child classes.
 
     /** Returns true if the artifacts should be written to the global dalvik-cache directory. */
-    protected abstract boolean isInDalvikCache();
+    protected abstract boolean isInDalvikCache() throws RemoteException;
 
     /** Returns information about all dex files. */
     @NonNull protected abstract List<DexInfoType> getDexInfoList();
@@ -558,12 +567,10 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
     protected abstract boolean isDexFilePublic(@NonNull DexInfoType dexInfo);
 
     /**
-     * Returns a reference profile initialized from an external profile (e.g., a DM profile) if
-     * one exists, or null otherwise.
+     * Returns a list of external profiles (e.g., a DM profile) that the reference profile can be
+     * initialized from, in the order of preference.
      */
-    @Nullable
-    protected abstract ProfilePath initReferenceProfile(@NonNull DexInfoType dexInfo)
-            throws RemoteException;
+    @NonNull protected abstract List<ProfilePath> getExternalProfiles(@NonNull DexInfoType dexInfo);
 
     /** Returns the permission settings to use for the artifacts of the given dex file. */
     @NonNull
@@ -655,7 +662,11 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
         }
 
         public boolean isSystemUiPackage(@NonNull String packageName) {
-            return packageName.equals(mContext.getString(R.string.config_systemUi));
+            return Utils.isSystemUiPackage(mContext, packageName);
+        }
+
+        public boolean isLauncherPackage(@NonNull String packageName) {
+            return Utils.isLauncherPackage(mContext, packageName);
         }
 
         @NonNull
@@ -677,6 +688,26 @@ public abstract class Dexopter<DexInfoType extends DetailedDexInfo> {
         @NonNull
         public StorageManager getStorageManager() {
             return Objects.requireNonNull(mContext.getSystemService(StorageManager.class));
+        }
+
+        @NonNull
+        private PackageManagerLocal getPackageManagerLocal() {
+            return Objects.requireNonNull(
+                    LocalManagerRegistry.getManager(PackageManagerLocal.class));
+        }
+
+        public long getArtVersion() {
+            try (var snapshot = getPackageManagerLocal().withUnfilteredSnapshot()) {
+                Map<String, PackageState> packageStates = snapshot.getPackageStates();
+                for (String artPackageName : ART_PACKAGE_NAMES) {
+                    PackageState pkgState = packageStates.get(artPackageName);
+                    if (pkgState != null) {
+                        AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
+                        return pkg.getLongVersionCode();
+                    }
+                }
+            }
+            return -1;
         }
     }
 }

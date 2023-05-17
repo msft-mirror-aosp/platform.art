@@ -22,6 +22,7 @@
 #include <deque>
 #include <forward_list>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <queue>
@@ -32,7 +33,7 @@
 #include <vector>
 
 #include "android-base/stringprintf.h"
-
+#include "android-base/strings.h"
 #include "art_field-inl.h"
 #include "art_method-inl.h"
 #include "barrier.h"
@@ -69,6 +70,7 @@
 #include "dex/class_accessor-inl.h"
 #include "dex/descriptors_names.h"
 #include "dex/dex_file-inl.h"
+#include "dex/dex_file_annotations.h"
 #include "dex/dex_file_exception_helpers.h"
 #include "dex/dex_file_loader.h"
 #include "dex/signature-inl.h"
@@ -122,8 +124,8 @@
 #include "mirror/object_array-alloc-inl.h"
 #include "mirror/object_array-inl.h"
 #include "mirror/object_array.h"
-#include "mirror/object_reference.h"
 #include "mirror/object_reference-inl.h"
+#include "mirror/object_reference.h"
 #include "mirror/proxy.h"
 #include "mirror/reference-inl.h"
 #include "mirror/stack_trace_element.h"
@@ -1133,7 +1135,7 @@ void ClassLinker::RunRootClinits(Thread* self) {
   // classes are always in the boot image, so this code is primarily intended
   // for running without boot image but may be needed for boot image if the
   // AOT-initialization fails due to introduction of new code to `<clinit>`.
-  ArtMethod* static_methods_of_classes_to_initialize[] = {
+  ArtMethod* methods_of_classes_to_initialize[] = {
       // Initialize primitive boxing classes (avoid check at runtime).
       WellKnownClasses::java_lang_Boolean_valueOf,
       WellKnownClasses::java_lang_Byte_valueOf,
@@ -1178,10 +1180,10 @@ void ClassLinker::RunRootClinits(Thread* self) {
       // suppress class initialization error (say, due to OOM), so initialize it early.
       WellKnownClasses::org_apache_harmony_dalvik_ddmc_DdmServer_dispatch,
   };
-  for (ArtMethod* method : static_methods_of_classes_to_initialize) {
+  for (ArtMethod* method : methods_of_classes_to_initialize) {
     EnsureRootInitialized(this, self, method->GetDeclaringClass());
   }
-  ArtField* static_fields_of_classes_to_initialize[] = {
+  ArtField* fields_of_classes_to_initialize[] = {
       // Ensure classes used by class loaders are initialized (avoid check at runtime).
       WellKnownClasses::dalvik_system_DexFile_cookie,
       WellKnownClasses::dalvik_system_DexPathList_dexElements,
@@ -1192,7 +1194,7 @@ void ClassLinker::RunRootClinits(Thread* self) {
       WellKnownClasses::java_util_Collections_EMPTY_LIST,
       WellKnownClasses::libcore_util_EmptyArray_STACK_TRACE_ELEMENT,
   };
-  for (ArtField* field : static_fields_of_classes_to_initialize) {
+  for (ArtField* field : fields_of_classes_to_initialize) {
     EnsureRootInitialized(this, self, field->GetDeclaringClass());
   }
 }
@@ -1395,19 +1397,13 @@ bool ClassLinker::InitFromBootImage(std::string* error_msg) {
   runtime->SetSentinel(boot_image_live_objects->Get(ImageHeader::kClearedJniWeakSentinel));
   DCHECK(runtime->GetSentinel().Read()->GetClass() == GetClassRoot<mirror::Object>(this));
 
-  for (size_t i = 0u, size = spaces.size(); i != size; ++i) {
-    // Boot class loader, use a null handle.
-    std::vector<std::unique_ptr<const DexFile>> dex_files;
-    if (!AddImageSpace(spaces[i],
-                       ScopedNullHandle<mirror::ClassLoader>(),
-                       /*out*/&dex_files,
-                       error_msg)) {
-      return false;
-    }
-    // Append opened dex files at the end.
-    boot_dex_files_.insert(boot_dex_files_.end(),
-                           std::make_move_iterator(dex_files.begin()),
-                           std::make_move_iterator(dex_files.end()));
+  // Boot class loader, use a null handle.
+  if (!AddImageSpaces(ArrayRef<gc::space::ImageSpace*>(spaces),
+                      ScopedNullHandle<mirror::ClassLoader>(),
+                      /*context=*/nullptr,
+                      &boot_dex_files_,
+                      error_msg)) {
+    return false;
   }
   for (const std::unique_ptr<const DexFile>& dex_file : boot_dex_files_) {
     OatDexFile::MadviseDexFileAtLoad(*dex_file);
@@ -1586,24 +1582,40 @@ static void VisitInternedStringReferences(
 
     uint32_t raw_member_offset = sro_base[offset_index].second;
     DCHECK_ALIGNED(base_offset, 2);
-    DCHECK_ALIGNED(raw_member_offset, 2);
 
     ObjPtr<mirror::Object> obj_ptr =
         reinterpret_cast<mirror::Object*>(space->Begin() + base_offset);
-    MemberOffset member_offset(raw_member_offset);
-    ObjPtr<mirror::String> referred_string =
-        obj_ptr->GetFieldObject<mirror::String,
-                                kVerifyNone,
-                                kWithoutReadBarrier,
-                                /* kIsVolatile= */ false>(member_offset);
-    DCHECK(referred_string != nullptr);
+    if (obj_ptr->IsDexCache() && raw_member_offset >= sizeof(mirror::DexCache)) {
+      // Special case for strings referenced from dex cache array: the offset is
+      // actually decoded as an index into the dex cache string array.
+      uint32_t index = raw_member_offset - sizeof(mirror::DexCache);
+      mirror::GcRootArray<mirror::String>* array = obj_ptr->AsDexCache()->GetStringsArray();
+      // The array could be concurrently set to null. See `StartupCompletedTask`.
+      if (array != nullptr) {
+        ObjPtr<mirror::String> referred_string = array->Get(index);
+        DCHECK(referred_string != nullptr);
+        ObjPtr<mirror::String> visited = visitor(referred_string);
+        if (visited != referred_string) {
+          array->Set(index, visited.Ptr());
+        }
+      }
+    } else {
+      DCHECK_ALIGNED(raw_member_offset, 2);
+      MemberOffset member_offset(raw_member_offset);
+      ObjPtr<mirror::String> referred_string =
+          obj_ptr->GetFieldObject<mirror::String,
+                                  kVerifyNone,
+                                  kWithoutReadBarrier,
+                                  /* kIsVolatile= */ false>(member_offset);
+      DCHECK(referred_string != nullptr);
 
-    ObjPtr<mirror::String> visited = visitor(referred_string);
-    if (visited != referred_string) {
-      obj_ptr->SetFieldObject</* kTransactionActive= */ false,
-                              /* kCheckTransaction= */ false,
-                              kVerifyNone,
-                              /* kIsVolatile= */ false>(member_offset, visited);
+      ObjPtr<mirror::String> visited = visitor(referred_string);
+      if (visited != referred_string) {
+        obj_ptr->SetFieldObject</* kTransactionActive= */ false,
+                                /* kCheckTransaction= */ false,
+                                kVerifyNone,
+                                /* kIsVolatile= */ false>(member_offset, visited);
+      }
     }
   }
 }
@@ -1669,6 +1681,7 @@ void AppImageLoadingHelper::Update(
   Runtime* const runtime = Runtime::Current();
   gc::Heap* const heap = runtime->GetHeap();
   const ImageHeader& header = space->GetImageHeader();
+  int32_t number_of_dex_cache_arrays_cleared = 0;
   {
     // Register dex caches with the class loader.
     WriterMutexLock mu(self, *Locks::classlinker_classes_lock_);
@@ -1677,9 +1690,23 @@ void AppImageLoadingHelper::Update(
       {
         WriterMutexLock mu2(self, *Locks::dex_lock_);
         CHECK(class_linker->FindDexCacheDataLocked(*dex_file) == nullptr);
+        if (runtime->GetStartupCompleted()) {
+          number_of_dex_cache_arrays_cleared++;
+          // Free up dex cache arrays that we would only allocate at startup.
+          // We do this here before registering and within the lock to be
+          // consistent with `StartupCompletedTask`.
+          dex_cache->UnlinkStartupCaches();
+        }
         class_linker->RegisterDexFileLocked(*dex_file, dex_cache, class_loader.Get());
       }
     }
+  }
+  if (number_of_dex_cache_arrays_cleared == dex_caches->GetLength()) {
+    // Free up dex cache arrays that we would only allocate at startup.
+    // If `number_of_dex_cache_arrays_cleared` isn't the number of dex caches in
+    // the image, then there is a race with the `StartupCompletedTask`, which
+    // will release the space instead.
+    space->ReleaseMetadata();
   }
 
   if (ClassLinker::kAppImageMayContainStrings) {
@@ -1820,6 +1847,50 @@ bool ClassLinker::OpenImageDexFiles(gc::space::ImageSpace* space,
       return false;
     }
     dex_cache->SetDexFile(dex_file.get());
+    out_dex_files->push_back(std::move(dex_file));
+  }
+  return true;
+}
+
+bool ClassLinker::OpenAndInitImageDexFiles(
+    const gc::space::ImageSpace* space,
+    Handle<mirror::ClassLoader> class_loader,
+    std::vector<std::unique_ptr<const DexFile>>* out_dex_files,
+    std::string* error_msg) {
+  DCHECK(out_dex_files != nullptr);
+  const bool app_image = class_loader != nullptr;
+  const ImageHeader& header = space->GetImageHeader();
+  ObjPtr<mirror::Object> dex_caches_object = header.GetImageRoot(ImageHeader::kDexCaches);
+  DCHECK(dex_caches_object != nullptr);
+  Thread* const self = Thread::Current();
+  StackHandleScope<3> hs(self);
+  Handle<mirror::ObjectArray<mirror::DexCache>> dex_caches(
+      hs.NewHandle(dex_caches_object->AsObjectArray<mirror::DexCache>()));
+  const OatFile* oat_file = space->GetOatFile();
+  if (oat_file->GetOatHeader().GetDexFileCount() !=
+      static_cast<uint32_t>(dex_caches->GetLength())) {
+    *error_msg =
+        "Dex cache count and dex file count mismatch while trying to initialize from image";
+    return false;
+  }
+
+  for (auto dex_cache : dex_caches.Iterate<mirror::DexCache>()) {
+    std::string dex_file_location = dex_cache->GetLocation()->ToModifiedUtf8();
+    std::unique_ptr<const DexFile> dex_file =
+        OpenOatDexFile(oat_file, dex_file_location.c_str(), error_msg);
+    if (dex_file == nullptr) {
+      return false;
+    }
+
+    {
+      // Native fields are all null.  Initialize them.
+      WriterMutexLock mu(self, *Locks::dex_lock_);
+      dex_cache->Initialize(dex_file.get(), class_loader.Get());
+    }
+    if (!app_image) {
+      // Register dex files, keep track of existing ones that are conflicts.
+      AppendToBootClassPath(dex_file.get(), dex_cache);
+    }
     out_dex_files->push_back(std::move(dex_file));
   }
   return true;
@@ -1968,12 +2039,11 @@ static void VerifyAppImage(const ImageHeader& header,
   }
 }
 
-bool ClassLinker::AddImageSpace(
-    gc::space::ImageSpace* space,
-    Handle<mirror::ClassLoader> class_loader,
-    std::vector<std::unique_ptr<const DexFile>>* out_dex_files,
-    std::string* error_msg) {
-  DCHECK(out_dex_files != nullptr);
+bool ClassLinker::AddImageSpace(gc::space::ImageSpace* space,
+                                Handle<mirror::ClassLoader> class_loader,
+                                ClassLoaderContext* context,
+                                const std::vector<std::unique_ptr<const DexFile>>& dex_files,
+                                std::string* error_msg) {
   DCHECK(error_msg != nullptr);
   const uint64_t start_time = NanoTime();
   const bool app_image = class_loader != nullptr;
@@ -2020,52 +2090,87 @@ bool ClassLinker::AddImageSpace(
     }
   }
   const OatFile* oat_file = space->GetOatFile();
-  if (oat_file->GetOatHeader().GetDexFileCount() !=
-      static_cast<uint32_t>(dex_caches->GetLength())) {
-    *error_msg = "Dex cache count and dex file count mismatch while trying to initialize from "
-                 "image";
-    return false;
-  }
-
-  for (auto dex_cache : dex_caches.Iterate<mirror::DexCache>()) {
-    std::string dex_file_location = dex_cache->GetLocation()->ToModifiedUtf8();
-    std::unique_ptr<const DexFile> dex_file = OpenOatDexFile(oat_file,
-                                                             dex_file_location.c_str(),
-                                                             error_msg);
-    if (dex_file == nullptr) {
-      return false;
-    }
-
-    {
-      // Native fields are all null.  Initialize them.
-      WriterMutexLock mu(self, *Locks::dex_lock_);
-      dex_cache->Initialize(dex_file.get(), class_loader.Get());
-    }
-    if (!app_image) {
-      // Register dex files, keep track of existing ones that are conflicts.
-      AppendToBootClassPath(dex_file.get(), dex_cache);
-    }
-    out_dex_files->push_back(std::move(dex_file));
-  }
 
   if (app_image) {
     ScopedAssertNoThreadSuspension sants("Checking app image");
     if (special_root == nullptr) {
       *error_msg = "Unexpected null special root in app image";
       return false;
-    } else if (special_root->IsIntArray()) {
-      size_t count = special_root->AsIntArray()->GetLength();
-      if (oat_file->GetVdexFile()->GetNumberOfDexFiles() != count) {
+    } else if (special_root->IsByteArray()) {
+      OatHeader* oat_header = reinterpret_cast<OatHeader*>(special_root->AsByteArray()->GetData());
+      if (!oat_header->IsValid()) {
+        *error_msg = "Invalid oat header in special root";
+        return false;
+      }
+      if (oat_file->GetVdexFile()->GetNumberOfDexFiles() != oat_header->GetDexFileCount()) {
         *error_msg = "Checksums count does not match";
         return false;
       }
-      static_assert(sizeof(VdexFile::VdexChecksum) == sizeof(int32_t));
-      const VdexFile::VdexChecksum* art_checksums =
-          reinterpret_cast<VdexFile::VdexChecksum*>(special_root->AsIntArray()->GetData());
-      const VdexFile::VdexChecksum* vdex_checksums =
-          oat_file->GetVdexFile()->GetDexChecksumsArray();
-      if (memcmp(art_checksums, vdex_checksums, sizeof(VdexFile::VdexChecksum) * count) != 0) {
-        *error_msg = "Image and vdex checksums did not match";
+      if (oat_header->IsConcurrentCopying() != gUseReadBarrier) {
+        *error_msg = "GCs do not match";
+        return false;
+      }
+
+      // Check if the dex checksums match the dex files that we just loaded.
+      uint32_t* checksums = reinterpret_cast<uint32_t*>(
+          reinterpret_cast<uint8_t*>(oat_header) + oat_header->GetHeaderSize());
+      for (uint32_t i = 0; i  < oat_header->GetDexFileCount(); ++i) {
+        uint32_t dex_checksum = dex_files.at(i)->GetHeader().checksum_;
+        if (checksums[i] != dex_checksum) {
+          *error_msg = StringPrintf(
+              "Image and dex file checksums did not match for %s: image has %d, dex file has %d",
+              dex_files.at(i)->GetLocation().c_str(),
+              checksums[i],
+              dex_checksum);
+          return false;
+        }
+      }
+
+      // Validate the class loader context.
+      const char* stored_context = oat_header->GetStoreValueByKey(OatHeader::kClassPathKey);
+      if (stored_context == nullptr) {
+        *error_msg = "Missing class loader context in special root";
+        return false;
+      }
+      if (context->VerifyClassLoaderContextMatch(stored_context) ==
+              ClassLoaderContext::VerificationResult::kMismatch) {
+        *error_msg = StringPrintf("Class loader contexts don't match: %s", stored_context);
+        return false;
+      }
+
+      // Validate the apex versions.
+      if (!gc::space::ImageSpace::ValidateApexVersions(*oat_header,
+                                                       runtime->GetApexVersions(),
+                                                       space->GetImageLocation(),
+                                                       error_msg)) {
+        return false;
+      }
+
+      // Validate the boot classpath.
+      const char* bcp = oat_header->GetStoreValueByKey(OatHeader::kBootClassPathKey);
+      if (bcp == nullptr) {
+        *error_msg = "Missing boot classpath in special root";
+        return false;
+      }
+      std::string runtime_bcp = android::base::Join(runtime->GetBootClassPathLocations(), ':');
+      if (strcmp(bcp, runtime_bcp.c_str()) != 0) {
+        *error_msg = StringPrintf("Mismatch boot classpath: image has %s, runtime has %s",
+                                  bcp,
+                                  runtime_bcp.c_str());
+        return false;
+      }
+
+      // Validate the dex checksums of the boot classpath.
+      const char* bcp_checksums =
+          oat_header->GetStoreValueByKey(OatHeader::kBootClassPathChecksumsKey);
+      if (bcp_checksums == nullptr) {
+        *error_msg = "Missing boot classpath checksums in special root";
+        return false;
+      }
+      if (strcmp(bcp_checksums, runtime->GetBootClassPathChecksums().c_str()) != 0) {
+        *error_msg = StringPrintf("Mismatch boot classpath checksums: image has %s, runtime has %s",
+                                  bcp_checksums,
+                                  runtime->GetBootClassPathChecksums().c_str());
         return false;
       }
     } else if (IsBootClassLoader(special_root.Get())) {
@@ -2180,9 +2285,11 @@ bool ClassLinker::AddImageSpace(
         ObjPtr<mirror::Class> klass(root.Read());
         // Do not update class loader for boot image classes where the app image
         // class loader is only the initiating loader but not the defining loader.
-        // Avoid read barrier since we are comparing against null.
-        if (klass->GetClassLoader<kDefaultVerifyFlags, kWithoutReadBarrier>() != nullptr) {
+        if (space->HasAddress(klass.Ptr())) {
           klass->SetClassLoader(loader);
+        } else {
+          DCHECK(klass->IsBootStrapClassLoaded());
+          DCHECK(Runtime::Current()->GetHeap()->ObjectIsInBootImageSpace(klass.Ptr()));
         }
       }
     }
@@ -2227,6 +2334,32 @@ bool ClassLinker::AddImageSpace(
   return true;
 }
 
+bool ClassLinker::AddImageSpaces(ArrayRef<gc::space::ImageSpace*> spaces,
+                                 Handle<mirror::ClassLoader> class_loader,
+                                 ClassLoaderContext* context,
+                                 /*out*/ std::vector<std::unique_ptr<const DexFile>>* dex_files,
+                                 /*out*/ std::string* error_msg) {
+  std::vector<std::vector<std::unique_ptr<const DexFile>>> dex_files_by_space_index;
+  for (const gc::space::ImageSpace* space : spaces) {
+    std::vector<std::unique_ptr<const DexFile>> space_dex_files;
+    if (!OpenAndInitImageDexFiles(space, class_loader, /*out*/ &space_dex_files, error_msg)) {
+      return false;
+    }
+    dex_files_by_space_index.push_back(std::move(space_dex_files));
+  }
+  // This must be done in a separate loop after all dex files are initialized because there can be
+  // references from an image space to another image space that comes after it.
+  for (size_t i = 0u, size = spaces.size(); i != size; ++i) {
+    std::vector<std::unique_ptr<const DexFile>>& space_dex_files = dex_files_by_space_index[i];
+    if (!AddImageSpace(spaces[i], class_loader, context, space_dex_files, error_msg)) {
+      return false;
+    }
+    // Append opened dex files at the end.
+    std::move(space_dex_files.begin(), space_dex_files.end(), std::back_inserter(*dex_files));
+  }
+  return true;
+}
+
 void ClassLinker::VisitClassRoots(RootVisitor* visitor, VisitRootFlags flags) {
   // Acquire tracing_enabled before locking class linker lock to prevent lock order violation. Since
   // enabling tracing requires the mutator lock, there are no race conditions here.
@@ -2268,8 +2401,7 @@ void ClassLinker::VisitClassRoots(RootVisitor* visitor, VisitRootFlags flags) {
       // Don't visit class-loaders if compacting with userfaultfd GC as these
       // weaks are updated using Runtime::SweepSystemWeaks() and the GC doesn't
       // tolerate double updates.
-      if (!gUseUserfaultfd
-          || !heap->MarkCompactCollector()->IsCompacting(self)) {
+      if (!heap->IsPerformingUffdCompaction()) {
         for (const ClassLoaderData& data : class_loaders_) {
           GcRoot<mirror::Object> root(GcRoot<mirror::Object>(self->DecodeJObject(data.weak_root)));
           root.VisitRoot(visitor, RootInfo(kRootVMInternal));
@@ -4162,11 +4294,22 @@ ObjPtr<mirror::DexCache> ClassLinker::FindDexCache(Thread* self, const OatDexFil
   for (const auto& entry : dex_caches_) {
     const DexCacheData& data = entry.second;
     if (DecodeDexCacheLocked(self, &data) != nullptr) {
-      LOG(FATAL_WITHOUT_ABORT) << "Registered dex file " << entry.first->GetLocation();
+      const OatDexFile* other_oat_dex_file = entry.first->GetOatDexFile();
+      const OatFile* oat_file =
+          (other_oat_dex_file == nullptr) ? nullptr : other_oat_dex_file->GetOatFile();
+      LOG(FATAL_WITHOUT_ABORT)
+          << "Registered dex file " << entry.first->GetLocation()
+          << " oat_dex_file=" << other_oat_dex_file
+          << " oat_file=" << oat_file
+          << " oat_location=" << (oat_file == nullptr ? "null" : oat_file->GetLocation())
+          << " dex_file=" << &entry.first;
     }
   }
-  LOG(FATAL) << "Failed to find DexCache for OatDexFile " << oat_dex_file.GetDexFileLocation()
-             << " " << &oat_dex_file;
+  LOG(FATAL) << "Failed to find DexCache for OatDexFile "
+             << oat_dex_file.GetDexFileLocation()
+             << " oat_dex_file=" << &oat_dex_file
+             << " oat_file=" << oat_dex_file.GetOatFile()
+             << " oat_location=" << oat_dex_file.GetOatFile()->GetLocation();
   UNREACHABLE();
 }
 
@@ -5973,17 +6116,6 @@ ClassTable* ClassLinker::ClassTableForClassLoader(ObjPtr<mirror::ClassLoader> cl
   return class_loader == nullptr ? boot_class_table_.get() : class_loader->GetClassTable();
 }
 
-static ImTable* FindSuperImt(ObjPtr<mirror::Class> klass, PointerSize pointer_size)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  while (klass->HasSuperClass()) {
-    klass = klass->GetSuperClass();
-    if (klass->ShouldHaveImt()) {
-      return klass->GetImt(pointer_size);
-    }
-  }
-  return nullptr;
-}
-
 bool ClassLinker::LinkClass(Thread* self,
                             const char* descriptor,
                             Handle<mirror::Class> klass,
@@ -6019,7 +6151,7 @@ bool ClassLinker::LinkClass(Thread* self,
     // will possibly create a table that is incorrect for either of the classes.
     // Same IMT with new_conflict does not happen very often.
     if (!new_conflict) {
-      ImTable* super_imt = FindSuperImt(klass.Get(), image_pointer_size_);
+      ImTable* super_imt = klass->FindSuperImt(image_pointer_size_);
       if (super_imt != nullptr) {
         bool imt_equals = true;
         for (size_t i = 0; i < ImTable::kSize && imt_equals; ++i) {
@@ -6226,6 +6358,10 @@ bool ClassLinker::LinkSuperClass(Handle<mirror::Class> klass) {
                             klass->PrettyDescriptor().c_str());
     return false;
   }
+  if (!VerifyRecordClass(klass, super)) {
+    DCHECK(Thread::Current()->IsExceptionPending());
+    return false;
+  }
 
   // Inherit kAccClassIsFinalizable from the superclass in case this
   // class doesn't override finalize.
@@ -6302,13 +6438,36 @@ class MethodNameAndSignatureComparator final : public ValueObject {
   std::string_view name_view_;
 };
 
+static ObjPtr<mirror::Class> GetImtOwner(ObjPtr<mirror::Class> klass)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  ImTable* imt = klass->GetImt(kRuntimePointerSize);
+  DCHECK(imt != nullptr);
+  while (klass->HasSuperClass()) {
+    ObjPtr<mirror::Class> super_class = klass->GetSuperClass();
+    if (super_class->ShouldHaveImt() && imt != super_class->GetImt(kRuntimePointerSize)) {
+      // IMT not shared with the super class, return the current class.
+      return klass;
+    }
+    klass = super_class;
+  }
+  return nullptr;
+}
+
 ArtMethod* ClassLinker::AddMethodToConflictTable(ObjPtr<mirror::Class> klass,
                                                  ArtMethod* conflict_method,
                                                  ArtMethod* interface_method,
                                                  ArtMethod* method) {
   ImtConflictTable* current_table = conflict_method->GetImtConflictTable(kRuntimePointerSize);
   Runtime* const runtime = Runtime::Current();
-  LinearAlloc* linear_alloc = GetAllocatorForClassLoader(klass->GetClassLoader());
+
+  // The IMT may be shared with a super class, in which case we need to use that
+  // super class's `LinearAlloc`. The conflict itself should be limited to
+  // methods at or higher up the chain of the IMT owner, otherwise class
+  // linker would have created a different IMT.
+  ObjPtr<mirror::Class> imt_owner = GetImtOwner(klass);
+  DCHECK(imt_owner != nullptr);
+
+  LinearAlloc* linear_alloc = GetAllocatorForClassLoader(imt_owner->GetClassLoader());
 
   // Create a new entry if the existing one is the shared conflict method.
   ArtMethod* new_conflict_method = (conflict_method == runtime->GetImtConflictMethod())
@@ -6393,9 +6552,8 @@ void ClassLinker::FillIMTAndConflictTables(ObjPtr<mirror::Class> klass) {
   // Compare the IMT with the super class including the conflict methods. If they are equivalent,
   // we can just use the same pointer.
   ImTable* imt = nullptr;
-  ObjPtr<mirror::Class> super_class = klass->GetSuperClass();
-  if (super_class != nullptr && super_class->ShouldHaveImt()) {
-    ImTable* super_imt = super_class->GetImt(image_pointer_size_);
+  ImTable* super_imt = klass->FindSuperImt(image_pointer_size_);
+  if (super_imt != nullptr) {
     bool same = true;
     for (size_t i = 0; same && i < ImTable::kSize; ++i) {
       ArtMethod* method = imt_data[i];
@@ -6424,6 +6582,7 @@ void ClassLinker::FillIMTAndConflictTables(ObjPtr<mirror::Class> klass) {
   if (imt == nullptr) {
     imt = klass->GetImt(image_pointer_size_);
     DCHECK(imt != nullptr);
+    DCHECK_NE(imt, super_imt);
     imt->Populate(imt_data, image_pointer_size_);
   } else {
     klass->SetImt(imt, image_pointer_size_);
@@ -7903,7 +8062,8 @@ bool ClassLinker::LinkMethodsHelper<kPointerSize>::FinalizeIfTable(
       LengthPrefixedArray<ArtMethod>* const new_methods = klass->GetMethodsPtr();
       if (new_methods != nullptr) {
         DCHECK_NE(new_methods->size(), 0u);
-        imt_methods_begin = reinterpret_cast<uintptr_t>(&new_methods->At(0));
+        imt_methods_begin =
+            reinterpret_cast<uintptr_t>(&new_methods->At(0, kMethodSize, kMethodAlignment));
         imt_methods_size = new_methods->size() * kMethodSize;
       }
     }
@@ -9211,6 +9371,308 @@ bool ClassLinker::LinkInstanceFields(Thread* self, Handle<mirror::Class> klass) 
 bool ClassLinker::LinkStaticFields(Thread* self, Handle<mirror::Class> klass, size_t* class_size) {
   CHECK(klass != nullptr);
   return LinkFieldsHelper::LinkFields(this, self, klass, true, class_size);
+}
+
+enum class RecordElementType : uint8_t {
+  kNames = 0,
+  kTypes = 1,
+  kSignatures = 2,
+  kAnnotationVisibilities = 3,
+  kAnnotations = 4
+};
+
+static const char* kRecordElementNames[] = {"componentNames",
+                                            "componentTypes",
+                                            "componentSignatures",
+                                            "componentAnnotationVisibilities",
+                                            "componentAnnotations"};
+
+class RecordAnnotationVisitor final : public annotations::AnnotationVisitor {
+ public:
+  RecordAnnotationVisitor() {}
+
+  bool ValidateCounts() {
+    if (is_error_) {
+      return false;
+    }
+
+    // Verify the counts.
+    bool annotation_element_exists =
+        (signatures_count_ != UINT32_MAX) || (annotations_count_ != UINT32_MAX);
+    if (count_ >= 2) {
+      SetErrorMsg("Record class can't have more than one @Record Annotation");
+    } else if (names_count_ == UINT32_MAX) {
+      SetErrorMsg("componentNames element is required");
+    } else if (types_count_ == UINT32_MAX) {
+      SetErrorMsg("componentTypes element is required");
+    } else if (names_count_ != types_count_) {  // Every component must have a name and a type.
+      SetErrorMsg(StringPrintf(
+          "componentTypes is expected to have %i, but has %i types", names_count_, types_count_));
+      // The other 3 elements are optional, but is expected to have the same count if it exists.
+    } else if (signatures_count_ != UINT32_MAX && signatures_count_ != names_count_) {
+      SetErrorMsg(StringPrintf("componentSignatures size is %i, but is expected to be %i",
+                               signatures_count_,
+                               names_count_));
+    } else if (annotation_element_exists && visibilities_count_ != names_count_) {
+      SetErrorMsg(
+          StringPrintf("componentAnnotationVisibilities size is %i, but is expected to be %i",
+                       visibilities_count_,
+                       names_count_));
+    } else if (annotation_element_exists && annotations_count_ != names_count_) {
+      SetErrorMsg(StringPrintf("componentAnnotations size is %i, but is expected to be %i",
+                               annotations_count_,
+                               names_count_));
+    }
+
+    return !is_error_;
+  }
+
+  const std::string& GetErrorMsg() { return error_msg_; }
+
+  bool IsRecordAnnotationFound() { return count_ != 0; }
+
+  annotations::VisitorStatus VisitAnnotation(const char* descriptor, uint8_t visibility) override {
+    if (is_error_) {
+      return annotations::VisitorStatus::kVisitBreak;
+    }
+
+    if (visibility != DexFile::kDexVisibilitySystem) {
+      return annotations::VisitorStatus::kVisitNext;
+    }
+
+    if (strcmp(descriptor, "Ldalvik/annotation/Record;") != 0) {
+      return annotations::VisitorStatus::kVisitNext;
+    }
+
+    count_ += 1;
+    if (count_ >= 2) {
+      return annotations::VisitorStatus::kVisitBreak;
+    }
+    return annotations::VisitorStatus::kVisitInner;
+  }
+
+  annotations::VisitorStatus VisitAnnotationElement(const char* element_name,
+                                                    uint8_t type,
+                                                    [[maybe_unused]] const JValue& value) override {
+    if (is_error_) {
+      return annotations::VisitorStatus::kVisitBreak;
+    }
+
+    RecordElementType visiting_type;
+    uint32_t* element_count;
+    if (strcmp(element_name, "componentNames") == 0) {
+      visiting_type = RecordElementType::kNames;
+      element_count = &names_count_;
+    } else if (strcmp(element_name, "componentTypes") == 0) {
+      visiting_type = RecordElementType::kTypes;
+      element_count = &types_count_;
+    } else if (strcmp(element_name, "componentSignatures") == 0) {
+      visiting_type = RecordElementType::kSignatures;
+      element_count = &signatures_count_;
+    } else if (strcmp(element_name, "componentAnnotationVisibilities") == 0) {
+      visiting_type = RecordElementType::kAnnotationVisibilities;
+      element_count = &visibilities_count_;
+    } else if (strcmp(element_name, "componentAnnotations") == 0) {
+      visiting_type = RecordElementType::kAnnotations;
+      element_count = &annotations_count_;
+    } else {
+      // ignore this element that could be introduced in the future ART.
+      return annotations::VisitorStatus::kVisitNext;
+    }
+
+    if ((*element_count) != UINT32_MAX) {
+      SetErrorMsg(StringPrintf("Two %s annotation elements are found but only one is expected",
+                               kRecordElementNames[static_cast<uint8_t>(visiting_type)]));
+      return annotations::VisitorStatus::kVisitBreak;
+    }
+
+    if (type != DexFile::kDexAnnotationArray) {
+      SetErrorMsg(StringPrintf("%s must be array type", element_name));
+      return annotations::VisitorStatus::kVisitBreak;
+    }
+
+    *element_count = 0;
+    visiting_type_ = visiting_type;
+    return annotations::VisitorStatus::kVisitInner;
+  }
+
+  annotations::VisitorStatus VisitArrayElement(uint8_t depth,
+                                               uint32_t index,
+                                               uint8_t type,
+                                               [[maybe_unused]] const JValue& value) override {
+    if (is_error_) {
+      return annotations::VisitorStatus::kVisitBreak;
+    }
+    switch (visiting_type_) {
+      case RecordElementType::kNames: {
+        if (depth == 0) {
+          if (!ExpectedTypeOrError(
+                  type, DexFile::kDexAnnotationString, visiting_type_, index, depth)) {
+            return annotations::VisitorStatus::kVisitBreak;
+          }
+          names_count_++;
+          return annotations::VisitorStatus::kVisitNext;
+        }
+        break;
+      }
+      case RecordElementType::kTypes: {
+        if (depth == 0) {
+          if (!ExpectedTypeOrError(
+                  type, DexFile::kDexAnnotationType, visiting_type_, index, depth)) {
+            return annotations::VisitorStatus::kVisitBreak;
+          }
+          types_count_++;
+          return annotations::VisitorStatus::kVisitNext;
+        }
+        break;
+      }
+      case RecordElementType::kSignatures: {
+        if (depth == 0) {
+          // kDexAnnotationNull implies no generic signature for the component.
+          if (type != DexFile::kDexAnnotationNull &&
+              !ExpectedTypeOrError(
+                  type, DexFile::kDexAnnotationAnnotation, visiting_type_, index, depth)) {
+            return annotations::VisitorStatus::kVisitBreak;
+          }
+          signatures_count_++;
+          return annotations::VisitorStatus::kVisitNext;
+        }
+        break;
+      }
+      case RecordElementType::kAnnotationVisibilities: {
+        if (depth == 0) {
+          if (!ExpectedTypeOrError(
+                  type, DexFile::kDexAnnotationArray, visiting_type_, index, depth)) {
+            return annotations::VisitorStatus::kVisitBreak;
+          }
+          visibilities_count_++;
+          return annotations::VisitorStatus::kVisitInner;
+        } else if (depth == 1) {
+          if (!ExpectedTypeOrError(
+                  type, DexFile::kDexAnnotationByte, visiting_type_, index, depth)) {
+            return annotations::VisitorStatus::kVisitBreak;
+          }
+          return annotations::VisitorStatus::kVisitNext;
+        }
+        break;
+      }
+      case RecordElementType::kAnnotations: {
+        if (depth == 0) {
+          if (!ExpectedTypeOrError(
+                  type, DexFile::kDexAnnotationArray, visiting_type_, index, depth)) {
+            return annotations::VisitorStatus::kVisitBreak;
+          }
+          annotations_count_++;
+          return annotations::VisitorStatus::kVisitInner;
+        } else if (depth == 1) {
+          if (!ExpectedTypeOrError(
+                  type, DexFile::kDexAnnotationAnnotation, visiting_type_, index, depth)) {
+            return annotations::VisitorStatus::kVisitBreak;
+          }
+          return annotations::VisitorStatus::kVisitNext;
+        }
+        break;
+      }
+    }
+
+    // Should never happen if every next depth level is handled above whenever kVisitInner is
+    // returned.
+    DCHECK(false) << StringPrintf("Unexpected depth %i for element %s",
+                                  depth,
+                                  kRecordElementNames[static_cast<uint8_t>(visiting_type_)]);
+    return annotations::VisitorStatus::kVisitBreak;
+  }
+
+ private:
+  bool is_error_ = false;
+  uint32_t count_ = 0;
+  uint32_t names_count_ = UINT32_MAX;
+  uint32_t types_count_ = UINT32_MAX;
+  uint32_t signatures_count_ = UINT32_MAX;
+  uint32_t visibilities_count_ = UINT32_MAX;
+  uint32_t annotations_count_ = UINT32_MAX;
+  std::string error_msg_;
+  RecordElementType visiting_type_;
+
+  inline bool ExpectedTypeOrError(uint8_t type,
+                                  uint8_t expected,
+                                  RecordElementType visiting_type,
+                                  uint8_t depth,
+                                  uint32_t index) {
+    if (type == expected) {
+      return true;
+    }
+
+    SetErrorMsg(StringPrintf(
+        "Expect 0x%02x type but got 0x%02x at the index %i and depth %i for the element %s",
+        expected,
+        type,
+        index,
+        depth,
+        kRecordElementNames[static_cast<uint8_t>(visiting_type)]));
+    return false;
+  }
+
+  void SetErrorMsg(const std::string& msg) {
+    is_error_ = true;
+    error_msg_ = msg;
+  }
+
+  DISALLOW_COPY_AND_ASSIGN(RecordAnnotationVisitor);
+};
+
+/**
+ * Set kClassFlagRecord and verify if klass is a record class.
+ * If the verification fails, a pending java exception is thrown.
+ *
+ * @return false if verification fails. If klass isn't a record class,
+ * it should always return true.
+ */
+bool ClassLinker::VerifyRecordClass(Handle<mirror::Class> klass, ObjPtr<mirror::Class> super) {
+  CHECK(klass != nullptr);
+  // First, we check the conditions specified in java.lang.Class#isRecord().
+  // If any of the conditions isn't fulfilled, it's not a record class and
+  // ART should treat it as a normal class even if it's inherited from java.lang.Record.
+  if (!klass->IsFinal()) {
+    return true;
+  }
+
+  if (super == nullptr) {
+    return true;
+  }
+
+  // Compare the string directly when this ClassLinker is initializing before
+  // WellKnownClasses initializes
+  if (WellKnownClasses::java_lang_Record == nullptr) {
+    if (!super->DescriptorEquals("Ljava/lang/Record;")) {
+      return true;
+    }
+  } else {
+    ObjPtr<mirror::Class> java_lang_Record =
+        WellKnownClasses::ToClass(WellKnownClasses::java_lang_Record);
+    if (super.Ptr() != java_lang_Record.Ptr()) {
+      return true;
+    }
+  }
+
+  // Verify @dalvik.annotation.Record
+  // The annotation has a mandatory element componentNames[] and componentTypes[] of the same size.
+  // componentSignatures[], componentAnnotationVisibilities[][], componentAnnotations[][] are
+  // optional, but should have the same size if it exists.
+  RecordAnnotationVisitor visitor;
+  annotations::VisitClassAnnotations(klass, &visitor);
+  if (!visitor.IsRecordAnnotationFound()) {
+    return true;
+  }
+
+  if (!visitor.ValidateCounts()) {
+    ThrowClassFormatError(klass.Get(), "%s", visitor.GetErrorMsg().c_str());
+    return false;
+  }
+
+  // Set kClassFlagRecord.
+  klass->SetRecordClass();
+  return true;
 }
 
 //  Set the bitmap of reference instance field offsets.

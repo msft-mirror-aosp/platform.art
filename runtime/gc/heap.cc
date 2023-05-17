@@ -419,7 +419,18 @@ Heap::Heap(size_t initial_size,
   if (VLOG_IS_ON(heap) || VLOG_IS_ON(startup)) {
     LOG(INFO) << "Heap() entering";
   }
+
   LOG(INFO) << "Using " << foreground_collector_type_ << " GC.";
+  if (!gUseUserfaultfd) {
+    // This ensures that userfaultfd syscall is done before any seccomp filter is installed.
+    // TODO(b/266731037): Remove this when we no longer need to collect metric on userfaultfd
+    // support.
+    auto [uffd_supported, minor_fault_supported] = collector::MarkCompact::GetUffdAndMinorFault();
+    // The check is just to ensure that compiler doesn't eliminate the function call above.
+    // Userfaultfd support is certain to be there if its minor-fault feature is supported.
+    CHECK_IMPLIES(minor_fault_supported, uffd_supported);
+  }
+
   if (gUseReadBarrier) {
     CHECK_EQ(foreground_collector_type_, kCollectorTypeCC);
     CHECK_EQ(background_collector_type_, kCollectorTypeCCBackground);
@@ -1091,15 +1102,11 @@ void Heap::UpdateProcessState(ProcessState old_process_state, ProcessState new_p
       RequestCollectorTransition(foreground_collector_type_, 0);
       GrowHeapOnJankPerceptibleSwitch();
     } else {
-      // Don't delay for debug builds since we may want to stress test the GC.
       // If background_collector_type_ is kCollectorTypeHomogeneousSpaceCompact then we have
       // special handling which does a homogenous space compaction once but then doesn't transition
       // the collector. Similarly, we invoke a full compaction for kCollectorTypeCC but don't
       // transition the collector.
-      RequestCollectorTransition(background_collector_type_,
-                                 kStressCollectorTransition
-                                     ? 0
-                                     : kCollectorTransitionWait);
+      RequestCollectorTransition(background_collector_type_, 0);
     }
   }
 }
@@ -1531,10 +1538,13 @@ void Heap::ThrowOutOfMemoryError(Thread* self, size_t byte_count, AllocatorType 
 void Heap::DoPendingCollectorTransition() {
   CollectorType desired_collector_type = desired_collector_type_;
 
-  if (collector_type_ == kCollectorTypeCC) {
+  if (collector_type_ == kCollectorTypeCC || collector_type_ == kCollectorTypeCMC) {
     // App's allocations (since last GC) more than the threshold then do TransitionGC
     // when the app was in background. If not then don't do TransitionGC.
-    size_t num_bytes_allocated_since_gc = GetBytesAllocated() - num_bytes_alive_after_gc_;
+    // num_bytes_allocated_since_gc should always be positive even if initially
+    // num_bytes_alive_after_gc_ is coming from Zygote. This gives positive or zero value.
+    size_t num_bytes_allocated_since_gc =
+        UnsignedDifference(GetBytesAllocated(), num_bytes_alive_after_gc_);
     if (num_bytes_allocated_since_gc <
         (UnsignedDifference(target_footprint_.load(std::memory_order_relaxed),
                             num_bytes_alive_after_gc_)/4)
@@ -1551,15 +1561,15 @@ void Heap::DoPendingCollectorTransition() {
     } else {
       VLOG(gc) << "Homogeneous compaction ignored due to jank perceptible process state";
     }
-  } else if (desired_collector_type == kCollectorTypeCCBackground) {
-    DCHECK(gUseReadBarrier);
+  } else if (desired_collector_type == kCollectorTypeCCBackground ||
+             desired_collector_type == kCollectorTypeCMC) {
     if (!CareAboutPauseTimes()) {
-      // Invoke CC full compaction.
+      // Invoke full compaction.
       CollectGarbageInternal(collector::kGcTypeFull,
                              kGcCauseCollectorTransition,
                              /*clear_soft_references=*/false, GetCurrentGcNum() + 1);
     } else {
-      VLOG(gc) << "CC background compaction ignored due to jank perceptible process state";
+      VLOG(gc) << "background compaction ignored due to jank perceptible process state";
     }
   } else {
     CHECK_EQ(desired_collector_type, collector_type_) << "Unsupported collector transition";
@@ -1808,7 +1818,7 @@ void Heap::VerifyObjectBody(ObjPtr<mirror::Object> obj) {
 
 void Heap::VerifyHeap() {
   ReaderMutexLock mu(Thread::Current(), *Locks::heap_bitmap_lock_);
-  auto visitor = [&](mirror::Object* obj) {
+  auto visitor = [&](mirror::Object* obj) NO_THREAD_SAFETY_ANALYSIS {
     VerifyObjectBody(obj);
   };
   // Technically we need the mutator lock here to call Visit. However, VerifyObjectBody is already
@@ -2542,7 +2552,7 @@ void Heap::PreZygoteFork() {
       new accounting::ModUnionTableCardCache("zygote space mod-union table", this, zygote_space_);
   CHECK(mod_union_table != nullptr) << "Failed to create zygote space mod-union table";
 
-  if (collector_type_ != kCollectorTypeCC) {
+  if (collector_type_ != kCollectorTypeCC && collector_type_ != kCollectorTypeCMC) {
     // Set all the cards in the mod-union table since we don't know which objects contain references
     // to large objects.
     mod_union_table->SetCards();
@@ -2554,10 +2564,10 @@ void Heap::PreZygoteFork() {
     mod_union_table->ProcessCards();
     mod_union_table->ClearTable();
 
-    // For CC we never collect zygote large objects. This means we do not need to set the cards for
-    // the zygote mod-union table and we can also clear all of the existing image mod-union tables.
-    // The existing mod-union tables are only for image spaces and may only reference zygote and
-    // image objects.
+    // For CC and CMC we never collect zygote large objects. This means we do not need to set the
+    // cards for the zygote mod-union table and we can also clear all of the existing image
+    // mod-union tables. The existing mod-union tables are only for image spaces and may only
+    // reference zygote and image objects.
     for (auto& pair : mod_union_tables_) {
       CHECK(pair.first->IsImageSpace());
       CHECK(!pair.first->AsImageSpace()->GetImageHeader().IsAppImage());
@@ -3620,6 +3630,15 @@ collector::GcType Heap::WaitForGcToCompleteLocked(GcCause cause, Thread* self) {
 void Heap::DumpForSigQuit(std::ostream& os) {
   os << "Heap: " << GetPercentFree() << "% free, " << PrettySize(GetBytesAllocated()) << "/"
      << PrettySize(GetTotalMemory()) << "; " << GetObjectsAllocated() << " objects\n";
+  {
+    os << "Image spaces:\n";
+    ScopedObjectAccess soa(Thread::Current());
+    for (const auto& space : continuous_spaces_) {
+      if (space->IsImageSpace()) {
+        os << space->GetName() << "\n";
+      }
+    }
+  }
   DumpGcPerformanceInfo(os);
 }
 

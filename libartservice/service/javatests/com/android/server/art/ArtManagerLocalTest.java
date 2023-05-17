@@ -18,7 +18,7 @@ package com.android.server.art;
 
 import static android.os.ParcelFileDescriptor.AutoCloseInputStream;
 
-import static com.android.server.art.DexUseManagerLocal.SecondaryDexInfo;
+import static com.android.server.art.DexUseManagerLocal.DetailedSecondaryDexInfo;
 import static com.android.server.art.model.DexoptStatus.DexContainerFileDexoptStatus;
 import static com.android.server.art.testing.TestingUtils.deepEq;
 import static com.android.server.art.testing.TestingUtils.inAnyOrder;
@@ -40,8 +40,8 @@ import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.same;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 import android.apphibernation.AppHibernationManager;
@@ -56,6 +56,7 @@ import android.os.storage.StorageManager;
 
 import androidx.test.filters.SmallTest;
 
+import com.android.modules.utils.pm.PackageStateModulesUtils;
 import com.android.server.art.model.Config;
 import com.android.server.art.model.DeleteResult;
 import com.android.server.art.model.DexoptParams;
@@ -83,7 +84,10 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
@@ -93,8 +97,8 @@ import java.util.stream.Collectors;
 @SmallTest
 @RunWith(Parameterized.class)
 public class ArtManagerLocalTest {
-    private static final String PKG_NAME = "com.example.foo";
-    private static final String PKG_NAME_SYS_UI = "com.android.systemui";
+    private static final String PKG_NAME_1 = "com.example.foo";
+    private static final String PKG_NAME_2 = "com.android.bar";
     private static final String PKG_NAME_HIBERNATING = "com.example.hibernating";
     private static final int INACTIVE_DAYS = 1;
     private static final long CURRENT_TIME_MS = 10000000000l;
@@ -104,8 +108,8 @@ public class ArtManagerLocalTest {
             CURRENT_TIME_MS - TimeUnit.DAYS.toMillis(INACTIVE_DAYS) - 1;
 
     @Rule
-    public StaticMockitoRule mockitoRule =
-            new StaticMockitoRule(SystemProperties.class, Constants.class);
+    public StaticMockitoRule mockitoRule = new StaticMockitoRule(
+            SystemProperties.class, Constants.class, PackageStateModulesUtils.class);
 
     @Mock private ArtManagerLocal.Injector mInjector;
     @Mock private PackageManagerLocal mPackageManagerLocal;
@@ -116,18 +120,26 @@ public class ArtManagerLocalTest {
     @Mock private UserManager mUserManager;
     @Mock private DexUseManagerLocal mDexUseManager;
     @Mock private StorageManager mStorageManager;
-    private PackageState mPkgState;
-    private AndroidPackage mPkg;
+    private PackageState mPkgState1;
+    private AndroidPackage mPkg1;
+    private List<DetailedSecondaryDexInfo> mSecondaryDexInfo1;
     private Config mConfig;
 
-    // True if the primary dex'es are in a readonly partition.
-    @Parameter(0) public boolean mIsInReadonlyPartition;
+    // True if the primary dex'es are in a system partition.
+    @Parameter(0) public boolean mIsInSystemPartition;
+    // True if the primary dex'es are in Incremental FS.
+    @Parameter(1) public boolean mIsInIncrementalFs;
+    // True if the artifacts should be in dalvik-cache.
+    @Parameter(2) public boolean mExpectedIsInDalvikCache;
 
     private ArtManagerLocal mArtManagerLocal;
 
-    @Parameters(name = "isInReadonlyPartition={0}")
-    public static Iterable<? extends Object> data() {
-        return List.of(false, true);
+    @Parameters(name = "isInReadonlyPartition={0},isInIncrementalFs={1},"
+                    + "expectedIsInDalvikCache={2}")
+    public static Iterable<Object[]>
+    data() {
+        return List.of(new Object[] {true, false, true}, new Object[] {false, true, true},
+                new Object[] {false, false, false});
     }
 
     @Before
@@ -144,10 +156,14 @@ public class ArtManagerLocalTest {
         lenient().when(mInjector.getAppHibernationManager()).thenReturn(mAppHibernationManager);
         lenient().when(mInjector.getUserManager()).thenReturn(mUserManager);
         lenient().when(mInjector.isSystemUiPackage(any())).thenReturn(false);
-        lenient().when(mInjector.isSystemUiPackage(PKG_NAME_SYS_UI)).thenReturn(true);
+        lenient().when(mInjector.isLauncherPackage(any())).thenReturn(false);
         lenient().when(mInjector.getDexUseManager()).thenReturn(mDexUseManager);
         lenient().when(mInjector.getCurrentTimeMillis()).thenReturn(CURRENT_TIME_MS);
         lenient().when(mInjector.getStorageManager()).thenReturn(mStorageManager);
+
+        Path tempDir = Files.createTempDirectory("temp");
+        tempDir.toFile().deleteOnExit();
+        lenient().when(mInjector.getTempDir()).thenReturn(tempDir.toString());
 
         lenient().when(SystemProperties.get(eq("pm.dexopt.install"))).thenReturn("speed-profile");
         lenient().when(SystemProperties.get(eq("pm.dexopt.bg-dexopt"))).thenReturn("speed-profile");
@@ -170,10 +186,6 @@ public class ArtManagerLocalTest {
                 .when(SystemProperties.getInt(
                         eq("pm.dexopt.downgrade_after_inactive_days"), anyInt()))
                 .thenReturn(INACTIVE_DAYS);
-        lenient()
-                .when(SystemProperties.getLong(
-                        eq("pm.dexopt.storage_threshold_above_low_bytes"), anyLong()))
-                .thenReturn(1000l);
 
         // No ISA translation.
         lenient()
@@ -183,6 +195,7 @@ public class ArtManagerLocalTest {
         lenient().when(Constants.getPreferredAbi()).thenReturn("arm64-v8a");
         lenient().when(Constants.getNative64BitAbi()).thenReturn("arm64-v8a");
         lenient().when(Constants.getNative32BitAbi()).thenReturn("armeabi-v7a");
+        lenient().when(Constants.isBootImageProfilingEnabled()).thenReturn(true);
 
         lenient().when(mAppHibernationManager.isHibernatingGlobally(any())).thenReturn(false);
         lenient().when(mAppHibernationManager.isOatArtifactDeletionEnabled()).thenReturn(true);
@@ -193,10 +206,17 @@ public class ArtManagerLocalTest {
 
         // All packages are by default recently used.
         lenient().when(mDexUseManager.getPackageLastUsedAtMs(any())).thenReturn(RECENT_TIME_MS);
-        List<? extends SecondaryDexInfo> secondaryDexInfo = createSecondaryDexInfo();
-        lenient().doReturn(secondaryDexInfo).when(mDexUseManager).getSecondaryDexInfo(eq(PKG_NAME));
+        mSecondaryDexInfo1 = createSecondaryDexInfo();
+        lenient()
+                .doReturn(mSecondaryDexInfo1)
+                .when(mDexUseManager)
+                .getSecondaryDexInfo(eq(PKG_NAME_1));
+        lenient()
+                .doReturn(mSecondaryDexInfo1)
+                .when(mDexUseManager)
+                .getFilteredDetailedSecondaryDexInfo(eq(PKG_NAME_1));
 
-        lenient().when(mStorageManager.getAllocatableBytes(any())).thenReturn(1000l);
+        simulateStorageNotLow();
 
         lenient().when(mPackageManagerLocal.withFilteredSnapshot()).thenReturn(mSnapshot);
         List<PackageState> pkgStates = createPackageStates();
@@ -208,8 +228,14 @@ public class ArtManagerLocalTest {
         var packageStateMap = pkgStates.stream().collect(
                 Collectors.toMap(PackageState::getPackageName, it -> it));
         lenient().when(mSnapshot.getPackageStates()).thenReturn(packageStateMap);
-        mPkgState = mSnapshot.getPackageState(PKG_NAME);
-        mPkg = mPkgState.getAndroidPackage();
+        mPkgState1 = mSnapshot.getPackageState(PKG_NAME_1);
+        mPkg1 = mPkgState1.getAndroidPackage();
+
+        lenient().when(mArtd.isIncrementalFsPath(any())).thenReturn(mIsInIncrementalFs);
+
+        // By default, none of the profiles are usable.
+        lenient().when(mArtd.isProfileUsable(any(), any())).thenReturn(false);
+        lenient().when(mArtd.copyAndRewriteProfile(any(), any(), any())).thenReturn(false);
 
         mArtManagerLocal = new ArtManagerLocal(mInjector);
     }
@@ -218,20 +244,22 @@ public class ArtManagerLocalTest {
     public void testdeleteDexoptArtifacts() throws Exception {
         when(mArtd.deleteArtifacts(any())).thenReturn(1l);
 
-        DeleteResult result = mArtManagerLocal.deleteDexoptArtifacts(mSnapshot, PKG_NAME);
+        DeleteResult result = mArtManagerLocal.deleteDexoptArtifacts(mSnapshot, PKG_NAME_1);
         assertThat(result.getFreedBytes()).isEqualTo(5);
 
         verify(mArtd).deleteArtifacts(deepEq(AidlUtils.buildArtifactsPath(
-                "/data/app/foo/base.apk", "arm64", mIsInReadonlyPartition)));
+                "/data/app/foo/base.apk", "arm64", mExpectedIsInDalvikCache)));
         verify(mArtd).deleteArtifacts(deepEq(AidlUtils.buildArtifactsPath(
-                "/data/app/foo/base.apk", "arm", mIsInReadonlyPartition)));
+                "/data/app/foo/base.apk", "arm", mExpectedIsInDalvikCache)));
         verify(mArtd).deleteArtifacts(deepEq(AidlUtils.buildArtifactsPath(
-                "/data/app/foo/split_0.apk", "arm64", mIsInReadonlyPartition)));
+                "/data/app/foo/split_0.apk", "arm64", mExpectedIsInDalvikCache)));
         verify(mArtd).deleteArtifacts(deepEq(AidlUtils.buildArtifactsPath(
-                "/data/app/foo/split_0.apk", "arm", mIsInReadonlyPartition)));
+                "/data/app/foo/split_0.apk", "arm", mExpectedIsInDalvikCache)));
         verify(mArtd).deleteArtifacts(deepEq(AidlUtils.buildArtifactsPath(
                 "/data/user/0/foo/1.apk", "arm64", false /* isInDalvikCache */)));
-        verifyNoMoreInteractions(mArtd);
+
+        // Verify that there are no more calls than the ones above.
+        verify(mArtd, times(5)).deleteArtifacts(any());
     }
 
     @Test
@@ -241,38 +269,41 @@ public class ArtManagerLocalTest {
         lenient().when(Constants.getPreferredAbi()).thenReturn("x86_64");
         lenient().when(Constants.getNative64BitAbi()).thenReturn("x86_64");
         lenient().when(Constants.getNative32BitAbi()).thenReturn("x86");
+        when(mSecondaryDexInfo1.get(0).abiNames()).thenReturn(Set.of("x86_64"));
 
         when(mArtd.deleteArtifacts(any())).thenReturn(1l);
 
-        DeleteResult result = mArtManagerLocal.deleteDexoptArtifacts(mSnapshot, PKG_NAME);
+        DeleteResult result = mArtManagerLocal.deleteDexoptArtifacts(mSnapshot, PKG_NAME_1);
         assertThat(result.getFreedBytes()).isEqualTo(5);
 
         verify(mArtd).deleteArtifacts(deepEq(AidlUtils.buildArtifactsPath(
-                "/data/app/foo/base.apk", "x86_64", mIsInReadonlyPartition)));
+                "/data/app/foo/base.apk", "x86_64", mExpectedIsInDalvikCache)));
         verify(mArtd).deleteArtifacts(deepEq(AidlUtils.buildArtifactsPath(
-                "/data/app/foo/base.apk", "x86", mIsInReadonlyPartition)));
+                "/data/app/foo/base.apk", "x86", mExpectedIsInDalvikCache)));
         verify(mArtd).deleteArtifacts(deepEq(AidlUtils.buildArtifactsPath(
-                "/data/app/foo/split_0.apk", "x86_64", mIsInReadonlyPartition)));
+                "/data/app/foo/split_0.apk", "x86_64", mExpectedIsInDalvikCache)));
         verify(mArtd).deleteArtifacts(deepEq(AidlUtils.buildArtifactsPath(
-                "/data/app/foo/split_0.apk", "x86", mIsInReadonlyPartition)));
+                "/data/app/foo/split_0.apk", "x86", mExpectedIsInDalvikCache)));
         // We assume that the ISA got from `DexUseManagerLocal` is already the translated one.
         verify(mArtd).deleteArtifacts(deepEq(AidlUtils.buildArtifactsPath(
-                "/data/user/0/foo/1.apk", "arm64", false /* isInDalvikCache */)));
-        verifyNoMoreInteractions(mArtd);
+                "/data/user/0/foo/1.apk", "x86_64", false /* isInDalvikCache */)));
+
+        // Verify that there are no more calls than the ones above.
+        verify(mArtd, times(5)).deleteArtifacts(any());
     }
 
     @Test(expected = IllegalArgumentException.class)
     public void testdeleteDexoptArtifactsPackageNotFound() throws Exception {
         when(mSnapshot.getPackageState(anyString())).thenReturn(null);
 
-        mArtManagerLocal.deleteDexoptArtifacts(mSnapshot, PKG_NAME);
+        mArtManagerLocal.deleteDexoptArtifacts(mSnapshot, PKG_NAME_1);
     }
 
     @Test(expected = IllegalArgumentException.class)
     public void testdeleteDexoptArtifactsNoPackage() throws Exception {
-        when(mPkgState.getAndroidPackage()).thenReturn(null);
+        when(mPkgState1.getAndroidPackage()).thenReturn(null);
 
-        mArtManagerLocal.deleteDexoptArtifacts(mSnapshot, PKG_NAME);
+        mArtManagerLocal.deleteDexoptArtifacts(mSnapshot, PKG_NAME_1);
     }
 
     @Test
@@ -297,7 +328,7 @@ public class ArtManagerLocalTest {
                 .when(mArtd)
                 .getDexoptStatus("/data/user/0/foo/1.apk", "arm64", "CLC");
 
-        DexoptStatus result = mArtManagerLocal.getDexoptStatus(mSnapshot, PKG_NAME);
+        DexoptStatus result = mArtManagerLocal.getDexoptStatus(mSnapshot, PKG_NAME_1);
 
         assertThat(result.getDexContainerFileDexoptStatuses())
                 .comparingElementsUsing(TestingUtils.<DexContainerFileDexoptStatus>deepEquality())
@@ -323,14 +354,14 @@ public class ArtManagerLocalTest {
     public void testGetDexoptStatusPackageNotFound() throws Exception {
         when(mSnapshot.getPackageState(anyString())).thenReturn(null);
 
-        mArtManagerLocal.getDexoptStatus(mSnapshot, PKG_NAME);
+        mArtManagerLocal.getDexoptStatus(mSnapshot, PKG_NAME_1);
     }
 
     @Test(expected = IllegalArgumentException.class)
     public void testGetDexoptStatusNoPackage() throws Exception {
-        when(mPkgState.getAndroidPackage()).thenReturn(null);
+        when(mPkgState1.getAndroidPackage()).thenReturn(null);
 
-        mArtManagerLocal.getDexoptStatus(mSnapshot, PKG_NAME);
+        mArtManagerLocal.getDexoptStatus(mSnapshot, PKG_NAME_1);
     }
 
     @Test
@@ -338,7 +369,7 @@ public class ArtManagerLocalTest {
         when(mArtd.getDexoptStatus(any(), any(), any()))
                 .thenThrow(new ServiceSpecificException(1 /* errorCode */, "some error message"));
 
-        DexoptStatus result = mArtManagerLocal.getDexoptStatus(mSnapshot, PKG_NAME);
+        DexoptStatus result = mArtManagerLocal.getDexoptStatus(mSnapshot, PKG_NAME_1);
 
         List<DexContainerFileDexoptStatus> statuses = result.getDexContainerFileDexoptStatuses();
         assertThat(statuses.size()).isEqualTo(5);
@@ -352,14 +383,14 @@ public class ArtManagerLocalTest {
 
     @Test
     public void testClearAppProfiles() throws Exception {
-        mArtManagerLocal.clearAppProfiles(mSnapshot, PKG_NAME);
+        mArtManagerLocal.clearAppProfiles(mSnapshot, PKG_NAME_1);
 
         verify(mArtd).deleteProfile(
-                deepEq(AidlUtils.buildProfilePathForPrimaryRef(PKG_NAME, "primary")));
+                deepEq(AidlUtils.buildProfilePathForPrimaryRef(PKG_NAME_1, "primary")));
         verify(mArtd).deleteProfile(deepEq(
-                AidlUtils.buildProfilePathForPrimaryCur(0 /* userId */, PKG_NAME, "primary")));
+                AidlUtils.buildProfilePathForPrimaryCur(0 /* userId */, PKG_NAME_1, "primary")));
         verify(mArtd).deleteProfile(deepEq(
-                AidlUtils.buildProfilePathForPrimaryCur(1 /* userId */, PKG_NAME, "primary")));
+                AidlUtils.buildProfilePathForPrimaryCur(1 /* userId */, PKG_NAME_1, "primary")));
 
         verify(mArtd).deleteProfile(
                 deepEq(AidlUtils.buildProfilePathForSecondaryRef("/data/user/0/foo/1.apk")));
@@ -371,14 +402,14 @@ public class ArtManagerLocalTest {
     public void testClearAppProfilesPackageNotFound() throws Exception {
         when(mSnapshot.getPackageState(anyString())).thenReturn(null);
 
-        mArtManagerLocal.clearAppProfiles(mSnapshot, PKG_NAME);
+        mArtManagerLocal.clearAppProfiles(mSnapshot, PKG_NAME_1);
     }
 
     @Test(expected = IllegalArgumentException.class)
     public void testClearAppProfilesNoPackage() throws Exception {
-        when(mPkgState.getAndroidPackage()).thenReturn(null);
+        when(mPkgState1.getAndroidPackage()).thenReturn(null);
 
-        mArtManagerLocal.clearAppProfiles(mSnapshot, PKG_NAME);
+        mArtManagerLocal.clearAppProfiles(mSnapshot, PKG_NAME_1);
     }
 
     @Test
@@ -387,11 +418,12 @@ public class ArtManagerLocalTest {
         var result = mock(DexoptResult.class);
         var cancellationSignal = new CancellationSignal();
 
-        when(mDexoptHelper.dexopt(any(), deepEq(List.of(PKG_NAME)), same(params),
+        when(mDexoptHelper.dexopt(any(), deepEq(List.of(PKG_NAME_1)), same(params),
                      same(cancellationSignal), any()))
                 .thenReturn(result);
 
-        assertThat(mArtManagerLocal.dexoptPackage(mSnapshot, PKG_NAME, params, cancellationSignal))
+        assertThat(
+                mArtManagerLocal.dexoptPackage(mSnapshot, PKG_NAME_1, params, cancellationSignal))
                 .isSameInstanceAs(result);
     }
 
@@ -401,27 +433,27 @@ public class ArtManagerLocalTest {
         var cancellationSignal = new CancellationSignal();
 
         when(mDexoptHelper.dexopt(
-                     any(), deepEq(List.of(PKG_NAME)), any(), same(cancellationSignal), any()))
+                     any(), deepEq(List.of(PKG_NAME_1)), any(), same(cancellationSignal), any()))
                 .thenReturn(result);
 
-        assertThat(mArtManagerLocal.resetDexoptStatus(mSnapshot, PKG_NAME, cancellationSignal))
+        assertThat(mArtManagerLocal.resetDexoptStatus(mSnapshot, PKG_NAME_1, cancellationSignal))
                 .isSameInstanceAs(result);
 
         verify(mArtd).deleteProfile(
-                deepEq(AidlUtils.buildProfilePathForPrimaryRef(PKG_NAME, "primary")));
+                deepEq(AidlUtils.buildProfilePathForPrimaryRef(PKG_NAME_1, "primary")));
         verify(mArtd).deleteProfile(deepEq(
-                AidlUtils.buildProfilePathForPrimaryCur(0 /* userId */, PKG_NAME, "primary")));
+                AidlUtils.buildProfilePathForPrimaryCur(0 /* userId */, PKG_NAME_1, "primary")));
         verify(mArtd).deleteProfile(deepEq(
-                AidlUtils.buildProfilePathForPrimaryCur(1 /* userId */, PKG_NAME, "primary")));
+                AidlUtils.buildProfilePathForPrimaryCur(1 /* userId */, PKG_NAME_1, "primary")));
 
         verify(mArtd).deleteArtifacts(deepEq(AidlUtils.buildArtifactsPath(
-                "/data/app/foo/base.apk", "arm64", mIsInReadonlyPartition)));
+                "/data/app/foo/base.apk", "arm64", mExpectedIsInDalvikCache)));
         verify(mArtd).deleteArtifacts(deepEq(AidlUtils.buildArtifactsPath(
-                "/data/app/foo/base.apk", "arm", mIsInReadonlyPartition)));
+                "/data/app/foo/base.apk", "arm", mExpectedIsInDalvikCache)));
         verify(mArtd).deleteArtifacts(deepEq(AidlUtils.buildArtifactsPath(
-                "/data/app/foo/split_0.apk", "arm64", mIsInReadonlyPartition)));
+                "/data/app/foo/split_0.apk", "arm64", mExpectedIsInDalvikCache)));
         verify(mArtd).deleteArtifacts(deepEq(AidlUtils.buildArtifactsPath(
-                "/data/app/foo/split_0.apk", "arm", mIsInReadonlyPartition)));
+                "/data/app/foo/split_0.apk", "arm", mExpectedIsInDalvikCache)));
 
         verify(mArtd).deleteProfile(
                 deepEq(AidlUtils.buildProfilePathForSecondaryRef("/data/user/0/foo/1.apk")));
@@ -436,14 +468,14 @@ public class ArtManagerLocalTest {
     public void testDexoptPackages() throws Exception {
         var dexoptResult = mock(DexoptResult.class);
         var cancellationSignal = new CancellationSignal();
-        when(mDexUseManager.getPackageLastUsedAtMs(PKG_NAME_SYS_UI)).thenReturn(CURRENT_TIME_MS);
-        when(mStorageManager.getAllocatableBytes(any())).thenReturn(999l);
+        when(mDexUseManager.getPackageLastUsedAtMs(PKG_NAME_2)).thenReturn(CURRENT_TIME_MS);
+        simulateStorageLow();
 
         // It should use the default package list and params. The list is sorted by last active
         // time in descending order.
         doReturn(dexoptResult)
                 .when(mDexoptHelper)
-                .dexopt(any(), deepEq(List.of(PKG_NAME_SYS_UI, PKG_NAME)),
+                .dexopt(any(), deepEq(List.of(PKG_NAME_2, PKG_NAME_1)),
                         argThat(params -> params.getReason().equals("bg-dexopt")),
                         same(cancellationSignal), any(), any(), any());
 
@@ -460,25 +492,25 @@ public class ArtManagerLocalTest {
     @Test
     public void testDexoptPackagesRecentlyInstalled() throws Exception {
         // The package is recently installed but hasn't been used.
-        PackageUserState userState = mPkgState.getStateForUser(UserHandle.of(1));
+        PackageUserState userState = mPkgState1.getStateForUser(UserHandle.of(1));
         when(userState.getFirstInstallTimeMillis()).thenReturn(RECENT_TIME_MS);
-        when(mDexUseManager.getPackageLastUsedAtMs(PKG_NAME)).thenReturn(0l);
-        when(mStorageManager.getAllocatableBytes(any())).thenReturn(999l);
+        when(mDexUseManager.getPackageLastUsedAtMs(PKG_NAME_1)).thenReturn(0l);
+        simulateStorageLow();
 
         var result = mock(DexoptResult.class);
         var cancellationSignal = new CancellationSignal();
 
-        // PKG_NAME should be dexopted.
+        // PKG_NAME_1 should be dexopted.
         doReturn(result)
                 .when(mDexoptHelper)
-                .dexopt(any(), inAnyOrder(PKG_NAME, PKG_NAME_SYS_UI),
+                .dexopt(any(), inAnyOrder(PKG_NAME_1, PKG_NAME_2),
                         argThat(params -> params.getReason().equals("bg-dexopt")), any(), any(),
                         any(), any());
 
         mArtManagerLocal.dexoptPackages(mSnapshot, "bg-dexopt", cancellationSignal,
                 null /* processCallbackExecutor */, null /* processCallback */);
 
-        // PKG_NAME should not be downgraded.
+        // PKG_NAME_1 should not be downgraded.
         verify(mDexoptHelper, never())
                 .dexopt(any(), any(), argThat(params -> params.getReason().equals("inactive")),
                         any(), any(), any(), any());
@@ -486,26 +518,26 @@ public class ArtManagerLocalTest {
 
     @Test
     public void testDexoptPackagesInactive() throws Exception {
-        // PKG_NAME is neither recently installed nor recently used.
-        PackageUserState userState = mPkgState.getStateForUser(UserHandle.of(1));
+        // PKG_NAME_1 is neither recently installed nor recently used.
+        PackageUserState userState = mPkgState1.getStateForUser(UserHandle.of(1));
         when(userState.getFirstInstallTimeMillis()).thenReturn(NOT_RECENT_TIME_MS);
-        when(mDexUseManager.getPackageLastUsedAtMs(PKG_NAME)).thenReturn(NOT_RECENT_TIME_MS);
-        when(mStorageManager.getAllocatableBytes(any())).thenReturn(999l);
+        when(mDexUseManager.getPackageLastUsedAtMs(PKG_NAME_1)).thenReturn(NOT_RECENT_TIME_MS);
+        simulateStorageLow();
 
         var result = mock(DexoptResult.class);
         var cancellationSignal = new CancellationSignal();
 
-        // PKG_NAME should not be dexopted.
+        // PKG_NAME_1 should not be dexopted.
         doReturn(result)
                 .when(mDexoptHelper)
-                .dexopt(any(), deepEq(List.of(PKG_NAME_SYS_UI)),
+                .dexopt(any(), deepEq(List.of(PKG_NAME_2)),
                         argThat(params -> params.getReason().equals("bg-dexopt")), any(), any(),
                         any(), any());
 
-        // PKG_NAME should be downgraded.
+        // PKG_NAME_1 should be downgraded.
         doReturn(result)
                 .when(mDexoptHelper)
-                .dexopt(any(), deepEq(List.of(PKG_NAME)),
+                .dexopt(any(), deepEq(List.of(PKG_NAME_1)),
                         argThat(params -> params.getReason().equals("inactive")), any(), any(),
                         any(), any());
 
@@ -514,20 +546,66 @@ public class ArtManagerLocalTest {
     }
 
     @Test
+    public void testDexoptPackagesInactiveStorageNotLow() throws Exception {
+        // PKG_NAME_1 is neither recently installed nor recently used.
+        PackageUserState userState = mPkgState1.getStateForUser(UserHandle.of(1));
+        when(userState.getFirstInstallTimeMillis()).thenReturn(NOT_RECENT_TIME_MS);
+        when(mDexUseManager.getPackageLastUsedAtMs(PKG_NAME_1)).thenReturn(NOT_RECENT_TIME_MS);
+
+        var result = mock(DexoptResult.class);
+        var cancellationSignal = new CancellationSignal();
+
+        // PKG_NAME_1 should not be dexopted.
+        doReturn(result)
+                .when(mDexoptHelper)
+                .dexopt(any(), deepEq(List.of(PKG_NAME_2)),
+                        argThat(params -> params.getReason().equals("bg-dexopt")), any(), any(),
+                        any(), any());
+
+        mArtManagerLocal.dexoptPackages(mSnapshot, "bg-dexopt", cancellationSignal,
+                null /* processCallbackExecutor */, null /* processCallback */);
+
+        // PKG_NAME_1 should not be downgraded because the storage is not low.
+        verify(mDexoptHelper, never())
+                .dexopt(any(), any(), argThat(params -> params.getReason().equals("inactive")),
+                        any(), any(), any(), any());
+    }
+
+    @Test
     public void testDexoptPackagesBootAfterMainlineUpdate() throws Exception {
         var result = mock(DexoptResult.class);
         var cancellationSignal = new CancellationSignal();
-        lenient().when(mStorageManager.getAllocatableBytes(any())).thenReturn(999l);
 
-        // It should only dexopt system UI.
+        lenient().when(mInjector.isSystemUiPackage(PKG_NAME_1)).thenReturn(true);
+        lenient().when(mInjector.isLauncherPackage(PKG_NAME_2)).thenReturn(true);
+
+        // It should dexopt the system UI and the launcher.
         when(mDexoptHelper.dexopt(
-                     any(), deepEq(List.of(PKG_NAME_SYS_UI)), any(), any(), any(), any(), any()))
+                     any(), inAnyOrder(PKG_NAME_1, PKG_NAME_2), any(), any(), any(), any(), any()))
                 .thenReturn(result);
 
-        assertThat(mArtManagerLocal.dexoptPackages(mSnapshot, "boot-after-mainline-update",
-                           cancellationSignal, null /* processCallbackExecutor */,
-                           null /* processCallback */))
-                .isSameInstanceAs(result);
+        mArtManagerLocal.dexoptPackages(mSnapshot, "boot-after-mainline-update", cancellationSignal,
+                null /* processCallbackExecutor */, null /* processCallback */);
+    }
+
+    @Test
+    public void testDexoptPackagesBootAfterMainlineUpdatePackagesNotFound() throws Exception {
+        var result = mock(DexoptResult.class);
+        var cancellationSignal = new CancellationSignal();
+        // PKG_NAME_1 is neither recently installed nor recently used.
+        PackageUserState userState = mPkgState1.getStateForUser(UserHandle.of(1));
+        lenient().when(userState.getFirstInstallTimeMillis()).thenReturn(NOT_RECENT_TIME_MS);
+        lenient()
+                .when(mDexUseManager.getPackageLastUsedAtMs(PKG_NAME_1))
+                .thenReturn(NOT_RECENT_TIME_MS);
+        simulateStorageLow();
+
+        // It should dexopt the system UI and the launcher, but they are not found.
+        when(mDexoptHelper.dexopt(any(), deepEq(List.of()), any(), any(), any(), any(), any()))
+                .thenReturn(result);
+
+        mArtManagerLocal.dexoptPackages(mSnapshot, "boot-after-mainline-update", cancellationSignal,
+                null /* processCallbackExecutor */, null /* processCallback */);
 
         // It should never downgrade apps, even if the storage is low.
         verify(mDexoptHelper, never())
@@ -537,11 +615,11 @@ public class ArtManagerLocalTest {
 
     @Test
     public void testDexoptPackagesOverride() throws Exception {
-        // PKG_NAME is neither recently installed nor recently used.
-        PackageUserState userState = mPkgState.getStateForUser(UserHandle.of(1));
+        // PKG_NAME_1 is neither recently installed nor recently used.
+        PackageUserState userState = mPkgState1.getStateForUser(UserHandle.of(1));
         when(userState.getFirstInstallTimeMillis()).thenReturn(NOT_RECENT_TIME_MS);
-        when(mDexUseManager.getPackageLastUsedAtMs(PKG_NAME)).thenReturn(NOT_RECENT_TIME_MS);
-        when(mStorageManager.getAllocatableBytes(any())).thenReturn(999l);
+        when(mDexUseManager.getPackageLastUsedAtMs(PKG_NAME_1)).thenReturn(NOT_RECENT_TIME_MS);
+        simulateStorageLow();
 
         var params = new DexoptParams.Builder("bg-dexopt").build();
         var result = mock(DexoptResult.class);
@@ -550,21 +628,22 @@ public class ArtManagerLocalTest {
         mArtManagerLocal.setBatchDexoptStartCallback(ForkJoinPool.commonPool(),
                 (snapshot, reason, defaultPackages, builder, passedSignal) -> {
                     assertThat(reason).isEqualTo("bg-dexopt");
-                    assertThat(defaultPackages).containsExactly(PKG_NAME_SYS_UI);
+                    assertThat(defaultPackages).containsExactly(PKG_NAME_2);
                     assertThat(passedSignal).isSameInstanceAs(cancellationSignal);
-                    builder.setPackages(List.of(PKG_NAME)).setDexoptParams(params);
+                    builder.setPackages(List.of(PKG_NAME_1)).setDexoptParams(params);
                 });
 
         // It should use the overridden package list and params.
         doReturn(result)
                 .when(mDexoptHelper)
-                .dexopt(any(), deepEq(List.of(PKG_NAME)), same(params), any(), any(), any(), any());
+                .dexopt(any(), deepEq(List.of(PKG_NAME_1)), same(params), any(), any(), any(),
+                        any());
 
         mArtManagerLocal.dexoptPackages(mSnapshot, "bg-dexopt", cancellationSignal,
                 null /* processCallbackExecutor */, null /* processCallback */);
 
-        // It should not downgrade PKG_NAME because it's in the overridden package list. It should
-        // not downgrade PKG_NAME_SYS_UI either because it's not an inactive package.
+        // It should not downgrade PKG_NAME_1 because it's in the overridden package list. It should
+        // not downgrade PKG_NAME_2 either because it's not an inactive package.
         verify(mDexoptHelper, never())
                 .dexopt(any(), any(), argThat(params2 -> params2.getReason().equals("inactive")),
                         any(), any(), any(), any());
@@ -578,12 +657,12 @@ public class ArtManagerLocalTest {
 
         mArtManagerLocal.setBatchDexoptStartCallback(ForkJoinPool.commonPool(),
                 (snapshot, reason, defaultPackages, builder, passedSignal) -> {
-                    builder.setPackages(List.of(PKG_NAME)).setDexoptParams(params);
+                    builder.setPackages(List.of(PKG_NAME_1)).setDexoptParams(params);
                 });
         mArtManagerLocal.clearBatchDexoptStartCallback();
 
         // It should use the default package list and params.
-        when(mDexoptHelper.dexopt(any(), inAnyOrder(PKG_NAME, PKG_NAME_SYS_UI), not(same(params)),
+        when(mDexoptHelper.dexopt(any(), inAnyOrder(PKG_NAME_1, PKG_NAME_2), not(same(params)),
                      same(cancellationSignal), any(), any(), any()))
                 .thenReturn(result);
 
@@ -615,16 +694,20 @@ public class ArtManagerLocalTest {
         File tempFile = File.createTempFile("primary", ".prof");
         tempFile.deleteOnExit();
 
-        when(mArtd.mergeProfiles(
-                     deepEq(List.of(AidlUtils.buildProfilePathForPrimaryRef(PKG_NAME, "primary"),
-                             AidlUtils.buildProfilePathForPrimaryCur(
-                                     0 /* userId */, PKG_NAME, "primary"),
-                             AidlUtils.buildProfilePathForPrimaryCur(
-                                     1 /* userId */, PKG_NAME, "primary"))),
+        ProfilePath refProfile = AidlUtils.buildProfilePathForPrimaryRef(PKG_NAME_1, "primary");
+        String dexPath = "/data/app/foo/base.apk";
+
+        when(mArtd.isProfileUsable(deepEq(refProfile), eq(dexPath))).thenReturn(true);
+
+        when(mArtd.mergeProfiles(deepEq(List.of(refProfile,
+                                         AidlUtils.buildProfilePathForPrimaryCur(
+                                                 0 /* userId */, PKG_NAME_1, "primary"),
+                                         AidlUtils.buildProfilePathForPrimaryCur(
+                                                 1 /* userId */, PKG_NAME_1, "primary"))),
                      isNull(),
-                     deepEq(AidlUtils.buildOutputProfileForPrimary(PKG_NAME, "primary",
+                     deepEq(AidlUtils.buildOutputProfileForPrimary(PKG_NAME_1, "primary",
                              Process.SYSTEM_UID, Process.SYSTEM_UID, false /* isPublic */)),
-                     deepEq(List.of("/data/app/foo/base.apk")), deepEq(options)))
+                     deepEq(List.of(dexPath)), deepEq(options)))
                 .thenAnswer(invocation -> {
                     try (var writer = new FileWriter(tempFile)) {
                         writer.write("snapshot");
@@ -637,11 +720,12 @@ public class ArtManagerLocalTest {
                 });
 
         ParcelFileDescriptor fd =
-                mArtManagerLocal.snapshotAppProfile(mSnapshot, PKG_NAME, null /* splitName */);
+                mArtManagerLocal.snapshotAppProfile(mSnapshot, PKG_NAME_1, null /* splitName */);
 
         verify(mArtd).deleteProfile(
                 argThat(profile -> profile.getTmpProfilePath().tmpPath.equals(tempFile.getPath())));
 
+        assertThat(fd.getStatSize()).isGreaterThan(0);
         try (InputStream inputStream = new AutoCloseInputStream(fd)) {
             String contents = new String(inputStream.readAllBytes(), StandardCharsets.UTF_8);
             assertThat(contents).isEqualTo("snapshot");
@@ -649,20 +733,69 @@ public class ArtManagerLocalTest {
     }
 
     @Test
+    public void testSnapshotAppProfileFromDm() throws Exception {
+        String tempPathForRef = "/temp/path/for/ref";
+        File tempFileForSnapshot = File.createTempFile("primary", ".prof");
+        tempFileForSnapshot.deleteOnExit();
+
+        ProfilePath refProfile = AidlUtils.buildProfilePathForPrimaryRef(PKG_NAME_1, "primary");
+        String dexPath = "/data/app/foo/base.apk";
+
+        // Simulate that the reference profile doesn't exist.
+        when(mArtd.isProfileUsable(deepEq(refProfile), eq(dexPath))).thenReturn(false);
+
+        // The DM file is usable.
+        when(mArtd.copyAndRewriteProfile(
+                     deepEq(AidlUtils.buildProfilePathForDm(dexPath)), any(), eq(dexPath)))
+                .thenAnswer(invocation -> {
+                    var output = invocation.<OutputProfile>getArgument(1);
+                    output.profilePath.tmpPath = tempPathForRef;
+                    return true;
+                });
+
+        // Verify that the reference file initialized from the DM file is used.
+        when(mArtd.mergeProfiles(
+                     argThat(profiles
+                             -> profiles.stream().anyMatch(profile
+                                     -> profile.getTag() == ProfilePath.tmpProfilePath
+                                             && profile.getTmpProfilePath().tmpPath.equals(
+                                                     tempPathForRef))),
+                     isNull(), any(), deepEq(List.of(dexPath)), any()))
+                .thenAnswer(invocation -> {
+                    var output = invocation.<OutputProfile>getArgument(2);
+                    output.profilePath.tmpPath = tempFileForSnapshot.getPath();
+                    return true;
+                });
+
+        ParcelFileDescriptor fd =
+                mArtManagerLocal.snapshotAppProfile(mSnapshot, PKG_NAME_1, null /* splitName */);
+
+        verify(mArtd).deleteProfile(argThat(profile
+                -> profile.getTmpProfilePath().tmpPath.equals(tempFileForSnapshot.getPath())));
+        verify(mArtd).deleteProfile(
+                argThat(profile -> profile.getTmpProfilePath().tmpPath.equals(tempPathForRef)));
+    }
+
+    @Test
     public void testSnapshotAppProfileSplit() throws Exception {
-        when(mArtd.mergeProfiles(deepEq(List.of(AidlUtils.buildProfilePathForPrimaryRef(
-                                                        PKG_NAME, "split_0.split"),
+        ProfilePath refProfile =
+                AidlUtils.buildProfilePathForPrimaryRef(PKG_NAME_1, "split_0.split");
+        String dexPath = "/data/app/foo/split_0.apk";
+
+        when(mArtd.isProfileUsable(deepEq(refProfile), eq(dexPath))).thenReturn(true);
+
+        when(mArtd.mergeProfiles(deepEq(List.of(refProfile,
                                          AidlUtils.buildProfilePathForPrimaryCur(
-                                                 0 /* userId */, PKG_NAME, "split_0.split"),
+                                                 0 /* userId */, PKG_NAME_1, "split_0.split"),
                                          AidlUtils.buildProfilePathForPrimaryCur(
-                                                 1 /* userId */, PKG_NAME, "split_0.split"))),
+                                                 1 /* userId */, PKG_NAME_1, "split_0.split"))),
                      isNull(),
-                     deepEq(AidlUtils.buildOutputProfileForPrimary(PKG_NAME, "split_0.split",
+                     deepEq(AidlUtils.buildOutputProfileForPrimary(PKG_NAME_1, "split_0.split",
                              Process.SYSTEM_UID, Process.SYSTEM_UID, false /* isPublic */)),
-                     deepEq(List.of("/data/app/foo/split_0.apk")), any()))
+                     deepEq(List.of(dexPath)), any()))
                 .thenReturn(false);
 
-        mArtManagerLocal.snapshotAppProfile(mSnapshot, PKG_NAME, "split_0");
+        mArtManagerLocal.snapshotAppProfile(mSnapshot, PKG_NAME_1, "split_0");
     }
 
     @Test
@@ -670,10 +803,11 @@ public class ArtManagerLocalTest {
         when(mArtd.mergeProfiles(any(), any(), any(), any(), any())).thenReturn(false);
 
         ParcelFileDescriptor fd =
-                mArtManagerLocal.snapshotAppProfile(mSnapshot, PKG_NAME, null /* splitName */);
+                mArtManagerLocal.snapshotAppProfile(mSnapshot, PKG_NAME_1, null /* splitName */);
 
         verify(mArtd, never()).deleteProfile(any());
 
+        assertThat(fd.getStatSize()).isEqualTo(0);
         try (InputStream inputStream = new AutoCloseInputStream(fd)) {
             assertThat(inputStream.readAllBytes()).isEmpty();
         }
@@ -683,19 +817,19 @@ public class ArtManagerLocalTest {
     public void testSnapshotAppProfilePackageNotFound() throws Exception {
         when(mSnapshot.getPackageState(anyString())).thenReturn(null);
 
-        mArtManagerLocal.snapshotAppProfile(mSnapshot, PKG_NAME, null /* splitName */);
+        mArtManagerLocal.snapshotAppProfile(mSnapshot, PKG_NAME_1, null /* splitName */);
     }
 
     @Test(expected = IllegalArgumentException.class)
     public void testSnapshotAppProfileNoPackage() throws Exception {
-        when(mPkgState.getAndroidPackage()).thenReturn(null);
+        when(mPkgState1.getAndroidPackage()).thenReturn(null);
 
-        mArtManagerLocal.snapshotAppProfile(mSnapshot, PKG_NAME, null /* splitName */);
+        mArtManagerLocal.snapshotAppProfile(mSnapshot, PKG_NAME_1, null /* splitName */);
     }
 
     @Test(expected = IllegalArgumentException.class)
     public void testSnapshotAppProfileSplitNotFound() throws Exception {
-        mArtManagerLocal.snapshotAppProfile(mSnapshot, PKG_NAME, "non-existent-split");
+        mArtManagerLocal.snapshotAppProfile(mSnapshot, PKG_NAME_1, "non-existent-split");
     }
 
     @Test
@@ -707,7 +841,7 @@ public class ArtManagerLocalTest {
                 .thenReturn(false); // A non-empty merge is tested in `testSnapshotAppProfile`.
 
         ParcelFileDescriptor fd = mArtManagerLocal.dumpAppProfile(
-                mSnapshot, PKG_NAME, null /* splitName */, false /* dumpClassesAndMethods */);
+                mSnapshot, PKG_NAME_1, null /* splitName */, false /* dumpClassesAndMethods */);
     }
 
     @Test
@@ -719,7 +853,7 @@ public class ArtManagerLocalTest {
                 .thenReturn(false); // A non-empty merge is tested in `testSnapshotAppProfile`.
 
         ParcelFileDescriptor fd = mArtManagerLocal.dumpAppProfile(
-                mSnapshot, PKG_NAME, null /* splitName */, true /* dumpClassesAndMethods */);
+                mSnapshot, PKG_NAME_1, null /* splitName */, true /* dumpClassesAndMethods */);
     }
 
     @Test
@@ -740,21 +874,21 @@ public class ArtManagerLocalTest {
                                      0 /* userId */, "android", "primary"),
                              AidlUtils.buildProfilePathForPrimaryCur(
                                      1 /* userId */, "android", "primary"),
-                             AidlUtils.buildProfilePathForPrimaryRef(PKG_NAME, "primary"),
+                             AidlUtils.buildProfilePathForPrimaryRef(PKG_NAME_1, "primary"),
                              AidlUtils.buildProfilePathForPrimaryCur(
-                                     0 /* userId */, PKG_NAME, "primary"),
+                                     0 /* userId */, PKG_NAME_1, "primary"),
                              AidlUtils.buildProfilePathForPrimaryCur(
-                                     1 /* userId */, PKG_NAME, "primary"),
-                             AidlUtils.buildProfilePathForPrimaryRef(PKG_NAME, "split_0.split"),
+                                     1 /* userId */, PKG_NAME_1, "primary"),
+                             AidlUtils.buildProfilePathForPrimaryRef(PKG_NAME_1, "split_0.split"),
                              AidlUtils.buildProfilePathForPrimaryCur(
-                                     0 /* userId */, PKG_NAME, "split_0.split"),
+                                     0 /* userId */, PKG_NAME_1, "split_0.split"),
                              AidlUtils.buildProfilePathForPrimaryCur(
-                                     1 /* userId */, PKG_NAME, "split_0.split"),
-                             AidlUtils.buildProfilePathForPrimaryRef(PKG_NAME_SYS_UI, "primary"),
+                                     1 /* userId */, PKG_NAME_1, "split_0.split"),
+                             AidlUtils.buildProfilePathForPrimaryRef(PKG_NAME_2, "primary"),
                              AidlUtils.buildProfilePathForPrimaryCur(
-                                     0 /* userId */, PKG_NAME_SYS_UI, "primary"),
+                                     0 /* userId */, PKG_NAME_2, "primary"),
                              AidlUtils.buildProfilePathForPrimaryCur(
-                                     1 /* userId */, PKG_NAME_SYS_UI, "primary"),
+                                     1 /* userId */, PKG_NAME_2, "primary"),
                              AidlUtils.buildProfilePathForPrimaryRef(
                                      PKG_NAME_HIBERNATING, "primary"),
                              AidlUtils.buildProfilePathForPrimaryCur(
@@ -769,6 +903,56 @@ public class ArtManagerLocalTest {
                 .thenReturn(false); // A non-empty merge is tested in `testSnapshotAppProfile`.
 
         mArtManagerLocal.snapshotBootImageProfile(mSnapshot);
+    }
+
+    @Test
+    public void testCleanup() throws Exception {
+        // It should keep all artifacts.
+        doReturn(createGetDexoptStatusResult("speed-profile", "bg-dexopt", "location"))
+                .when(mArtd)
+                .getDexoptStatus(eq("/data/app/foo/base.apk"), eq("arm64"), any());
+        doReturn(createGetDexoptStatusResult("verify", "cmdline", "location"))
+                .when(mArtd)
+                .getDexoptStatus(eq("/data/user/0/foo/1.apk"), eq("arm64"), any());
+
+        // It should only keep VDEX files.
+        doReturn(createGetDexoptStatusResult("verify", "vdex", "location"))
+                .when(mArtd)
+                .getDexoptStatus(eq("/data/app/foo/split_0.apk"), eq("arm64"), any());
+        doReturn(createGetDexoptStatusResult("verify", "vdex", "location"))
+                .when(mArtd)
+                .getDexoptStatus(eq("/data/app/foo/split_0.apk"), eq("arm"), any());
+
+        // It should not keep any artifacts.
+        doReturn(createGetDexoptStatusResult("run-from-apk", "unknown", "unknown"))
+                .when(mArtd)
+                .getDexoptStatus(eq("/data/app/foo/base.apk"), eq("arm"), any());
+
+        when(mSnapshot.getPackageStates()).thenReturn(Map.of(PKG_NAME_1, mPkgState1));
+        mArtManagerLocal.cleanup(mSnapshot);
+
+        verify(mArtd).cleanup(
+                inAnyOrderDeepEquals(AidlUtils.buildProfilePathForPrimaryRef(PKG_NAME_1, "primary"),
+                        AidlUtils.buildProfilePathForPrimaryCur(
+                                0 /* userId */, PKG_NAME_1, "primary"),
+                        AidlUtils.buildProfilePathForPrimaryCur(
+                                1 /* userId */, PKG_NAME_1, "primary"),
+                        AidlUtils.buildProfilePathForPrimaryRef(PKG_NAME_1, "split_0.split"),
+                        AidlUtils.buildProfilePathForPrimaryCur(
+                                0 /* userId */, PKG_NAME_1, "split_0.split"),
+                        AidlUtils.buildProfilePathForPrimaryCur(
+                                1 /* userId */, PKG_NAME_1, "split_0.split"),
+                        AidlUtils.buildProfilePathForSecondaryRef("/data/user/0/foo/1.apk"),
+                        AidlUtils.buildProfilePathForSecondaryCur("/data/user/0/foo/1.apk")),
+                inAnyOrderDeepEquals(AidlUtils.buildArtifactsPath("/data/app/foo/base.apk", "arm64",
+                                             mExpectedIsInDalvikCache),
+                        AidlUtils.buildArtifactsPath(
+                                "/data/user/0/foo/1.apk", "arm64", false /* isInDalvikCache */)),
+                inAnyOrderDeepEquals(
+                        VdexPath.artifactsPath(AidlUtils.buildArtifactsPath(
+                                "/data/app/foo/split_0.apk", "arm64", mExpectedIsInDalvikCache)),
+                        VdexPath.artifactsPath(AidlUtils.buildArtifactsPath(
+                                "/data/app/foo/split_0.apk", "arm", mExpectedIsInDalvikCache))));
     }
 
     private AndroidPackage createPackage(boolean multiSplit) {
@@ -806,60 +990,48 @@ public class ArtManagerLocalTest {
     }
 
     private PackageState createPackageState(
-            String packageName, int appId, boolean hasPackage, boolean multiSplit) {
+            String packageName, boolean isDexoptable, boolean multiSplit) {
         PackageState pkgState = mock(PackageState.class);
 
         lenient().when(pkgState.getPackageName()).thenReturn(packageName);
         lenient().when(pkgState.getPrimaryCpuAbi()).thenReturn("arm64-v8a");
         lenient().when(pkgState.getSecondaryCpuAbi()).thenReturn("armeabi-v7a");
-        lenient().when(pkgState.isSystem()).thenReturn(mIsInReadonlyPartition);
+        lenient().when(pkgState.isSystem()).thenReturn(mIsInSystemPartition);
         lenient().when(pkgState.isUpdatedSystemApp()).thenReturn(false);
-        lenient().when(pkgState.getAppId()).thenReturn(appId);
 
-        if (hasPackage) {
-            AndroidPackage pkg = createPackage(multiSplit);
-            lenient().when(pkgState.getAndroidPackage()).thenReturn(pkg);
-        } else {
-            lenient().when(pkgState.getAndroidPackage()).thenReturn(null);
-        }
+        AndroidPackage pkg = createPackage(multiSplit);
+        lenient().when(pkgState.getAndroidPackage()).thenReturn(pkg);
 
         PackageUserState pkgUserState0 = createPackageUserState();
         lenient().when(pkgState.getStateForUser(UserHandle.of(0))).thenReturn(pkgUserState0);
         PackageUserState pkgUserState1 = createPackageUserState();
         lenient().when(pkgState.getStateForUser(UserHandle.of(1))).thenReturn(pkgUserState1);
 
+        lenient().when(PackageStateModulesUtils.isDexoptable(pkgState)).thenReturn(isDexoptable);
+
         return pkgState;
     }
 
     private List<PackageState> createPackageStates() {
-        PackageState pkgState = createPackageState(
-                PKG_NAME, 10001 /* appId */, true /* hasPackage */, true /* multiSplit */);
+        PackageState pkgState1 =
+                createPackageState(PKG_NAME_1, true /* isDexoptable */, true /* multiSplit */);
 
-        PackageState sysUiPkgState = createPackageState(
-                PKG_NAME_SYS_UI, 1234 /* appId */, true /* hasPackage */, false /* multiSplit */);
+        PackageState pkgState2 =
+                createPackageState(PKG_NAME_2, true /* isDexoptable */, false /* multiSplit */);
 
         // This should not be dexopted because it's hibernating. However, it should be included
         // when snapshotting boot image profile.
-        PackageState pkgHibernatingState = createPackageState(PKG_NAME_HIBERNATING,
-                10002 /* appId */, true /* hasPackage */, false /* multiSplit */);
+        PackageState pkgHibernatingState = createPackageState(
+                PKG_NAME_HIBERNATING, true /* isDexoptable */, false /* multiSplit */);
         lenient()
                 .when(mAppHibernationManager.isHibernatingGlobally(PKG_NAME_HIBERNATING))
                 .thenReturn(true);
 
-        // This should not be dexopted because it does't have AndroidPackage.
-        PackageState nullPkgState = createPackageState("com.example.null", 10003 /* appId */,
-                false /* hasPackage */, false /* multiSplit */);
+        // This should not be dexopted because it's not dexoptable.
+        PackageState nonDexoptablePkgState = createPackageState(
+                "com.example.non-dexoptable", false /* isDexoptable */, false /* multiSplit */);
 
-        // This should not be dexopted because it has a negative app id.
-        PackageState apexPkgState = createPackageState(
-                "com.android.art", -1 /* appId */, true /* hasPackage */, false /* multiSplit */);
-
-        // This should not be dexopted because it's "android".
-        PackageState platformPkgState = createPackageState(Utils.PLATFORM_PACKAGE_NAME,
-                1000 /* appId */, true /* hasPackage */, false /* multiSplit */);
-
-        return List.of(pkgState, sysUiPkgState, pkgHibernatingState, nullPkgState, apexPkgState,
-                platformPkgState);
+        return List.of(pkgState1, pkgState2, pkgHibernatingState, nonDexoptablePkgState);
     }
 
     private GetDexoptStatusResult createGetDexoptStatusResult(
@@ -871,11 +1043,23 @@ public class ArtManagerLocalTest {
         return getDexoptStatusResult;
     }
 
-    private List<? extends SecondaryDexInfo> createSecondaryDexInfo() throws Exception {
-        var dexInfo = mock(SecondaryDexInfo.class);
+    private List<DetailedSecondaryDexInfo> createSecondaryDexInfo() throws Exception {
+        var dexInfo = mock(DetailedSecondaryDexInfo.class);
         lenient().when(dexInfo.dexPath()).thenReturn("/data/user/0/foo/1.apk");
         lenient().when(dexInfo.abiNames()).thenReturn(Set.of("arm64-v8a"));
         lenient().when(dexInfo.classLoaderContext()).thenReturn("CLC");
         return List.of(dexInfo);
+    }
+
+    private void simulateStorageLow() throws Exception {
+        lenient()
+                .when(mStorageManager.getAllocatableBytes(any()))
+                .thenReturn(ArtManagerLocal.DOWNGRADE_THRESHOLD_ABOVE_LOW_BYTES - 1);
+    }
+
+    private void simulateStorageNotLow() throws Exception {
+        lenient()
+                .when(mStorageManager.getAllocatableBytes(any()))
+                .thenReturn(ArtManagerLocal.DOWNGRADE_THRESHOLD_ABOVE_LOW_BYTES);
     }
 }

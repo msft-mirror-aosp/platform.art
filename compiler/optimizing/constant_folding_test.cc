@@ -32,7 +32,7 @@ namespace art HIDDEN {
 /**
  * Fixture class for the constant folding and dce tests.
  */
-class ConstantFoldingTest : public OptimizingUnitTest {
+class ConstantFoldingTest : public CommonCompilerTest, public OptimizingUnitTestHelper {
  public:
   ConstantFoldingTest() : graph_(nullptr) { }
 
@@ -60,7 +60,9 @@ class ConstantFoldingTest : public OptimizingUnitTest {
     std::string actual_before = printer_before.str();
     EXPECT_EQ(expected_before, actual_before);
 
-    HConstantFolding(graph_, /* stats= */ nullptr, "constant_folding").Run();
+    HConstantFolding constant_folding(
+        graph_, /* stats= */ nullptr, "constant_folding", /* use_all_optimizations= */ true);
+    constant_folding.Run();
     GraphChecker graph_checker_cf(graph_);
     graph_checker_cf.Run();
     ASSERT_TRUE(graph_checker_cf.IsValid());

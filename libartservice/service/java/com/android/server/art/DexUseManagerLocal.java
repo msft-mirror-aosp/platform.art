@@ -49,6 +49,7 @@ import com.android.server.art.proto.SecondaryDexUseProto;
 import com.android.server.art.proto.SecondaryDexUseRecordProto;
 import com.android.server.pm.PackageManagerLocal;
 import com.android.server.pm.pkg.AndroidPackage;
+import com.android.server.pm.pkg.AndroidPackageSplit;
 import com.android.server.pm.pkg.PackageState;
 
 import com.google.auto.value.AutoValue;
@@ -60,19 +61,23 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.function.BiFunction;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
@@ -86,8 +91,9 @@ import java.util.stream.Collectors;
  * @hide
  */
 @SystemApi(client = SystemApi.Client.SYSTEM_SERVER)
+@RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
 public class DexUseManagerLocal {
-    private static final String TAG = "DexUseManagerLocal";
+    private static final String TAG = ArtManagerLocal.TAG;
     private static final String FILENAME = "/data/system/package-dex-usage.pb";
 
     /**
@@ -112,6 +118,10 @@ public class DexUseManagerLocal {
     @GuardedBy("mLock") @NonNull private DexUse mDexUse; // Initialized by `load`.
     @GuardedBy("mLock") private int mRevision = 0;
     @GuardedBy("mLock") private int mLastCommittedRevision = 0;
+    @GuardedBy("mLock")
+    @NonNull
+    private SecondaryDexLocationManager mSecondaryDexLocationManager =
+            new SecondaryDexLocationManager();
 
     /**
      * Creates the singleton instance.
@@ -124,7 +134,9 @@ public class DexUseManagerLocal {
      * PackageManagerService} starts because {@code PackageManagerService} needs it as soon as it
      * starts. It's safe to create an instance early because it doesn't depend on anything else.
      *
+     * @param context the system server context
      * @throws IllegalStateException if the instance is already created
+     * @throws NullPointerException if required dependencies are missing
      */
     @NonNull
     public static DexUseManagerLocal createInstance(@NonNull Context context) {
@@ -360,7 +372,6 @@ public class DexUseManagerLocal {
      * @throws IllegalArgumentException if {@code classLoaderContextByDexContainerFile} contains
      *         invalid entries
      */
-    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public void notifyDexContainersLoaded(@NonNull PackageManagerLocal.FilteredSnapshot snapshot,
             @NonNull String loadingPackageName,
             @NonNull Map<String, String> classLoaderContextByDexContainerFile) {
@@ -381,15 +392,18 @@ public class DexUseManagerLocal {
         for (var entry : classLoaderContextByDexContainerFile.entrySet()) {
             String dexPath = Utils.assertNonEmpty(entry.getKey());
             String classLoaderContext = Utils.assertNonEmpty(entry.getValue());
-            String owningPackageName = findOwningPackage(snapshot, loadingPackageName, dexPath,
-                    DexUseManagerLocal::isOwningPackageForPrimaryDex);
+            String owningPackageName = findOwningPackage(snapshot, loadingPackageName,
+                    (pkgState) -> isOwningPackageForPrimaryDex(pkgState, dexPath));
             if (owningPackageName != null) {
                 addPrimaryDexUse(owningPackageName, dexPath, loadingPackageName, isolatedProcess,
                         lastUsedAtMs);
                 continue;
             }
-            owningPackageName = findOwningPackage(snapshot, loadingPackageName, dexPath,
-                    DexUseManagerLocal::isOwningPackageForSecondaryDex);
+            Path path = Paths.get(dexPath);
+            synchronized (mLock) {
+                owningPackageName = findOwningPackage(snapshot, loadingPackageName,
+                        (pkgState) -> isOwningPackageForSecondaryDexLocked(pkgState, path));
+            }
             if (owningPackageName != null) {
                 PackageState loadingPkgState =
                         Utils.getPackageStateOrThrow(snapshot, loadingPackageName);
@@ -399,56 +413,53 @@ public class DexUseManagerLocal {
                         classLoaderContext, abi.name(), lastUsedAtMs);
                 continue;
             }
-            // It is expected that a dex file isn't owned by any package. For example, the dex file
-            // could be a shared library jar.
+            // It is expected that a dex file isn't owned by any package. For example, the dex
+            // file could be a shared library jar.
         }
     }
 
     @Nullable
     private static String findOwningPackage(@NonNull PackageManagerLocal.FilteredSnapshot snapshot,
-            @NonNull String loadingPackageName, @NonNull String dexPath,
-            @NonNull BiFunction<PackageState, String, Boolean> predicate) {
+            @NonNull String loadingPackageName,
+            @NonNull Function<PackageState, Boolean> predicate) {
         // Most likely, the package is loading its own dex file, so we check this first as an
         // optimization.
         PackageState loadingPkgState = Utils.getPackageStateOrThrow(snapshot, loadingPackageName);
-        if (predicate.apply(loadingPkgState, dexPath)) {
+        if (predicate.apply(loadingPkgState)) {
             return loadingPkgState.getPackageName();
         }
 
-        return snapshot.getPackageStates()
-                .values()
-                .stream()
-                .filter(packageState -> predicate.apply(packageState, dexPath))
-                .map(PackageState::getPackageName)
-                .findFirst()
-                .orElse(null);
+        for (PackageState pkgState : snapshot.getPackageStates().values()) {
+            if (predicate.apply(pkgState)) {
+                return pkgState.getPackageName();
+            }
+        }
+
+        return null;
     }
 
     private static boolean isOwningPackageForPrimaryDex(
             @NonNull PackageState pkgState, @NonNull String dexPath) {
         AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
-        return PrimaryDexUtils.getDexInfo(pkg).stream().anyMatch(
-                dexInfo -> dexInfo.dexPath().equals(dexPath));
+        List<AndroidPackageSplit> splits = pkg.getSplits();
+        for (int i = 0; i < splits.size(); i++) {
+            if (splits.get(i).getPath().equals(dexPath)) {
+                return true;
+            }
+        }
+        return false;
     }
 
-    private static boolean isOwningPackageForSecondaryDex(
-            @NonNull PackageState pkgState, @NonNull String dexPath) {
-        AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
-        UUID storageUuid = pkg.getStorageUuid();
-        UserHandle handle = Binder.getCallingUserHandle();
-
-        File ceDir = Environment.getDataCePackageDirectoryForUser(
-                storageUuid, handle, pkgState.getPackageName());
-        if (Paths.get(dexPath).startsWith(ceDir.toPath())) {
-            return true;
+    @GuardedBy("mLock")
+    private boolean isOwningPackageForSecondaryDexLocked(
+            @NonNull PackageState pkgState, @NonNull Path dexPath) {
+        UserHandle userHandle = Binder.getCallingUserHandle();
+        List<Path> locations = mSecondaryDexLocationManager.getLocations(pkgState, userHandle);
+        for (int i = 0; i < locations.size(); i++) {
+            if (dexPath.startsWith(locations.get(i))) {
+                return true;
+            }
         }
-
-        File deDir = Environment.getDataDePackageDirectoryForUser(
-                storageUuid, handle, pkgState.getPackageName());
-        if (Paths.get(dexPath).startsWith(deDir.toPath())) {
-            return true;
-        }
-
         return false;
     }
 
@@ -601,6 +612,173 @@ public class DexUseManagerLocal {
         } catch (ServiceSpecificException | RemoteException e) {
             Log.e(TAG, "Failed to get visibility of " + dexPath, e);
             return FileVisibility.NOT_FOUND;
+        }
+    }
+
+    /** @hide */
+    @Nullable
+    public String getSecondaryClassLoaderContext(
+            @NonNull String owningPackageName, @NonNull String dexFile, @NonNull DexLoader loader) {
+        synchronized (mLock) {
+            return Optional
+                    .ofNullable(mDexUse.mPackageDexUseByOwningPackageName.get(owningPackageName))
+                    .map(packageDexUse -> packageDexUse.mSecondaryDexUseByDexFile.get(dexFile))
+                    .map(secondaryDexUse -> secondaryDexUse.mRecordByLoader.get(loader))
+                    .map(record -> record.mClassLoaderContext)
+                    .orElse(null);
+        }
+    }
+
+    /**
+     * Cleans up obsolete information about dex files and packages that no longer exist.
+     *
+     * @hide
+     */
+    public void cleanup() {
+        Set<String> packageNames = mInjector.getAllPackageNames();
+        Map<String, Integer> dexFileVisibilityByName = new HashMap<>();
+
+        // Scan the data in two passes to avoid holding the lock during I/O.
+        synchronized (mLock) {
+            for (PackageDexUse packageDexUse : mDexUse.mPackageDexUseByOwningPackageName.values()) {
+                for (String dexFile : packageDexUse.mPrimaryDexUseByDexFile.keySet()) {
+                    dexFileVisibilityByName.put(dexFile, FileVisibility.NOT_FOUND);
+                }
+                for (String dexFile : packageDexUse.mSecondaryDexUseByDexFile.keySet()) {
+                    dexFileVisibilityByName.put(dexFile, FileVisibility.NOT_FOUND);
+                }
+            }
+        }
+
+        for (var entry : dexFileVisibilityByName.entrySet()) {
+            entry.setValue(getDexFileVisibility(entry.getKey()));
+        }
+
+        synchronized (mLock) {
+            for (var it = mDexUse.mPackageDexUseByOwningPackageName.entrySet().iterator();
+                    it.hasNext();) {
+                Map.Entry<String, PackageDexUse> entry = it.next();
+                String owningPackageName = entry.getKey();
+                PackageDexUse packageDexUse = entry.getValue();
+
+                if (!packageNames.contains(owningPackageName)) {
+                    // Remove information about the non-existing owning package.
+                    it.remove();
+                    mRevision++;
+                    continue;
+                }
+
+                cleanupPrimaryDexUsesLocked(packageDexUse.mPrimaryDexUseByDexFile, packageNames,
+                        dexFileVisibilityByName, owningPackageName);
+
+                cleanupSecondaryDexUsesLocked(packageDexUse.mSecondaryDexUseByDexFile, packageNames,
+                        dexFileVisibilityByName, owningPackageName);
+
+                if (packageDexUse.mPrimaryDexUseByDexFile.isEmpty()
+                        && packageDexUse.mSecondaryDexUseByDexFile.isEmpty()) {
+                    it.remove();
+                    mRevision++;
+                }
+            }
+        }
+
+        maybeSaveAsync();
+    }
+
+    @GuardedBy("mLock")
+    private void cleanupPrimaryDexUsesLocked(@NonNull Map<String, PrimaryDexUse> primaryDexUses,
+            @NonNull Set<String> packageNames,
+            @NonNull Map<String, Integer> dexFileVisibilityByName,
+            @NonNull String owningPackageName) {
+        for (var it = primaryDexUses.entrySet().iterator(); it.hasNext();) {
+            Map.Entry<String, PrimaryDexUse> entry = it.next();
+            String dexFile = entry.getKey();
+            PrimaryDexUse primaryDexUse = entry.getValue();
+
+            if (!dexFileVisibilityByName.containsKey(dexFile)) {
+                // This can only happen when the file is added after the first pass. We can just
+                // keep it as-is and check it in the next `cleanup` run.
+                continue;
+            }
+
+            @FileVisibility int visibility = dexFileVisibilityByName.get(dexFile);
+
+            if (visibility == FileVisibility.NOT_FOUND) {
+                // Remove information about the non-existing dex files.
+                it.remove();
+                mRevision++;
+                continue;
+            }
+
+            cleanupRecordsLocked(
+                    primaryDexUse.mRecordByLoader, packageNames, visibility, owningPackageName);
+
+            if (primaryDexUse.mRecordByLoader.isEmpty()) {
+                it.remove();
+                mRevision++;
+            }
+        }
+    }
+
+    @GuardedBy("mLock")
+    private void cleanupSecondaryDexUsesLocked(
+            @NonNull Map<String, SecondaryDexUse> secondaryDexUses,
+            @NonNull Set<String> packageNames,
+            @NonNull Map<String, Integer> dexFileVisibilityByName,
+            @NonNull String owningPackageName) {
+        for (var it = secondaryDexUses.entrySet().iterator(); it.hasNext();) {
+            Map.Entry<String, SecondaryDexUse> entry = it.next();
+            String dexFile = entry.getKey();
+            SecondaryDexUse secondaryDexUse = entry.getValue();
+
+            if (!dexFileVisibilityByName.containsKey(dexFile)) {
+                // This can only happen when the file is added after the first pass. We can just
+                // keep it as-is and check it in the next `cleanup` run.
+                continue;
+            }
+
+            @FileVisibility int visibility = dexFileVisibilityByName.get(dexFile);
+
+            // Remove information about non-existing dex files.
+            if (visibility == FileVisibility.NOT_FOUND) {
+                it.remove();
+                mRevision++;
+                continue;
+            }
+
+            cleanupRecordsLocked(
+                    secondaryDexUse.mRecordByLoader, packageNames, visibility, owningPackageName);
+
+            if (secondaryDexUse.mRecordByLoader.isEmpty()) {
+                it.remove();
+                mRevision++;
+            }
+        }
+    }
+
+    @GuardedBy("mLock")
+    private void cleanupRecordsLocked(@NonNull Map<DexLoader, ?> records,
+            @NonNull Set<String> packageNames, @FileVisibility int visibility,
+            @NonNull String owningPackageName) {
+        for (var it = records.entrySet().iterator(); it.hasNext();) {
+            Map.Entry<DexLoader, ?> entry = it.next();
+            DexLoader loader = entry.getKey();
+
+            if (!packageNames.contains(loader.loadingPackageName())) {
+                // Remove information about the non-existing loading package.
+                it.remove();
+                mRevision++;
+                continue;
+            }
+
+            if (visibility == FileVisibility.NOT_OTHER_READABLE
+                    && isLoaderOtherApp(loader, owningPackageName)) {
+                // The visibility must have changed since the last load. The loader cannot load this
+                // dex file anymore.
+                it.remove();
+                mRevision++;
+                continue;
+            }
         }
     }
 
@@ -815,7 +993,7 @@ public class DexUseManagerLocal {
      */
     @Immutable
     @AutoValue
-    public abstract static class DexLoader {
+    public abstract static class DexLoader implements Comparable<DexLoader> {
         static DexLoader create(@NonNull String loadingPackageName, boolean isolatedProcess) {
             return new AutoValue_DexUseManagerLocal_DexLoader(loadingPackageName, isolatedProcess);
         }
@@ -824,6 +1002,19 @@ public class DexUseManagerLocal {
 
         /** @see Process#isIsolatedUid(int) */
         abstract boolean isolatedProcess();
+
+        @Override
+        @NonNull
+        public String toString() {
+            return loadingPackageName() + (isolatedProcess() ? " (isolated)" : "");
+        }
+
+        @Override
+        public int compareTo(DexLoader o) {
+            return Comparator.comparing(DexLoader::loadingPackageName)
+                    .thenComparing(DexLoader::isolatedProcess)
+                    .compare(this, o);
+        }
     }
 
     private static class PrimaryDexUseRecord {
@@ -861,6 +1052,58 @@ public class DexUseManagerLocal {
         }
     }
 
+    // TODO(b/278697552): Consider removing the cache or moving it to `Environment`.
+    static class SecondaryDexLocationManager {
+        private @NonNull Map<CacheKey, CacheValue> mCache = new HashMap<>();
+
+        public @NonNull List<Path> getLocations(
+                @NonNull PackageState pkgState, @NonNull UserHandle userHandle) {
+            AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
+            UUID storageUuid = pkg.getStorageUuid();
+            String packageName = pkgState.getPackageName();
+
+            CacheKey cacheKey = CacheKey.create(packageName, userHandle);
+            CacheValue cacheValue = mCache.get(cacheKey);
+            if (cacheValue != null && cacheValue.storageUuid().equals(storageUuid)) {
+                return cacheValue.locations();
+            }
+
+            File ceDir = Environment.getDataCePackageDirectoryForUser(
+                    storageUuid, userHandle, packageName);
+            File deDir = Environment.getDataDePackageDirectoryForUser(
+                    storageUuid, userHandle, packageName);
+            List<Path> locations = List.of(ceDir.toPath(), deDir.toPath());
+            mCache.put(cacheKey, CacheValue.create(locations, storageUuid));
+            return locations;
+        }
+
+        @Immutable
+        @AutoValue
+        abstract static class CacheKey {
+            static CacheKey create(@NonNull String packageName, @NonNull UserHandle userHandle) {
+                return new AutoValue_DexUseManagerLocal_SecondaryDexLocationManager_CacheKey(
+                        packageName, userHandle);
+            }
+
+            abstract @NonNull String packageName();
+
+            abstract @NonNull UserHandle userHandle();
+        }
+
+        @Immutable
+        @AutoValue
+        abstract static class CacheValue {
+            static CacheValue create(@NonNull List<Path> locations, @NonNull UUID storageUuid) {
+                return new AutoValue_DexUseManagerLocal_SecondaryDexLocationManager_CacheValue(
+                        locations, storageUuid);
+            }
+
+            abstract @NonNull List<Path> locations();
+
+            abstract @NonNull UUID storageUuid();
+        }
+    }
+
     /**
      * Injector pattern for testing purpose.
      *
@@ -875,6 +1118,7 @@ public class DexUseManagerLocal {
 
             // Call the getters for various dependencies, to ensure correct initialization order.
             ArtModuleServiceInitializer.getArtModuleServiceManager();
+            getPackageManagerLocal();
         }
 
         @NonNull
@@ -899,6 +1143,20 @@ public class DexUseManagerLocal {
         @NonNull
         public Context getContext() {
             return mContext;
+        }
+
+        @NonNull
+        public Set<String> getAllPackageNames() {
+            try (PackageManagerLocal.UnfilteredSnapshot snapshot =
+                            getPackageManagerLocal().withUnfilteredSnapshot()) {
+                return new HashSet<>(snapshot.getPackageStates().keySet());
+            }
+        }
+
+        @NonNull
+        private PackageManagerLocal getPackageManagerLocal() {
+            return Objects.requireNonNull(
+                    LocalManagerRegistry.getManager(PackageManagerLocal.class));
         }
     }
 }

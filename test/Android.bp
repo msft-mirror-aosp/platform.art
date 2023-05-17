@@ -94,6 +94,9 @@ art_module_cc_defaults {
         android_arm64: {
             relative_install_path: "art/arm64",
         },
+        android_riscv64: {
+            relative_install_path: "art/riscv64",
+        },
         android_x86: {
             relative_install_path: "art/x86",
         },
@@ -123,6 +126,9 @@ art_cc_defaults {
             relative_install_path: "com.android.art/lib",
         },
         android_arm64: {
+            relative_install_path: "com.android.art/lib64",
+        },
+        android_riscv64: {
             relative_install_path: "com.android.art/lib64",
         },
         android_x86: {
@@ -381,6 +387,7 @@ art_cc_defaults {
         // apex_available lists need to be the same for internal libs to avoid
         // stubs, and this depends on libdexfiled and others.
         "com.android.art",
+        "test_broken_com.android.art",
     ],
 }
 
@@ -447,6 +454,7 @@ art_cc_defaults {
         // apex_available lists need to be the same for internal libs to avoid
         // stubs, and this depends on libdexfiled and others.
         "com.android.art",
+        "test_broken_com.android.art",
     ],
 }
 
@@ -744,6 +752,7 @@ art_cc_defaults {
         "2005-pause-all-redefine-multithreaded/pause-all.cc",
         "2009-structural-local-ref/local-ref.cc",
         "2035-structural-native-method/structural-native.cc",
+	"2243-single-step-default/single_step_helper.cc"
     ],
     // Use NDK-compatible headers for ctstiagent.
     header_libs: [
@@ -981,6 +990,7 @@ cc_defaults {
         "2037-thread-name-inherit/thread_name_inherit.cc",
         "2040-huge-native-alloc/huge_native_buf.cc",
         "2235-JdkUnsafeTest/unsafe_test.cc",
+	"2262-miranda-methods/jni_invoke.cc",
         "common/runtime_state.cc",
         "common/stack_inspect.cc",
     ],

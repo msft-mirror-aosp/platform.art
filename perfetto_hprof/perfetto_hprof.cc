@@ -19,6 +19,7 @@
 #include "perfetto_hprof.h"
 
 #include <fcntl.h>
+#include <fnmatch.h>
 #include <inttypes.h>
 #include <sched.h>
 #include <signal.h>
@@ -34,6 +35,7 @@
 #include <optional>
 #include <type_traits>
 
+#include "android-base/file.h"
 #include "android-base/logging.h"
 #include "android-base/properties.h"
 #include "base/fast_exit.h"
@@ -89,6 +91,7 @@ static art::ConditionVariable& GetStateCV() {
 static int requested_tracing_session_id = 0;
 static State g_state = State::kUninitialized;
 static bool g_oome_triggered = false;
+static uint32_t g_oome_sessions_pending = 0;
 
 // Pipe to signal from the signal handler into a worker thread that handles the
 // dump requests.
@@ -162,15 +165,35 @@ uint64_t GetCurrentBootClockNs() {
   return ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
+bool IsDebugBuild() {
+  std::string build_type = android::base::GetProperty("ro.build.type", "");
+  return !build_type.empty() && build_type != "user";
+}
+
+// Verifies the manifest restrictions are respected.
+// For regular heap dumps this is already handled by heapprofd.
+bool IsOomeHeapDumpAllowed(const perfetto::DataSourceConfig& ds_config) {
+  if (art::Runtime::Current()->IsJavaDebuggable() || IsDebugBuild()) {
+    return true;
+  }
+
+  if (ds_config.session_initiator() ==
+      perfetto::DataSourceConfig::SESSION_INITIATOR_TRUSTED_SYSTEM) {
+    return art::Runtime::Current()->IsProfileable() || art::Runtime::Current()->IsSystemServer();
+  } else {
+    return art::Runtime::Current()->IsProfileableFromShell();
+  }
+}
+
 class JavaHprofDataSource : public perfetto::DataSource<JavaHprofDataSource> {
  public:
   constexpr static perfetto::BufferExhaustedPolicy kBufferExhaustedPolicy =
     perfetto::BufferExhaustedPolicy::kStall;
 
-  explicit JavaHprofDataSource(bool verify_session_id) : verify_session_id_(verify_session_id) {}
+  explicit JavaHprofDataSource(bool is_oome_heap) : is_oome_heap_(is_oome_heap) {}
 
   void OnSetup(const SetupArgs& args) override {
-    if (verify_session_id_) {
+    if (!is_oome_heap_) {
       uint64_t normalized_tracing_session_id =
         args.config->tracing_session_id() % std::numeric_limits<int32_t>::max();
       if (requested_tracing_session_id < 0) {
@@ -190,24 +213,35 @@ class JavaHprofDataSource : public perfetto::DataSource<JavaHprofDataSource> {
     dump_smaps_ = cfg->dump_smaps();
     for (auto it = cfg->ignored_types(); it; ++it) {
       std::string name = (*it).ToStdString();
-      ignored_types_.emplace_back(std::move(name));
+      ignored_types_.emplace_back(art::InversePrettyDescriptor(name));
     }
     // This tracing session ID matches the requesting tracing session ID, so we know heapprofd
     // has verified it targets this process.
-    enabled_ = true;
+    enabled_ =
+        !is_oome_heap_ || (IsOomeHeapDumpAllowed(*args.config) && IsOomeDumpEnabled(*cfg.get()));
   }
 
   bool dump_smaps() { return dump_smaps_; }
+
+  // Per-DataSource enable bit. Invoked by the ::Trace method.
   bool enabled() { return enabled_; }
 
   void OnStart(const StartArgs&) override {
-    if (!enabled()) {
-      return;
-    }
     art::MutexLock lk(art_thread(), GetStateMutex());
+    // In case there are multiple tracing sessions waiting for an OOME error,
+    // there will be a data source instance for each of them. Before the
+    // transition to kStart and signaling the dumping thread, we need to make
+    // sure all the data sources are ready.
+    if (is_oome_heap_ && g_oome_sessions_pending > 0) {
+      --g_oome_sessions_pending;
+    }
     if (g_state == State::kWaitForStart) {
-      g_state = State::kStart;
-      GetStateCV().Broadcast(art_thread());
+      // WriteHeapPackets is responsible for checking whether the DataSource is\
+      // actually enabled.
+      if (!is_oome_heap_ || g_oome_sessions_pending == 0) {
+        g_state = State::kStart;
+        GetStateCV().Broadcast(art_thread());
+      }
     }
   }
 
@@ -248,7 +282,23 @@ class JavaHprofDataSource : public perfetto::DataSource<JavaHprofDataSource> {
   }
 
  private:
-  bool verify_session_id_ = false;
+  static bool IsOomeDumpEnabled(const perfetto::protos::pbzero::JavaHprofConfig::Decoder& cfg) {
+    std::string cmdline;
+    if (!android::base::ReadFileToString("/proc/self/cmdline", &cmdline)) {
+      return false;
+    }
+    const char* argv0 = cmdline.c_str();
+
+    for (auto it = cfg.process_cmdline(); it; ++it) {
+      std::string pattern = (*it).ToStdString();
+      if (fnmatch(pattern.c_str(), argv0, FNM_NOESCAPE) == 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool is_oome_heap_ = false;
   bool enabled_ = false;
   bool dump_smaps_ = false;
   std::vector<std::string> ignored_types_;
@@ -259,7 +309,7 @@ class JavaHprofDataSource : public perfetto::DataSource<JavaHprofDataSource> {
   std::function<void()> async_stop_;
 };
 
-void SetupDataSource(const std::string& ds_name, bool verify_session_id) {
+void SetupDataSource(const std::string& ds_name, bool is_oome_heap) {
   perfetto::TracingInitArgs args;
   args.backends = perfetto::BackendType::kSystemBackend;
   perfetto::Tracing::Initialize(args);
@@ -267,7 +317,7 @@ void SetupDataSource(const std::string& ds_name, bool verify_session_id) {
   perfetto::DataSourceDescriptor dsd;
   dsd.set_name(ds_name);
   dsd.set_will_notify_on_stop(true);
-  JavaHprofDataSource::Register(dsd, verify_session_id);
+  JavaHprofDataSource::Register(dsd, is_oome_heap);
   LOG(INFO) << "registered data source " << ds_name;
 }
 
@@ -362,8 +412,9 @@ class Writer {
 class ReferredObjectsFinder {
  public:
   explicit ReferredObjectsFinder(
-      std::vector<std::pair<std::string, art::mirror::Object*>>* referred_objects)
-      : referred_objects_(referred_objects) {}
+      std::vector<std::pair<std::string, art::mirror::Object*>>* referred_objects,
+      bool emit_field_ids)
+      : referred_objects_(referred_objects), emit_field_ids_(emit_field_ids) {}
 
   // For art::mirror::Object::VisitReferences.
   void operator()(art::ObjPtr<art::mirror::Object> obj, art::MemberOffset offset,
@@ -381,7 +432,7 @@ class ReferredObjectsFinder {
       field = art::ArtField::FindInstanceFieldWithOffset(obj->GetClass(), offset.Uint32Value());
     }
     std::string field_name = "";
-    if (field != nullptr) {
+    if (field != nullptr && emit_field_ids_) {
       field_name = field->PrettyField(/*with_type=*/true);
     }
     referred_objects_->emplace_back(std::move(field_name), ref);
@@ -396,6 +447,8 @@ class ReferredObjectsFinder {
   // We can use a raw Object* pointer here, because there are no concurrent GC threads after the
   // fork.
   std::vector<std::pair<std::string, art::mirror::Object*>>* referred_objects_;
+  // Prettifying field names is expensive; avoid if field name will not be used.
+  bool emit_field_ids_;
 };
 
 class RootFinder : public art::SingleRootVisitor {
@@ -490,7 +543,7 @@ std::string PrettyType(art::mirror::Class* klass) NO_THREAD_SAFETY_ANALYSIS {
 }
 
 void DumpSmaps(JavaHprofDataSource::TraceContext* ctx) {
-  FILE* smaps = fopen("/proc/self/smaps", "r");
+  FILE* smaps = fopen("/proc/self/smaps", "re");
   if (smaps != nullptr) {
     auto trace_packet = ctx->NewTracePacket();
     auto* smaps_packet = trace_packet->set_smaps_packet();
@@ -533,10 +586,11 @@ size_t EncodedSize(uint64_t n) {
 
 // Returns all the references that `*obj` (an object of type `*klass`) is holding.
 std::vector<std::pair<std::string, art::mirror::Object*>> GetReferences(art::mirror::Object* obj,
-                                                                        art::mirror::Class* klass)
+                                                                        art::mirror::Class* klass,
+                                                                        bool emit_field_ids)
     REQUIRES_SHARED(art::Locks::mutator_lock_) {
   std::vector<std::pair<std::string, art::mirror::Object*>> referred_objects;
-  ReferredObjectsFinder objf(&referred_objects);
+  ReferredObjectsFinder objf(&referred_objects, emit_field_ids);
 
   if (klass->GetClassFlags() != art::mirror::kClassFlagNormal &&
       klass->GetClassFlags() != art::mirror::kClassFlagPhantomReference) {
@@ -747,16 +801,15 @@ class HeapGraphDumper {
                       art::mirror::Class* klass,
                       perfetto::protos::pbzero::HeapGraphObject* object_proto)
       REQUIRES_SHARED(art::Locks::mutator_lock_) {
+    const bool emit_field_ids = klass->GetClassFlags() != art::mirror::kClassFlagObjectArray &&
+                                klass->GetClassFlags() != art::mirror::kClassFlagNormal &&
+                                klass->GetClassFlags() != art::mirror::kClassFlagPhantomReference;
     std::vector<std::pair<std::string, art::mirror::Object*>> referred_objects =
-        GetReferences(obj, klass);
+        GetReferences(obj, klass, emit_field_ids);
 
     art::mirror::Object* min_nonnull_ptr = FilterIgnoredReferencesAndFindMin(referred_objects);
 
     uint64_t base_obj_id = EncodeBaseObjId(referred_objects, min_nonnull_ptr);
-
-    const bool emit_field_ids = klass->GetClassFlags() != art::mirror::kClassFlagObjectArray &&
-                                klass->GetClassFlags() != art::mirror::kClassFlagNormal &&
-                                klass->GetClassFlags() != art::mirror::kClassFlagPhantomReference;
 
     for (const auto& p : referred_objects) {
       const std::string& field_name = p.first;
@@ -835,8 +888,9 @@ class HeapGraphDumper {
       return false;
     }
     art::mirror::Class* klass = obj->GetClass();
-    return std::find(ignored_types_.begin(), ignored_types_.end(), PrettyType(klass)) !=
-           ignored_types_.end();
+    std::string temp;
+    std::string_view name(klass->GetDescriptor(&temp));
+    return std::find(ignored_types_.begin(), ignored_types_.end(), name) != ignored_types_.end();
   }
 
   // Name of classes whose instances should be ignored.
@@ -898,7 +952,7 @@ void ForkAndRun(art::Thread* self,
                 const std::function<void(pid_t child)>& parent_runnable,
                 const std::function<void(pid_t parent, uint64_t timestamp)>& child_runnable) {
   pid_t parent_pid = getpid();
-  LOG(INFO) << "preparing to dump heap for " << parent_pid;
+  LOG(INFO) << "forking for " << parent_pid;
   // Need to take a heap dump while GC isn't running. See the comment in
   // Heap::VisitObjects(). Also we need the critical section to avoid visiting
   // the same object twice. See b/34967844.
@@ -1026,7 +1080,7 @@ void DumpPerfetto(art::Thread* self) {
       // Make sure that this is the first thing we do after forking, so if anything
       // below hangs, the fork will go away from the watchdog.
       ArmWatchdogOrDie();
-      SetupDataSource("android.java_hprof", true);
+      SetupDataSource("android.java_hprof", false);
       WaitForDataSource(self);
       WriteHeapPackets(dumped_pid, timestamp);
       LOG(INFO) << "finished dumping heap for " << dumped_pid;
@@ -1039,6 +1093,13 @@ void DumpPerfettoOutOfMemory() REQUIRES_SHARED(art::Locks::mutator_lock_) {
     LOG(FATAL_WITHOUT_ABORT) << "no thread in DumpPerfettoOutOfMemory";
     return;
   }
+
+  // Ensure that there is an active, armed tracing session
+  uint32_t session_cnt =
+      android::base::GetUintProperty<uint32_t>("traced.oome_heap_session.count", 0);
+  if (session_cnt == 0) {
+    return;
+  }
   {
     // OutOfMemoryErrors are reentrant, make sure we do not fork and process
     // more than once.
@@ -1047,6 +1108,7 @@ void DumpPerfettoOutOfMemory() REQUIRES_SHARED(art::Locks::mutator_lock_) {
       return;
     }
     g_oome_triggered = true;
+    g_oome_sessions_pending = session_cnt;
   }
 
   art::ScopedThreadSuspension sts(self, art::ThreadState::kSuspended);
@@ -1075,23 +1137,18 @@ void DumpPerfettoOutOfMemory() REQUIRES_SHARED(art::Locks::mutator_lock_) {
     [self](pid_t dumped_pid, uint64_t timestamp) {
       ArmWatchdogOrDie();
       art::ScopedTrace trace("perfetto_hprof oome");
-      SetupDataSource("android.java_hprof.oom", false);
+      SetupDataSource("android.java_hprof.oom", true);
       perfetto::Tracing::ActivateTriggers({"com.android.telemetry.art-outofmemory"}, 500);
 
       // A pre-armed tracing session might not exist, so we should wait for a
       // limited amount of time before we decide to let the execution continue.
-      if (!TimedWaitForDataSource(self, 500)) {
-        LOG(INFO) << "timeout waiting for data source start (no active session?)";
+      if (!TimedWaitForDataSource(self, 1000)) {
+        LOG(INFO) << "OOME hprof timeout (state " << g_state << ")";
         return;
       }
       WriteHeapPackets(dumped_pid, timestamp);
-      LOG(INFO) << "finished dumping heap for OOME " << dumped_pid;
+      LOG(INFO) << "OOME hprof complete for " << dumped_pid;
     });
-}
-
-bool CanProfile() {
-  std::string build_type = android::base::GetProperty("ro.build.type", "");
-  return !build_type.empty() && build_type != "user";
 }
 
 // The plugin initialization function.
@@ -1182,17 +1239,13 @@ extern "C" bool ArtPlugin_Initialize() {
   th.detach();
 
   // Register the OOM error handler.
-  if (CanProfile()) {
-    art::Runtime::Current()->SetOutOfMemoryErrorHook(perfetto_hprof::DumpPerfettoOutOfMemory);
-  }
+  art::Runtime::Current()->SetOutOfMemoryErrorHook(perfetto_hprof::DumpPerfettoOutOfMemory);
 
   return true;
 }
 
 extern "C" bool ArtPlugin_Deinitialize() {
-  if (CanProfile()) {
-    art::Runtime::Current()->SetOutOfMemoryErrorHook(nullptr);
-  }
+  art::Runtime::Current()->SetOutOfMemoryErrorHook(nullptr);
 
   if (sigaction(kJavaHeapprofdSignal, &g_orig_act, nullptr) != 0) {
     PLOG(ERROR) << "failed to reset signal handler";

@@ -16,16 +16,29 @@
 
 package com.android.server.art;
 
+import static com.android.server.art.ProfilePath.TmpProfilePath;
+
+import android.R;
 import android.annotation.NonNull;
 import android.annotation.Nullable;
+import android.app.role.RoleManager;
 import android.apphibernation.AppHibernationManager;
-import android.os.ServiceManager;
+import android.content.Context;
+import android.os.Build;
+import android.os.RemoteException;
+import android.os.ServiceSpecificException;
+import android.os.SystemClock;
 import android.os.SystemProperties;
+import android.os.Trace;
 import android.os.UserManager;
 import android.text.TextUtils;
 import android.util.Log;
+import android.util.Pair;
 import android.util.SparseArray;
 
+import androidx.annotation.RequiresApi;
+
+import com.android.modules.utils.pm.PackageStateModulesUtils;
 import com.android.server.art.model.DexoptParams;
 import com.android.server.pm.PackageManagerLocal;
 import com.android.server.pm.pkg.AndroidPackage;
@@ -42,6 +55,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -51,9 +65,13 @@ import java.util.concurrent.Future;
 import java.util.stream.Collectors;
 
 /** @hide */
+@RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
 public final class Utils {
-    public static final String TAG = "ArtServiceUtils";
+    public static final String TAG = ArtManagerLocal.TAG;
     public static final String PLATFORM_PACKAGE_NAME = "android";
+
+    /** A copy of {@link android.os.Trace.TRACE_TAG_DALVIK}. */
+    private static final long TRACE_TAG_DALVIK = 1L << 14;
 
     private Utils() {}
 
@@ -78,7 +96,7 @@ public final class Utils {
         return array == null || array.length == 0;
     }
 
-    /** Returns the ABI information for the package. */
+    /** Returns the ABI information for the package. The primary ABI comes first. */
     @NonNull
     public static List<Abi> getAllAbis(@NonNull PackageState pkgState) {
         List<Abi> abis = new ArrayList<>();
@@ -99,15 +117,20 @@ public final class Utils {
         return abis;
     }
 
-    /** Returns the ABI information for the ABIs with the given names. */
+    /**
+     * Returns the ABI information for the ABIs with the given names. The primary ABI comes first,
+     * if given.
+     */
     @NonNull
     public static List<Abi> getAllAbisForNames(
             @NonNull Set<String> abiNames, @NonNull PackageState pkgState) {
+        Utils.check(abiNames.stream().allMatch(Utils::isNativeAbi));
         Abi pkgPrimaryAbi = getPrimaryAbi(pkgState);
         return abiNames.stream()
                 .map(name
                         -> Abi.create(name, VMRuntime.getInstructionSet(name),
                                 name.equals(pkgPrimaryAbi.name())))
+                .sorted(Comparator.comparing(Abi::isPrimaryAbi).reversed())
                 .collect(Collectors.toList());
     }
 
@@ -122,6 +145,7 @@ public final class Utils {
         // the package doesn't contain any native library. The app is launched with the device's
         // preferred ABI.
         String preferredAbi = Constants.getPreferredAbi();
+        Utils.check(isNativeAbi(preferredAbi));
         return Abi.create(
                 preferredAbi, VMRuntime.getInstructionSet(preferredAbi), true /* isPrimaryAbi */);
     }
@@ -159,9 +183,42 @@ public final class Utils {
         throw new IllegalStateException(String.format("Non-native isa '%s'", isa));
     }
 
+    private static boolean isNativeAbi(@NonNull String abiName) {
+        return abiName.equals(Constants.getNative64BitAbi())
+                || abiName.equals(Constants.getNative32BitAbi());
+    }
+
+    /**
+     * Returns whether the artifacts of the primary dex files should be in the global dalvik-cache
+     * directory.
+     *
+     * This method is not needed for secondary dex files because they are always in writable
+     * locations.
+     */
     @NonNull
-    public static boolean isInDalvikCache(@NonNull PackageState pkg) {
-        return pkg.isSystem() && !pkg.isUpdatedSystemApp();
+    public static boolean isInDalvikCache(@NonNull PackageState pkgState, @NonNull IArtd artd)
+            throws RemoteException {
+        // The artifacts should be in the global dalvik-cache directory if:
+        // (1). the package is on a system partition, even if the partition is remounted read-write,
+        //      or
+        // (2). the package is in any other readonly location. (At the time of writing, this only
+        //      include Incremental FS.)
+        //
+        // Right now, we are using some heuristics to determine this. For (1), we can potentially
+        // use "libfstab" instead as a general solution, but for (2), unfortunately, we have to
+        // stick with heuristics.
+        //
+        // We cannot rely on access(2) because:
+        // - It doesn't take effective capabilities into account, from which artd gets root access
+        //   to the filesystem.
+        // - The `faccessat` variant with the `AT_EACCESS` flag, which takes effective capabilities
+        //   into account, is not supported by bionic.
+        //
+        // We cannot rely on `f_flags` returned by statfs(2) because:
+        // - Incremental FS is tagged as read-write while it's actually not.
+        return (pkgState.isSystem() && !pkgState.isUpdatedSystemApp())
+                || artd.isIncrementalFsPath(
+                        pkgState.getAndroidPackage().getSplits().get(0).getPath());
     }
 
     /** Returns true if the given string is a valid compiler filter. */
@@ -248,31 +305,24 @@ public final class Utils {
      */
     public static boolean canDexoptPackage(
             @NonNull PackageState pkgState, @Nullable AppHibernationManager appHibernationManager) {
-        // An APEX has a uid of -1.
-        // TODO(b/256637152): Consider using `isApex` instead.
-        if (pkgState.getAppId() <= 0) {
-            return false;
-        }
-
-        // "android" is a special package that represents the platform, not an app.
-        if (pkgState.getPackageName().equals(Utils.PLATFORM_PACKAGE_NAME)) {
-            return false;
-        }
-
-        AndroidPackage pkg = pkgState.getAndroidPackage();
-        if (pkg == null || !pkg.getSplits().get(0).isHasCode()) {
+        if (!PackageStateModulesUtils.isDexoptable(pkgState)) {
             return false;
         }
 
         // We do not dexopt unused packages.
         // If `appHibernationManager` is null, the caller's intention is to skip the check.
         if (appHibernationManager != null
-                && appHibernationManager.isHibernatingGlobally(pkgState.getPackageName())
-                && appHibernationManager.isOatArtifactDeletionEnabled()) {
+                && shouldSkipDexoptDueToHibernation(pkgState, appHibernationManager)) {
             return false;
         }
 
         return true;
+    }
+
+    public static boolean shouldSkipDexoptDueToHibernation(
+            @NonNull PackageState pkgState, @NonNull AppHibernationManager appHibernationManager) {
+        return appHibernationManager.isHibernatingGlobally(pkgState.getPackageName())
+                && appHibernationManager.isOatArtifactDeletionEnabled();
     }
 
     public static long getPackageLastActiveTime(@NonNull PackageState pkgState,
@@ -283,8 +333,7 @@ public final class Utils {
                 userManager.getUserHandles(true /* excludeDying */)
                         .stream()
                         .map(handle -> pkgState.getStateForUser(handle))
-                        .map(com.android.server.art.wrapper.PackageUserState::new)
-                        .map(userState -> userState.getFirstInstallTime())
+                        .map(userState -> userState.getFirstInstallTimeMillis())
                         .max(Long::compare)
                         .orElse(0l);
         return Math.max(lastUsedAtMs, lastFirstInstallTimeMs);
@@ -304,6 +353,86 @@ public final class Utils {
         }
     }
 
+    public static boolean isSystemUiPackage(@NonNull Context context, @NonNull String packageName) {
+        return packageName.equals(context.getString(R.string.config_systemUi));
+    }
+
+    public static boolean isLauncherPackage(@NonNull Context context, @NonNull String packageName) {
+        RoleManager roleManager = context.getSystemService(RoleManager.class);
+        return roleManager.getRoleHolders(RoleManager.ROLE_HOME).contains(packageName);
+    }
+
+    /**
+     * Gets the existing reference profile if one exists, or initializes a reference profile from an
+     * external profile.
+     *
+     * If the reference profile is initialized from an external profile, the returned profile path
+     * will be a {@link TmpProfilePath}. It's the callers responsibility to either commit it to the
+     * final location by calling {@link IArtd#commitTmpProfile} or clean it up by calling {@link
+     * IArtd#deleteProfile}.
+     *
+     * @param dexPath the path to the dex file that the profile is checked against
+     * @param refProfile the path where an existing reference profile would be found, if present
+     * @param externalProfiles a list of external profiles to initialize the reference profile from,
+     *         in the order of preference
+     * @param initOutput the final location to initialize the reference profile to
+     *
+     * @return a pair where the first element is the found or initialized profile, and the second
+     *         element is true if the profile is readable by others. Returns null if there is no
+     *         reference profile or external profile to use
+     */
+    @Nullable
+    public static Pair<ProfilePath, Boolean> getOrInitReferenceProfile(@NonNull IArtd artd,
+            @NonNull String dexPath, @NonNull ProfilePath refProfile,
+            @NonNull List<ProfilePath> externalProfiles, @NonNull OutputProfile initOutput)
+            throws RemoteException {
+        try {
+            if (artd.isProfileUsable(refProfile, dexPath)) {
+                boolean isOtherReadable =
+                        artd.getProfileVisibility(refProfile) == FileVisibility.OTHER_READABLE;
+                return Pair.create(refProfile, isOtherReadable);
+            }
+        } catch (ServiceSpecificException e) {
+            Log.e(TAG,
+                    "Failed to use the existing reference profile "
+                            + AidlUtils.toString(refProfile),
+                    e);
+        }
+
+        ProfilePath initializedProfile =
+                initReferenceProfile(artd, dexPath, externalProfiles, initOutput);
+        return initializedProfile != null ? Pair.create(initializedProfile, true) : null;
+    }
+
+    /**
+     * Similar to above, but never uses an existing profile.
+     *
+     * Unlike the one above, this method doesn't return a boolean flag to indicate if the profile is
+     * readable by others. The profile returned by this method is initialized form an external
+     * profile, meaning it has no user data, so it's always readable by others.
+     */
+    @Nullable
+    public static ProfilePath initReferenceProfile(@NonNull IArtd artd, @NonNull String dexPath,
+            @NonNull List<ProfilePath> externalProfiles, @NonNull OutputProfile output)
+            throws RemoteException {
+        for (ProfilePath profile : externalProfiles) {
+            try {
+                // If the profile path is a PrebuiltProfilePath, and the APK is really a prebuilt
+                // one, rewriting the profile is unnecessary because the dex location is known at
+                // build time and is correctly set in the profile header. However, the APK can also
+                // be an installed one, in which case partners may place a profile file next to the
+                // APK at install time. Rewriting the profile in the latter case is necessary.
+                if (artd.copyAndRewriteProfile(profile, output, dexPath)) {
+                    return ProfilePath.tmpProfilePath(output.profilePath);
+                }
+            } catch (ServiceSpecificException e) {
+                Log.e(TAG, "Failed to initialize profile from " + AidlUtils.toString(profile), e);
+            }
+        }
+
+        return null;
+    }
+
     @AutoValue
     public abstract static class Abi {
         static @NonNull Abi create(
@@ -318,5 +447,38 @@ public final class Utils {
         abstract @NonNull String isa();
 
         abstract boolean isPrimaryAbi();
+    }
+
+    public static class Tracing implements AutoCloseable {
+        public Tracing(@NonNull String methodName) {
+            Trace.traceBegin(TRACE_TAG_DALVIK, methodName);
+        }
+
+        @Override
+        public void close() {
+            Trace.traceEnd(TRACE_TAG_DALVIK);
+        }
+    }
+
+    public static class TracingWithTimingLogging extends Tracing {
+        @NonNull private final String mTag;
+        @NonNull private final String mMethodName;
+        @NonNull private final long mStartTimeMs;
+
+        public TracingWithTimingLogging(@NonNull String tag, @NonNull String methodName) {
+            super(methodName);
+            mTag = tag;
+            mMethodName = methodName;
+            mStartTimeMs = SystemClock.elapsedRealtime();
+            Log.d(tag, methodName);
+        }
+
+        @Override
+        public void close() {
+            Log.d(mTag,
+                    mMethodName + " took to complete: "
+                            + (SystemClock.elapsedRealtime() - mStartTimeMs) + "ms");
+            super.close();
+        }
     }
 }

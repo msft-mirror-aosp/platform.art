@@ -65,6 +65,7 @@ template<typename T> class StrideIterator;
 template<size_t kNumReferences> class PACKED(4) StackHandleScope;
 class Thread;
 class DexCacheVisitor;
+class RuntimeImageHelper;
 
 namespace mirror {
 
@@ -316,6 +317,15 @@ class MANAGED Class final : public Object {
     SetClassFlags(GetClassFlags() | kClassFlagDexCache);
   }
 
+  template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
+  ALWAYS_INLINE bool IsRecordClass() REQUIRES_SHARED(Locks::mutator_lock_) {
+    return (GetClassFlags<kVerifyFlags>() & kClassFlagRecord) != 0;
+  }
+
+  ALWAYS_INLINE void SetRecordClass() REQUIRES_SHARED(Locks::mutator_lock_) {
+    SetClassFlags(GetClassFlags() | kClassFlagRecord);
+  }
+
   // Returns true if the class is abstract.
   template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
   ALWAYS_INLINE bool IsAbstract() REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -565,7 +575,7 @@ class MANAGED Class final : public Object {
   // The size of java.lang.Class.class.
   static uint32_t ClassClassSize(PointerSize pointer_size) {
     // The number of vtable entries in java.lang.Class.
-    uint32_t vtable_entries = Object::kVTableLength + 73;
+    uint32_t vtable_entries = Object::kVTableLength + 81;
     return ComputeClassSize(true, vtable_entries, 0, 0, 4, 1, 0, pointer_size);
   }
 
@@ -865,6 +875,8 @@ class MANAGED Class final : public Object {
   ImTable* GetImt(PointerSize pointer_size) REQUIRES_SHARED(Locks::mutator_lock_);
 
   void SetImt(ImTable* imt, PointerSize pointer_size) REQUIRES_SHARED(Locks::mutator_lock_);
+
+  ImTable* FindSuperImt(PointerSize pointer_size) REQUIRES_SHARED(Locks::mutator_lock_);
 
   ArtMethod* GetEmbeddedVTableEntry(uint32_t i, PointerSize pointer_size)
       REQUIRES_SHARED(Locks::mutator_lock_);
@@ -1579,6 +1591,7 @@ class MANAGED Class final : public Object {
   friend struct art::ClassOffsets;  // for verifying offset information
   friend class Object;  // For VisitReferences
   friend class linker::ImageWriter;  // For SetStatusInternal
+  friend class art::RuntimeImageHelper;  // For SetStatusInternal
   DISALLOW_IMPLICIT_CONSTRUCTORS(Class);
 };
 

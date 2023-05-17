@@ -24,7 +24,10 @@ import static com.android.server.art.Utils.Abi;
 import android.annotation.NonNull;
 import android.annotation.Nullable;
 import android.content.Context;
+import android.os.Build;
 import android.os.CancellationSignal;
+
+import androidx.annotation.RequiresApi;
 
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.server.art.model.DexoptParams;
@@ -34,8 +37,9 @@ import com.android.server.pm.pkg.PackageState;
 import java.util.List;
 
 /** @hide */
+@RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
 public class SecondaryDexopter extends Dexopter<DetailedSecondaryDexInfo> {
-    private static final String TAG = "SecondaryDexopter";
+    private static final String TAG = ArtManagerLocal.TAG;
 
     public SecondaryDexopter(@NonNull Context context, @NonNull PackageState pkgState,
             @NonNull AndroidPackage pkg, @NonNull DexoptParams params,
@@ -80,10 +84,10 @@ public class SecondaryDexopter extends Dexopter<DetailedSecondaryDexInfo> {
     }
 
     @Override
-    @Nullable
-    protected ProfilePath initReferenceProfile(@NonNull DetailedSecondaryDexInfo dexInfo) {
+    @NonNull
+    protected List<ProfilePath> getExternalProfiles(@NonNull DetailedSecondaryDexInfo dexInfo) {
         // A secondary dex file doesn't have any external profile to use.
-        return null;
+        return List.of();
     }
 
     @Override

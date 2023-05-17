@@ -18,13 +18,15 @@ package com.android.server.art;
 
 import android.annotation.NonNull;
 import android.annotation.Nullable;
+import android.os.Build;
 import android.os.UserHandle;
 import android.os.UserManager;
 import android.text.TextUtils;
 
+import androidx.annotation.RequiresApi;
+
 import com.android.internal.annotations.Immutable;
 import com.android.server.art.model.DetailedDexInfo;
-import com.android.server.art.wrapper.PackageStateWrapper;
 import com.android.server.pm.pkg.AndroidPackage;
 import com.android.server.pm.pkg.AndroidPackageSplit;
 import com.android.server.pm.pkg.PackageState;
@@ -42,7 +44,9 @@ import java.util.Objects;
 import java.util.stream.Collectors;
 
 /** @hide */
+@RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
 public class PrimaryDexUtils {
+    public static final String PROFILE_PRIMARY = "primary";
     private static final String SHARED_LIBRARY_LOADER_TYPE = PathClassLoader.class.getName();
 
     /**
@@ -112,7 +116,7 @@ public class PrimaryDexUtils {
 
         // Shared libraries are the dependencies of the base APK.
         baseApk.mSharedLibrariesContext =
-                encodeSharedLibraries(PackageStateWrapper.getSharedLibraryDependencies(pkgState));
+                encodeSharedLibraries(pkgState.getSharedLibraryDependencies());
 
         boolean isIsolatedSplitLoading = isIsolatedSplitLoading(pkg);
 
@@ -284,6 +288,7 @@ public class PrimaryDexUtils {
             return null;
         }
         return sharedLibraries.stream()
+                .filter(library -> !library.isNative())
                 .map(library
                         -> encodeClassLoader(SHARED_LIBRARY_LOADER_TYPE, library.getAllCodePaths(),
                                 null /* parentContext */,
@@ -327,7 +332,13 @@ public class PrimaryDexUtils {
 
     @NonNull
     public static String getProfileName(@Nullable String splitName) {
-        return splitName == null ? "primary" : splitName + ".split";
+        return splitName == null ? PROFILE_PRIMARY : splitName + ".split";
+    }
+
+    @NonNull
+    public static List<ProfilePath> getExternalProfiles(@NonNull PrimaryDexInfo dexInfo) {
+        return List.of(AidlUtils.buildProfilePathForPrebuilt(dexInfo.dexPath()),
+                AidlUtils.buildProfilePathForDm(dexInfo.dexPath()));
     }
 
     /** Basic information about a primary dex file (either the base APK or a split APK). */

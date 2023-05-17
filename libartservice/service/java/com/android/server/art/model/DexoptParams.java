@@ -22,13 +22,18 @@ import static com.android.server.art.model.ArtFlags.PriorityClassApi;
 import android.annotation.NonNull;
 import android.annotation.Nullable;
 import android.annotation.SystemApi;
+import android.os.Build;
+
+import androidx.annotation.RequiresApi;
 
 import com.android.internal.annotations.Immutable;
+import com.android.server.art.ArtConstants;
 import com.android.server.art.ReasonMapping;
 import com.android.server.art.Utils;
 
 /** @hide */
 @SystemApi(client = SystemApi.Client.SYSTEM_SERVER)
+@RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
 @Immutable
 public class DexoptParams {
     /** @hide */
@@ -119,6 +124,10 @@ public class DexoptParams {
         public DexoptParams build() {
             if (mParams.mReason.isEmpty()) {
                 throw new IllegalArgumentException("Reason must not be empty");
+            }
+            if (mParams.mReason.equals(ArtConstants.REASON_VDEX)) {
+                throw new IllegalArgumentException(
+                        "Reason must not be '" + ArtConstants.REASON_VDEX + "'");
             }
 
             if (mParams.mCompilerFilter.isEmpty()) {

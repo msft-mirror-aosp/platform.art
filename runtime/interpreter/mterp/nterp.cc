@@ -29,65 +29,10 @@
 #include "interpreter/shadow_frame-inl.h"
 #include "mirror/string-alloc-inl.h"
 #include "nterp_helpers.h"
+#include "verify_object-inl.h"
 
 namespace art {
 namespace interpreter {
-
-bool IsNterpSupported() {
-  return !kPoisonHeapReferences && kReserveMarkingRegister;
-}
-
-bool CanRuntimeUseNterp() REQUIRES_SHARED(Locks::mutator_lock_) {
-  Runtime* runtime = Runtime::Current();
-  instrumentation::Instrumentation* instr = runtime->GetInstrumentation();
-  // If the runtime is interpreter only, we currently don't use nterp as some
-  // parts of the runtime (like instrumentation) make assumption on an
-  // interpreter-only runtime to always be in a switch-like interpreter.
-  return IsNterpSupported() &&
-      !runtime->IsJavaDebuggable() &&
-      !instr->EntryExitStubsInstalled() &&
-      !instr->InterpretOnly() &&
-      !runtime->IsAotCompiler() &&
-      !instr->NeedsSlowInterpreterForListeners() &&
-      // An async exception has been thrown. We need to go to the switch interpreter. nterp doesn't
-      // know how to deal with these so we could end up never dealing with it if we are in an
-      // infinite loop.
-      !runtime->AreAsyncExceptionsThrown() &&
-      (runtime->GetJit() == nullptr || !runtime->GetJit()->JitAtFirstUse());
-}
-
-// The entrypoint for nterp, which ArtMethods can directly point to.
-extern "C" void ExecuteNterpImpl() REQUIRES_SHARED(Locks::mutator_lock_);
-
-// Another entrypoint, which does a clinit check at entry.
-extern "C" void ExecuteNterpWithClinitImpl() REQUIRES_SHARED(Locks::mutator_lock_);
-
-const void* GetNterpEntryPoint() {
-  return reinterpret_cast<const void*>(interpreter::ExecuteNterpImpl);
-}
-
-const void* GetNterpWithClinitEntryPoint() {
-  return reinterpret_cast<const void*>(interpreter::ExecuteNterpWithClinitImpl);
-}
-
-/*
- * Verify some constants used by the nterp interpreter.
- */
-void CheckNterpAsmConstants() {
-  /*
-   * If we're using computed goto instruction transitions, make sure
-   * none of the handlers overflows the byte limit.  This won't tell
-   * which one did, but if any one is too big the total size will
-   * overflow.
-   */
-  const int width = kNterpHandlerSize;
-  ptrdiff_t interp_size = reinterpret_cast<uintptr_t>(artNterpAsmInstructionEnd) -
-                          reinterpret_cast<uintptr_t>(artNterpAsmInstructionStart);
-  if ((interp_size == 0) || (interp_size != (art::kNumPackedOpcodes * width))) {
-      LOG(FATAL) << "ERROR: unexpected asm interp size " << interp_size
-                 << "(did an instruction handler exceed " << width << " bytes?)";
-  }
-}
 
 inline void UpdateHotness(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_) {
   // The hotness we will add to a method when we perform a
@@ -287,9 +232,39 @@ static constexpr std::array<uint8_t, 256u> GenerateOpcodeInvokeTypes() {
 
 static constexpr std::array<uint8_t, 256u> kOpcodeInvokeTypes = GenerateOpcodeInvokeTypes();
 
+// Temporary dumping output for helping diagnose b/261719949.
+static std::string DumpInformation(
+    Thread* self, ArtMethod* caller, const uint16_t* dex_pc_ptr) {
+  return android::base::StringPrintf(
+      "b/261719949: self=%p, caller=%p, dex_pc_ptr=%p", self, caller, dex_pc_ptr);
+}
+
+NO_INLINE static void CheckParameters(Thread* self, ArtMethod* caller, const uint16_t* dex_pc_ptr)
+    REQUIRES_SHARED(Locks::mutator_lock_) {
+  CHECK_EQ(self, Thread::Current()) << DumpInformation(self, caller, dex_pc_ptr);
+  // AOT compiler cross-compiles 64bits to 32bits, so for simplicity, don't
+  // check.
+  if (!Runtime::Current()->IsAotCompiler()) {
+    CHECK(IsAligned<sizeof(void*)>(caller)) << DumpInformation(self, caller, dex_pc_ptr);
+  }
+  ObjPtr<mirror::Class> cls = caller->GetDeclaringClass();
+  CHECK(IsAligned<kObjectAlignment>(cls.Ptr())) << DumpInformation(self, caller, dex_pc_ptr);
+  CHECK(VerifyClassClass(cls)) << DumpInformation(self, caller, dex_pc_ptr);
+  const DexFile& dex_file = cls->GetDexFile();
+  if (!caller->IsObsolete()) {
+    CHECK_LT(reinterpret_cast<uintptr_t>(dex_pc_ptr),
+             reinterpret_cast<uintptr_t>(dex_file.DataBegin() + dex_file.DataSize()))
+        << DumpInformation(self, caller, dex_pc_ptr);
+    CHECK_GT(reinterpret_cast<uintptr_t>(dex_pc_ptr),
+             reinterpret_cast<uintptr_t>(dex_file.DataBegin()))
+        << DumpInformation(self, caller, dex_pc_ptr);
+  }
+}
+
 FLATTEN
 extern "C" size_t NterpGetMethod(Thread* self, ArtMethod* caller, const uint16_t* dex_pc_ptr)
     REQUIRES_SHARED(Locks::mutator_lock_) {
+  CheckParameters(self, caller, dex_pc_ptr);
   UpdateHotness(caller);
   const Instruction* inst = Instruction::At(dex_pc_ptr);
   Instruction::Code opcode = inst->Opcode();
@@ -365,6 +340,7 @@ extern "C" size_t NterpGetStaticField(Thread* self,
                                       const uint16_t* dex_pc_ptr,
                                       size_t resolve_field_type)  // Resolve if not zero
     REQUIRES_SHARED(Locks::mutator_lock_) {
+  CheckParameters(self, caller, dex_pc_ptr);
   UpdateHotness(caller);
   const Instruction* inst = Instruction::At(dex_pc_ptr);
   uint16_t field_index = inst->VRegB_21c();
@@ -420,6 +396,7 @@ extern "C" uint32_t NterpGetInstanceFieldOffset(Thread* self,
                                                 const uint16_t* dex_pc_ptr,
                                                 size_t resolve_field_type)  // Resolve if not zero
     REQUIRES_SHARED(Locks::mutator_lock_) {
+  CheckParameters(self, caller, dex_pc_ptr);
   UpdateHotness(caller);
   const Instruction* inst = Instruction::At(dex_pc_ptr);
   uint16_t field_index = inst->VRegC_22c();
@@ -524,6 +501,7 @@ extern "C" mirror::Object* NterpAllocateObject(Thread* self,
 
 extern "C" mirror::Object* NterpLoadObject(Thread* self, ArtMethod* caller, uint16_t* dex_pc_ptr)
     REQUIRES_SHARED(Locks::mutator_lock_) {
+  CheckParameters(self, caller, dex_pc_ptr);
   const Instruction* inst = Instruction::At(dex_pc_ptr);
   ClassLinker* const class_linker = Runtime::Current()->GetClassLinker();
   switch (inst->Opcode()) {
