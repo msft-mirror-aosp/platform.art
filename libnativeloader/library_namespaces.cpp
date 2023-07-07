@@ -30,6 +30,7 @@
 #include <android-base/macros.h>
 #include <android-base/result.h>
 #include <android-base/strings.h>
+#include <android-base/stringprintf.h>
 #include <nativehelper/scoped_utf_chars.h>
 
 #include "nativeloader/dlext_namespaces.h"
@@ -55,24 +56,26 @@ constexpr const char* kVndkNamespaceName = "vndk";
 // vndk_product namespace for unbundled product apps
 constexpr const char* kVndkProductNamespaceName = "vndk_product";
 
-// classloader-namespace is a linker namespace that is created for the loaded
-// app. To be specific, it is created for the app classloader. When
-// System.load() is called from a Java class that is loaded from the
-// classloader, the classloader-namespace namespace associated with that
-// classloader is selected for dlopen. The namespace is configured so that its
-// search path is set to the app-local JNI directory and it is linked to the
-// system namespace with the names of libs listed in the public.libraries.txt.
-// This way an app can only load its own JNI libraries along with the public libs.
-constexpr const char* kClassloaderNamespaceName = "classloader-namespace";
-// Same thing for vendor APKs.
-constexpr const char* kVendorClassloaderNamespaceName = "vendor-classloader-namespace";
-// If the namespace is shared then add this suffix to form
-// "classloader-namespace-shared" or "vendor-classloader-namespace-shared",
-// respectively. A shared namespace (cf. ANDROID_NAMESPACE_TYPE_SHARED) has
+// clns-XX is a linker namespace that is created for normal apps installed in
+// the data partition. To be specific, it is created for the app classloader.
+// When System.load() is called from a Java class that is loaded from the
+// classloader, the clns namespace associated with that classloader is selected
+// for dlopen. The namespace is configured so that its search path is set to the
+// app-local JNI directory and it is linked to the system namespace with the
+// names of libs listed in the public.libraries.txt and other public libraries.
+// This way an app can only load its own JNI libraries along with the public
+// libs.
+constexpr const char* kClassloaderNamespaceName = "clns";
+// Same thing for unbundled APKs in the vendor partition.
+constexpr const char* kVendorClassloaderNamespaceName = "vendor-clns";
+// Same thing for unbundled APKs in the product partition.
+constexpr const char* kProductClassloaderNamespaceName = "product-clns";
+// If the namespace is shared then add this suffix to help identify it in debug
+// messages. A shared namespace (cf. ANDROID_NAMESPACE_TYPE_SHARED) has
 // inherited all the libraries of the parent classloader namespace, or the
-// system namespace for the main app classloader. It is used to give full
-// access to the platform libraries for apps bundled in the system image,
-// including their later updates installed in /data.
+// system namespace for the main app classloader. It is used to give full access
+// to the platform libraries for apps bundled in the system image, including
+// their later updates installed in /data.
 constexpr const char* kSharedNamespaceSuffix = "-shared";
 
 // (http://b/27588281) This is a workaround for apps using custom classloaders and calling
@@ -85,18 +88,15 @@ constexpr const char* kVendorLibPath = "/vendor/" LIB;
 // below, because they can't be two separate directories - either one has to be
 // a symlink to the other.
 constexpr const char* kProductLibPath = "/product/" LIB ":/system/product/" LIB;
-constexpr const char* kSystemLibPath = "/system/" LIB ":/system_ext/" LIB;
 
 const std::regex kVendorDexPathRegex("(^|:)(/system)?/vendor/");
 const std::regex kProductDexPathRegex("(^|:)(/system)?/product/");
-const std::regex kSystemDexPathRegex("(^|:)/system(_ext)?/");  // MUST be tested last.
 
 // Define origin partition of APK
 using ApkOrigin = enum {
   APK_ORIGIN_DEFAULT = 0,
   APK_ORIGIN_VENDOR = 1,   // Includes both /vendor and /system/vendor
   APK_ORIGIN_PRODUCT = 2,  // Includes both /product and /system/product
-  APK_ORIGIN_SYSTEM = 3,   // Includes both /system and /system_ext but not /system/{vendor,product}
 };
 
 jobject GetParentClassLoader(JNIEnv* env, jobject class_loader) {
@@ -118,9 +118,6 @@ ApkOrigin GetApkOriginFromDexPath(const std::string& dex_path) {
                         dex_path.c_str());
 
     apk_origin = APK_ORIGIN_PRODUCT;
-  }
-  if (apk_origin == APK_ORIGIN_DEFAULT && std::regex_search(dex_path, kSystemDexPathRegex)) {
-    apk_origin = APK_ORIGIN_SYSTEM;
   }
   return apk_origin;
 }
@@ -243,18 +240,7 @@ Result<NativeLoaderNamespace*> LibraryNamespaces::Create(JNIEnv* env, uint32_t t
   const char* apk_origin_msg = "other apk";  // Only for debug logging.
 
   if (!is_shared) {
-    if (apk_origin == APK_ORIGIN_SYSTEM) {
-      // System apps commonly get shared namespaces and hence don't need this.
-      // In practice it's necessary for shared system libraries (i.e. JARs
-      // rather than actual APKs) that are loaded by ordinary apps which don't
-      // get shared namespaces.
-      apk_origin_msg = "system apk";
-
-      // Give access to all libraries in the system and system_ext partitions
-      // (they can freely access each other's private APIs).
-      library_path = library_path + ":" + kSystemLibPath;
-      permitted_path = permitted_path + ":" + kSystemLibPath;
-    } else if (apk_origin == APK_ORIGIN_VENDOR) {
+    if (apk_origin == APK_ORIGIN_VENDOR) {
       unbundled_app_origin = APK_ORIGIN_VENDOR;
       apk_origin_msg = "unbundled vendor apk";
 
@@ -282,7 +268,7 @@ Result<NativeLoaderNamespace*> LibraryNamespaces::Create(JNIEnv* env, uint32_t t
       system_exposed_libraries = system_exposed_libraries + ':' + llndk_libraries_product();
 
       // Different name is useful for debugging
-      namespace_name = kVendorClassloaderNamespaceName;
+      namespace_name = kProductClassloaderNamespaceName;
     }
   }
 
@@ -291,6 +277,11 @@ Result<NativeLoaderNamespace*> LibraryNamespaces::Create(JNIEnv* env, uint32_t t
     // purposes.
     namespace_name = namespace_name + kSharedNamespaceSuffix;
   }
+
+  // Append a unique number to the namespace name, to tell them apart when
+  // debugging linker issues, e.g. with debug.ld.all set to "dlopen,dlerror".
+  static int clns_count = 0;
+  namespace_name = android::base::StringPrintf("%s-%d", namespace_name.c_str(), ++clns_count);
 
   ALOGD(
       "Configuring %s for %s %s. target_sdk_version=%u, uses_libraries=%s, library_path=%s, "
