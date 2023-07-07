@@ -29,7 +29,6 @@
 
 #if defined(__linux__)
 
-#include <memory>
 #include <vector>
 
 #include <linux/unistd.h>
@@ -74,11 +73,11 @@ std::string FindAddr2line() {
 #endif
 #if defined(ART_CLANG_PATH)
   const char* env_value = getenv("ANDROID_BUILD_TOP");
-  if (env_value != nullptr) {
-    return std::string(env_value) + "/" + ART_CLANG_PATH + "/bin/llvm-addr2line";
-  }
-#endif
+  std::string_view top(env_value != nullptr ? env_value : ".");
+  return std::string(top) + "/" + ART_CLANG_PATH + "/bin/llvm-addr2line";
+#else
   return std::string("llvm-addr2line");
+#endif
 }
 
 ALWAYS_INLINE

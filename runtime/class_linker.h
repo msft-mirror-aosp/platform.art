@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include "base/array_ref.h"
 #include "base/enums.h"
 #include "base/hash_map.h"
 #include "base/intrusive_forward_list.h"
@@ -182,17 +183,16 @@ class ClassLinker {
                             std::vector<std::unique_ptr<const DexFile>>&& additional_dex_files)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  // Add an image space to the class linker, may fix up classloader fields and dex cache fields.
-  // The dex files that were newly opened for the space are placed in the out argument
-  // out_dex_files. Returns true if the operation succeeded.
+  // Add image spaces to the class linker, may fix up classloader fields and dex cache fields.
+  // The dex files that were newly opened for the space are placed in the out argument `dex_files`.
+  // Returns true if the operation succeeded.
   // The space must be already added to the heap before calling AddImageSpace since we need to
   // properly handle read barriers and object marking.
-  bool AddImageSpace(gc::space::ImageSpace* space,
-                     Handle<mirror::ClassLoader> class_loader,
-                     ClassLoaderContext* context,
-                     std::vector<std::unique_ptr<const DexFile>>* out_dex_files,
-                     std::string* error_msg)
-      REQUIRES(!Locks::dex_lock_)
+  bool AddImageSpaces(ArrayRef<gc::space::ImageSpace*> spaces,
+                      Handle<mirror::ClassLoader> class_loader,
+                      ClassLoaderContext* context,
+                      /*out*/ std::vector<std::unique_ptr<const DexFile>>* dex_files,
+                      /*out*/ std::string* error_msg) REQUIRES(!Locks::dex_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   bool OpenImageDexFiles(gc::space::ImageSpace* space,
@@ -381,6 +381,12 @@ class ClassLinker {
       REQUIRES(!Locks::dex_lock_, !Roles::uninterruptible_);
 
   ArtField* LookupResolvedField(uint32_t field_idx, ArtMethod* referrer, bool is_static)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+  // Find a field by its field index.
+  ArtField* LookupResolvedField(uint32_t field_idx,
+                                ObjPtr<mirror::DexCache> dex_cache,
+                                ObjPtr<mirror::ClassLoader> class_loader,
+                                bool is_static)
       REQUIRES_SHARED(Locks::mutator_lock_);
   ArtField* ResolveField(uint32_t field_idx, ArtMethod* referrer, bool is_static)
       REQUIRES_SHARED(Locks::mutator_lock_)
@@ -1113,13 +1119,6 @@ class ClassLinker {
       REQUIRES(!Locks::classlinker_classes_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  // Find a field by its field index.
-  ArtField* LookupResolvedField(uint32_t field_idx,
-                                ObjPtr<mirror::DexCache> dex_cache,
-                                ObjPtr<mirror::ClassLoader> class_loader,
-                                bool is_static)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-
   void RegisterDexFileLocked(const DexFile& dex_file,
                              ObjPtr<mirror::DexCache> dex_cache,
                              ObjPtr<mirror::ClassLoader> class_loader)
@@ -1185,6 +1184,8 @@ class ClassLinker {
   bool LinkStaticFields(Thread* self, Handle<mirror::Class> klass, size_t* class_size)
       REQUIRES_SHARED(Locks::mutator_lock_);
   bool LinkInstanceFields(Thread* self, Handle<mirror::Class> klass)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+  bool VerifyRecordClass(Handle<mirror::Class> klass, ObjPtr<mirror::Class> super)
       REQUIRES_SHARED(Locks::mutator_lock_);
   void CreateReferenceInstanceOffsets(Handle<mirror::Class> klass)
       REQUIRES_SHARED(Locks::mutator_lock_);
@@ -1293,6 +1294,19 @@ class ClassLinker {
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   ObjPtr<mirror::IfTable> GetArrayIfTable() REQUIRES_SHARED(Locks::mutator_lock_);
+
+  bool OpenAndInitImageDexFiles(const gc::space::ImageSpace* space,
+                                Handle<mirror::ClassLoader> class_loader,
+                                std::vector<std::unique_ptr<const DexFile>>* out_dex_files,
+                                std::string* error_msg) REQUIRES(!Locks::dex_lock_)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  bool AddImageSpace(gc::space::ImageSpace* space,
+                     Handle<mirror::ClassLoader> class_loader,
+                     ClassLoaderContext* context,
+                     const std::vector<std::unique_ptr<const DexFile>>& dex_files,
+                     std::string* error_msg) REQUIRES(!Locks::dex_lock_)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   std::vector<const DexFile*> boot_class_path_;
   std::vector<std::unique_ptr<const DexFile>> boot_dex_files_;

@@ -27,6 +27,7 @@ import static com.google.common.truth.Truth.assertThat;
 
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyBoolean;
+import static org.mockito.Mockito.anyInt;
 import static org.mockito.Mockito.argThat;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
@@ -34,7 +35,8 @@ import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.isNull;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.verifyNoMoreInteractions;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import android.content.pm.ApplicationInfo;
@@ -47,13 +49,11 @@ import androidx.test.filters.SmallTest;
 import com.android.server.art.model.ArtFlags;
 import com.android.server.art.model.DexoptParams;
 import com.android.server.art.model.DexoptResult;
-import com.android.server.art.testing.OnSuccessRule;
 import com.android.server.art.testing.TestingUtils;
 
 import dalvik.system.DexFile;
 
 import org.junit.Before;
-import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -67,12 +67,6 @@ import java.util.List;
 @SmallTest
 @RunWith(Parameterized.class)
 public class PrimaryDexopterParameterizedTest extends PrimaryDexopterTestBase {
-    @Rule
-    public OnSuccessRule onSuccessRule = new OnSuccessRule(() -> {
-        // Don't do this on failure because it will make the failure hard to understand.
-        verifyNoMoreInteractions(mArtd);
-    });
-
     private DexoptParams mDexoptParams;
 
     private PrimaryDexopter mPrimaryDexopter;
@@ -94,19 +88,11 @@ public class PrimaryDexopterParameterizedTest extends PrimaryDexopterTestBase {
         list.add(params);
 
         params = new Params();
-        params.mIsSystem = true;
-        params.mExpectedIsInDalvikCache = true;
+        params.mIsInDalvikCache = true;
         list.add(params);
 
         params = new Params();
-        params.mIsSystem = true;
-        params.mIsUpdatedSystemApp = true;
-        list.add(params);
-
-        params = new Params();
-        params.mIsSystem = true;
         params.mHiddenApiEnforcementPolicy = ApplicationInfo.HIDDEN_API_ENFORCEMENT_DISABLED;
-        params.mExpectedIsInDalvikCache = true;
         params.mExpectedIsHiddenApiPolicyEnabled = false;
         list.add(params);
 
@@ -191,16 +177,14 @@ public class PrimaryDexopterParameterizedTest extends PrimaryDexopterTestBase {
                 .when(mPkgState.getHiddenApiEnforcementPolicy())
                 .thenReturn(mParams.mHiddenApiEnforcementPolicy);
         lenient().when(mPkg.isUseEmbeddedDex()).thenReturn(mParams.mIsUseEmbeddedDex);
-        lenient().when(mPkgState.isSystem()).thenReturn(mParams.mIsSystem);
-        lenient().when(mPkgState.isUpdatedSystemApp()).thenReturn(mParams.mIsUpdatedSystemApp);
 
-        if (DexFile.isProfileGuidedCompilerFilter(mParams.mExpectedCompilerFilter)) {
-            // Make all profile-related operations succeed so that "speed-profile" doesn't fall back
-            // to "verify".
-            when(mArtd.isProfileUsable(any(), any())).thenReturn(true);
-            when(mArtd.getProfileVisibility(any())).thenReturn(FileVisibility.OTHER_READABLE);
-            when(mArtd.mergeProfiles(any(), any(), any(), any(), any())).thenReturn(false);
-        }
+        // Make all profile-related operations succeed so that "speed-profile" doesn't fall back to
+        // "verify".
+        lenient().when(mArtd.isProfileUsable(any(), any())).thenReturn(true);
+        lenient().when(mArtd.getProfileVisibility(any())).thenReturn(FileVisibility.OTHER_READABLE);
+        lenient().when(mArtd.mergeProfiles(any(), any(), any(), any(), any())).thenReturn(false);
+
+        lenient().when(mArtd.isInDalvikCache(any())).thenReturn(mParams.mIsInDalvikCache);
 
         mDexoptParams =
                 new DexoptParams.Builder("install")
@@ -230,7 +214,10 @@ public class PrimaryDexopterParameterizedTest extends PrimaryDexopterTestBase {
         ArgumentMatcher<DexoptOptions> dexoptOptionsMatcher = options
                 -> options.compilationReason.equals("install") && options.targetSdkVersion == 123
                 && options.debuggable == mParams.mExpectedIsDebuggable
-                && options.hiddenApiPolicyEnabled == mParams.mExpectedIsHiddenApiPolicyEnabled;
+                && options.hiddenApiPolicyEnabled == mParams.mExpectedIsHiddenApiPolicyEnabled
+                && options.comments.equals(
+                        String.format("app-version-name:%s,app-version-code:%d,art-version:%d",
+                                APP_VERSION_NAME, APP_VERSION_CODE, ART_VERSION));
 
         when(mArtd.createCancellationSignal()).thenReturn(mock(IArtdCancellationSignal.class));
         when(mArtd.getDmFileVisibility(any())).thenReturn(FileVisibility.NOT_FOUND);
@@ -244,7 +231,7 @@ public class PrimaryDexopterParameterizedTest extends PrimaryDexopterTestBase {
                          400 /* cpuTimeMs */, 30000 /* sizeBytes */, 32000 /* sizeBeforeBytes */))
                 .when(mArtd)
                 .dexopt(deepEq(buildOutputArtifacts("/data/app/foo/base.apk", "arm64",
-                                mParams.mExpectedIsInDalvikCache, permissionSettings)),
+                                mParams.mIsInDalvikCache, permissionSettings)),
                         eq("/data/app/foo/base.apk"), eq("arm64"), eq("PCL[]"),
                         eq(mParams.mExpectedCompilerFilter), any() /* profile */,
                         isNull() /* inputVdex */, isNull() /* dmFile */,
@@ -258,7 +245,7 @@ public class PrimaryDexopterParameterizedTest extends PrimaryDexopterTestBase {
         doThrow(ServiceSpecificException.class)
                 .when(mArtd)
                 .dexopt(deepEq(buildOutputArtifacts("/data/app/foo/base.apk", "arm",
-                                mParams.mExpectedIsInDalvikCache, permissionSettings)),
+                                mParams.mIsInDalvikCache, permissionSettings)),
                         eq("/data/app/foo/base.apk"), eq("arm"), eq("PCL[]"),
                         eq(mParams.mExpectedCompilerFilter), any() /* profile */,
                         isNull() /* inputVdex */, isNull() /* dmFile */,
@@ -279,7 +266,7 @@ public class PrimaryDexopterParameterizedTest extends PrimaryDexopterTestBase {
                          200 /* cpuTimeMs */, 10000 /* sizeBytes */, 0 /* sizeBeforeBytes */))
                 .when(mArtd)
                 .dexopt(deepEq(buildOutputArtifacts("/data/app/foo/split_0.apk", "arm",
-                                mParams.mExpectedIsInDalvikCache, permissionSettings)),
+                                mParams.mIsInDalvikCache, permissionSettings)),
                         eq("/data/app/foo/split_0.apk"), eq("arm"), eq("PCL[base.apk]"),
                         eq(mParams.mExpectedCompilerFilter), any() /* profile */,
                         isNull() /* inputVdex */, isNull() /* dmFile */,
@@ -312,12 +299,16 @@ public class PrimaryDexopterParameterizedTest extends PrimaryDexopterTestBase {
                                 200 /* dex2oatWallTimeMillis */, 200 /* dex2oatCpuTimeMillis */,
                                 10000 /* sizeBytes */, 0 /* sizeBeforeBytes */,
                                 false /* isSkippedDueToStorageLow */));
+
+        // Verify that there are no more calls than the ones above.
+        verify(mArtd, times(3))
+                .dexopt(any(), any(), any(), any(), any(), any(), any(), any(), anyInt(), any(),
+                        any());
     }
 
     private static class Params {
         // Package information.
-        public boolean mIsSystem = false;
-        public boolean mIsUpdatedSystemApp = false;
+        public boolean mIsInDalvikCache = false;
         public int mHiddenApiEnforcementPolicy = ApplicationInfo.HIDDEN_API_ENFORCEMENT_ENABLED;
         public boolean mIsVmSafeMode = false;
         public boolean mIsDebuggable = false;
@@ -338,13 +329,11 @@ public class PrimaryDexopterParameterizedTest extends PrimaryDexopterTestBase {
         public String mExpectedCompilerFilter = "verify";
         public int mExpectedDexoptTrigger = DexoptTrigger.COMPILER_FILTER_IS_BETTER
                 | DexoptTrigger.PRIMARY_BOOT_IMAGE_BECOMES_USABLE | DexoptTrigger.NEED_EXTRACTION;
-        public boolean mExpectedIsInDalvikCache = false;
         public boolean mExpectedIsDebuggable = false;
         public boolean mExpectedIsHiddenApiPolicyEnabled = true;
 
         public String toString() {
-            return String.format("isSystem=%b,"
-                            + "isUpdatedSystemApp=%b,"
+            return String.format("mIsInDalvikCache=%b,"
                             + "mHiddenApiEnforcementPolicy=%d,"
                             + "isVmSafeMode=%b,"
                             + "isDebuggable=%b,"
@@ -359,14 +348,12 @@ public class PrimaryDexopterParameterizedTest extends PrimaryDexopterTestBase {
                             + " => "
                             + "targetCompilerFilter=%s,"
                             + "expectedDexoptTrigger=%d,"
-                            + "expectedIsInDalvikCache=%b,"
                             + "expectedIsDebuggable=%b,"
                             + "expectedIsHiddenApiPolicyEnabled=%b",
-                    mIsSystem, mIsUpdatedSystemApp, mHiddenApiEnforcementPolicy, mIsVmSafeMode,
-                    mIsDebuggable, mIsSystemUi, mIsLauncher, mIsUseEmbeddedDex,
-                    mRequestedCompilerFilter, mForce, mShouldDowngrade, mSkipIfStorageLow,
-                    mAlwaysDebuggable, mExpectedCompilerFilter, mExpectedDexoptTrigger,
-                    mExpectedIsInDalvikCache, mExpectedIsDebuggable,
+                    mIsInDalvikCache, mHiddenApiEnforcementPolicy, mIsVmSafeMode, mIsDebuggable,
+                    mIsSystemUi, mIsLauncher, mIsUseEmbeddedDex, mRequestedCompilerFilter, mForce,
+                    mShouldDowngrade, mSkipIfStorageLow, mAlwaysDebuggable, mExpectedCompilerFilter,
+                    mExpectedDexoptTrigger, mExpectedIsDebuggable,
                     mExpectedIsHiddenApiPolicyEnabled);
         }
     }

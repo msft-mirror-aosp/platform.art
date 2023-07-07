@@ -279,9 +279,15 @@ class QuickArgumentVisitor {
     return reinterpret_cast<StackReference<mirror::Object>*>(this_arg_address);
   }
 
-  static ArtMethod* GetCallingMethod(ArtMethod** sp) REQUIRES_SHARED(Locks::mutator_lock_) {
+  static ArtMethod* GetCallingMethodAndDexPc(ArtMethod** sp, uint32_t* dex_pc)
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     DCHECK((*sp)->IsCalleeSaveMethod());
-    return GetCalleeSaveMethodCaller(sp, CalleeSaveType::kSaveRefsAndArgs);
+    return GetCalleeSaveMethodCallerAndDexPc(sp, CalleeSaveType::kSaveRefsAndArgs, dex_pc);
+  }
+
+  static ArtMethod* GetCallingMethod(ArtMethod** sp) REQUIRES_SHARED(Locks::mutator_lock_) {
+    uint32_t dex_pc;
+    return GetCallingMethodAndDexPc(sp, &dex_pc);
   }
 
   static ArtMethod* GetOuterMethod(ArtMethod** sp) REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -289,31 +295,6 @@ class QuickArgumentVisitor {
     uint8_t* previous_sp =
         reinterpret_cast<uint8_t*>(sp) + kQuickCalleeSaveFrame_RefAndArgs_FrameSize;
     return *reinterpret_cast<ArtMethod**>(previous_sp);
-  }
-
-  static uint32_t GetCallingDexPc(ArtMethod** sp) REQUIRES_SHARED(Locks::mutator_lock_) {
-    DCHECK((*sp)->IsCalleeSaveMethod());
-    constexpr size_t callee_frame_size =
-        RuntimeCalleeSaveFrame::GetFrameSize(CalleeSaveType::kSaveRefsAndArgs);
-    ArtMethod** caller_sp = reinterpret_cast<ArtMethod**>(
-        reinterpret_cast<uintptr_t>(sp) + callee_frame_size);
-    uintptr_t outer_pc = QuickArgumentVisitor::GetCallingPc(sp);
-    const OatQuickMethodHeader* current_code = (*caller_sp)->GetOatQuickMethodHeader(outer_pc);
-    uintptr_t outer_pc_offset = current_code->NativeQuickPcOffset(outer_pc);
-
-    if (current_code->IsOptimized()) {
-      CodeInfo code_info = CodeInfo::DecodeInlineInfoOnly(current_code);
-      StackMap stack_map = code_info.GetStackMapForNativePcOffset(outer_pc_offset);
-      DCHECK(stack_map.IsValid());
-      BitTableRange<InlineInfo> inline_infos = code_info.GetInlineInfosOf(stack_map);
-      if (!inline_infos.empty()) {
-        return inline_infos.back().GetDexPc();
-      } else {
-        return stack_map.GetDexPc();
-      }
-    } else {
-      return current_code->ToDexPc(caller_sp, outer_pc);
-    }
   }
 
   static uint8_t* GetCallingPcAddr(ArtMethod** sp) REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -1154,11 +1135,11 @@ extern "C" const void* artQuickResolutionTrampoline(
   const bool called_method_known_on_entry = !called->IsRuntimeMethod();
   ArtMethod* caller = nullptr;
   if (!called_method_known_on_entry) {
-    caller = QuickArgumentVisitor::GetCallingMethod(sp);
+    uint32_t dex_pc;
+    caller = QuickArgumentVisitor::GetCallingMethodAndDexPc(sp, &dex_pc);
     called_method.dex_file = caller->GetDexFile();
 
     {
-      uint32_t dex_pc = QuickArgumentVisitor::GetCallingDexPc(sp);
       CodeItemInstructionAccessor accessor(caller->DexInstructions());
       CHECK_LT(dex_pc, accessor.InsnsSizeInCodeUnits());
       const Instruction& instr = accessor.InstructionAt(dex_pc);
@@ -1366,10 +1347,10 @@ template<class T> class BuildNativeCallFrameStateMachine {
   static constexpr size_t kRegistersNeededForLong = 2;
   static constexpr size_t kRegistersNeededForDouble = 2;
   static constexpr bool kMultiRegistersAligned = true;
-  static constexpr bool kMultiFPRegistersWidened = false;
   static constexpr bool kMultiGPRegistersWidened = false;
   static constexpr bool kAlignLongOnStack = true;
   static constexpr bool kAlignDoubleOnStack = true;
+  static constexpr bool kNaNBoxing = false;
 #elif defined(__aarch64__)
   static constexpr bool kNativeSoftFloatAbi = false;  // This is a hard float ABI.
   static constexpr size_t kNumNativeGprArgs = 8;  // 8 arguments passed in GPRs.
@@ -1378,10 +1359,10 @@ template<class T> class BuildNativeCallFrameStateMachine {
   static constexpr size_t kRegistersNeededForLong = 1;
   static constexpr size_t kRegistersNeededForDouble = 1;
   static constexpr bool kMultiRegistersAligned = false;
-  static constexpr bool kMultiFPRegistersWidened = false;
   static constexpr bool kMultiGPRegistersWidened = false;
   static constexpr bool kAlignLongOnStack = false;
   static constexpr bool kAlignDoubleOnStack = false;
+  static constexpr bool kNaNBoxing = false;
 #elif defined(__riscv)
   static constexpr bool kNativeSoftFloatAbi = false;
   static constexpr size_t kNumNativeGprArgs = 8;
@@ -1390,10 +1371,10 @@ template<class T> class BuildNativeCallFrameStateMachine {
   static constexpr size_t kRegistersNeededForLong = 1;
   static constexpr size_t kRegistersNeededForDouble = 1;
   static constexpr bool kMultiRegistersAligned = false;
-  static constexpr bool kMultiFPRegistersWidened = false;
   static constexpr bool kMultiGPRegistersWidened = true;
   static constexpr bool kAlignLongOnStack = false;
   static constexpr bool kAlignDoubleOnStack = false;
+  static constexpr bool kNaNBoxing = true;
 #elif defined(__i386__)
   static constexpr bool kNativeSoftFloatAbi = false;  // Not using int registers for fp
   static constexpr size_t kNumNativeGprArgs = 0;  // 0 arguments passed in GPRs.
@@ -1402,10 +1383,10 @@ template<class T> class BuildNativeCallFrameStateMachine {
   static constexpr size_t kRegistersNeededForLong = 2;
   static constexpr size_t kRegistersNeededForDouble = 2;
   static constexpr bool kMultiRegistersAligned = false;  // x86 not using regs, anyways
-  static constexpr bool kMultiFPRegistersWidened = false;
   static constexpr bool kMultiGPRegistersWidened = false;
   static constexpr bool kAlignLongOnStack = false;
   static constexpr bool kAlignDoubleOnStack = false;
+  static constexpr bool kNaNBoxing = false;
 #elif defined(__x86_64__)
   static constexpr bool kNativeSoftFloatAbi = false;  // This is a hard float ABI.
   static constexpr size_t kNumNativeGprArgs = 6;  // 6 arguments passed in GPRs.
@@ -1414,10 +1395,10 @@ template<class T> class BuildNativeCallFrameStateMachine {
   static constexpr size_t kRegistersNeededForLong = 1;
   static constexpr size_t kRegistersNeededForDouble = 1;
   static constexpr bool kMultiRegistersAligned = false;
-  static constexpr bool kMultiFPRegistersWidened = false;
   static constexpr bool kMultiGPRegistersWidened = false;
   static constexpr bool kAlignLongOnStack = false;
   static constexpr bool kAlignDoubleOnStack = false;
+  static constexpr bool kNaNBoxing = false;
 #else
 #error "Unsupported architecture"
 #endif
@@ -1533,8 +1514,10 @@ template<class T> class BuildNativeCallFrameStateMachine {
       if (HaveFloatFpr()) {
         fpr_index_--;
         if (kRegistersNeededForDouble == 1) {
-          if (kMultiFPRegistersWidened) {
-            PushFpr8(bit_cast<uint64_t, double>(val));
+          if (kNaNBoxing) {
+            // NaN boxing: no widening, just use the bits, but reset upper bits to 1s.
+            // See e.g. RISC-V manual, D extension, section "NaN Boxing of Narrower Values".
+            PushFpr8(0xFFFFFFFF00000000lu | static_cast<uint64_t>(bit_cast<uint32_t, float>(val)));
           } else {
             // No widening, just use the bits.
             PushFpr8(static_cast<uint64_t>(bit_cast<uint32_t, float>(val)));
@@ -1544,14 +1527,7 @@ template<class T> class BuildNativeCallFrameStateMachine {
         }
       } else {
         stack_entries_++;
-        if (kRegistersNeededForDouble == 1 && kMultiFPRegistersWidened) {
-          // Need to widen before storing: Note the "double" in the template instantiation.
-          // Note: We need to jump through those hoops to make the compiler happy.
-          DCHECK_EQ(sizeof(uintptr_t), sizeof(uint64_t));
-          PushStack(static_cast<uintptr_t>(bit_cast<uint64_t, double>(val)));
-        } else {
-          PushStack(static_cast<uintptr_t>(bit_cast<uint32_t, float>(val)));
-        }
+        PushStack(static_cast<uintptr_t>(bit_cast<uint32_t, float>(val)));
         fpr_index_ = 0;
       }
     }
@@ -1839,10 +1815,10 @@ class BuildGenericJniFrameVisitor final : public QuickArgumentVisitor {
                               uint32_t shorty_len,
                               ArtMethod** managed_sp,
                               uintptr_t* reserved_area)
-     : QuickArgumentVisitor(managed_sp, is_static, shorty, shorty_len),
-       jni_call_(nullptr, nullptr, nullptr, critical_native),
-       sm_(&jni_call_),
-       current_vreg_(nullptr) {
+      : QuickArgumentVisitor(managed_sp, is_static, shorty, shorty_len),
+        jni_call_(nullptr, nullptr, nullptr),
+        sm_(&jni_call_),
+        current_vreg_(nullptr) {
     DCHECK_ALIGNED(managed_sp, kStackAlignment);
     DCHECK_ALIGNED(reserved_area, sizeof(uintptr_t));
 
@@ -1891,33 +1867,8 @@ class BuildGenericJniFrameVisitor final : public QuickArgumentVisitor {
   void Visit() REQUIRES_SHARED(Locks::mutator_lock_) override;
 
  private:
-  // A class to fill a JNI call. Adds reference/handle-scope management to FillNativeCall.
-  class FillJniCall final : public FillNativeCall {
-   public:
-    FillJniCall(uintptr_t* gpr_regs,
-                uint32_t* fpr_regs,
-                uintptr_t* stack_args,
-                bool critical_native)
-        : FillNativeCall(gpr_regs, fpr_regs, stack_args),
-          cur_entry_(0),
-          critical_native_(critical_native) {}
-
-    void Reset(uintptr_t* gpr_regs, uint32_t* fpr_regs, uintptr_t* stack_args) {
-      FillNativeCall::Reset(gpr_regs, fpr_regs, stack_args);
-      cur_entry_ = 0U;
-    }
-
-    bool CriticalNative() const {
-      return critical_native_;
-    }
-
-   private:
-    size_t cur_entry_;
-    const bool critical_native_;
-  };
-
-  FillJniCall jni_call_;
-  BuildNativeCallFrameStateMachine<FillJniCall> sm_;
+  FillNativeCall jni_call_;
+  BuildNativeCallFrameStateMachine<FillNativeCall> sm_;
 
   // Pointer to the current vreg in caller's reserved out vreg area.
   // Used for spilling reference arguments.
@@ -2146,8 +2097,8 @@ static TwoWordReturn artInvokeCommon(uint32_t method_idx,
                                      ArtMethod** sp) {
   ScopedQuickEntrypointChecks sqec(self);
   DCHECK_EQ(*sp, Runtime::Current()->GetCalleeSaveMethod(CalleeSaveType::kSaveRefsAndArgs));
-  ArtMethod* caller_method = QuickArgumentVisitor::GetCallingMethod(sp);
-  uint32_t dex_pc = QuickArgumentVisitor::GetCallingDexPc(sp);
+  uint32_t dex_pc;
+  ArtMethod* caller_method = QuickArgumentVisitor::GetCallingMethodAndDexPc(sp, &dex_pc);
   CodeItemInstructionAccessor accessor(caller_method->DexInstructions());
   DCHECK_LT(dex_pc, accessor.InsnsSizeInCodeUnits());
   const Instruction& instr = accessor.InstructionAt(dex_pc);
@@ -2260,9 +2211,9 @@ extern "C" TwoWordReturn artInvokeInterfaceTrampoline(ArtMethod* interface_metho
     // Fetch the dex_method_idx of the target interface method from the caller.
     StackHandleScope<1> hs(self);
     Handle<mirror::Object> this_object = hs.NewHandle(raw_this_object);
-    ArtMethod* caller_method = QuickArgumentVisitor::GetCallingMethod(sp);
+    uint32_t dex_pc;
+    ArtMethod* caller_method = QuickArgumentVisitor::GetCallingMethodAndDexPc(sp, &dex_pc);
     uint32_t dex_method_idx;
-    uint32_t dex_pc = QuickArgumentVisitor::GetCallingDexPc(sp);
     const Instruction& instr = caller_method->DexInstructions().InstructionAt(dex_pc);
     Instruction::Code instr_code = instr.Opcode();
     DCHECK(instr_code == Instruction::INVOKE_INTERFACE ||
@@ -2381,8 +2332,8 @@ extern "C" uint64_t artInvokePolymorphic(mirror::Object* raw_receiver, Thread* s
   const char* old_cause = self->StartAssertNoThreadSuspension("Making stack arguments safe.");
 
   // From the instruction, get the |callsite_shorty| and expose arguments on the stack to the GC.
-  ArtMethod* caller_method = QuickArgumentVisitor::GetCallingMethod(sp);
-  uint32_t dex_pc = QuickArgumentVisitor::GetCallingDexPc(sp);
+  uint32_t dex_pc;
+  ArtMethod* caller_method = QuickArgumentVisitor::GetCallingMethodAndDexPc(sp, &dex_pc);
   const Instruction& inst = caller_method->DexInstructions().InstructionAt(dex_pc);
   DCHECK(inst.Opcode() == Instruction::INVOKE_POLYMORPHIC ||
          inst.Opcode() == Instruction::INVOKE_POLYMORPHIC_RANGE);
@@ -2508,8 +2459,8 @@ extern "C" uint64_t artInvokeCustom(uint32_t call_site_idx, Thread* self, ArtMet
   const char* old_cause = self->StartAssertNoThreadSuspension("Making stack arguments safe.");
 
   // From the instruction, get the |callsite_shorty| and expose arguments on the stack to the GC.
-  ArtMethod* caller_method = QuickArgumentVisitor::GetCallingMethod(sp);
-  uint32_t dex_pc = QuickArgumentVisitor::GetCallingDexPc(sp);
+  uint32_t dex_pc;
+  ArtMethod* caller_method = QuickArgumentVisitor::GetCallingMethodAndDexPc(sp, &dex_pc);
   const DexFile* dex_file = caller_method->GetDexFile();
   const dex::ProtoIndex proto_idx(dex_file->GetProtoIndexForCallSite(call_site_idx));
   const char* shorty = caller_method->GetDexFile()->GetShorty(proto_idx);

@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -111,8 +112,10 @@ class DexFileLoader {
         file_(fd == -1 ? std::optional<File>() : File(fd, /*check_usage=*/false)),
         location_(location) {}
 
-  DexFileLoader(std::unique_ptr<DexFileContainer>&& container, const std::string& location)
-      : root_container_(std::move(container)), location_(location) {}
+  DexFileLoader(std::shared_ptr<DexFileContainer> container, const std::string& location)
+      : root_container_(std::move(container)), location_(location) {
+    DCHECK(root_container_ != nullptr);
+  }
 
   DexFileLoader(const uint8_t* base, size_t size, const std::string& location);
 
@@ -148,7 +151,7 @@ class DexFileLoader {
                 error_msg);
   }
 
-  // Opens all .dex files, guessing the container format based on file extension.
+  // Opens all dex files, guessing the container format based on file magic.
   bool Open(bool verify,
             bool verify_checksum,
             bool allow_no_dex_files,
@@ -192,52 +195,64 @@ class DexFileLoader {
   }
 
  protected:
-  enum class VerifyResult {  // private
-    kVerifyNotAttempted,
-    kVerifySucceeded,
-    kVerifyFailed
-  };
-
   bool InitAndReadMagic(uint32_t* magic, std::string* error_msg);
 
   // Ensure we have root container.  If we are backed by a file, memory-map it.
   // We can only do this for dex files since zip files might be too big to map.
   bool MapRootContainer(std::string* error_msg);
 
-  static std::unique_ptr<DexFile> OpenCommon(std::unique_ptr<DexFileContainer> container,
+  static std::unique_ptr<DexFile> OpenCommon(std::shared_ptr<DexFileContainer> container,
+                                             const uint8_t* base,
+                                             size_t size,
+                                             const std::string& location,
+                                             std::optional<uint32_t> location_checksum,
+                                             const OatDexFile* oat_dex_file,
+                                             bool verify,
+                                             bool verify_checksum,
+                                             std::string* error_msg,
+                                             DexFileLoaderErrorCode* error_code);
+
+  // Old signature preserved for app-compat.
+  std::unique_ptr<const DexFile> Open(const uint8_t* base,
+                                      size_t size,
+                                      const std::string& location,
+                                      uint32_t location_checksum,
+                                      const OatDexFile* oat_dex_file,
+                                      bool verify,
+                                      bool verify_checksum,
+                                      std::string* error_msg,
+                                      std::unique_ptr<DexFileContainer> container) const;
+
+  // Old signature preserved for app-compat.
+  enum VerifyResult {};
+  static std::unique_ptr<DexFile> OpenCommon(const uint8_t* base,
+                                             size_t size,
+                                             const uint8_t* data_base,
+                                             size_t data_size,
                                              const std::string& location,
                                              uint32_t location_checksum,
                                              const OatDexFile* oat_dex_file,
                                              bool verify,
                                              bool verify_checksum,
                                              std::string* error_msg,
+                                             std::unique_ptr<DexFileContainer> container,
                                              VerifyResult* verify_result);
 
-  // Open all classesXXX.dex files from a zip archive.
-  bool OpenAllDexFilesFromZip(const ZipArchive& zip_archive,
-                              const std::string& location,
-                              bool verify,
-                              bool verify_checksum,
-                              bool allow_no_dex_files,
-                              DexFileLoaderErrorCode* error_code,
-                              std::string* error_msg,
-                              std::vector<std::unique_ptr<const DexFile>>* dex_files) const;
-
-  // Opens .dex file from the entry_name in a zip archive. error_code is undefined when non-null
-  // return.
-  std::unique_ptr<const DexFile> OpenOneDexFileFromZip(const ZipArchive& zip_archive,
-                                                       const char* entry_name,
-                                                       const std::string& location,
-                                                       bool verify,
-                                                       bool verify_checksum,
-                                                       DexFileLoaderErrorCode* error_code,
-                                                       std::string* error_msg) const;
+  // Open .dex files from the entry_name in a zip archive.
+  bool OpenFromZipEntry(const ZipArchive& zip_archive,
+                        const char* entry_name,
+                        const std::string& location,
+                        bool verify,
+                        bool verify_checksum,
+                        DexFileLoaderErrorCode* error_code,
+                        std::string* error_msg,
+                        std::vector<std::unique_ptr<const DexFile>>* dex_files) const;
 
   // The DexFileLoader can be backed either by file or by memory (i.e. DexFileContainer).
   // We can not just mmap the file since APKs might be unreasonably large for 32-bit system.
   std::string filename_;
   std::optional<File> file_;
-  std::unique_ptr<DexFileContainer> root_container_;
+  std::shared_ptr<DexFileContainer> root_container_;
   const std::string location_;
 };
 

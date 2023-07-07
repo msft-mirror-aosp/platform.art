@@ -472,6 +472,10 @@ bool OatWriter::AddDexFileSource(File&& dex_file_fd, const char* location) {
     return false;
   }
   for (auto& dex_file : dex_files) {
+    if (dex_file->IsCompactDexFile()) {
+      LOG(ERROR) << "Compact dex is only supported from vdex: " << location;
+      return false;
+    }
     oat_dex_files_.emplace_back(std::move(dex_file));
   }
   return true;
@@ -568,7 +572,7 @@ bool OatWriter::WriteAndOpenDexFiles(
   std::vector<MemMap> dex_files_map;
   std::vector<std::unique_ptr<const DexFile>> dex_files;
   if (!WriteDexFiles(vdex_file, verify, use_existing_vdex, copy_dex_files, &dex_files_map) ||
-      !OpenDexFiles(vdex_file, verify, &dex_files_map, &dex_files)) {
+      !OpenDexFiles(vdex_file, &dex_files_map, &dex_files)) {
     return false;
   }
 
@@ -2259,8 +2263,10 @@ size_t OatWriter::InitOatCode(size_t offset) {
   offset = RoundUp(offset, kPageSize);
   oat_header_->SetExecutableOffset(offset);
   size_executable_offset_alignment_ = offset - old_offset;
-  if (GetCompilerOptions().IsBootImage() && primary_oat_file_) {
-    InstructionSet instruction_set = compiler_options_.GetInstructionSet();
+  InstructionSet instruction_set = compiler_options_.GetInstructionSet();
+  if (GetCompilerOptions().IsBootImage() && primary_oat_file_ &&
+      // TODO(riscv64): remove this when we have compiler support for RISC-V.
+      instruction_set != InstructionSet::kRiscv64) {
     const bool generate_debug_info = GetCompilerOptions().GenerateAnyDebugInfo();
     size_t adjusted_offset = offset;
 
@@ -3065,9 +3071,10 @@ size_t OatWriter::WriteBcpBssInfo(OutputStream* out, size_t file_offset, size_t 
 }
 
 size_t OatWriter::WriteCode(OutputStream* out, size_t file_offset, size_t relative_offset) {
-  if (GetCompilerOptions().IsBootImage() && primary_oat_file_) {
-    InstructionSet instruction_set = compiler_options_.GetInstructionSet();
-
+  InstructionSet instruction_set = compiler_options_.GetInstructionSet();
+  if (GetCompilerOptions().IsBootImage() && primary_oat_file_ &&
+      // TODO(riscv64): remove this when we have compiler support for RISC-V.
+      instruction_set != InstructionSet::kRiscv64) {
     #define DO_TRAMPOLINE(field) \
       do { \
         /* Pad with at least four 0xFFs so we can do DCHECKs in OatQuickMethodHeader */ \
@@ -3199,10 +3206,11 @@ bool OatWriter::WriteDexFiles(File* file,
     TimingLogger::ScopedTiming split2("Verify input Dex files", timings_);
     for (OatDexFile& oat_dex_file : oat_dex_files_) {
       const DexFile* dex_file = oat_dex_file.GetDexFile();
+      if (dex_file->IsCompactDexFile()) {
+        continue;  // Compact dex files can not be verified.
+      }
       std::string error_msg;
       if (!dex::Verify(dex_file,
-                       dex_file->Begin(),
-                       dex_file->Size(),
                        dex_file->GetLocation().c_str(),
                        /*verify_checksum=*/true,
                        &error_msg)) {
@@ -3436,7 +3444,6 @@ bool OatWriter::LayoutDexFile(OatDexFile* oat_dex_file) {
 
 bool OatWriter::OpenDexFiles(
     File* file,
-    bool verify,
     /*inout*/ std::vector<MemMap>* opened_dex_files_map,
     /*out*/ std::vector<std::unique_ptr<const DexFile>>* opened_dex_files) {
   TimingLogger::ScopedTiming split("OpenDexFiles", timings_);
@@ -3487,10 +3494,11 @@ bool OatWriter::OpenDexFiles(
     std::string error_msg;
     ArtDexFileLoader dex_file_loader(
         raw_dex_file, oat_dex_file.dex_file_size_, oat_dex_file.GetLocation());
+    // All dex files have been already verified in WriteDexFiles before we copied them.
     dex_files.emplace_back(dex_file_loader.Open(oat_dex_file.dex_file_location_checksum_,
-                                                /* oat_dex_file */ nullptr,
-                                                verify,
-                                                verify,
+                                                /*oat_dex_file=*/nullptr,
+                                                /*verify=*/false,
+                                                /*verify_checksum=*/false,
                                                 &error_msg));
     if (dex_files.back() == nullptr) {
       LOG(ERROR) << "Failed to open dex file from oat file. File: " << oat_dex_file.GetLocation()

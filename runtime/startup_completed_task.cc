@@ -34,109 +34,108 @@
 
 namespace art {
 
-class CollectStartupDexCacheVisitor : public DexCacheVisitor {
+class UnlinkStartupDexCacheVisitor : public DexCacheVisitor {
  public:
-  explicit CollectStartupDexCacheVisitor(VariableSizedHandleScope& handles) : handles_(handles) {}
+  UnlinkStartupDexCacheVisitor() {}
 
   void Visit(ObjPtr<mirror::DexCache> dex_cache)
       REQUIRES_SHARED(Locks::dex_lock_, Locks::mutator_lock_) override {
-    handles_.NewHandle(dex_cache);
-  }
-
- private:
-  VariableSizedHandleScope& handles_;
-};
-
-class UnlinkVisitor {
- public:
-  UnlinkVisitor() {}
-
-  void VisitRootIfNonNull(StackReference<mirror::Object>* ref)
-      REQUIRES_SHARED(Locks::mutator_lock_) {
-    if (!ref->IsNull()) {
-      ref->AsMirrorPtr()->AsDexCache()->UnlinkStartupCaches();
-    }
+    dex_cache->UnlinkStartupCaches();
   }
 };
 
 void StartupCompletedTask::Run(Thread* self) {
-  VLOG(startup) << "StartupCompletedTask running";
   Runtime* const runtime = Runtime::Current();
-  if (!runtime->NotifyStartupCompleted()) {
-    return;
-  }
-
-  // Maybe generate a runtime app image.
-  {
-    std::string compiler_filter;
-    std::string compilation_reason;
-    runtime->GetAppInfo()->GetPrimaryApkOptimizationStatus(&compiler_filter, &compilation_reason);
-    CompilerFilter::Filter filter;
-    if (CompilerFilter::ParseCompilerFilter(compiler_filter.c_str(), &filter) &&
-        !CompilerFilter::IsAotCompilationEnabled(filter)) {
-      std::string error_msg;
-      if (!RuntimeImage::WriteImageToDisk(&error_msg)) {
-        LOG(DEBUG) << "Could not write temporary image to disk " << error_msg;
-      }
-    }
-  }
-
-  // Fetch the startup linear alloc before the checkpoint to play nice with
-  // 1002-notify-startup test which resets the startup state.
-  std::unique_ptr<LinearAlloc> startup_linear_alloc(runtime->ReleaseStartupLinearAlloc());
-  {
-    ScopedTrace trace("Releasing dex caches and app image spaces metadata");
-    ScopedObjectAccess soa(Thread::Current());
-
-    // Collect dex caches that were allocated with the startup linear alloc.
-    VariableSizedHandleScope handles(soa.Self());
-    {
-      CollectStartupDexCacheVisitor visitor(handles);
-      ReaderMutexLock mu(self, *Locks::dex_lock_);
-      runtime->GetClassLinker()->VisitDexCaches(&visitor);
-    }
-
-    // Request empty checkpoints to make sure no threads are:
-    // - accessing the image space metadata section when we madvise it
-    // - accessing dex caches when we free them
-    //
-    // Use GC exclusion to prevent deadlocks that may happen if
-    // multiple threads are attempting to run empty checkpoints at the same time.
-    {
-      // Avoid using ScopedGCCriticalSection since that does not allow thread suspension. This is
-      // not allowed to prevent allocations, but it's still safe to suspend temporarily for the
-      // checkpoint.
-      gc::ScopedInterruptibleGCCriticalSection sigcs(self,
-                                                     gc::kGcCauseRunEmptyCheckpoint,
-                                                     gc::kCollectorTypeCriticalSection);
-      // Do the unlinking of dex cache arrays in the GC critical section to
-      // avoid GC not seeing these arrays. We do it before the checkpoint so
-      // we know after the checkpoint, no thread is holding onto the array.
-      UnlinkVisitor visitor;
-      handles.VisitRoots(visitor);
-
-      runtime->GetThreadList()->RunEmptyCheckpoint();
-    }
-
-    for (gc::space::ContinuousSpace* space : runtime->GetHeap()->GetContinuousSpaces()) {
-      if (space->IsImageSpace()) {
-        gc::space::ImageSpace* image_space = space->AsImageSpace();
-        if (image_space->GetImageHeader().IsAppImage()) {
-          image_space->ReleaseMetadata();
+  if (runtime->NotifyStartupCompleted()) {
+    // Maybe generate a runtime app image. If the runtime is debuggable, boot
+    // classpath classes can be dynamically changed, so don't bother generating an
+    // image.
+    if (!runtime->IsJavaDebuggable()) {
+      std::string compiler_filter;
+      std::string compilation_reason;
+      runtime->GetAppInfo()->GetPrimaryApkOptimizationStatus(&compiler_filter, &compilation_reason);
+      CompilerFilter::Filter filter;
+      if (CompilerFilter::ParseCompilerFilter(compiler_filter.c_str(), &filter) &&
+          !CompilerFilter::IsAotCompilationEnabled(filter)) {
+        std::string error_msg;
+        if (!RuntimeImage::WriteImageToDisk(&error_msg)) {
+          LOG(DEBUG) << "Could not write temporary image to disk " << error_msg;
         }
       }
     }
+
+    ScopedObjectAccess soa(self);
+    DeleteStartupDexCaches(self, /* called_by_gc= */ false);
+  }
+
+  // Delete the thread pool used for app image loading since startup is assumed to be completed.
+  ScopedTrace trace2("Delete thread pool");
+  Runtime::Current()->DeleteThreadPool();
+}
+
+void StartupCompletedTask::DeleteStartupDexCaches(Thread* self, bool called_by_gc) {
+  VLOG(startup) << "StartupCompletedTask running";
+  Runtime* const runtime = Runtime::Current();
+
+  ScopedTrace trace("Releasing dex caches and app image spaces metadata");
+
+  static struct EmptyClosure : Closure {
+    void Run([[maybe_unused]] Thread* thread) override {}
+  } closure;
+
+  // Fetch the startup linear alloc so no other thread tries to allocate there.
+  std::unique_ptr<LinearAlloc> startup_linear_alloc(runtime->ReleaseStartupLinearAlloc());
+  // No thread could be allocating arrays or accessing dex caches when this
+  // thread has mutator-lock held exclusively.
+  bool run_checkpoints = !Locks::mutator_lock_->IsExclusiveHeld(self);
+
+  // Request a checkpoint to make sure all threads see we have started up and
+  // won't allocate in the startup linear alloc. Without this checkpoint what
+  // could happen is (T0 == self):
+  // 1) T1 fetches startup alloc, allocates an array there.
+  // 2) T0 goes over the dex caches, clear dex cache arrays in the startup alloc.
+  // 3) T1 sets the dex cache array from startup alloc in a dex cache.
+  // 4) T0 releases startup alloc.
+  //
+  // With this checkpoint, 3) cannot happen as T0 waits for T1 to reach the
+  // checkpoint.
+  if (run_checkpoints) {
+    runtime->GetThreadList()->RunCheckpoint(&closure);
   }
 
   {
-    // Delete the thread pool used for app image loading since startup is assumed to be completed.
-    ScopedTrace trace2("Delete thread pool");
-    runtime->DeleteThreadPool();
+    UnlinkStartupDexCacheVisitor visitor;
+    ReaderMutexLock mu(self, *Locks::dex_lock_);
+    runtime->GetClassLinker()->VisitDexCaches(&visitor);
+  }
+
+
+  // Request a checkpoint to make sure no threads are:
+  // - accessing the image space metadata section when we madvise it
+  // - accessing dex caches when we free them
+  if (run_checkpoints) {
+    runtime->GetThreadList()->RunCheckpoint(&closure);
+  }
+
+  // If this isn't the GC calling `DeleteStartupDexCaches` and a GC may be
+  // running, wait for it to be complete. We don't want it to see these dex
+  // caches.
+  if (!called_by_gc) {
+    runtime->GetHeap()->WaitForGcToComplete(gc::kGcCauseDeletingDexCacheArrays, self);
+  }
+
+  // At this point, we know no other thread can see the arrays, nor the GC. So
+  // we can safely release them.
+  for (gc::space::ContinuousSpace* space : runtime->GetHeap()->GetContinuousSpaces()) {
+    if (space->IsImageSpace()) {
+      gc::space::ImageSpace* image_space = space->AsImageSpace();
+      if (image_space->GetImageHeader().IsAppImage()) {
+        image_space->ReleaseMetadata();
+      }
+    }
   }
 
   if (startup_linear_alloc != nullptr) {
-    // We know that after the checkpoint, there is no thread that can hold
-    // the startup linear alloc, so it's safe to delete it now.
     ScopedTrace trace2("Delete startup linear alloc");
     ArenaPool* arena_pool = startup_linear_alloc->GetArenaPool();
     startup_linear_alloc.reset();

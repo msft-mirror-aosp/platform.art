@@ -86,12 +86,6 @@ TEST_F(PathUtilsTest, BuildOatPathNul) {
               HasError(WithMessage("Path '/a/\0/b.apk' has invalid character '\\0'"s)));
 }
 
-TEST_F(PathUtilsTest, BuildOatPathInvalidDexExtension) {
-  EXPECT_THAT(BuildOatPath(ArtifactsPath{
-                  .dexPath = "/a/b.invalid", .isa = "arm64", .isInDalvikCache = false}),
-              HasError(WithMessage("Dex path '/a/b.invalid' has an invalid extension")));
-}
-
 TEST_F(PathUtilsTest, BuildOatPathInvalidIsa) {
   EXPECT_THAT(BuildOatPath(
                   ArtifactsPath{.dexPath = "/a/b.apk", .isa = "invalid", .isInDalvikCache = false}),
@@ -263,6 +257,22 @@ TEST_F(PathUtilsTest, BuildVdexPath) {
   EXPECT_THAT(
       BuildVdexPath(ArtifactsPath{.dexPath = "/a/b.apk", .isa = "arm64", .isInDalvikCache = false}),
       HasValue("/a/oat/arm64/b.vdex"));
+}
+
+TEST_F(PathUtilsTest, PathStartsWith) {
+  EXPECT_TRUE(PathStartsWith("/a/b", "/a"));
+  EXPECT_TRUE(PathStartsWith("/a/b", "/a/"));
+
+  EXPECT_FALSE(PathStartsWith("/a/c", "/a/b"));
+  EXPECT_FALSE(PathStartsWith("/ab", "/a"));
+
+  EXPECT_TRUE(PathStartsWith("/a", "/a"));
+  EXPECT_TRUE(PathStartsWith("/a/", "/a"));
+  EXPECT_TRUE(PathStartsWith("/a", "/a/"));
+
+  EXPECT_TRUE(PathStartsWith("/a", "/"));
+  EXPECT_TRUE(PathStartsWith("/", "/"));
+  EXPECT_FALSE(PathStartsWith("/", "/a"));
 }
 
 }  // namespace

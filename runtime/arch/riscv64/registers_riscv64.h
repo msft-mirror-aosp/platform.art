@@ -28,7 +28,7 @@ enum XRegister {
   Zero = 0,  // X0, hard-wired zero
   RA = 1,    // X1, return address
   SP = 2,    // X2, stack pointer
-  GP = 3,    // X3, global pointer
+  GP = 3,    // X3, global pointer (unavailable, used for shadow stack by the compiler / libc)
   TP = 4,    // X4, thread pointer (points to TLS area, not ART-internal thread)
 
   T0 = 5,  // X5, temporary 0
@@ -36,7 +36,7 @@ enum XRegister {
   T2 = 7,  // X7, temporary 2
 
   S0 = 8,  // X8/FP, callee-saved 0 / frame pointer
-  S1 = 9,  // X9, callee-saved 1
+  S1 = 9,  // X9, callee-saved 1 / ART thread register
 
   A0 = 10,  // X10, argument 0 / return value 0
   A1 = 11,  // X11, argument 1 / return value 1
@@ -64,7 +64,7 @@ enum XRegister {
   T6 = 31,  // X31, temporary 6
 
   kNumberOfXRegisters = 32,
-  kNoRegister = -1,  // Signals an illegal register.
+  kNoXRegister = -1,  // Signals an illegal X register.
 
   // Aliases.
   TR = S1,  // ART Thread Register - managed runtime
@@ -111,6 +111,7 @@ enum FRegister {
   FT11 = 31,  // F31, temporary 11
 
   kNumberOfFRegisters = 32,
+  kNoFRegister = -1,  // Signals an illegal F register.
 };
 
 std::ostream& operator<<(std::ostream& os, const FRegister& rhs);

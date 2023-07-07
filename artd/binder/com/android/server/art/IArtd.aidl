@@ -35,7 +35,7 @@ interface IArtd {
      */
     com.android.server.art.GetDexoptStatusResult getDexoptStatus(
             @utf8InCpp String dexFile, @utf8InCpp String instructionSet,
-            @utf8InCpp String classLoaderContext);
+            @nullable @utf8InCpp String classLoaderContext);
 
     /**
      * Returns true if the profile exists and contains entries for the given dex file.
@@ -169,4 +169,12 @@ interface IArtd {
     long cleanup(in List<com.android.server.art.ProfilePath> profilesToKeep,
             in List<com.android.server.art.ArtifactsPath> artifactsToKeep,
             in List<com.android.server.art.VdexPath> vdexFilesToKeep);
+
+    /**
+     * Returns whether the artifacts of the primary dex files should be in the global dalvik-cache
+     * directory.
+     *
+     * Throws fatal and non-fatal errors.
+     */
+    boolean isInDalvikCache(@utf8InCpp String dexFile);
 }

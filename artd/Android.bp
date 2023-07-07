@@ -31,6 +31,7 @@ cc_defaults {
         "path_utils.cc",
     ],
     header_libs: [
+        "art_cmdlineparser_headers",
         "profman_headers",
     ],
     shared_libs: [
@@ -41,6 +42,7 @@ cc_defaults {
     ],
     static_libs: [
         "artd-aidl-ndk",
+        "libfstab",
     ],
 }
 
@@ -58,13 +60,6 @@ art_cc_binary {
         "com.android.art",
         "com.android.art.debug",
     ],
-}
-
-prebuilt_etc {
-    name: "com.android.art.artd.init.rc",
-    src: "artd.rc",
-    filename: "init.rc",
-    installable: false,
 }
 
 art_cc_defaults {

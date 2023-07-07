@@ -385,9 +385,25 @@ class ImageSpace::PatchObjectVisitor final {
     if (array == nullptr) {
       return;
     }
-    uint32_t size = reinterpret_cast<uint32_t*>(array)[-1];
+    DCHECK_ALIGNED(array, static_cast<size_t>(kPointerSize));
+    uint32_t size = (kPointerSize == PointerSize::k32)
+        ? reinterpret_cast<uint32_t*>(array)[-1]
+        : dchecked_integral_cast<uint32_t>(reinterpret_cast<uint64_t*>(array)[-1]);
     for (uint32_t i = 0; i < size; ++i) {
       PatchNativePointer(array->GetPtrEntryPtrSize(i, kPointerSize));
+    }
+  }
+
+  template <typename T> void VisitGcRootDexCacheArray(mirror::GcRootArray<T>* array)
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+    if (array == nullptr) {
+      return;
+    }
+    DCHECK_ALIGNED(array, sizeof(GcRoot<T>));
+    static_assert(sizeof(GcRoot<T>) == sizeof(uint32_t));
+    uint32_t size = reinterpret_cast<uint32_t*>(array)[-1];
+    for (uint32_t i = 0; i < size; ++i) {
+      PatchGcRoot(array->GetGcRootAddress(i));
     }
   }
 
@@ -405,6 +421,20 @@ class ImageSpace::PatchObjectVisitor final {
       mirror::NativeArray<ArtField>* resolved_fields = native_visitor_(old_resolved_fields);
       dex_cache->SetResolvedFieldsArray(resolved_fields);
       VisitNativeDexCacheArray(resolved_fields);
+    }
+
+    mirror::GcRootArray<mirror::String>* old_strings = dex_cache->GetStringsArray();
+    if (old_strings != nullptr) {
+      mirror::GcRootArray<mirror::String>* strings = native_visitor_(old_strings);
+      dex_cache->SetStringsArray(strings);
+      VisitGcRootDexCacheArray(strings);
+    }
+
+    mirror::GcRootArray<mirror::Class>* old_types = dex_cache->GetResolvedTypesArray();
+    if (old_types != nullptr) {
+      mirror::GcRootArray<mirror::Class>* types = native_visitor_(old_types);
+      dex_cache->SetResolvedTypesArray(types);
+      VisitGcRootDexCacheArray(types);
     }
   }
 
@@ -1342,7 +1372,8 @@ class ImageSpace::Loader {
           image_header->GetImageRoot<kWithoutReadBarrier>(ImageHeader::kDexCaches)
               ->AsObjectArray<mirror::DexCache, kVerifyNone>();
       for (int32_t i = 0, count = dex_caches->GetLength(); i < count; ++i) {
-        ObjPtr<mirror::DexCache> dex_cache = dex_caches->Get<kVerifyNone, kWithoutReadBarrier>(i);
+        ObjPtr<mirror::DexCache> dex_cache =
+            dex_caches->GetWithoutChecks<kVerifyNone, kWithoutReadBarrier>(i);
         patch_object_visitor.VisitDexCacheArrays(dex_cache);
       }
     }

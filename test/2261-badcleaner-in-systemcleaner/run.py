@@ -1,4 +1,6 @@
-# Copyright (C) 2021 The Android Open Source Project
+#!/bin/bash
+#
+# Copyright 2023 The Android Open Source Project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,12 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# A lazy service that is started and stopped dynamically as needed.
-service artd /apex/com.android.art/bin/artd
-    interface aidl artd
-    disabled  # Prevents the service from automatically starting at boot.
-    oneshot  # Prevents the service from automatically restarting each time it is stopped.
-    class core
-    user artd
-    group artd
-    capabilities DAC_OVERRIDE DAC_READ_SEARCH FOWNER CHOWN
+
+def run(ctx, args):
+  ctx.default_run(args, android_log_tags="*:f", expected_exit_code=2)

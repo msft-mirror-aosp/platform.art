@@ -22,6 +22,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <variant>
 
 #include "arch/instruction_set.h"
@@ -385,6 +386,8 @@ class OatFileAssistant {
 
     const std::string* Filename();
 
+    const char* DisplayFilename();
+
     // Returns true if this oat file can be used for running code. The oat
     // file can be used for running code as long as it is not out of date with
     // respect to the dex code or boot image. An oat file that is out of date
@@ -430,6 +433,11 @@ class OatFileAssistant {
     // called, because access to the loaded oat file has been taken away from
     // the OatFileInfo object.
     std::unique_ptr<OatFile> ReleaseFileForUse();
+
+    // Check if we should reject vdex containing cdex code as part of the
+    // disable_cdex experiment.
+    // TODO(b/256664509): Clean this up.
+    bool CheckDisableCompactDexExperiment();
 
    private:
     // Returns true if the oat file is usable but at least one dexopt trigger is matched. This

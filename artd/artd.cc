@@ -18,6 +18,7 @@
 
 #include <fcntl.h>
 #include <stdlib.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -57,10 +58,13 @@
 #include "base/compiler_filter.h"
 #include "base/file_utils.h"
 #include "base/globals.h"
+#include "base/logging.h"
 #include "base/os.h"
+#include "cmdline_types.h"
 #include "exec_utils.h"
 #include "file_utils.h"
 #include "fmt/format.h"
+#include "fstab/fstab.h"
 #include "oat_file_assistant.h"
 #include "oat_file_assistant_context.h"
 #include "path_utils.h"
@@ -99,6 +103,7 @@ using ::android::base::Result;
 using ::android::base::Split;
 using ::android::base::StringReplace;
 using ::android::base::WriteStringToFd;
+using ::android::fs_mgr::FstabEntry;
 using ::art::tools::CmdlineBuilder;
 using ::ndk::ScopedAStatus;
 
@@ -326,6 +331,22 @@ Result<void> CopyFile(const std::string& src_path, const NewFile& dst_file) {
   return {};
 }
 
+Result<void> SetLogVerbosity() {
+  std::string options = android::base::GetProperty("dalvik.vm.artd-verbose", /*default_value=*/"");
+  if (options.empty()) {
+    return {};
+  }
+
+  CmdlineType<LogVerbosity> parser;
+  CmdlineParseResult<LogVerbosity> result = parser.Parse(options);
+  if (!result.IsSuccess()) {
+    return Error() << result.GetMessage();
+  }
+
+  gLogVerbosity = result.ReleaseValue();
+  return {};
+}
+
 class FdLogger {
  public:
   void Add(const NewFile& file) { fd_mapping_.emplace_back(file.Fd(), file.TempPath()); }
@@ -385,7 +406,7 @@ ScopedAStatus Artd::deleteArtifacts(const ArtifactsPath& in_artifactsPath, int64
 
 ScopedAStatus Artd::getDexoptStatus(const std::string& in_dexFile,
                                     const std::string& in_instructionSet,
-                                    const std::string& in_classLoaderContext,
+                                    const std::optional<std::string>& in_classLoaderContext,
                                     GetDexoptStatusResult* _aidl_return) {
   Result<OatFileAssistantContext*> ofa_context = GetOatFileAssistantContext();
   if (!ofa_context.ok()) {
@@ -394,9 +415,9 @@ ScopedAStatus Artd::getDexoptStatus(const std::string& in_dexFile,
 
   std::unique_ptr<ClassLoaderContext> context;
   std::string error_msg;
-  auto oat_file_assistant = OatFileAssistant::Create(in_dexFile.c_str(),
-                                                     in_instructionSet.c_str(),
-                                                     in_classLoaderContext.c_str(),
+  auto oat_file_assistant = OatFileAssistant::Create(in_dexFile,
+                                                     in_instructionSet,
+                                                     in_classLoaderContext,
                                                      /*load_executable=*/false,
                                                      /*only_load_trusted_executable=*/true,
                                                      ofa_context.value(),
@@ -932,6 +953,9 @@ ndk::ScopedAStatus Artd::dexopt(
       in_instructionSet, in_compilerFilter, in_priorityClass, in_dexoptOptions, args);
   AddPerfConfigFlags(in_priorityClass, art_exec_args, args);
 
+  // For being surfaced in crash reports on crashes.
+  args.Add("--comments=%s", in_dexoptOptions.comments);
+
   art_exec_args.Add("--keep-fds=%s", fd_logger.GetFds()).Add("--").Concat(std::move(args));
 
   LOG(INFO) << "Running dex2oat: " << Join(art_exec_args.Get(), /*separator=*/" ")
@@ -1041,7 +1065,40 @@ ScopedAStatus Artd::cleanup(const std::vector<ProfilePath>& in_profilesToKeep,
   return ScopedAStatus::ok();
 }
 
+ScopedAStatus Artd::isInDalvikCache(const std::string& in_dexFile, bool* _aidl_return) {
+  // The artifacts should be in the global dalvik-cache directory if:
+  // (1). the dex file is on a system partition, even if the partition is remounted read-write,
+  //      or
+  // (2). the dex file is in any other readonly location. (At the time of writing, this only
+  //      include Incremental FS.)
+  //
+  // We cannot rely on access(2) because:
+  // - It doesn't take effective capabilities into account, from which artd gets root access
+  //   to the filesystem.
+  // - The `faccessat` variant with the `AT_EACCESS` flag, which takes effective capabilities
+  //   into account, is not supported by bionic.
+
+  OR_RETURN_FATAL(ValidateDexPath(in_dexFile));
+
+  std::vector<FstabEntry> entries = OR_RETURN_NON_FATAL(GetProcMountsEntriesForPath(in_dexFile));
+  // The last one controls because `/proc/mounts` reflects the sequence of `mount`.
+  for (auto it = entries.rbegin(); it != entries.rend(); it++) {
+    if (it->fs_type == "overlay") {
+      // Ignore the overlays created by `remount`.
+      continue;
+    }
+    // We need to special-case Incremental FS since it is tagged as read-write while it's actually
+    // not.
+    *_aidl_return = (it->flags & MS_RDONLY) != 0 || it->fs_type == "incremental-fs";
+    return ScopedAStatus::ok();
+  }
+
+  return NonFatal("Fstab entries not found for '{}'"_format(in_dexFile));
+}
+
 Result<void> Artd::Start() {
+  OR_RETURN(SetLogVerbosity());
+
   ScopedAStatus status = ScopedAStatus::fromStatus(
       AServiceManager_registerLazyService(this->asBinder().get(), kServiceName));
   if (!status.isOk()) {

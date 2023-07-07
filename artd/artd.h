@@ -88,7 +88,7 @@ class Artd : public aidl::com::android::server::art::BnArtd {
   ndk::ScopedAStatus getDexoptStatus(
       const std::string& in_dexFile,
       const std::string& in_instructionSet,
-      const std::string& in_classLoaderContext,
+      const std::optional<std::string>& in_classLoaderContext,
       aidl::com::android::server::art::GetDexoptStatusResult* _aidl_return) override;
 
   ndk::ScopedAStatus isProfileUsable(const aidl::com::android::server::art::ProfilePath& in_profile,
@@ -163,6 +163,8 @@ class Artd : public aidl::com::android::server::art::BnArtd {
       const std::vector<aidl::com::android::server::art::ArtifactsPath>& in_artifactsToKeep,
       const std::vector<aidl::com::android::server::art::VdexPath>& in_vdexFilesToKeep,
       int64_t* _aidl_return) override;
+
+  ndk::ScopedAStatus isInDalvikCache(const std::string& in_dexFile, bool* _aidl_return) override;
 
   android::base::Result<void> Start();
 

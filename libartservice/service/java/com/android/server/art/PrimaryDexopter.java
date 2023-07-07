@@ -23,8 +23,8 @@ import static com.android.server.art.Utils.Abi;
 
 import android.annotation.NonNull;
 import android.annotation.Nullable;
-import android.annotation.SuppressLint;
 import android.content.Context;
+import android.os.Build;
 import android.os.CancellationSignal;
 import android.os.Process;
 import android.os.RemoteException;
@@ -32,6 +32,8 @@ import android.os.ServiceSpecificException;
 import android.os.UserHandle;
 import android.text.TextUtils;
 import android.util.Log;
+
+import androidx.annotation.RequiresApi;
 
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.modules.utils.pm.PackageStateModulesUtils;
@@ -51,8 +53,9 @@ import java.util.List;
 import java.util.Objects;
 
 /** @hide */
+@RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
 public class PrimaryDexopter extends Dexopter<DetailedPrimaryDexInfo> {
-    private static final String TAG = "PrimaryDexopter";
+    private static final String TAG = ArtManagerLocal.TAG;
 
     private final int mSharedGid;
 
@@ -77,8 +80,8 @@ public class PrimaryDexopter extends Dexopter<DetailedPrimaryDexInfo> {
     }
 
     @Override
-    protected boolean isInDalvikCache() {
-        return Utils.isInDalvikCache(mPkgState);
+    protected boolean isInDalvikCache() throws RemoteException {
+        return Utils.isInDalvikCache(mPkgState, mInjector.getArtd());
     }
 
     @Override
@@ -113,42 +116,9 @@ public class PrimaryDexopter extends Dexopter<DetailedPrimaryDexInfo> {
     }
 
     @Override
-    @Nullable
-    protected ProfilePath initReferenceProfile(@NonNull DetailedPrimaryDexInfo dexInfo)
-            throws RemoteException {
-        OutputProfile output = buildOutputProfile(dexInfo, true /* isPublic */);
-
-        ProfilePath prebuiltProfile = AidlUtils.buildProfilePathForPrebuilt(dexInfo.dexPath());
-        try {
-            // If the APK is really a prebuilt one, rewriting the profile is unnecessary because the
-            // dex location is known at build time and is correctly set in the profile header.
-            // However, the APK can also be an installed one, in which case partners may place a
-            // profile file next to the APK at install time. Rewriting the profile in the latter
-            // case is necessary.
-            if (mInjector.getArtd().copyAndRewriteProfile(
-                        prebuiltProfile, output, dexInfo.dexPath())) {
-                return ProfilePath.tmpProfilePath(output.profilePath);
-            }
-        } catch (ServiceSpecificException e) {
-            Log.e(TAG,
-                    "Failed to use prebuilt profile "
-                            + AidlUtils.toString(output.profilePath.finalPath),
-                    e);
-        }
-
-        ProfilePath dmProfile = AidlUtils.buildProfilePathForDm(dexInfo.dexPath());
-        try {
-            if (mInjector.getArtd().copyAndRewriteProfile(dmProfile, output, dexInfo.dexPath())) {
-                return ProfilePath.tmpProfilePath(output.profilePath);
-            }
-        } catch (ServiceSpecificException e) {
-            Log.e(TAG,
-                    "Failed to use profile in dex metadata file "
-                            + AidlUtils.toString(output.profilePath.finalPath),
-                    e);
-        }
-
-        return null;
+    @NonNull
+    protected List<ProfilePath> getExternalProfiles(@NonNull DetailedPrimaryDexInfo dexInfo) {
+        return PrimaryDexUtils.getExternalProfiles(dexInfo);
     }
 
     @Override
@@ -211,7 +181,6 @@ public class PrimaryDexopter extends Dexopter<DetailedPrimaryDexInfo> {
         return AidlUtils.buildDexMetadataPath(dexInfo.dexPath());
     }
 
-    @SuppressLint("NewApi")
     private boolean isSharedLibrary() {
         return PackageStateModulesUtils.isLoadableInOtherProcesses(mPkgState, true /* codeOnly */);
     }

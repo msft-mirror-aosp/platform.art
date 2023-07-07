@@ -19,6 +19,7 @@ package com.android.server.art.model;
 import android.annotation.DurationMillisLong;
 import android.annotation.IntDef;
 import android.annotation.NonNull;
+import android.annotation.Nullable;
 import android.annotation.SystemApi;
 
 import com.android.internal.annotations.Immutable;
@@ -108,6 +109,22 @@ public abstract class DexoptResult {
                 .orElse(DEXOPT_SKIPPED);
     }
 
+    /** @hide */
+    @NonNull
+    public static String dexoptResultStatusToString(@DexoptResultStatus int status) {
+        switch (status) {
+            case DexoptResult.DEXOPT_SKIPPED:
+                return "SKIPPED";
+            case DexoptResult.DEXOPT_PERFORMED:
+                return "PERFORMED";
+            case DexoptResult.DEXOPT_FAILED:
+                return "FAILED";
+            case DexoptResult.DEXOPT_CANCELLED:
+                return "CANCELLED";
+        }
+        throw new IllegalArgumentException("Unknown dexopt status " + status);
+    }
+
     /**
      * Describes the result of a package.
      *
@@ -123,9 +140,9 @@ public abstract class DexoptResult {
         /** @hide */
         public static @NonNull PackageDexoptResult create(@NonNull String packageName,
                 @NonNull List<DexContainerFileDexoptResult> dexContainerFileDexoptResults,
-                boolean isCanceled) {
+                @Nullable @DexoptResultStatus Integer packageLevelStatus) {
             return new AutoValue_DexoptResult_PackageDexoptResult(
-                    packageName, dexContainerFileDexoptResults, isCanceled);
+                    packageName, dexContainerFileDexoptResults, packageLevelStatus);
         }
 
         /** The package name. */
@@ -139,16 +156,16 @@ public abstract class DexoptResult {
         getDexContainerFileDexoptResults();
 
         /** @hide */
-        public abstract boolean isCanceled();
+        @Nullable @DexoptResultStatus public abstract Integer getPackageLevelStatus();
 
         /** The overall status of the package. */
         public @DexoptResultStatus int getStatus() {
-            return isCanceled() ? DEXOPT_CANCELLED
-                                : getDexContainerFileDexoptResults()
-                                          .stream()
-                                          .mapToInt(result -> result.getStatus())
-                                          .max()
-                                          .orElse(DEXOPT_SKIPPED);
+            return getPackageLevelStatus() != null ? getPackageLevelStatus()
+                                                   : getDexContainerFileDexoptResults()
+                                                             .stream()
+                                                             .mapToInt(result -> result.getStatus())
+                                                             .max()
+                                                             .orElse(DEXOPT_SKIPPED);
         }
 
         /** True if the package has any artifacts updated by this operation. */
@@ -234,5 +251,24 @@ public abstract class DexoptResult {
 
         /** @hide */
         public abstract boolean isSkippedDueToStorageLow();
+
+        @Override
+        @NonNull
+        public String toString() {
+            return String.format("DexContainerFileDexoptResult{"
+                            + "dexContainerFile=%s, "
+                            + "primaryAbi=%b, "
+                            + "abi=%s, "
+                            + "actualCompilerFilter=%s, "
+                            + "status=%s, "
+                            + "dex2oatWallTimeMillis=%d, "
+                            + "dex2oatCpuTimeMillis=%d, "
+                            + "sizeBytes=%d, "
+                            + "sizeBeforeBytes=%d}",
+                    getDexContainerFile(), isPrimaryAbi(), getAbi(), getActualCompilerFilter(),
+                    DexoptResult.dexoptResultStatusToString(getStatus()),
+                    getDex2oatWallTimeMillis(), getDex2oatCpuTimeMillis(), getSizeBytes(),
+                    getSizeBeforeBytes());
+        }
     }
 }

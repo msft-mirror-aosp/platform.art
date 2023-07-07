@@ -52,6 +52,9 @@ public class PrimaryDexopterTestBase {
     protected static final String PKG_NAME = "com.example.foo";
     protected static final int UID = 12345;
     protected static final int SHARED_GID = UserHandle.getSharedAppGid(UID);
+    protected static final long ART_VERSION = 331413030l;
+    protected static final String APP_VERSION_NAME = "12.34.56";
+    protected static final long APP_VERSION_CODE = 1536036288l;
 
     @Rule
     public StaticMockitoRule mockitoRule = new StaticMockitoRule(
@@ -76,6 +79,7 @@ public class PrimaryDexopterTestBase {
         lenient().when(mInjector.getUserManager()).thenReturn(mUserManager);
         lenient().when(mInjector.getDexUseManager()).thenReturn(mDexUseManager);
         lenient().when(mInjector.getStorageManager()).thenReturn(mStorageManager);
+        lenient().when(mInjector.getArtVersion()).thenReturn(ART_VERSION);
 
         lenient()
                 .when(SystemProperties.get("dalvik.vm.systemuicompilerfilter"))
@@ -136,6 +140,8 @@ public class PrimaryDexopterTestBase {
         lenient().when(pkg.getTargetSdkVersion()).thenReturn(123);
         lenient().when(pkg.isSignedWithPlatformKey()).thenReturn(false);
         lenient().when(pkg.isNonSdkApiRequested()).thenReturn(false);
+        lenient().when(pkg.getVersionName()).thenReturn(APP_VERSION_NAME);
+        lenient().when(pkg.getLongVersionCode()).thenReturn(APP_VERSION_CODE);
         return pkg;
     }
 
@@ -144,8 +150,6 @@ public class PrimaryDexopterTestBase {
         lenient().when(pkgState.getPackageName()).thenReturn(PKG_NAME);
         lenient().when(pkgState.getPrimaryCpuAbi()).thenReturn("arm64-v8a");
         lenient().when(pkgState.getSecondaryCpuAbi()).thenReturn("armeabi-v7a");
-        lenient().when(pkgState.isSystem()).thenReturn(false);
-        lenient().when(pkgState.isUpdatedSystemApp()).thenReturn(false);
         lenient().when(pkgState.getAppId()).thenReturn(UID);
         lenient().when(pkgState.getSharedLibraryDependencies()).thenReturn(new ArrayList<>());
         lenient().when(pkgState.getStateForUser(any())).thenReturn(mPkgUserStateNotInstalled);

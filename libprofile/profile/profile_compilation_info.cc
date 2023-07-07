@@ -16,6 +16,7 @@
 
 #include "profile_compilation_info.h"
 
+#include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -34,6 +35,7 @@
 #include <vector>
 
 #include "android-base/file.h"
+#include "android-base/properties.h"
 #include "android-base/scopeguard.h"
 #include "android-base/unique_fd.h"
 #include "base/arena_allocator.h"
@@ -782,6 +784,9 @@ bool ProfileCompilationInfo::Load(const std::string& filename, bool clear_if_inv
       LockedFile::Open(filename.c_str(), flags, /*block=*/false, &error);
 
   if (profile_file.get() == nullptr) {
+    if (clear_if_invalid && errno == ENOENT) {
+      return true;
+    }
     LOG(WARNING) << "Couldn't lock the profile file " << filename << ": " << error;
     return false;
   }
@@ -799,6 +804,8 @@ bool ProfileCompilationInfo::Load(const std::string& filename, bool clear_if_inv
        (status == ProfileLoadStatus::kBadData))) {
     LOG(WARNING) << "Clearing bad or obsolete profile data from file "
                  << filename << ": " << error;
+    // When ART Service is enabled, this is the only place where we mutate a profile in place.
+    // TODO(jiakaiz): Get rid of this.
     if (profile_file->ClearContent()) {
       return true;
     } else {
@@ -818,7 +825,12 @@ bool ProfileCompilationInfo::Save(const std::string& filename, uint64_t* bytes_w
   return SaveFallback(filename, bytes_written);
 #else
   // Prior to U, SELinux policy doesn't allow apps to create profile files.
-  if (!android::modules::sdklevel::IsAtLeastU()) {
+  // Additionally, when installd is being used for dexopt, it acquires a flock when working on a
+  // profile. It's unclear to us whether the flock means that the file at the fd shouldn't change or
+  // that the file at the path shouldn't change, especially when the installd code is modified by
+  // partners. Therefore, we fall back to using a flock as well just to be safe.
+  if (!android::modules::sdklevel::IsAtLeastU() ||
+      !android::base::GetBoolProperty("dalvik.vm.useartservice", /*default_value=*/false)) {
     return SaveFallback(filename, bytes_written);
   }
 
@@ -872,9 +884,9 @@ bool ProfileCompilationInfo::Save(const std::string& filename, uint64_t* bytes_w
 bool ProfileCompilationInfo::SaveFallback(const std::string& filename, uint64_t* bytes_written) {
   std::string error;
 #ifdef _WIN32
-  int flags = O_WRONLY;
+  int flags = O_WRONLY | O_CREAT;
 #else
-  int flags = O_WRONLY | O_NOFOLLOW | O_CLOEXEC;
+  int flags = O_WRONLY | O_NOFOLLOW | O_CLOEXEC | O_CREAT;
 #endif
   // There's no need to fsync profile data right away. We get many chances
   // to write it again in case something goes wrong. We can rely on a simple
@@ -2178,6 +2190,16 @@ bool ProfileCompilationInfo::GetClassesAndMethods(
     class_set->insert(type_index);
   }
   return true;
+}
+
+const ArenaSet<dex::TypeIndex>* ProfileCompilationInfo::GetClasses(
+    const DexFile& dex_file,
+    const ProfileSampleAnnotation& annotation) const {
+  const DexFileData* dex_data = FindDexDataUsingAnnotations(&dex_file, annotation);
+  if (dex_data == nullptr) {
+    return nullptr;
+  }
+  return &dex_data->class_set;
 }
 
 bool ProfileCompilationInfo::SameVersion(const ProfileCompilationInfo& other) const {

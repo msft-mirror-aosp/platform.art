@@ -463,10 +463,12 @@ class ProfileCompilationInfo {
   //   the dex_file they are in.
   bool VerifyProfileData(const std::vector<const DexFile*>& dex_files);
 
-  // Load profile information from the given file
+  // Loads profile information from the given file.
+  // Returns true on success, false otherwise.
   // If the current profile is non-empty the load will fail.
-  // If clear_if_invalid is true and the file is invalid the method clears the
-  // the file and returns true.
+  // If clear_if_invalid is true:
+  // - If the file is invalid, the method clears the file and returns true.
+  // - If the file doesn't exist, the method returns true.
   bool Load(const std::string& filename, bool clear_if_invalid);
 
   // Merge the data from another ProfileCompilationInfo into the current object. Only merges
@@ -591,6 +593,10 @@ class ProfileCompilationInfo {
       /*out*/std::set<uint16_t>* hot_method_set,
       /*out*/std::set<uint16_t>* startup_method_set,
       /*out*/std::set<uint16_t>* post_startup_method_method_set,
+      const ProfileSampleAnnotation& annotation = ProfileSampleAnnotation::kNone) const;
+
+  const ArenaSet<dex::TypeIndex>* GetClasses(
+      const DexFile& dex_file,
       const ProfileSampleAnnotation& annotation = ProfileSampleAnnotation::kNone) const;
 
   // Returns true iff both profiles have the same version.

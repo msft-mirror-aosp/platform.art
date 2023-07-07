@@ -241,13 +241,14 @@ class OptimizingUnitTestHelper {
 
     // Create the dex file based on the fake data. Call the constructor so that we can use virtual
     // functions. Don't use the arena for the StandardDexFile otherwise the dex location leaks.
-    dex_files_.emplace_back(new StandardDexFile(
-        dex_data,
-        sizeof(StandardDexFile::Header),
-        "no_location",
-        /*location_checksum*/ 0,
-        /*oat_dex_file*/ nullptr,
-        /*container*/ nullptr));
+    auto container =
+        std::make_shared<MemoryDexFileContainer>(dex_data, sizeof(StandardDexFile::Header));
+    dex_files_.emplace_back(new StandardDexFile(dex_data,
+                                                sizeof(StandardDexFile::Header),
+                                                "no_location",
+                                                /*location_checksum*/ 0,
+                                                /*oat_dex_file*/ nullptr,
+                                                std::move(container)));
 
     graph_ = new (allocator) HGraph(
         allocator,
@@ -460,7 +461,8 @@ class OptimizingUnitTestHelper {
                               HInvokeStaticOrDirect::DispatchInfo{},
                               InvokeType::kStatic,
                               /* resolved_method_reference= */ method_reference,
-                              HInvokeStaticOrDirect::ClinitCheckRequirement::kNone);
+                              HInvokeStaticOrDirect::ClinitCheckRequirement::kNone,
+                              !graph_->IsDebuggable());
     for (auto [ins, idx] : ZipCount(MakeIterationRange(args))) {
       res->SetRawInputAt(idx, ins);
     }
@@ -572,7 +574,7 @@ inline std::ostream& operator<<(std::ostream& oss, const AdjacencyListGraph& alg
   return alg.Dump(oss);
 }
 
-class PatternMatchGraphVisitor : public HGraphVisitor {
+class PatternMatchGraphVisitor final : public HGraphVisitor {
  private:
   struct HandlerWrapper {
    public:

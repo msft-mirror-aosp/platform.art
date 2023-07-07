@@ -256,11 +256,14 @@ class Trace final : public instrumentation::InstrumentationListener {
   void FinishTracing()
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!tracing_lock_);
 
-  void ReadClocks(Thread* thread, uint32_t* thread_clock_diff, uint32_t* wall_clock_diff);
+  void ReadClocks(Thread* thread, uint32_t* thread_clock_diff, uint64_t* timestamp_counter);
 
-  void LogMethodTraceEvent(Thread* thread, ArtMethod* method, TraceAction action,
-                           uint32_t thread_clock_diff, uint32_t wall_clock_diff)
-      REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!tracing_lock_);
+  void LogMethodTraceEvent(Thread* thread,
+                           ArtMethod* method,
+                           TraceAction action,
+                           uint32_t thread_clock_diff,
+                           uint64_t timestamp_counter) REQUIRES_SHARED(Locks::mutator_lock_)
+      REQUIRES(!tracing_lock_);
 
   // Methods to output traced methods and threads.
   void DumpMethodList(std::ostream& os)
@@ -271,7 +274,7 @@ class Trace final : public instrumentation::InstrumentationListener {
                          ArtMethod* method,
                          TraceAction action,
                          uint32_t thread_clock_diff,
-                         uint32_t wall_clock_diff) REQUIRES(!tracing_lock_);
+                         uint64_t timestamp) REQUIRES(!tracing_lock_);
 
   // Encodes event in non-streaming mode. This assumes that there is enough space reserved to
   // encode the entry.
@@ -291,7 +294,7 @@ class Trace final : public instrumentation::InstrumentationListener {
                                   ArtMethod* method,
                                   TraceAction action,
                                   uint32_t thread_clock_diff,
-                                  uint32_t wall_clock_diff) REQUIRES_SHARED(Locks::mutator_lock_)
+                                  uint64_t timestamp) REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!tracing_lock_);
   // This encodes all the events in the per-thread trace buffer and writes it to the trace file.
   // This acquires streaming lock to prevent any other threads writing concurrently. It is required
@@ -324,6 +327,8 @@ class Trace final : public instrumentation::InstrumentationListener {
 
   void DumpBuf(uint8_t* buf, size_t buf_size, TraceClockSource clock_source)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!tracing_lock_);
+
+  void UpdateThreadsList(Thread* thread);
 
   // Singleton instance of the Trace or null when no method tracing is active.
   static Trace* volatile the_trace_ GUARDED_BY(Locks::trace_lock_);
@@ -392,8 +397,9 @@ class Trace final : public instrumentation::InstrumentationListener {
   // Did we overflow the buffer recording traces?
   bool overflow_;
 
-  // Map of thread ids and names that have already exited.
-  SafeMap<pid_t, std::string> exited_threads_;
+  // Map of thread ids and names. We record the information when the threads are
+  // exiting and when the tracing has finished.
+  SafeMap<pid_t, std::string> threads_list_;
 
   // Sampling profiler sampling interval.
   int interval_us_;
