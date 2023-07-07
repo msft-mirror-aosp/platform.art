@@ -43,6 +43,7 @@ using ::art::odrefresh::ExitCode;
 using ::art::odrefresh::kCheckedSystemPropertyPrefixes;
 using ::art::odrefresh::kIgnoredSystemProperties;
 using ::art::odrefresh::kSystemProperties;
+using ::art::odrefresh::kSystemPropertySystemServerCompilerFilterOverride;
 using ::art::odrefresh::OdrCompilationLog;
 using ::art::odrefresh::OdrConfig;
 using ::art::odrefresh::OdrMetrics;
@@ -146,6 +147,8 @@ int InitializeConfig(int argc, char** argv, OdrConfig* config) {
       config->SetArtifactDirectory(GetApexDataDalvikCacheDirectory(art::InstructionSet::kNone));
     } else if (ArgumentMatches(arg, "--zygote-arch=", &value)) {
       zygote = value;
+    } else if (ArgumentMatches(arg, "--boot-image-compiler-filter=", &value)) {
+      config->SetBootImageCompilerFilter(value);
     } else if (ArgumentMatches(arg, "--system-server-compiler-filter=", &value)) {
       config->SetSystemServerCompilerFilter(value);
     } else if (ArgumentMatches(arg, "--staging-dir=", &value)) {
@@ -174,7 +177,8 @@ int InitializeConfig(int argc, char** argv, OdrConfig* config) {
   config->SetZygoteKind(zygote_kind);
 
   if (config->GetSystemServerCompilerFilter().empty()) {
-    std::string filter = GetProperty("dalvik.vm.systemservercompilerfilter", "speed");
+    std::string filter = GetProperty("dalvik.vm.systemservercompilerfilter", "");
+    filter = GetProperty(kSystemPropertySystemServerCompilerFilterOverride, filter);
     config->SetSystemServerCompilerFilter(filter);
   }
 
@@ -234,6 +238,9 @@ NO_RETURN void UsageHelp(const char* argv0) {
   UsageMsg("--staging-dir=<DIR>              Write temporary artifacts to <DIR> rather than");
   UsageMsg("                                 .../staging");
   UsageMsg("--zygote-arch=<STRING>           Zygote kind that overrides ro.zygote");
+  UsageMsg("--boot-image-compiler-filter=<STRING>");
+  UsageMsg("                                 Compiler filter for the boot image. Default: ");
+  UsageMsg("                                 speed-profile");
   UsageMsg("--system-server-compiler-filter=<STRING>");
   UsageMsg("                                 Compiler filter that overrides");
   UsageMsg("                                 dalvik.vm.systemservercompilerfilter");
@@ -250,16 +257,21 @@ int main(int argc, char** argv) {
   // by others and prevents system_server from loading generated artifacts.
   umask(S_IWGRP | S_IWOTH);
 
-  // Explicitly initialize logging (b/201042799).
-  android::base::InitLogging(argv, android::base::LogdLogger(android::base::SYSTEM));
-
   OdrConfig config(argv[0]);
   int n = InitializeConfig(argc, argv, &config);
+
+  // Explicitly initialize logging (b/201042799).
+  // But not in CompOS mode - logd doesn't exist in Microdroid (b/265153235).
+  if (!config.GetCompilationOsMode()) {
+    android::base::InitLogging(argv, android::base::LogdLogger(android::base::SYSTEM));
+  }
+
   argv += n;
   argc -= n;
   if (argc != 1) {
     ArgumentError("Expected 1 argument, but have %d.", argc);
   }
+
   GetSystemProperties(config.MutableSystemProperties());
 
   OdrMetrics metrics(config.GetArtifactDirectory());
@@ -269,10 +281,17 @@ int main(int argc, char** argv) {
   CompilationOptions compilation_options;
   if (action == "--check") {
     // Fast determination of whether artifacts are up to date.
-    return odr.CheckArtifactsAreUpToDate(metrics, &compilation_options);
+    ExitCode exit_code = odr.CheckArtifactsAreUpToDate(metrics, &compilation_options);
+    // Normally, `--check` should not write metrics. If compilation is not required, there's no need
+    // to write metrics; if compilation is required, `--compile` will write metrics. Therefore,
+    // `--check` should only write metrics when things went wrong.
+    metrics.SetEnabled(exit_code != ExitCode::kOkay && exit_code != ExitCode::kCompilationRequired);
+    return exit_code;
   } else if (action == "--compile") {
-    const ExitCode exit_code = odr.CheckArtifactsAreUpToDate(metrics, &compilation_options);
+    ExitCode exit_code = odr.CheckArtifactsAreUpToDate(metrics, &compilation_options);
     if (exit_code != ExitCode::kCompilationRequired) {
+      // No compilation required, so only write metrics when things went wrong.
+      metrics.SetEnabled(exit_code != ExitCode::kOkay);
       return exit_code;
     }
     OdrCompilationLog compilation_log;
@@ -280,6 +299,8 @@ int main(int argc, char** argv) {
       LOG(INFO) << "Compilation skipped because it was attempted recently";
       return ExitCode::kOkay;
     }
+    // Compilation required, so always write metrics.
+    metrics.SetEnabled(true);
     ExitCode compile_result = odr.Compile(metrics, compilation_options);
     compilation_log.Log(metrics.GetArtApexVersion(),
                         metrics.GetArtApexLastUpdateMillis(),
@@ -292,11 +313,7 @@ int main(int argc, char** argv) {
       metrics.SetStatus(OdrMetrics::Status::kIoError);
       return ExitCode::kCleanupFailed;
     }
-    return odr.Compile(metrics,
-                       CompilationOptions{
-                           .compile_boot_classpath_for_isas = config.GetBootClasspathIsas(),
-                           .system_server_jars_to_compile = odr.AllSystemServerJars(),
-                       });
+    return odr.Compile(metrics, CompilationOptions::CompileAll(odr));
   } else if (action == "--help") {
     UsageHelp(argv[0]);
   } else {

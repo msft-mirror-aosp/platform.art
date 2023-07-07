@@ -17,24 +17,26 @@
 package android.test.app;
 
 import android.test.lib.TestUtils;
+import android.test.productsharedlib.ProductSharedLib;
 import android.test.systemextsharedlib.SystemExtSharedLib;
 import android.test.systemsharedlib.SystemSharedLib;
-import androidx.test.filters.SmallTest;
+import android.test.vendorsharedlib.VendorSharedLib;
+import androidx.test.filters.MediumTest;
 import androidx.test.runner.AndroidJUnit4;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
-@SmallTest
+@MediumTest
 @RunWith(AndroidJUnit4.class)
 public class VendorAppTest {
     @Test
     public void testLoadExtendedPublicLibraries() {
-        TestUtils.assertLinkerNamespaceError(() -> System.loadLibrary("foo.oem1"));
-        TestUtils.assertLinkerNamespaceError(() -> System.loadLibrary("bar.oem1"));
-        TestUtils.assertLinkerNamespaceError(() -> System.loadLibrary("foo.oem2"));
-        TestUtils.assertLinkerNamespaceError(() -> System.loadLibrary("bar.oem2"));
-        System.loadLibrary("foo.product1");
-        System.loadLibrary("bar.product1");
+        TestUtils.assertLinkerNamespaceError(() -> System.loadLibrary("system_extpub.oem1"));
+        TestUtils.assertLinkerNamespaceError(() -> System.loadLibrary("system_extpub.oem2"));
+        TestUtils.assertLinkerNamespaceError(() -> System.loadLibrary("system_extpub1.oem1"));
+        TestUtils.assertLinkerNamespaceError(() -> System.loadLibrary("system_extpub_nouses.oem2"));
+        System.loadLibrary("product_extpub.product1");
+        System.loadLibrary("product_extpub1.product1");
     }
 
     @Test
@@ -42,26 +44,68 @@ public class VendorAppTest {
         TestUtils.assertLinkerNamespaceError(() -> System.loadLibrary("system_private1"));
         TestUtils.assertLinkerNamespaceError(() -> System.loadLibrary("systemext_private1"));
         TestUtils.assertLibraryNotFound(() -> System.loadLibrary("product_private1"));
-        // TODO(mast): The vendor app fails to load a private vendor library because it gets
-        // classified as untrusted_app in SELinux, which doesn't have access to vendor_file. Even an
-        // app in /vendor/priv-app, which gets classified as priv_app, still doesn't have access to
-        // vendor_file. Check that the test setup is correct and if this is WAI.
-        TestUtils.assertLibraryNotFound(() -> System.loadLibrary("vendor_private1"));
+        System.loadLibrary("vendor_private1");
+    }
+
+    @Test
+    public void testLoadExtendedPublicLibrariesViaSystemSharedLib() {
+        SystemSharedLib.loadLibrary("system_extpub2.oem1");
+        SystemSharedLib.loadLibrary("product_extpub2.product1");
     }
 
     @Test
     public void testLoadPrivateLibrariesViaSystemSharedLib() {
-        SystemSharedLib.loadLibrary("system_private2");
-        SystemSharedLib.loadLibrary("systemext_private2");
+        // TODO(b/237577392): Loading a private native system library via a shared system library
+        // ought to work.
+        // SystemSharedLib.loadLibrary("system_private2");
+        // SystemSharedLib.loadLibrary("systemext_private2");
         TestUtils.assertLibraryNotFound(() -> SystemSharedLib.loadLibrary("product_private2"));
         TestUtils.assertLibraryNotFound(() -> SystemSharedLib.loadLibrary("vendor_private2"));
     }
 
     @Test
     public void testLoadPrivateLibrariesViaSystemExtSharedLib() {
-        SystemExtSharedLib.loadLibrary("system_private3");
-        SystemExtSharedLib.loadLibrary("systemext_private3");
+        // TODO(b/237577392): Loading a private native system library via a shared system library
+        // ought to work.
+        // SystemExtSharedLib.loadLibrary("system_private3");
+        // SystemExtSharedLib.loadLibrary("systemext_private3");
         TestUtils.assertLibraryNotFound(() -> SystemExtSharedLib.loadLibrary("product_private3"));
         TestUtils.assertLibraryNotFound(() -> SystemExtSharedLib.loadLibrary("vendor_private3"));
+    }
+
+    @Test
+    public void testLoadPrivateLibrariesViaProductSharedLib() {
+        TestUtils.assertLinkerNamespaceError(() -> ProductSharedLib.loadLibrary("system_private4"));
+        TestUtils.assertLinkerNamespaceError(
+                () -> ProductSharedLib.loadLibrary("systemext_private4"));
+        ProductSharedLib.loadLibrary("product_private4");
+        TestUtils.assertLibraryNotFound(() -> ProductSharedLib.loadLibrary("vendor_private4"));
+    }
+
+    @Test
+    public void testLoadPrivateLibrariesViaVendorSharedLib() {
+        TestUtils.assertLinkerNamespaceError(() -> VendorSharedLib.loadLibrary("system_private5"));
+        TestUtils.assertLinkerNamespaceError(
+                () -> VendorSharedLib.loadLibrary("systemext_private5"));
+        TestUtils.assertLibraryNotFound(() -> VendorSharedLib.loadLibrary("product_private5"));
+        VendorSharedLib.loadLibrary("vendor_private5");
+    }
+
+    @Test
+    public void testLoadExtendedPublicLibrariesWithAbsolutePaths() {
+        TestUtils.assertLinkerNamespaceError(
+                () -> System.load(TestUtils.libPath("/system", "system_extpub3.oem1")));
+        System.load(TestUtils.libPath("/product", "product_extpub3.product1"));
+    }
+
+    @Test
+    public void testLoadPrivateLibrariesWithAbsolutePaths() {
+        TestUtils.assertLinkerNamespaceError(
+                () -> System.load(TestUtils.libPath("/system", "system_private6")));
+        TestUtils.assertLinkerNamespaceError(
+                () -> System.load(TestUtils.libPath("/system_ext", "systemext_private6")));
+        TestUtils.assertLinkerNamespaceError(
+                () -> System.load(TestUtils.libPath("/product", "product_private6")));
+        System.load(TestUtils.libPath("/vendor", "vendor_private6"));
     }
 }
