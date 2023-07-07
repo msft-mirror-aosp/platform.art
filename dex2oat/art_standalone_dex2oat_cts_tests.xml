@@ -32,6 +32,7 @@
         <option name="push" value="art-gtest-jars-MainStripped.jar->/data/local/tmp/art_standalone_dex2oat_cts_tests/art-gtest-jars-MainStripped.jar" />
         <option name="push" value="art-gtest-jars-MultiDex.jar->/data/local/tmp/art_standalone_dex2oat_cts_tests/art-gtest-jars-MultiDex.jar" />
         <option name="push" value="art-gtest-jars-MultiDexModifiedSecondary.jar->/data/local/tmp/art_standalone_dex2oat_cts_tests/art-gtest-jars-MultiDexModifiedSecondary.jar" />
+        <option name="push" value="art-gtest-jars-MultiDexUncompressedAligned.jar->/data/local/tmp/art_standalone_dex2oat_cts_tests/art-gtest-jars-MultiDexUncompressedAligned.jar" />
         <option name="push" value="art-gtest-jars-Nested.jar->/data/local/tmp/art_standalone_dex2oat_cts_tests/art-gtest-jars-Nested.jar" />
     </target_preparer>
 
@@ -66,4 +67,9 @@
 
     <!-- Only run tests if the device under test is SDK version 31 (Android 12) or above. -->
     <object type="module_controller" class="com.android.tradefed.testtype.suite.module.Sdk31ModuleController" />
+
+    <!-- Controller that will skip the module if a native bridge situation is detected.
+         For example: module wants to run arm and device is x86. This module tests art
+         internals which are never executed in native bridge situation. -->
+    <object type="module_controller" class="com.android.tradefed.testtype.suite.module.NativeBridgeModuleController" />
 </configuration>

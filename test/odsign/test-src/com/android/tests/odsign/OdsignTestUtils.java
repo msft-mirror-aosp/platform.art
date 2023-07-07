@@ -16,8 +16,6 @@
 
 package com.android.tests.odsign;
 
-import static com.android.tradefed.testtype.DeviceJUnit4ClassRunner.TestLogData;
-
 import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.Truth.assertWithMessage;
 
@@ -27,22 +25,17 @@ import static org.junit.Assume.assumeTrue;
 import android.cts.install.lib.host.InstallUtilsHost;
 
 import com.android.tradefed.device.DeviceNotAvailableException;
-import com.android.tradefed.device.ITestDevice;
 import com.android.tradefed.device.TestDeviceOptions;
 import com.android.tradefed.invoker.TestInformation;
-import com.android.tradefed.result.FileInputStreamSource;
-import com.android.tradefed.result.LogDataType;
 import com.android.tradefed.util.CommandResult;
 
 import com.google.common.io.ByteStreams;
 
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
-import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -58,6 +51,7 @@ import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
+
 import javax.xml.parsers.DocumentBuilder;
 import javax.xml.parsers.DocumentBuilderFactory;
 
@@ -83,6 +77,7 @@ public class OdsignTestUtils {
 
     private static final String TAG = "OdsignTestUtils";
     private static final String PACKAGE_NAME_KEY = TAG + ":PACKAGE_NAME";
+    private static final String VERITY_DISABLED_BY_TEST_KEY = TAG + ":VERITY_DISABLED_BY_TEST";
 
     // Keep in sync with `ABI_TO_INSTRUCTION_SET_MAP` in
     // libcore/libart/src/main/java/dalvik/system/VMRuntime.java.
@@ -173,8 +168,7 @@ public class OdsignTestUtils {
         return getMappedArtifacts(systemServerPid, grepPattern);
     }
 
-    public Set<String> getZygoteExpectedArtifacts(String bootImageStem, String isa)
-            throws Exception {
+    private Set<String> getExpectedBootImage(String bootImageStem, String isa) throws Exception {
         Set<String> artifacts = new HashSet<>();
         for (String extension : BCP_ARTIFACT_EXTENSIONS) {
             artifacts.add(String.format(
@@ -183,16 +177,24 @@ public class OdsignTestUtils {
         return artifacts;
     }
 
-    public Set<String> getZygotesExpectedArtifacts(String bootImageStem) throws Exception {
+    private Set<String> getExpectedBootImage(String bootImageStem) throws Exception {
         Set<String> artifacts = new HashSet<>();
         for (String isa : getZygoteNamesAndIsas().values()) {
-            artifacts.addAll(getZygoteExpectedArtifacts(bootImageStem, isa));
+            artifacts.addAll(getExpectedBootImage(bootImageStem, isa));
         }
         return artifacts;
     }
 
-    public Set<String> getZygotesExpectedArtifacts() throws Exception {
-        return getZygotesExpectedArtifacts("boot");
+    public Set<String> getExpectedPrimaryBootImage() throws Exception {
+        return getExpectedBootImage("boot");
+    }
+
+    public Set<String> getExpectedMinimalBootImage() throws Exception {
+        return getExpectedBootImage("boot_minimal");
+    }
+
+    public Set<String> getExpectedBootImageMainlineExtension() throws Exception {
+        return getExpectedBootImage("boot-" + getFirstMainlineFrameworkLibraryName());
     }
 
     public Set<String> getSystemServerExpectedArtifacts() throws Exception {
@@ -214,17 +216,33 @@ public class OdsignTestUtils {
 
     // Verifies that boot image files with the given stem are loaded by Zygote for each instruction
     // set.
-    public void verifyZygotesLoadedArtifacts(String bootImageStem) throws Exception {
+    private void verifyZygotesLoadedBootImage(String bootImageStem) throws Exception {
         for (var entry : getZygoteNamesAndIsas().entrySet()) {
             assertThat(getZygoteLoadedArtifacts(entry.getKey()))
                     .containsAtLeastElementsIn(
-                            getZygoteExpectedArtifacts(bootImageStem, entry.getValue()));
+                            getExpectedBootImage(bootImageStem, entry.getValue()));
         }
     }
 
-    public void verifySystemServerLoadedArtifacts() throws Exception {
+    public void verifyZygotesLoadedPrimaryBootImage() throws Exception {
+        verifyZygotesLoadedBootImage("boot");
+    }
+
+    public void verifyZygotesLoadedMinimalBootImage() throws Exception {
+        verifyZygotesLoadedBootImage("boot_minimal");
+    }
+
+    public void verifyZygotesLoadedBootImageMainlineExtension() throws Exception {
+        verifyZygotesLoadedBootImage("boot-" + getFirstMainlineFrameworkLibraryName());
+    }
+
+    public void verifySystemServerLoadedArtifacts(Set<String> expectedArtifacts) throws Exception {
         assertThat(getSystemServerLoadedArtifacts())
-                .containsAtLeastElementsIn(getSystemServerExpectedArtifacts());
+                .containsAtLeastElementsIn(expectedArtifacts);
+    }
+
+    public void verifySystemServerLoadedArtifacts() throws Exception {
+        verifySystemServerLoadedArtifacts(getSystemServerExpectedArtifacts());
     }
 
     public boolean haveCompilationLog() throws Exception {
@@ -329,6 +347,24 @@ public class OdsignTestUtils {
         return filenames;
     }
 
+    // Keep in sync with `GetFirstMainlineFrameworkLibraryName` in
+    // art/libartbase/base/file_utils.cc.
+    private String getFirstMainlineFrameworkLibraryName() throws Exception {
+        String[] bcpElements = getListFromEnvironmentVariable("BOOTCLASSPATH");
+        assertTrue("BOOTCLASSPATH is empty", bcpElements.length > 0);
+        String[] dex2oatBcpElements = getListFromEnvironmentVariable("DEX2OATBOOTCLASSPATH");
+        assertTrue("DEX2OATBOOTCLASSPATH is empty", dex2oatBcpElements.length > 0);
+        assertTrue("DEX2OATBOOTCLASSPATH must be a prefix of BOOTCLASSPATH",
+                bcpElements.length > dex2oatBcpElements.length
+                        && Arrays.equals(
+                                Arrays.copyOfRange(bcpElements, 0, dex2oatBcpElements.length),
+                                dex2oatBcpElements));
+
+        String filename = bcpElements[dex2oatBcpElements.length];
+        String basename = basename(filename);
+        return replaceExtension(basename, "");
+    }
+
     private long parseFormattedDateTime(String dateTimeStr) throws Exception {
         DateTimeFormatter formatter =
                 DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.nnnnnnnnn Z");
@@ -377,17 +413,6 @@ public class OdsignTestUtils {
         CommandResult result = mTestInfo.getDevice().executeShellV2Command(command);
         assertWithMessage(result.toString()).that(result.getExitCode()).isEqualTo(0);
         return result.getStdout().trim();
-    }
-
-    public void archiveLogThenDelete(TestLogData logs, String remotePath, String localName)
-            throws DeviceNotAvailableException {
-        ITestDevice device = mTestInfo.getDevice();
-        File logFile = device.pullFile(remotePath);
-        if (logFile != null) {
-            logs.addTestLog(localName, LogDataType.TEXT, new FileInputStreamSource(logFile));
-            // Delete to avoid confusing logs from a previous run, just in case.
-            device.deleteFile(remotePath);
-        }
     }
 
     public File copyResourceToFile(String resourceName) throws Exception {
@@ -445,6 +470,12 @@ public class OdsignTestUtils {
         return filename.substring(0, index) + extension;
     }
 
+    public static String basename(String filename) throws Exception {
+        int index = filename.lastIndexOf("/");
+        assertTrue("Slash not found in filename: " + filename, index != -1);
+        return filename.substring(index + 1);
+    }
+
     public void runOdrefresh() throws Exception {
         runOdrefresh("" /* extraArgs */);
     }
@@ -473,5 +504,23 @@ public class OdsignTestUtils {
         assertThat(localFile).isNotNull();
         DocumentBuilder builder = DocumentBuilderFactory.newInstance().newDocumentBuilder();
         return builder.parse(localFile);
+    }
+
+    /** Disables dm-verity if it's enabled. */
+    public void maybeDisableVerity() throws Exception {
+        boolean disabled =
+                mTestInfo.getDevice().getProperty("ro.boot.veritymode").equals("disabled");
+        if (!disabled) {
+            assertCommandSucceeds("disable-verity");
+            setBoolean(VERITY_DISABLED_BY_TEST_KEY, true);
+        }
+    }
+
+    /** Enables dm-verity if it's disabled by {@link #maybeDisableVerity}. */
+    public void maybeEnableVerity() throws Exception {
+        boolean disabledByTest = getBooleanOrDefault(VERITY_DISABLED_BY_TEST_KEY);
+        if (disabledByTest) {
+            assertCommandSucceeds("enable-verity");
+        }
     }
 }

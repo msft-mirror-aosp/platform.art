@@ -40,8 +40,8 @@ namespace accounting {
 template<size_t kAlignment>
 class SpaceBitmap {
  public:
-  typedef void ScanCallback(mirror::Object* obj, void* finger, void* arg);
-  typedef void SweepCallback(size_t ptr_count, mirror::Object** ptrs, void* arg);
+  using ScanCallback = void(mirror::Object* obj, void* finger, void* arg);
+  using SweepCallback = void(size_t ptr_count, mirror::Object** ptrs, void* arg);
 
   // Initialize a space bitmap so that it points to a bitmap large enough to cover a heap at
   // heap_begin of heap_capacity bytes, where objects are guaranteed to be kAlignment-aligned.
@@ -164,7 +164,7 @@ class SpaceBitmap {
   void CopyFrom(SpaceBitmap* source_bitmap);
 
   // Starting address of our internal storage.
-  Atomic<uintptr_t>* Begin() {
+  Atomic<uintptr_t>* Begin() const {
     return bitmap_begin_;
   }
 

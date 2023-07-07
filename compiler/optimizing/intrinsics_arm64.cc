@@ -46,7 +46,7 @@ using namespace vixl::aarch64;  // NOLINT(build/namespaces)
 #include "aarch64/macro-assembler-aarch64.h"
 #pragma GCC diagnostic pop
 
-namespace art {
+namespace art HIDDEN {
 
 namespace arm64 {
 
@@ -55,7 +55,6 @@ using helpers::DRegisterFrom;
 using helpers::HeapOperand;
 using helpers::LocationFrom;
 using helpers::InputCPURegisterOrZeroRegAt;
-using helpers::IsConstantZeroBitPattern;
 using helpers::OperandFrom;
 using helpers::RegisterFrom;
 using helpers::SRegisterFrom;
@@ -2576,9 +2575,9 @@ void IntrinsicCodeGeneratorARM64::VisitStringGetCharsNoCheck(HInvoke* invoke) {
   __ Bind(&done);
 }
 
-// Mirrors ARRAYCOPY_SHORT_CHAR_ARRAY_THRESHOLD in libcore, so we can choose to use the native
-// implementation there for longer copy lengths.
-static constexpr int32_t kSystemArrayCopyCharThreshold = 32;
+// This value is greater than ARRAYCOPY_SHORT_CHAR_ARRAY_THRESHOLD in libcore,
+// so if we choose to jump to the slow path we will end up in the native implementation.
+static constexpr int32_t kSystemArrayCopyCharThreshold = 192;
 
 static void SetSystemArrayCopyLocationRequires(LocationSummary* locations,
                                                uint32_t at,
@@ -2710,11 +2709,13 @@ static void GenSystemArrayCopyAddresses(MacroAssembler* masm,
     __ Add(dst_base, dst_base, Operand(XRegisterFrom(dst_pos), LSL, element_size_shift));
   }
 
-  if (copy_length.IsConstant()) {
-    int32_t constant = copy_length.GetConstant()->AsIntConstant()->GetValue();
-    __ Add(src_end, src_base, element_size * constant);
-  } else {
-    __ Add(src_end, src_base, Operand(XRegisterFrom(copy_length), LSL, element_size_shift));
+  if (src_end.IsValid()) {
+    if (copy_length.IsConstant()) {
+      int32_t constant = copy_length.GetConstant()->AsIntConstant()->GetValue();
+      __ Add(src_end, src_base, element_size * constant);
+    } else {
+      __ Add(src_end, src_base, Operand(XRegisterFrom(copy_length), LSL, element_size_shift));
+    }
   }
 }
 
@@ -2745,13 +2746,14 @@ void IntrinsicCodeGeneratorARM64::VisitSystemArrayCopyChar(HInvoke* invoke) {
   if (!length.IsConstant()) {
     // Merge the following two comparisons into one:
     //   If the length is negative, bail out (delegate to libcore's native implementation).
-    //   If the length > 32 then (currently) prefer libcore's native implementation.
+    //   If the length > kSystemArrayCopyCharThreshold then (currently) prefer libcore's
+    //   native implementation.
     __ Cmp(WRegisterFrom(length), kSystemArrayCopyCharThreshold);
     __ B(slow_path->GetEntryLabel(), hi);
   } else {
     // We have already checked in the LocationsBuilder for the constant case.
     DCHECK_GE(length.GetConstant()->AsIntConstant()->GetValue(), 0);
-    DCHECK_LE(length.GetConstant()->AsIntConstant()->GetValue(), 32);
+    DCHECK_LE(length.GetConstant()->AsIntConstant()->GetValue(), kSystemArrayCopyCharThreshold);
   }
 
   Register src_curr_addr = WRegisterFrom(locations->GetTemp(0));
@@ -2787,21 +2789,102 @@ void IntrinsicCodeGeneratorARM64::VisitSystemArrayCopyChar(HInvoke* invoke) {
                               length,
                               src_curr_addr,
                               dst_curr_addr,
-                              src_stop_addr);
+                              Register());
 
   // Iterate over the arrays and do a raw copy of the chars.
   const int32_t char_size = DataType::Size(DataType::Type::kUint16);
   UseScratchRegisterScope temps(masm);
-  Register tmp = temps.AcquireW();
-  vixl::aarch64::Label loop, done;
-  __ Bind(&loop);
-  __ Cmp(src_curr_addr, src_stop_addr);
-  __ B(&done, eq);
-  __ Ldrh(tmp, MemOperand(src_curr_addr, char_size, PostIndex));
-  __ Strh(tmp, MemOperand(dst_curr_addr, char_size, PostIndex));
-  __ B(&loop);
-  __ Bind(&done);
 
+  // We split processing of the array in two parts: head and tail.
+  // A first loop handles the head by copying a block of characters per
+  // iteration (see: chars_per_block).
+  // A second loop handles the tail by copying the remaining characters.
+  // If the copy length is not constant, we copy them one-by-one.
+  // If the copy length is constant, we optimize by always unrolling the tail
+  // loop, and also unrolling the head loop when the copy length is small (see:
+  // unroll_threshold).
+  //
+  // Both loops are inverted for better performance, meaning they are
+  // implemented as conditional do-while loops.
+  // Here, the loop condition is first checked to determine if there are
+  // sufficient chars to run an iteration, then we enter the do-while: an
+  // iteration is performed followed by a conditional branch only if another
+  // iteration is necessary. As opposed to a standard while-loop, this inversion
+  // can save some branching (e.g. we don't branch back to the initial condition
+  // at the end of every iteration only to potentially immediately branch
+  // again).
+  //
+  // A full block of chars is subtracted and added before and after the head
+  // loop, respectively. This ensures that any remaining length after each
+  // head loop iteration means there is a full block remaining, reducing the
+  // number of conditional checks required on every iteration.
+  constexpr int32_t chars_per_block = 4;
+  constexpr int32_t unroll_threshold = 2 * chars_per_block;
+  vixl::aarch64::Label loop1, loop2, pre_loop2, done;
+
+  Register length_tmp = src_stop_addr.W();
+  Register tmp = temps.AcquireRegisterOfSize(char_size * chars_per_block * kBitsPerByte);
+
+  auto emitHeadLoop = [&]() {
+    __ Bind(&loop1);
+    __ Ldr(tmp, MemOperand(src_curr_addr, char_size * chars_per_block, PostIndex));
+    __ Subs(length_tmp, length_tmp, chars_per_block);
+    __ Str(tmp, MemOperand(dst_curr_addr, char_size * chars_per_block, PostIndex));
+    __ B(&loop1, ge);
+  };
+
+  auto emitTailLoop = [&]() {
+    __ Bind(&loop2);
+    __ Ldrh(tmp, MemOperand(src_curr_addr, char_size, PostIndex));
+    __ Subs(length_tmp, length_tmp, 1);
+    __ Strh(tmp, MemOperand(dst_curr_addr, char_size, PostIndex));
+    __ B(&loop2, gt);
+  };
+
+  auto emitUnrolledTailLoop = [&](const int32_t tail_length) {
+    DCHECK_LT(tail_length, 4);
+
+    // Don't use post-index addressing, and instead add a constant offset later.
+    if ((tail_length & 2) != 0) {
+      __ Ldr(tmp.W(), MemOperand(src_curr_addr));
+      __ Str(tmp.W(), MemOperand(dst_curr_addr));
+    }
+    if ((tail_length & 1) != 0) {
+      const int32_t offset = (tail_length & ~1) * char_size;
+      __ Ldrh(tmp, MemOperand(src_curr_addr, offset));
+      __ Strh(tmp, MemOperand(dst_curr_addr, offset));
+    }
+  };
+
+  if (length.IsConstant()) {
+    const int32_t constant_length = length.GetConstant()->AsIntConstant()->GetValue();
+    if (constant_length >= unroll_threshold) {
+      __ Mov(length_tmp, constant_length - chars_per_block);
+      emitHeadLoop();
+    } else {
+      static_assert(unroll_threshold == 8, "The unroll_threshold must be 8.");
+      // Fully unroll both the head and tail loops.
+      if ((constant_length & 4) != 0) {
+        __ Ldr(tmp, MemOperand(src_curr_addr, 4 * char_size, PostIndex));
+        __ Str(tmp, MemOperand(dst_curr_addr, 4 * char_size, PostIndex));
+      }
+    }
+    emitUnrolledTailLoop(constant_length % chars_per_block);
+  } else {
+    Register length_reg = WRegisterFrom(length);
+    __ Subs(length_tmp, length_reg, chars_per_block);
+    __ B(&pre_loop2, lt);
+
+    emitHeadLoop();
+
+    __ Bind(&pre_loop2);
+    __ Adds(length_tmp, length_tmp, chars_per_block);
+    __ B(&done, eq);
+
+    emitTailLoop();
+  }
+
+  __ Bind(&done);
   __ Bind(slow_path->GetExitLabel());
 }
 
@@ -3335,7 +3418,7 @@ void IntrinsicCodeGeneratorARM64::VisitSystemArrayCopy(HInvoke* invoke) {
   }
 
   // We only need one card marking on the destination array.
-  codegen_->MarkGCCard(dest.W(), Register(), /* value_can_be_null= */ false);
+  codegen_->MarkGCCard(dest.W(), Register(), /* emit_null_check= */ false);
 
   __ Bind(intrinsic_slow_path->GetExitLabel());
 }
@@ -4673,8 +4756,8 @@ static LocationSummary* CreateVarHandleCommonLocations(HInvoke* invoke) {
   uint32_t number_of_arguments = invoke->GetNumberOfArguments();
   for (size_t arg_index = arguments_start; arg_index != number_of_arguments; ++arg_index) {
     HInstruction* arg = invoke->InputAt(arg_index);
-    if (IsConstantZeroBitPattern(arg)) {
-      locations->SetInAt(arg_index, Location::ConstantLocation(arg->AsConstant()));
+    if (IsZeroBitPattern(arg)) {
+      locations->SetInAt(arg_index, Location::ConstantLocation(arg));
     } else if (DataType::IsFloatingPointType(arg->GetType())) {
       locations->SetInAt(arg_index, Location::RequiresFpuRegister());
     } else {
@@ -4898,7 +4981,7 @@ static void GenerateVarHandleSet(HInvoke* invoke,
   }
 
   if (CodeGenerator::StoreNeedsWriteBarrier(value_type, invoke->InputAt(value_index))) {
-    codegen->MarkGCCard(target.object, Register(value), /*value_can_be_null=*/ true);
+    codegen->MarkGCCard(target.object, Register(value), /* emit_null_check= */ true);
   }
 
   if (slow_path != nullptr) {
@@ -4985,16 +5068,16 @@ static void CreateVarHandleCompareAndSetOrExchangeLocations(HInvoke* invoke, boo
       // Add a temporary for old value and exclusive store result if floating point
       // `expected` and/or `new_value` take scratch registers.
       size_t available_scratch_registers =
-          (IsConstantZeroBitPattern(invoke->InputAt(number_of_arguments - 1u)) ? 1u : 0u) +
-          (IsConstantZeroBitPattern(invoke->InputAt(number_of_arguments - 2u)) ? 1u : 0u);
+          (IsZeroBitPattern(invoke->InputAt(number_of_arguments - 1u)) ? 1u : 0u) +
+          (IsZeroBitPattern(invoke->InputAt(number_of_arguments - 2u)) ? 1u : 0u);
       size_t temps_needed = /* pointer, old value, store result */ 3u - available_scratch_registers;
       // We can reuse the declaring class (if present) and offset temporary.
       if (temps_needed > old_temp_count) {
         locations->AddRegisterTemps(temps_needed - old_temp_count);
       }
     } else if ((value_type != DataType::Type::kReference && DataType::Size(value_type) != 1u) &&
-               !IsConstantZeroBitPattern(invoke->InputAt(number_of_arguments - 2u)) &&
-               !IsConstantZeroBitPattern(invoke->InputAt(number_of_arguments - 1u)) &&
+               !IsZeroBitPattern(invoke->InputAt(number_of_arguments - 2u)) &&
+               !IsZeroBitPattern(invoke->InputAt(number_of_arguments - 1u)) &&
                GetExpectedVarHandleCoordinatesCount(invoke) == 2u) {
       // Allocate a normal temporary for store result in the non-native byte order path
       // because scratch registers are used by the byte-swapped `expected` and `new_value`.
@@ -5316,7 +5399,7 @@ static void CreateVarHandleGetAndUpdateLocations(HInvoke* invoke,
       DCHECK(get_and_update_op == GetAndUpdateOp::kSet);
       // We can reuse the declaring class temporary if present.
       if (old_temp_count == 1u &&
-          !IsConstantZeroBitPattern(invoke->InputAt(invoke->GetNumberOfArguments() - 1u))) {
+          !IsZeroBitPattern(invoke->InputAt(invoke->GetNumberOfArguments() - 1u))) {
         // Add a temporary for `old_value` if floating point `new_value` takes a scratch register.
         locations->AddTemp(Location::RequiresRegister());
       }
@@ -5327,7 +5410,7 @@ static void CreateVarHandleGetAndUpdateLocations(HInvoke* invoke,
   if (old_temp_count == 1u &&
       (get_and_update_op != GetAndUpdateOp::kSet && get_and_update_op != GetAndUpdateOp::kAdd) &&
       GetExpectedVarHandleCoordinatesCount(invoke) == 2u &&
-      !IsConstantZeroBitPattern(invoke->InputAt(invoke->GetNumberOfArguments() - 1u))) {
+      !IsZeroBitPattern(invoke->InputAt(invoke->GetNumberOfArguments() - 1u))) {
     DataType::Type value_type =
         GetVarHandleExpectedValueType(invoke, /*expected_coordinates_count=*/ 2u);
     if (value_type != DataType::Type::kReference && DataType::Size(value_type) != 1u) {
@@ -5647,7 +5730,7 @@ void VarHandleSlowPathARM64::EmitByteArrayViewCode(CodeGenerator* codegen_in) {
 
     // Byte order check. For native byte order return to the main path.
     if (access_mode_template == mirror::VarHandle::AccessModeTemplate::kSet &&
-        IsConstantZeroBitPattern(invoke->InputAt(invoke->GetNumberOfArguments() - 1u))) {
+        IsZeroBitPattern(invoke->InputAt(invoke->GetNumberOfArguments() - 1u))) {
       // There is no reason to differentiate between native byte order and byte-swap
       // for setting a zero bit pattern. Just return to the main path.
       __ B(GetNativeByteOrderLabel());
@@ -5677,42 +5760,9 @@ void VarHandleSlowPathARM64::EmitByteArrayViewCode(CodeGenerator* codegen_in) {
   __ B(GetExitLabel());
 }
 
-UNIMPLEMENTED_INTRINSIC(ARM64, StringStringIndexOf);
-UNIMPLEMENTED_INTRINSIC(ARM64, StringStringIndexOfAfter);
-UNIMPLEMENTED_INTRINSIC(ARM64, StringBufferAppend);
-UNIMPLEMENTED_INTRINSIC(ARM64, StringBufferLength);
-UNIMPLEMENTED_INTRINSIC(ARM64, StringBufferToString);
-UNIMPLEMENTED_INTRINSIC(ARM64, StringBuilderAppendObject);
-UNIMPLEMENTED_INTRINSIC(ARM64, StringBuilderAppendString);
-UNIMPLEMENTED_INTRINSIC(ARM64, StringBuilderAppendCharSequence);
-UNIMPLEMENTED_INTRINSIC(ARM64, StringBuilderAppendCharArray);
-UNIMPLEMENTED_INTRINSIC(ARM64, StringBuilderAppendBoolean);
-UNIMPLEMENTED_INTRINSIC(ARM64, StringBuilderAppendChar);
-UNIMPLEMENTED_INTRINSIC(ARM64, StringBuilderAppendInt);
-UNIMPLEMENTED_INTRINSIC(ARM64, StringBuilderAppendLong);
-UNIMPLEMENTED_INTRINSIC(ARM64, StringBuilderAppendFloat);
-UNIMPLEMENTED_INTRINSIC(ARM64, StringBuilderAppendDouble);
-UNIMPLEMENTED_INTRINSIC(ARM64, StringBuilderLength);
-UNIMPLEMENTED_INTRINSIC(ARM64, StringBuilderToString);
-UNIMPLEMENTED_INTRINSIC(ARM64, SystemArrayCopyByte);
-UNIMPLEMENTED_INTRINSIC(ARM64, SystemArrayCopyInt);
-
-// 1.8.
-UNIMPLEMENTED_INTRINSIC(ARM64, UnsafeGetAndAddInt)
-UNIMPLEMENTED_INTRINSIC(ARM64, UnsafeGetAndAddLong)
-UNIMPLEMENTED_INTRINSIC(ARM64, UnsafeGetAndSetInt)
-UNIMPLEMENTED_INTRINSIC(ARM64, UnsafeGetAndSetLong)
-UNIMPLEMENTED_INTRINSIC(ARM64, UnsafeGetAndSetObject)
-
-UNIMPLEMENTED_INTRINSIC(ARM64, MethodHandleInvokeExact)
-UNIMPLEMENTED_INTRINSIC(ARM64, MethodHandleInvoke)
-
-// OpenJDK 11
-UNIMPLEMENTED_INTRINSIC(ARM64, JdkUnsafeGetAndAddInt)
-UNIMPLEMENTED_INTRINSIC(ARM64, JdkUnsafeGetAndAddLong)
-UNIMPLEMENTED_INTRINSIC(ARM64, JdkUnsafeGetAndSetInt)
-UNIMPLEMENTED_INTRINSIC(ARM64, JdkUnsafeGetAndSetLong)
-UNIMPLEMENTED_INTRINSIC(ARM64, JdkUnsafeGetAndSetObject)
+#define MARK_UNIMPLEMENTED(Name) UNIMPLEMENTED_INTRINSIC(ARM64, Name)
+UNIMPLEMENTED_INTRINSIC_LIST_ARM64(MARK_UNIMPLEMENTED);
+#undef MARK_UNIMPLEMENTED
 
 UNREACHABLE_INTRINSICS(ARM64)
 

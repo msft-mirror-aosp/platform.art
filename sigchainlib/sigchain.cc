@@ -298,9 +298,11 @@ class SignalChain {
 #if !defined(__BIONIC__)
 #define SA_RESTORER 0x04000000
 #endif
-    kernel_supported_flags_ = SA_NOCLDSTOP | SA_NOCLDWAIT | SA_SIGINFO |
-                              SA_ONSTACK | SA_RESTART | SA_NODEFER |
-                              SA_RESETHAND | SA_RESTORER;
+    kernel_supported_flags_ = SA_NOCLDSTOP | SA_NOCLDWAIT | SA_SIGINFO | SA_ONSTACK | SA_RESTART |
+                              SA_NODEFER | SA_RESETHAND;
+#if defined(SA_RESTORER)
+    kernel_supported_flags_ |= SA_RESTORER;
+#endif
 
     // Determine whether the kernel supports SA_EXPOSE_TAGBITS. For newer
     // kernels we use the flag support detection protocol described above. In
@@ -395,6 +397,12 @@ static SignalChain chains[_NSIG];
 
 static bool is_signal_hook_debuggable = false;
 
+// Weak linkage, as the ART APEX might be deployed on devices where this symbol doesn't exist (i.e.
+// all OS's before Android U). This symbol comes from libdl.
+__attribute__((weak)) extern "C" bool android_handle_signal(int signal_number,
+                                                            siginfo_t* info,
+                                                            void* context);
+
 void SignalChain::Handler(int signo, siginfo_t* siginfo, void* ucontext_raw) {
   // Try the special handlers first.
   // If one of them crashes, we'll reenter this handler and pass that crash onto the user handler.
@@ -419,6 +427,25 @@ void SignalChain::Handler(int signo, siginfo_t* siginfo, void* ucontext_raw) {
 
       linked_sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
     }
+  }
+
+  // In Android 14, there's a special feature called "recoverable" GWP-ASan. GWP-ASan is a tool that
+  // finds heap-buffer-overflow and heap-use-after-free on native heap allocations (e.g. malloc()
+  // inside of JNI, not the ART heap). The way it catches buffer overflow (roughly) is by rounding
+  // up the malloc() so that it's page-sized, and mapping an inaccessible page on the left- and
+  // right-hand side. It catches use-after-free by mprotecting the allocation page to be PROT_NONE
+  // on free(). The new "recoverable" mode is designed to allow debuggerd to print a crash report,
+  // but for the app or process in question to not crash (i.e. recover) and continue even after the
+  // bug is detected. Sigchain thus must allow debuggerd to handle the signal first, and if
+  // debuggerd has promised that it can recover, and it's done the steps to allow recovery (as
+  // identified by android_handle_signal returning true), then we should return from this handler
+  // and let the app continue.
+  //
+  // For all non-GWP-ASan-recoverable crashes, or crashes where recovery is not possible,
+  // android_handle_signal returns false, and we will continue to the rest of the sigchain handler
+  // logic.
+  if (android_handle_signal != nullptr && android_handle_signal(signo, siginfo, ucontext_raw)) {
+    return;
   }
 
   // Forward to the user's signal handler.
@@ -459,7 +486,15 @@ void SignalChain::Handler(int signo, siginfo_t* siginfo, void* ucontext_raw) {
     if (handler == SIG_IGN) {
       return;
     } else if (handler == SIG_DFL) {
-      fatal("exiting due to SIG_DFL handler for signal %d, ucontext %p", signo, ucontext);
+      // We'll only get here if debuggerd is disabled. In that case, whatever next tries to handle
+      // the crash will have no way to know our ucontext, and thus no way to dump the original crash
+      // stack (since we're on an alternate stack.) Let's remove our handler and return. Then the
+      // pre-crash state is restored, the crash happens again, and the next handler gets a chance.
+      log("reverting to SIG_DFL handler for signal %d, ucontext %p", signo, ucontext);
+      struct sigaction dfl = {};
+      dfl.sa_handler = SIG_DFL;
+      linked_sigaction(signo, &dfl, nullptr);
+      return;
     } else {
       handler(signo);
     }

@@ -16,7 +16,6 @@
 
 #include "arch/arm64/instruction_set_features_arm64.h"
 #include "assembler_arm64.h"
-#include "base/bit_utils_iterator.h"
 #include "entrypoints/quick/quick_entrypoints.h"
 #include "heap_poisoning.h"
 #include "offsets.h"
@@ -24,7 +23,7 @@
 
 using namespace vixl::aarch64;  // NOLINT(build/namespaces)
 
-namespace art {
+namespace art HIDDEN {
 namespace arm64 {
 
 #ifdef ___

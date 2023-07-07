@@ -17,7 +17,6 @@
 #include "exec_utils.h"
 
 #include <sys/utsname.h>
-#include <sysexits.h>
 
 #include <csignal>
 #include <cstring>
@@ -126,15 +125,6 @@ TEST_P(ExecUtilsTest, ExecError) {
   EXPECT_EQ(result.status, ExecResult::kSignaled);
   EXPECT_EQ(result.signal, SIGABRT);
   EXPECT_FALSE(error_msg.empty());
-}
-
-TEST_P(ExecUtilsTest, ExecPermissionDenied) {
-  std::vector<std::string> command;
-  command.push_back("/dev/null");
-  std::string error_msg;
-  ExecResult result = exec_utils_->ExecAndReturnResult(command, /*timeout_sec=*/-1, &error_msg);
-  EXPECT_EQ(result.status, ExecResult::kExited);
-  EXPECT_EQ(result.exit_code, EX_NOPERM);
 }
 
 TEST_P(ExecUtilsTest, EnvSnapshotAdditionsAreNotVisible) {

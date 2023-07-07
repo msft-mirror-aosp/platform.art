@@ -182,10 +182,8 @@ class Heap {
 
   // How often we allow heap trimming to happen (nanoseconds).
   static constexpr uint64_t kHeapTrimWait = MsToNs(5000);
-  // How long we wait after a transition request to perform a collector transition (nanoseconds).
-  static constexpr uint64_t kCollectorTransitionWait = MsToNs(5000);
-  // Whether the transition-wait applies or not. Zero wait will stress the
-  // transition code and collector, but increases jank probability.
+  // Whether the transition-GC heap threshold condition applies or not for non-low memory devices.
+  // Stressing GC will bypass the heap threshold condition.
   DECLARE_RUNTIME_DEBUG_FLAG(kStressCollectorTransition);
 
   // Create a heap with the requested sizes. The possible empty
@@ -832,10 +830,12 @@ class Heap {
 
   bool IsPerformingUffdCompaction() { return gUseUserfaultfd && mark_compact_->IsCompacting(); }
 
-  CollectorType CurrentCollectorType() {
+  CollectorType CurrentCollectorType() const {
     DCHECK(!gUseUserfaultfd || collector_type_ == kCollectorTypeCMC);
     return collector_type_;
   }
+
+  bool IsMovingGc() const { return IsMovingGc(CurrentCollectorType()); }
 
   CollectorType GetForegroundCollectorType() const { return foreground_collector_type_; }
 
@@ -1129,9 +1129,6 @@ class Heap {
   ALWAYS_INLINE bool IsOutOfMemoryOnAllocation(AllocatorType allocator_type,
                                                size_t alloc_size,
                                                bool grow);
-
-  // Run the finalizers. If timeout is non zero, then we use the VMRuntime version.
-  void RunFinalization(JNIEnv* env, uint64_t timeout);
 
   // Blocks the caller until the garbage collector becomes idle and returns the type of GC we
   // waited for.
@@ -1451,8 +1448,9 @@ class Heap {
 
   // Computed with foreground-multiplier in GrowForUtilization() when run in
   // jank non-perceptible state. On update to process state from background to
-  // foreground we set target_footprint_ to this value.
+  // foreground we set target_footprint_ and concurrent_start_bytes_ to the corresponding value.
   size_t min_foreground_target_footprint_ GUARDED_BY(process_state_update_lock_);
+  size_t min_foreground_concurrent_start_bytes_ GUARDED_BY(process_state_update_lock_);
 
   // When num_bytes_allocated_ exceeds this amount then a concurrent GC should be requested so that
   // it completes ahead of an allocation failing.

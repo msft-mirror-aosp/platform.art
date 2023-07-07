@@ -103,6 +103,7 @@
 #include "runtime.h"
 #include "javaheapprof/javaheapsampler.h"
 #include "scoped_thread_state_change-inl.h"
+#include "thread-inl.h"
 #include "thread_list.h"
 #include "verify_object-inl.h"
 #include "well_known_classes.h"
@@ -336,6 +337,7 @@ Heap::Heap(size_t initial_size,
       // this one.
       process_state_update_lock_("process state update lock", kPostMonitorLock),
       min_foreground_target_footprint_(0),
+      min_foreground_concurrent_start_bytes_(0),
       concurrent_start_bytes_(std::numeric_limits<size_t>::max()),
       total_bytes_freed_ever_(0),
       total_objects_freed_ever_(0),
@@ -495,6 +497,7 @@ Heap::Heap(size_t initial_size,
                                        runtime->ShouldRelocate(),
                                        /*executable=*/ !runtime->IsAotCompiler(),
                                        heap_reservation_size,
+                                       runtime->AllowInMemoryCompilation(),
                                        &boot_image_spaces,
                                        &heap_reservation)) {
     DCHECK_EQ(heap_reservation_size, heap_reservation.IsValid() ? heap_reservation.Size() : 0u);
@@ -1086,7 +1089,9 @@ void Heap::GrowHeapOnJankPerceptibleSwitch() {
                                               min_foreground_target_footprint_,
                                               std::memory_order_relaxed);
   }
-  min_foreground_target_footprint_ = 0;
+  if (IsGcConcurrent() && concurrent_start_bytes_ < min_foreground_concurrent_start_bytes_) {
+    concurrent_start_bytes_ = min_foreground_concurrent_start_bytes_;
+  }
 }
 
 void Heap::UpdateProcessState(ProcessState old_process_state, ProcessState new_process_state) {
@@ -1097,15 +1102,11 @@ void Heap::UpdateProcessState(ProcessState old_process_state, ProcessState new_p
       RequestCollectorTransition(foreground_collector_type_, 0);
       GrowHeapOnJankPerceptibleSwitch();
     } else {
-      // Don't delay for debug builds since we may want to stress test the GC.
       // If background_collector_type_ is kCollectorTypeHomogeneousSpaceCompact then we have
       // special handling which does a homogenous space compaction once but then doesn't transition
       // the collector. Similarly, we invoke a full compaction for kCollectorTypeCC but don't
       // transition the collector.
-      RequestCollectorTransition(background_collector_type_,
-                                 kStressCollectorTransition
-                                     ? 0
-                                     : kCollectorTransitionWait);
+      RequestCollectorTransition(background_collector_type_, 0);
     }
   }
 }
@@ -1536,6 +1537,23 @@ void Heap::ThrowOutOfMemoryError(Thread* self, size_t byte_count, AllocatorType 
 
 void Heap::DoPendingCollectorTransition() {
   CollectorType desired_collector_type = desired_collector_type_;
+
+  if (collector_type_ == kCollectorTypeCC || collector_type_ == kCollectorTypeCMC) {
+    // App's allocations (since last GC) more than the threshold then do TransitionGC
+    // when the app was in background. If not then don't do TransitionGC.
+    // num_bytes_allocated_since_gc should always be positive even if initially
+    // num_bytes_alive_after_gc_ is coming from Zygote. This gives positive or zero value.
+    size_t num_bytes_allocated_since_gc =
+        UnsignedDifference(GetBytesAllocated(), num_bytes_alive_after_gc_);
+    if (num_bytes_allocated_since_gc <
+        (UnsignedDifference(target_footprint_.load(std::memory_order_relaxed),
+                            num_bytes_alive_after_gc_)/4)
+        && !kStressCollectorTransition
+        && !IsLowMemoryMode()) {
+      return;
+    }
+  }
+
   // Launch homogeneous space compaction if it is desired.
   if (desired_collector_type == kCollectorTypeHomogeneousSpaceCompact) {
     if (!CareAboutPauseTimes()) {
@@ -1549,7 +1567,7 @@ void Heap::DoPendingCollectorTransition() {
       // Invoke full compaction.
       CollectGarbageInternal(collector::kGcTypeFull,
                              kGcCauseCollectorTransition,
-                             /*clear_soft_references=*/false, GC_NUM_ANY);
+                             /*clear_soft_references=*/false, GetCurrentGcNum() + 1);
     } else {
       VLOG(gc) << "background compaction ignored due to jank perceptible process state";
     }
@@ -1800,7 +1818,7 @@ void Heap::VerifyObjectBody(ObjPtr<mirror::Object> obj) {
 
 void Heap::VerifyHeap() {
   ReaderMutexLock mu(Thread::Current(), *Locks::heap_bitmap_lock_);
-  auto visitor = [&](mirror::Object* obj) {
+  auto visitor = [&](mirror::Object* obj) NO_THREAD_SAFETY_ANALYSIS {
     VerifyObjectBody(obj);
   };
   // Technically we need the mutator lock here to call Visit. However, VerifyObjectBody is already
@@ -3612,6 +3630,15 @@ collector::GcType Heap::WaitForGcToCompleteLocked(GcCause cause, Thread* self) {
 void Heap::DumpForSigQuit(std::ostream& os) {
   os << "Heap: " << GetPercentFree() << "% free, " << PrettySize(GetBytesAllocated()) << "/"
      << PrettySize(GetTotalMemory()) << "; " << GetObjectsAllocated() << " objects\n";
+  {
+    os << "Image spaces:\n";
+    ScopedObjectAccess soa(Thread::Current());
+    for (const auto& space : continuous_spaces_) {
+      if (space->IsImageSpace()) {
+        os << space->GetName() << "\n";
+      }
+    }
+  }
   DumpGcPerformanceInfo(os);
 }
 
@@ -3731,7 +3758,9 @@ void Heap::GrowForUtilization(collector::GarbageCollector* collector_ran,
     // process-state switch.
     min_foreground_target_footprint_ =
         (multiplier <= 1.0 && grow_bytes > 0)
-        ? bytes_allocated + static_cast<size_t>(grow_bytes * foreground_heap_growth_multiplier_)
+        ? std::min(
+          bytes_allocated + static_cast<size_t>(grow_bytes * foreground_heap_growth_multiplier_),
+          GetMaxMemory())
         : 0;
 
     if (IsGcConcurrent()) {
@@ -3763,6 +3792,12 @@ void Heap::GrowForUtilization(collector::GarbageCollector* collector_ran,
       // allocation rate is very high, remaining_bytes could tell us that we should start a GC
       // right away.
       concurrent_start_bytes_ = std::max(target_footprint - remaining_bytes, bytes_allocated);
+      // Store concurrent_start_bytes_ (computed with foreground heap growth multiplier) for update
+      // itself when process state switches to foreground.
+      min_foreground_concurrent_start_bytes_ =
+          min_foreground_target_footprint_ != 0
+          ? std::max(min_foreground_target_footprint_ - remaining_bytes, bytes_allocated)
+          : 0;
     }
   }
 }
@@ -3813,12 +3848,11 @@ void Heap::ClearGrowthLimit() {
 
 void Heap::AddFinalizerReference(Thread* self, ObjPtr<mirror::Object>* object) {
   ScopedObjectAccess soa(self);
-  ScopedLocalRef<jobject> arg(self->GetJniEnv(), soa.AddLocalReference<jobject>(*object));
-  jvalue args[1];
-  args[0].l = arg.get();
-  InvokeWithJValues(soa, nullptr, WellKnownClasses::java_lang_ref_FinalizerReference_add, args);
-  // Restore object in case it gets moved.
-  *object = soa.Decode<mirror::Object>(arg.get());
+  StackHandleScope<1u> hs(self);
+  // Use handle wrapper to update the `*object` if the object gets moved.
+  HandleWrapperObjPtr<mirror::Object> h_object = hs.NewHandleWrapper(object);
+  WellKnownClasses::java_lang_ref_FinalizerReference_add->InvokeStatic<'V', 'L'>(
+      self, h_object.Get());
 }
 
 void Heap::RequestConcurrentGCAndSaveObject(Thread* self,
@@ -3892,7 +3926,7 @@ void Heap::ConcurrentGC(Thread* self, GcCause cause, bool force_full, uint32_t r
       }
       // If we can't run the GC type we wanted to run, find the next appropriate one and try
       // that instead. E.g. can't do partial, so do full instead.
-      // We must ensure that we run something that ends up inrementing gcs_completed_.
+      // We must ensure that we run something that ends up incrementing gcs_completed_.
       // In the kGcTypePartial case, the initial CollectGarbageInternal call may not have that
       // effect, but the subsequent KGcTypeFull call will.
       if (CollectGarbageInternal(next_gc_type, cause, false, requested_gc_num)
@@ -3940,16 +3974,6 @@ void Heap::RequestCollectorTransition(CollectorType desired_collector_type, uint
     // For CC, we invoke a full compaction when going to the background, but the collector type
     // doesn't change.
     DCHECK_EQ(desired_collector_type_, kCollectorTypeCCBackground);
-    // App's allocations (since last GC) more than the threshold then do TransitionGC
-    // when the app was in background. If not then don't do TransitionGC.
-    size_t num_bytes_allocated_since_gc = GetBytesAllocated() - num_bytes_alive_after_gc_;
-    if (num_bytes_allocated_since_gc <
-        (UnsignedDifference(target_footprint_.load(std::memory_order_relaxed),
-                            num_bytes_alive_after_gc_)/4)
-        && !kStressCollectorTransition
-        && !IsLowMemoryMode()) {
-      return;
-    }
   }
   DCHECK_NE(collector_type_, kCollectorTypeCCBackground);
   CollectorTransitionTask* added_task = nullptr;
@@ -4060,12 +4084,6 @@ void Heap::RevokeAllThreadLocalBuffers() {
   }
 }
 
-void Heap::RunFinalization(JNIEnv* env, uint64_t timeout) {
-  env->CallStaticVoidMethod(WellKnownClasses::dalvik_system_VMRuntime,
-                            WellKnownClasses::dalvik_system_VMRuntime_runFinalization,
-                            static_cast<jlong>(timeout));
-}
-
 // For GC triggering purposes, we count old (pre-last-GC) and new native allocations as
 // different fractions of Java allocations.
 // For now, we essentially do not count old native allocations at all, so that we can preserve the
@@ -4151,7 +4169,7 @@ inline void Heap::CheckGCForNative(Thread* self) {
 // About kNotifyNativeInterval allocations have occurred. Check whether we should garbage collect.
 void Heap::NotifyNativeAllocations(JNIEnv* env) {
   native_objects_notified_.fetch_add(kNotifyNativeInterval, std::memory_order_relaxed);
-  CheckGCForNative(ThreadForEnv(env));
+  CheckGCForNative(Thread::ForEnv(env));
 }
 
 // Register a native allocation with an explicit size.
@@ -4165,7 +4183,7 @@ void Heap::RegisterNativeAllocation(JNIEnv* env, size_t bytes) {
       native_objects_notified_.fetch_add(1, std::memory_order_relaxed);
   if (objects_notified % kNotifyNativeInterval == kNotifyNativeInterval - 1
       || bytes > kCheckImmediatelyThreshold) {
-    CheckGCForNative(ThreadForEnv(env));
+    CheckGCForNative(Thread::ForEnv(env));
   }
   // Heap profiler treats this as a Java allocation with a null object.
   JHPCheckNonTlabSampleAllocation(Thread::Current(), nullptr, bytes);
@@ -4658,27 +4676,25 @@ void Heap::PostForkChildAction(Thread* self) {
 
   // Temporarily increase target_footprint_ and concurrent_start_bytes_ to
   // max values to avoid GC during app launch.
-  if (!IsLowMemoryMode()) {
-    // Set target_footprint_ to the largest allowed value.
-    SetIdealFootprint(growth_limit_);
-    SetDefaultConcurrentStartBytes();
+  // Set target_footprint_ to the largest allowed value.
+  SetIdealFootprint(growth_limit_);
+  SetDefaultConcurrentStartBytes();
 
-    // Shrink heap after kPostForkMaxHeapDurationMS, to force a memory hog process to GC.
-    // This remains high enough that many processes will continue without a GC.
-    if (initial_heap_size_ < growth_limit_) {
-      size_t first_shrink_size = std::max(growth_limit_ / 4, initial_heap_size_);
-      last_adj_time += MsToNs(kPostForkMaxHeapDurationMS);
+  // Shrink heap after kPostForkMaxHeapDurationMS, to force a memory hog process to GC.
+  // This remains high enough that many processes will continue without a GC.
+  if (initial_heap_size_ < growth_limit_) {
+    size_t first_shrink_size = std::max(growth_limit_ / 4, initial_heap_size_);
+    last_adj_time += MsToNs(kPostForkMaxHeapDurationMS);
+    GetTaskProcessor()->AddTask(
+        self, new ReduceTargetFootprintTask(last_adj_time, first_shrink_size, starting_gc_num));
+    // Shrink to a small value after a substantial time period. This will typically force a
+    // GC if none has occurred yet. Has no effect if there was a GC before this anyway, which
+    // is commonly the case, e.g. because of a process transition.
+    if (initial_heap_size_ < first_shrink_size) {
+      last_adj_time += MsToNs(4 * kPostForkMaxHeapDurationMS);
       GetTaskProcessor()->AddTask(
-          self, new ReduceTargetFootprintTask(last_adj_time, first_shrink_size, starting_gc_num));
-      // Shrink to a small value after a substantial time period. This will typically force a
-      // GC if none has occurred yet. Has no effect if there was a GC before this anyway, which
-      // is commonly the case, e.g. because of a process transition.
-      if (initial_heap_size_ < first_shrink_size) {
-        last_adj_time += MsToNs(4 * kPostForkMaxHeapDurationMS);
-        GetTaskProcessor()->AddTask(
-            self,
-            new ReduceTargetFootprintTask(last_adj_time, initial_heap_size_, starting_gc_num));
-      }
+          self,
+          new ReduceTargetFootprintTask(last_adj_time, initial_heap_size_, starting_gc_num));
     }
   }
   // Schedule a GC after a substantial period of time. This will become a no-op if another GC is

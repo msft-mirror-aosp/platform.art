@@ -230,10 +230,12 @@ class JitCodeCache {
   bool PrivateRegionContainsPc(const void* pc) const;
 
   // Return true if the code cache contains this method.
-  bool ContainsMethod(ArtMethod* method) REQUIRES(!Locks::jit_lock_);
+  bool ContainsMethod(ArtMethod* method)
+      REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Locks::jit_lock_);
 
   // Return the code pointer for a JNI-compiled stub if the method is in the cache, null otherwise.
-  const void* GetJniStubCode(ArtMethod* method) REQUIRES(!Locks::jit_lock_);
+  const void* GetJniStubCode(ArtMethod* method)
+      REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Locks::jit_lock_);
 
   // Allocate a region for both code and data in the JIT code cache.
   // The reserved memory is left completely uninitialized.
@@ -529,6 +531,14 @@ class JitCodeCache {
   JitMemoryRegion private_region_;
 
   // -------------- Global JIT maps --------------------------------------- //
+
+  // Note: The methods held in these maps may be dead, so we must ensure that we do not use
+  // read barriers on their declaring classes as that could unnecessarily keep them alive or
+  // crash the GC, depending on the GC phase and particular GC's details. Asserting that we
+  // do not emit read barriers for these methods can be tricky as we're allowed to emit read
+  // barriers for other methods that are known to be alive, such as the method being compiled.
+  // The GC must ensure that methods in these maps are cleaned up with `RemoveMethodsIn()`
+  // before the declaring class memory is freed.
 
   // Holds compiled code associated with the shorty for a JNI stub.
   SafeMap<JniStubKey, JniStubData> jni_stubs_map_ GUARDED_BY(Locks::jit_lock_);

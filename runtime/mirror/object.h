@@ -154,7 +154,7 @@ class MANAGED LOCKABLE Object {
   void SetLockWord(LockWord new_val, bool as_volatile) REQUIRES_SHARED(Locks::mutator_lock_);
   bool CasLockWord(LockWord old_val, LockWord new_val, CASMode mode, std::memory_order memory_order)
       REQUIRES_SHARED(Locks::mutator_lock_);
-  uint32_t GetLockOwnerThreadId();
+  uint32_t GetLockOwnerThreadId() REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Try to enter the monitor, returns non null if we succeeded.
   ObjPtr<mirror::Object> MonitorTryEnter(Thread* self)
@@ -675,6 +675,13 @@ class MANAGED LOCKABLE Object {
   std::string PrettyTypeOf()
       REQUIRES_SHARED(Locks::mutator_lock_);
 
+  // A utility function that does a raw copy of `src`'s data into the buffer `dst_bytes`.
+  // Skips the object header.
+  static void CopyRawObjectData(uint8_t* dst_bytes,
+                                ObjPtr<mirror::Object> src,
+                                size_t num_bytes)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
  protected:
   // Accessors for non-Java type fields
   template<class T, VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags, bool kIsVolatile = false>
@@ -736,7 +743,7 @@ class MANAGED LOCKABLE Object {
   }
 
   template<VerifyObjectFlags kVerifyFlags>
-  ALWAYS_INLINE void Verify() {
+  ALWAYS_INLINE void Verify() REQUIRES_SHARED(Locks::mutator_lock_) {
     if (kVerifyFlags & kVerifyThis) {
       VerifyObject(this);
     }
@@ -744,21 +751,23 @@ class MANAGED LOCKABLE Object {
 
   // Not ObjPtr since the values may be unaligned for logic in verification.cc.
   template<VerifyObjectFlags kVerifyFlags, typename Reference>
-  ALWAYS_INLINE static void VerifyRead(Reference value) {
+  ALWAYS_INLINE static void VerifyRead(Reference value) REQUIRES_SHARED(Locks::mutator_lock_) {
     if (kVerifyFlags & kVerifyReads) {
       VerifyObject(value);
     }
   }
 
   template<VerifyObjectFlags kVerifyFlags>
-  ALWAYS_INLINE static void VerifyWrite(ObjPtr<mirror::Object> value) {
+  ALWAYS_INLINE static void VerifyWrite(ObjPtr<mirror::Object> value)
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     if (kVerifyFlags & kVerifyWrites) {
       VerifyObject(value);
     }
   }
 
   template<VerifyObjectFlags kVerifyFlags>
-  ALWAYS_INLINE void VerifyCAS(ObjPtr<mirror::Object> new_value, ObjPtr<mirror::Object> old_value) {
+  ALWAYS_INLINE void VerifyCAS(ObjPtr<mirror::Object> new_value, ObjPtr<mirror::Object> old_value)
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     Verify<kVerifyFlags>();
     VerifyRead<kVerifyFlags>(old_value);
     VerifyWrite<kVerifyFlags>(new_value);

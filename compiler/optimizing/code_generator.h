@@ -26,6 +26,7 @@
 #include "base/bit_utils.h"
 #include "base/enums.h"
 #include "base/globals.h"
+#include "base/macros.h"
 #include "base/memory_region.h"
 #include "class_root.h"
 #include "dex/string_reference.h"
@@ -33,13 +34,15 @@
 #include "graph_visualizer.h"
 #include "locations.h"
 #include "nodes.h"
+#include "oat_quick_method_header.h"
 #include "optimizing_compiler_stats.h"
 #include "read_barrier_option.h"
 #include "stack.h"
+#include "subtype_check.h"
 #include "utils/assembler.h"
 #include "utils/label.h"
 
-namespace art {
+namespace art HIDDEN {
 
 // Binary encoding of 2^32 for type double.
 static int64_t constexpr k2Pow32EncodingForDouble = INT64_C(0x41F0000000000000);
@@ -58,6 +61,16 @@ static int64_t constexpr kPrimLongMax = INT64_C(0x7fffffffffffffff);
 
 static const ReadBarrierOption gCompilerReadBarrierOption =
     gUseReadBarrier ? kWithReadBarrier : kWithoutReadBarrier;
+
+constexpr size_t status_lsb_position = SubtypeCheckBits::BitStructSizeOf();
+constexpr size_t status_byte_offset =
+    mirror::Class::StatusOffset().SizeValue() + (status_lsb_position / kBitsPerByte);
+constexpr uint32_t shifted_visibly_initialized_value =
+    enum_cast<uint32_t>(ClassStatus::kVisiblyInitialized) << (status_lsb_position % kBitsPerByte);
+constexpr uint32_t shifted_initializing_value =
+    enum_cast<uint32_t>(ClassStatus::kInitializing) << (status_lsb_position % kBitsPerByte);
+constexpr uint32_t shifted_initialized_value =
+    enum_cast<uint32_t>(ClassStatus::kInitialized) << (status_lsb_position % kBitsPerByte);
 
 class Assembler;
 class CodeGenerator;
@@ -290,6 +303,12 @@ class CodeGenerator : public DeletableArenaObject<kArenaAllocCodeGenerator> {
   virtual bool NeedsTwoRegisters(DataType::Type type) const = 0;
   // Returns whether we should split long moves in parallel moves.
   virtual bool ShouldSplitLongMoves() const { return false; }
+
+  // Returns true if `invoke` is an implemented intrinsic in this codegen's arch.
+  bool IsImplementedIntrinsic(HInvoke* invoke) const {
+    return invoke->IsIntrinsic() &&
+           !unimplemented_intrinsics_[static_cast<size_t>(invoke->GetIntrinsic())];
+  }
 
   size_t GetNumberOfCoreCalleeSaveRegisters() const {
     return POPCOUNT(core_callee_save_mask_);
@@ -736,7 +755,8 @@ class CodeGenerator : public DeletableArenaObject<kArenaAllocCodeGenerator> {
                 uint32_t core_callee_save_mask,
                 uint32_t fpu_callee_save_mask,
                 const CompilerOptions& compiler_options,
-                OptimizingCompilerStats* stats);
+                OptimizingCompilerStats* stats,
+                const art::ArrayRef<const bool>& unimplemented_intrinsics);
 
   virtual HGraphVisitor* GetLocationBuilder() = 0;
   virtual HGraphVisitor* GetInstructionVisitor() = 0;
@@ -836,8 +856,11 @@ class CodeGenerator : public DeletableArenaObject<kArenaAllocCodeGenerator> {
   void BlockIfInRegister(Location location, bool is_out = false) const;
   void EmitEnvironment(HEnvironment* environment,
                        SlowPathCode* slow_path,
-                       bool needs_vreg_info = true);
-  void EmitVRegInfo(HEnvironment* environment, SlowPathCode* slow_path);
+                       bool needs_vreg_info = true,
+                       bool is_for_catch_handler = false,
+                       bool innermost_environment = true);
+  void EmitVRegInfo(HEnvironment* environment, SlowPathCode* slow_path, bool is_for_catch_handler);
+  void EmitVRegInfoOnlyCatchPhis(HEnvironment* environment);
 
   static void PrepareCriticalNativeArgumentMoves(
       HInvokeStaticOrDirect* invoke,
@@ -876,6 +899,9 @@ class CodeGenerator : public DeletableArenaObject<kArenaAllocCodeGenerator> {
   // held by the ArenaAllocator. This ScopedArenaAllocator is created in
   // CodeGenerator::Compile() and remains alive until the CodeGenerator is destroyed.
   std::unique_ptr<CodeGenerationData> code_generation_data_;
+
+  // Which intrinsics we don't have handcrafted code for.
+  art::ArrayRef<const bool> unimplemented_intrinsics_;
 
   friend class OptimizingCFITest;
   ART_FRIEND_TEST(CodegenTest, ARM64FrameSizeSIMD);

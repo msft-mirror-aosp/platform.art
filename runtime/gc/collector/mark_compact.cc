@@ -29,10 +29,15 @@
 
 #include <fstream>
 #include <numeric>
+#include <string>
+#include <string_view>
+#include <vector>
 
 #include "android-base/file.h"
 #include "android-base/parsebool.h"
+#include "android-base/parseint.h"
 #include "android-base/properties.h"
+#include "android-base/strings.h"
 #include "base/file_utils.h"
 #include "base/memfd.h"
 #include "base/quasi_atomic.h"
@@ -162,18 +167,64 @@ static gc::CollectorType FetchCmdlineGcType() {
 }
 
 #ifdef ART_TARGET_ANDROID
+static int GetOverrideCacheInfoFd() {
+  std::string args_str;
+  if (!android::base::ReadFileToString("/proc/self/cmdline", &args_str)) {
+    LOG(WARNING) << "Failed to load /proc/self/cmdline";
+    return -1;
+  }
+  std::vector<std::string_view> args;
+  Split(std::string_view(args_str), /*separator=*/'\0', &args);
+  for (std::string_view arg : args) {
+    if (android::base::ConsumePrefix(&arg, "--cache-info-fd=")) {  // This is a dex2oat flag.
+      int fd;
+      if (!android::base::ParseInt(std::string(arg), &fd)) {
+        LOG(ERROR) << "Failed to parse --cache-info-fd (value: '" << arg << "')";
+        return -1;
+      }
+      return fd;
+    }
+  }
+  return -1;
+}
+
 static bool GetCachedBoolProperty(const std::string& key, bool default_value) {
-  std::string path = GetApexDataDalvikCacheDirectory(InstructionSet::kNone) + "/cache-info.xml";
-  std::optional<com::android::art::CacheInfo> cache_info = com::android::art::read(path.c_str());
+  // For simplicity, we don't handle multiple calls because otherwise we would have to reset the fd.
+  static bool called = false;
+  CHECK(!called) << "GetCachedBoolProperty can be called only once";
+  called = true;
+
+  std::string cache_info_contents;
+  int fd = GetOverrideCacheInfoFd();
+  if (fd >= 0) {
+    if (!android::base::ReadFdToString(fd, &cache_info_contents)) {
+      PLOG(ERROR) << "Failed to read cache-info from fd " << fd;
+      return default_value;
+    }
+  } else {
+    std::string path = GetApexDataDalvikCacheDirectory(InstructionSet::kNone) + "/cache-info.xml";
+    if (!android::base::ReadFileToString(path, &cache_info_contents)) {
+      // If the file is not found, then we are in chroot or in a standalone runtime process (e.g.,
+      // IncidentHelper), or odsign/odrefresh failed to generate and sign the cache info. There's
+      // nothing we can do.
+      if (errno != ENOENT) {
+        PLOG(ERROR) << "Failed to read cache-info from the default path";
+      }
+      return default_value;
+    }
+  }
+
+  std::optional<com::android::art::CacheInfo> cache_info =
+      com::android::art::parse(cache_info_contents.c_str());
   if (!cache_info.has_value()) {
-    // We are in chroot or in a standalone runtime process (e.g., IncidentHelper), or
-    // odsign/odrefresh failed to generate and sign the cache info. There's nothing we can do.
+    // This should never happen.
+    LOG(ERROR) << "Failed to parse cache-info";
     return default_value;
   }
   const com::android::art::KeyValuePairList* list = cache_info->getFirstSystemProperties();
   if (list == nullptr) {
     // This should never happen.
-    LOG(ERROR) << "Missing system properties from cache-info.";
+    LOG(ERROR) << "Missing system properties from cache-info";
     return default_value;
   }
   const std::vector<com::android::art::KeyValuePair>& properties = list->getItem();
@@ -269,25 +320,34 @@ std::pair<bool, bool> MarkCompact::GetUffdAndMinorFault() {
 
 bool MarkCompact::CreateUserfaultfd(bool post_fork) {
   if (post_fork || uffd_ == kFdUnused) {
-    // Don't use O_NONBLOCK as we rely on read waiting on uffd_ if there isn't
-    // any read event available. We don't use poll.
-    uffd_ = syscall(__NR_userfaultfd, O_CLOEXEC | UFFD_USER_MODE_ONLY);
-    // On non-android devices we may not have the kernel patches that restrict
-    // userfaultfd to user mode. But that is not a security concern as we are
-    // on host. Therefore, attempt one more time without UFFD_USER_MODE_ONLY.
-    if (!kIsTargetAndroid && UNLIKELY(uffd_ == -1 && errno == EINVAL)) {
-      uffd_ = syscall(__NR_userfaultfd, O_CLOEXEC);
-    }
-    if (UNLIKELY(uffd_ == -1)) {
-      uffd_ = kFallbackMode;
-      LOG(WARNING) << "Userfaultfd isn't supported (reason: " << strerror(errno)
-                   << ") and therefore falling back to stop-the-world compaction.";
+    // Check if we have MREMAP_DONTUNMAP here for cases where
+    // 'ART_USE_READ_BARRIER=false' is used. Additionally, this check ensures
+    // that userfaultfd isn't used on old kernels, which cause random ioctl
+    // failures.
+    if (gHaveMremapDontunmap) {
+      // Don't use O_NONBLOCK as we rely on read waiting on uffd_ if there isn't
+      // any read event available. We don't use poll.
+      uffd_ = syscall(__NR_userfaultfd, O_CLOEXEC | UFFD_USER_MODE_ONLY);
+      // On non-android devices we may not have the kernel patches that restrict
+      // userfaultfd to user mode. But that is not a security concern as we are
+      // on host. Therefore, attempt one more time without UFFD_USER_MODE_ONLY.
+      if (!kIsTargetAndroid && UNLIKELY(uffd_ == -1 && errno == EINVAL)) {
+        uffd_ = syscall(__NR_userfaultfd, O_CLOEXEC);
+      }
+      if (UNLIKELY(uffd_ == -1)) {
+        uffd_ = kFallbackMode;
+        LOG(WARNING) << "Userfaultfd isn't supported (reason: " << strerror(errno)
+                     << ") and therefore falling back to stop-the-world compaction.";
+      } else {
+        DCHECK(IsValidFd(uffd_));
+        // Initialize uffd with the features which are required and available.
+        struct uffdio_api api = {.api = UFFD_API, .features = gUffdFeatures, .ioctls = 0};
+        api.features &= use_uffd_sigbus_ ? kUffdFeaturesRequired : kUffdFeaturesForMinorFault;
+        CHECK_EQ(ioctl(uffd_, UFFDIO_API, &api), 0)
+            << "ioctl_userfaultfd: API: " << strerror(errno);
+      }
     } else {
-      DCHECK(IsValidFd(uffd_));
-      // Initialize uffd with the features which are required and available.
-      struct uffdio_api api = {.api = UFFD_API, .features = gUffdFeatures, .ioctls = 0};
-      api.features &= use_uffd_sigbus_ ? kUffdFeaturesRequired : kUffdFeaturesForMinorFault;
-      CHECK_EQ(ioctl(uffd_, UFFDIO_API, &api), 0) << "ioctl_userfaultfd: API: " << strerror(errno);
+      uffd_ = kFallbackMode;
     }
   }
   uffd_initialized_ = !post_fork || uffd_ == kFallbackMode;
@@ -581,7 +641,7 @@ void MarkCompact::InitializePhase() {
   bytes_scanned_ = 0;
   freed_objects_ = 0;
   // The first buffer is used by gc-thread.
-  compaction_buffer_counter_ = 1;
+  compaction_buffer_counter_.store(1, std::memory_order_relaxed);
   from_space_slide_diff_ = from_space_begin_ - bump_pointer_space_->Begin();
   black_allocations_begin_ = bump_pointer_space_->Limit();
   walk_super_class_cache_ = nullptr;
@@ -1281,24 +1341,6 @@ void MarkCompact::SweepLargeObjects(bool swap_bitmaps) {
   }
 }
 
-class MarkCompact::CheckpointSweepInterpreterCache : public Closure {
- public:
-  explicit CheckpointSweepInterpreterCache(MarkCompact* collector) : collector_(collector) {}
-
-  void Run(Thread* thread) override REQUIRES_SHARED(Locks::mutator_lock_) {
-    Thread* const self = Thread::Current();
-    CHECK(thread == self
-          || thread->IsSuspended()
-          || thread->GetState() == ThreadState::kWaitingPerformingGc)
-        << thread->GetState() << " thread " << thread << " self " << self;
-    thread->SweepInterpreterCache(collector_);
-    collector_->GetBarrier().Pass(self);
-  }
-
- private:
-  MarkCompact* collector_;
-};
-
 void MarkCompact::ReclaimPhase() {
   TimingLogger::ScopedTiming t(__FUNCTION__, GetTimings());
   DCHECK(thread_running_gc_ == Thread::Current());
@@ -1322,24 +1364,6 @@ void MarkCompact::ReclaimPhase() {
     SwapBitmaps();
     // Unbind the live and mark bitmaps.
     GetHeap()->UnBindBitmaps();
-  }
-  {
-    // TODO: Once the logic in Runtime::ProcessWeakClass() is streamlined to not
-    // check for class-loader's liveness, we can remove this as the Sweep during
-    // compaction pause would suffice.
-    CHECK(!compacting_);
-    CheckpointSweepInterpreterCache check_point(this);
-    gc_barrier_.Init(thread_running_gc_, 0);
-    size_t barrier_count = runtime->GetThreadList()->RunCheckpoint(&check_point);
-    // Release locks, then wait for all mutator threads to pass the barrier. If there are
-    // no threads to wait for, which implies that all the checkpoint functions are finished,
-    // then no need to release locks.
-    if (barrier_count != 0) {
-      Locks::mutator_lock_->SharedUnlock(thread_running_gc_);
-      ScopedThreadStateChange tsc(thread_running_gc_, ThreadState::kWaitingForCheckPointsToRun);
-      gc_barrier_.Increment(thread_running_gc_, barrier_count);
-      Locks::mutator_lock_->SharedLock(thread_running_gc_);
-    }
   }
 }
 
@@ -1552,7 +1576,24 @@ void MarkCompact::CompactPage(mirror::Object* obj,
                                                                      + kPageSize));
     }
     obj_size = RoundUp(obj_size, kAlignment);
-    DCHECK_GT(obj_size, offset_within_obj);
+    DCHECK_GT(obj_size, offset_within_obj)
+        << "obj:" << obj
+        << " class:"
+        << obj->GetClass<kDefaultVerifyFlags, kWithFromSpaceBarrier>()
+        << " to_addr:" << to_ref
+        << " black-allocation-begin:" << reinterpret_cast<void*>(black_allocations_begin_)
+        << " post-compact-end:" << reinterpret_cast<void*>(post_compact_end_)
+        << " offset:" << offset * kAlignment
+        << " class-after-obj-iter:"
+        << (class_after_obj_iter_ != class_after_obj_ordered_map_.rend() ?
+            class_after_obj_iter_->first.AsMirrorPtr() : nullptr)
+        << " last-reclaimed-page:" << reinterpret_cast<void*>(last_reclaimed_page_)
+        << " last-checked-reclaim-page-idx:" << last_checked_reclaim_page_idx_
+        << " offset-of-last-idx:"
+        << pre_compact_offset_moving_space_[last_checked_reclaim_page_idx_] * kAlignment
+        << " first-obj-of-last-idx:"
+        << first_objs_moving_space_[last_checked_reclaim_page_idx_].AsMirrorPtr();
+
     obj_size -= offset_within_obj;
     // If there is only one stride, then adjust last_stride_begin to the
     // end of the first object.
@@ -1598,6 +1639,25 @@ void MarkCompact::CompactPage(mirror::Object* obj,
                                            MemberOffset(0),
                                            MemberOffset(end_addr - (addr + bytes_done)));
     obj_size = RoundUp(obj_size, kAlignment);
+    DCHECK_GT(obj_size, 0u)
+        << "from_addr:" << obj
+        << " from-space-class:"
+        << obj->GetClass<kDefaultVerifyFlags, kWithFromSpaceBarrier>()
+        << " to_addr:" << ref
+        << " black-allocation-begin:" << reinterpret_cast<void*>(black_allocations_begin_)
+        << " post-compact-end:" << reinterpret_cast<void*>(post_compact_end_)
+        << " offset:" << offset * kAlignment
+        << " bytes_done:" << bytes_done
+        << " class-after-obj-iter:"
+        << (class_after_obj_iter_ != class_after_obj_ordered_map_.rend() ?
+            class_after_obj_iter_->first.AsMirrorPtr() : nullptr)
+        << " last-reclaimed-page:" << reinterpret_cast<void*>(last_reclaimed_page_)
+        << " last-checked-reclaim-page-idx:" << last_checked_reclaim_page_idx_
+        << " offset-of-last-idx:"
+        << pre_compact_offset_moving_space_[last_checked_reclaim_page_idx_] * kAlignment
+        << " first-obj-of-last-idx:"
+        << first_objs_moving_space_[last_checked_reclaim_page_idx_].AsMirrorPtr();
+
     from_addr += obj_size;
     bytes_done += obj_size;
   }
@@ -1985,6 +2045,11 @@ void MarkCompact::FreeFromSpacePages(size_t cur_page_idx, int mode) {
     DCHECK(state >= PageState::kProcessed ||
            (state == PageState::kUnprocessed &&
             (mode == kFallbackMode || idx > moving_first_objs_count_)));
+  }
+  DCHECK_LE(idx, last_checked_reclaim_page_idx_);
+  if (idx == last_checked_reclaim_page_idx_) {
+    // Nothing to do.
+    return;
   }
 
   uint8_t* reclaim_begin;
@@ -2750,6 +2815,7 @@ void MarkCompact::CompactionPause() {
     RecordFree(ObjectBytePair(freed_objects_, freed_bytes));
   } else {
     DCHECK_EQ(compaction_in_progress_count_.load(std::memory_order_relaxed), 0u);
+    DCHECK_EQ(compaction_buffer_counter_.load(std::memory_order_relaxed), 1);
     if (!use_uffd_sigbus_) {
       // We must start worker threads before resuming mutators to avoid deadlocks.
       heap_->GetThreadPool()->StartWorkers(thread_running_gc_);
@@ -2995,16 +3061,8 @@ bool MarkCompact::SigbusHandler(siginfo_t* info) {
         ConcurrentlyProcessMovingPage<kMinorFaultMode>(
             fault_page, nullptr, nr_moving_space_used_pages);
       } else {
-        uint8_t* buf = self->GetThreadLocalGcBuffer();
-        if (buf == nullptr) {
-          uint16_t idx = compaction_buffer_counter_.fetch_add(1, std::memory_order_relaxed);
-          // The buffer-map is one page bigger as the first buffer is used by GC-thread.
-          CHECK_LE(idx, kMutatorCompactionBufferCount);
-          buf = compaction_buffers_map_.Begin() + idx * kPageSize;
-          DCHECK(compaction_buffers_map_.HasAddress(buf));
-          self->SetThreadLocalGcBuffer(buf);
-        }
-        ConcurrentlyProcessMovingPage<kCopyMode>(fault_page, buf, nr_moving_space_used_pages);
+        ConcurrentlyProcessMovingPage<kCopyMode>(
+            fault_page, self->GetThreadLocalGcBuffer(), nr_moving_space_used_pages);
       }
       return true;
     } else {
@@ -3113,6 +3171,14 @@ void MarkCompact::ConcurrentlyProcessMovingPage(uint8_t* fault_page,
           if (kMode == kMinorFaultMode) {
             DCHECK_EQ(buf, nullptr);
             buf = shadow_to_space_map_.Begin() + page_idx * kPageSize;
+          } else if (UNLIKELY(buf == nullptr)) {
+            DCHECK_EQ(kMode, kCopyMode);
+            uint16_t idx = compaction_buffer_counter_.fetch_add(1, std::memory_order_relaxed);
+            // The buffer-map is one page bigger as the first buffer is used by GC-thread.
+            CHECK_LE(idx, kMutatorCompactionBufferCount);
+            buf = compaction_buffers_map_.Begin() + idx * kPageSize;
+            DCHECK(compaction_buffers_map_.HasAddress(buf));
+            Thread::Current()->SetThreadLocalGcBuffer(buf);
           }
 
           if (fault_page < post_compact_end_) {

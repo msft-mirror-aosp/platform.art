@@ -103,6 +103,7 @@ class OdrConfig final {
   InstructionSet isa_;
   std::string program_name_;
   std::string system_server_classpath_;
+  std::string boot_image_compiler_filter_;
   std::string system_server_compiler_filter_;
   ZygoteKind zygote_kind_;
   std::string boot_classpath_;
@@ -132,11 +133,18 @@ class OdrConfig final {
     const auto [isa32, isa64] = GetPotentialInstructionSets();
     switch (zygote_kind_) {
       case ZygoteKind::kZygote32:
+        CHECK_NE(isa32, art::InstructionSet::kNone);
         return {isa32};
       case ZygoteKind::kZygote32_64:
-      case ZygoteKind::kZygote64_32:
+        CHECK_NE(isa32, art::InstructionSet::kNone);
+        CHECK_NE(isa64, art::InstructionSet::kNone);
         return {isa32, isa64};
+      case ZygoteKind::kZygote64_32:
+        CHECK_NE(isa32, art::InstructionSet::kNone);
+        CHECK_NE(isa64, art::InstructionSet::kNone);
+        return {isa64, isa32};
       case ZygoteKind::kZygote64:
+        CHECK_NE(isa64, art::InstructionSet::kNone);
         return {isa64};
     }
   }
@@ -146,9 +154,11 @@ class OdrConfig final {
     switch (zygote_kind_) {
       case ZygoteKind::kZygote32:
       case ZygoteKind::kZygote32_64:
+        CHECK_NE(isa32, art::InstructionSet::kNone);
         return isa32;
       case ZygoteKind::kZygote64_32:
       case ZygoteKind::kZygote64:
+        CHECK_NE(isa64, art::InstructionSet::kNone);
         return isa64;
     }
   }
@@ -188,6 +198,9 @@ class OdrConfig final {
   const std::string& GetSystemServerClasspath() const {
     return system_server_classpath_;
   }
+  const std::string& GetBootImageCompilerFilter() const {
+    return boot_image_compiler_filter_;
+  }
   const std::string& GetSystemServerCompilerFilter() const {
     return system_server_compiler_filter_;
   }
@@ -224,6 +237,9 @@ class OdrConfig final {
     system_server_classpath_ = classpath;
   }
 
+  void SetBootImageCompilerFilter(const std::string& filter) {
+    boot_image_compiler_filter_ = filter;
+  }
   void SetSystemServerCompilerFilter(const std::string& filter) {
     system_server_compiler_filter_ = filter;
   }
@@ -268,6 +284,8 @@ class OdrConfig final {
       case art::InstructionSet::kX86:
       case art::InstructionSet::kX86_64:
         return std::make_pair(art::InstructionSet::kX86, art::InstructionSet::kX86_64);
+      case art::InstructionSet::kRiscv64:
+        return std::make_pair(art::InstructionSet::kNone, art::InstructionSet::kRiscv64);
       case art::InstructionSet::kThumb2:
       case art::InstructionSet::kNone:
         LOG(FATAL) << "Invalid instruction set " << isa_;

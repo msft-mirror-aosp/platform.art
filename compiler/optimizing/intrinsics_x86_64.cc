@@ -36,7 +36,7 @@
 #include "utils/x86_64/assembler_x86_64.h"
 #include "utils/x86_64/constants_x86_64.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace x86_64 {
 
@@ -1224,7 +1224,7 @@ void IntrinsicCodeGeneratorX86_64::VisitSystemArrayCopy(HInvoke* invoke) {
   }
 
   // We only need one card marking on the destination array.
-  codegen_->MarkGCCard(temp1, temp2, dest, CpuRegister(kNoRegister), /* value_can_be_null= */ false);
+  codegen_->MarkGCCard(temp1, temp2, dest, CpuRegister(kNoRegister), /* emit_null_check= */ false);
 
   __ Bind(intrinsic_slow_path->GetExitLabel());
 }
@@ -3985,16 +3985,19 @@ static void GenerateVarHandleSet(HInvoke* invoke,
   Address dst(CpuRegister(target.object), CpuRegister(target.offset), TIMES_1, 0);
 
   // Store the value to the field.
-  codegen->GetInstructionCodegen()->HandleFieldSet(invoke,
-                                                   value_index,
-                                                   last_temp_index,
-                                                   value_type,
-                                                   dst,
-                                                   CpuRegister(target.object),
-                                                   is_volatile,
-                                                   is_atomic,
-                                                   /*value_can_be_null=*/ true,
-                                                   byte_swap);
+  codegen->GetInstructionCodegen()->HandleFieldSet(
+      invoke,
+      value_index,
+      last_temp_index,
+      value_type,
+      dst,
+      CpuRegister(target.object),
+      is_volatile,
+      is_atomic,
+      /*value_can_be_null=*/true,
+      byte_swap,
+      // Value can be null, and this write barrier is not being relied on for other sets.
+      WriteBarrierKind::kEmitWithNullCheck);
 
   // setVolatile needs kAnyAny barrier, but HandleFieldSet takes care of that.
 
@@ -4278,7 +4281,7 @@ static void GenerateVarHandleGetAndSet(HInvoke* invoke,
           &temp1,
           &temp2);
     }
-    codegen->MarkGCCard(temp1, temp2, ref, valreg, /*value_can_be_null=*/ false);
+    codegen->MarkGCCard(temp1, temp2, ref, valreg, /* emit_null_check= */ false);
 
     DCHECK_EQ(valreg, out.AsRegister<CpuRegister>());
     if (kPoisonHeapReferences) {
@@ -4987,57 +4990,9 @@ void VarHandleSlowPathX86_64::EmitByteArrayViewCode(CodeGeneratorX86_64* codegen
   __ jmp(GetExitLabel());
 }
 
-UNIMPLEMENTED_INTRINSIC(X86_64, CRC32Update)
-UNIMPLEMENTED_INTRINSIC(X86_64, CRC32UpdateBytes)
-UNIMPLEMENTED_INTRINSIC(X86_64, CRC32UpdateByteBuffer)
-UNIMPLEMENTED_INTRINSIC(X86_64, FP16ToFloat)
-UNIMPLEMENTED_INTRINSIC(X86_64, FP16ToHalf)
-UNIMPLEMENTED_INTRINSIC(X86_64, FP16Floor)
-UNIMPLEMENTED_INTRINSIC(X86_64, FP16Ceil)
-UNIMPLEMENTED_INTRINSIC(X86_64, FP16Rint)
-UNIMPLEMENTED_INTRINSIC(X86_64, FP16Greater)
-UNIMPLEMENTED_INTRINSIC(X86_64, FP16GreaterEquals)
-UNIMPLEMENTED_INTRINSIC(X86_64, FP16Less)
-UNIMPLEMENTED_INTRINSIC(X86_64, FP16LessEquals)
-UNIMPLEMENTED_INTRINSIC(X86_64, FP16Compare)
-UNIMPLEMENTED_INTRINSIC(X86_64, FP16Min)
-UNIMPLEMENTED_INTRINSIC(X86_64, FP16Max)
-
-UNIMPLEMENTED_INTRINSIC(X86_64, StringStringIndexOf);
-UNIMPLEMENTED_INTRINSIC(X86_64, StringStringIndexOfAfter);
-UNIMPLEMENTED_INTRINSIC(X86_64, StringBufferAppend);
-UNIMPLEMENTED_INTRINSIC(X86_64, StringBufferLength);
-UNIMPLEMENTED_INTRINSIC(X86_64, StringBufferToString);
-UNIMPLEMENTED_INTRINSIC(X86_64, StringBuilderAppendObject);
-UNIMPLEMENTED_INTRINSIC(X86_64, StringBuilderAppendString);
-UNIMPLEMENTED_INTRINSIC(X86_64, StringBuilderAppendCharSequence);
-UNIMPLEMENTED_INTRINSIC(X86_64, StringBuilderAppendCharArray);
-UNIMPLEMENTED_INTRINSIC(X86_64, StringBuilderAppendBoolean);
-UNIMPLEMENTED_INTRINSIC(X86_64, StringBuilderAppendChar);
-UNIMPLEMENTED_INTRINSIC(X86_64, StringBuilderAppendInt);
-UNIMPLEMENTED_INTRINSIC(X86_64, StringBuilderAppendLong);
-UNIMPLEMENTED_INTRINSIC(X86_64, StringBuilderAppendFloat);
-UNIMPLEMENTED_INTRINSIC(X86_64, StringBuilderAppendDouble);
-UNIMPLEMENTED_INTRINSIC(X86_64, StringBuilderLength);
-UNIMPLEMENTED_INTRINSIC(X86_64, StringBuilderToString);
-
-// 1.8.
-
-UNIMPLEMENTED_INTRINSIC(X86_64, UnsafeGetAndAddInt)
-UNIMPLEMENTED_INTRINSIC(X86_64, UnsafeGetAndAddLong)
-UNIMPLEMENTED_INTRINSIC(X86_64, UnsafeGetAndSetInt)
-UNIMPLEMENTED_INTRINSIC(X86_64, UnsafeGetAndSetLong)
-UNIMPLEMENTED_INTRINSIC(X86_64, UnsafeGetAndSetObject)
-
-UNIMPLEMENTED_INTRINSIC(X86_64, MethodHandleInvokeExact)
-UNIMPLEMENTED_INTRINSIC(X86_64, MethodHandleInvoke)
-
-// OpenJDK 11
-UNIMPLEMENTED_INTRINSIC(X86_64, JdkUnsafeGetAndAddInt)
-UNIMPLEMENTED_INTRINSIC(X86_64, JdkUnsafeGetAndAddLong)
-UNIMPLEMENTED_INTRINSIC(X86_64, JdkUnsafeGetAndSetInt)
-UNIMPLEMENTED_INTRINSIC(X86_64, JdkUnsafeGetAndSetLong)
-UNIMPLEMENTED_INTRINSIC(X86_64, JdkUnsafeGetAndSetObject)
+#define MARK_UNIMPLEMENTED(Name) UNIMPLEMENTED_INTRINSIC(X86_64, Name)
+UNIMPLEMENTED_INTRINSIC_LIST_X86_64(MARK_UNIMPLEMENTED);
+#undef MARK_UNIMPLEMENTED
 
 UNREACHABLE_INTRINSICS(X86_64)
 

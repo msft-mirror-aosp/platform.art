@@ -167,7 +167,7 @@ class MarkCompact final : public GarbageCollector {
   };
 
  private:
-  using ObjReference = mirror::ObjectReference</*kPoisonReferences*/ false, mirror::Object>;
+  using ObjReference = mirror::CompressedReference<mirror::Object>;
   // Number of bits (live-words) covered by a single chunk-info (below)
   // entry/word.
   // TODO: Since popcount is performed usomg SIMD instructions, we should
@@ -767,7 +767,6 @@ class MarkCompact final : public GarbageCollector {
   class VerifyRootMarkedVisitor;
   class ScanObjectVisitor;
   class CheckpointMarkThreadRoots;
-  class CheckpointSweepInterpreterCache;
   template<size_t kBufferSize> class ThreadRootsVisitor;
   class CardModifiedVisitor;
   class RefFieldsVisitor;

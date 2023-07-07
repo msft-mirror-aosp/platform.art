@@ -208,7 +208,6 @@ Jit* Jit::Create(JitCodeCache* code_cache, JitOptions* options) {
   // Jit GC for now (b/147208992).
   if (code_cache->GetGarbageCollectCode()) {
     code_cache->SetGarbageCollectCode(!jit_compiler_->GenerateDebugInfo() &&
-        !Runtime::Current()->GetInstrumentation()->AreExitStubsInstalled() &&
         !jit->JitAtFirstUse());
   }
 
@@ -283,9 +282,8 @@ bool Jit::CompileMethodInternal(ArtMethod* method,
     compilation_kind = CompilationKind::kOptimized;
   }
 
-  RuntimeCallbacks* cb = Runtime::Current()->GetRuntimeCallbacks();
   // Don't compile the method if it has breakpoints.
-  if (cb->IsMethodBeingInspected(method)) {
+  if (Runtime::Current()->GetInstrumentation()->IsDeoptimized(method)) {
     VLOG(jit) << "JIT not compiling " << method->PrettyMethod()
               << " due to not being safe to jit according to runtime-callbacks. For example, there"
               << " could be breakpoints in this method.";
@@ -572,12 +570,11 @@ bool Jit::MaybeDoOnStackReplacement(Thread* thread,
   // Before allowing the jump, make sure no code is actively inspecting the method to avoid
   // jumping from interpreter to OSR while e.g. single stepping. Note that we could selectively
   // disable OSR when single stepping, but that's currently hard to know at this point.
-  if (Runtime::Current()->GetInstrumentation()->InterpreterStubsInstalled() ||
-      Runtime::Current()->GetInstrumentation()->IsDeoptimized(method) ||
-      thread->IsForceInterpreter() ||
-      method->GetDeclaringClass()->IsObsoleteObject() ||
-      Dbg::IsForcedInterpreterNeededForUpcall(thread, method) ||
-      Runtime::Current()->GetRuntimeCallbacks()->IsMethodBeingInspected(method)) {
+  // Currently, HaveLocalsChanged is not frame specific. It is possible to make it frame specific
+  // to allow OSR of frames that don't have any locals changed but it isn't worth the additional
+  // complexity.
+  if (Runtime::Current()->GetInstrumentation()->NeedsSlowInterpreterForMethod(thread, method) ||
+      Runtime::Current()->GetRuntimeCallbacks()->HaveLocalsChanged()) {
     return false;
   }
 
@@ -754,7 +751,7 @@ void Jit::NotifyZygoteCompilationDone() {
 
 class ScopedCompilation {
  public:
-  ScopedCompilation(ScopedCompilation&& other) :
+  ScopedCompilation(ScopedCompilation&& other) noexcept :
       jit_(other.jit_),
       method_(other.method_),
       compilation_kind_(other.compilation_kind_),
@@ -768,7 +765,11 @@ class ScopedCompilation {
         compilation_kind_(compilation_kind),
         owns_compilation_(true) {
     MutexLock mu(Thread::Current(), *Locks::jit_lock_);
-    if (jit_->GetCodeCache()->IsMethodBeingCompiled(method_, compilation_kind_)) {
+    // We don't want to enqueue any new tasks when thread pool has stopped. This simplifies
+    // the implementation of redefinition feature in jvmti.
+    if (jit_->GetThreadPool() == nullptr ||
+        !jit_->GetThreadPool()->HasStarted(Thread::Current()) ||
+        jit_->GetCodeCache()->IsMethodBeingCompiled(method_, compilation_kind_)) {
       owns_compilation_ = false;
       return;
     }
@@ -778,7 +779,6 @@ class ScopedCompilation {
   bool OwnsCompilation() const {
     return owns_compilation_;
   }
-
 
   ~ScopedCompilation() {
     if (owns_compilation_) {
@@ -925,22 +925,16 @@ class ZygoteVerificationTask final : public Task {
     uint64_t start_ns = ThreadCpuNanoTime();
     uint64_t number_of_classes = 0;
     for (const DexFile* dex_file : boot_class_path) {
-      if (dex_file->GetOatDexFile() != nullptr &&
-          dex_file->GetOatDexFile()->GetOatFile() != nullptr) {
-        // If backed by an .oat file, we have already run verification at
-        // compile-time. Note that some classes may still have failed
-        // verification there if they reference updatable mainline module
-        // classes.
-        continue;
-      }
       for (uint32_t i = 0; i < dex_file->NumClassDefs(); ++i) {
         const dex::ClassDef& class_def = dex_file->GetClassDef(i);
         const char* descriptor = dex_file->GetClassDescriptor(class_def);
-        ScopedNullHandle<mirror::ClassLoader> null_loader;
-        klass.Assign(linker->FindClass(self, descriptor, null_loader));
+        klass.Assign(linker->LookupResolvedType(descriptor, /* class_loader= */ nullptr));
         if (klass == nullptr) {
-          self->ClearException();
-          LOG(WARNING) << "Could not find " << descriptor;
+          // Class not loaded yet.
+          DCHECK(!self->IsExceptionPending());
+          continue;
+        }
+        if (klass->IsVerified()) {
           continue;
         }
         if (linker->VerifyClass(self, /* verifier_deps= */ nullptr, klass) ==
@@ -955,9 +949,9 @@ class ZygoteVerificationTask final : public Task {
         CHECK(!self->IsExceptionPending());
       }
     }
-    LOG(INFO) << "Verified "
+    LOG(INFO) << "Background verification of "
               << number_of_classes
-              << " classes from mainline modules in "
+              << " classes from boot classpath took "
               << PrettyDuration(ThreadCpuNanoTime() - start_ns);
   }
 };
@@ -1317,12 +1311,21 @@ void Jit::RegisterDexFiles(const std::vector<std::unique_ptr<const DexFile>>& de
     return;
   }
   Runtime* runtime = Runtime::Current();
-  // If the runtime is debuggable, no need to precompile methods.
+  // If the runtime is debuggable, don't bother precompiling methods.
+  // If system server is being profiled, don't precompile as we are going to use
+  // the JIT to count hotness. Note that --count-hotness-in-compiled-code is
+  // only forced when we also profile the boot classpath, see
+  // AndroidRuntime.cpp.
   if (runtime->IsSystemServer() &&
       UseJitCompilation() &&
       options_->UseProfiledJitCompilation() &&
       runtime->HasImageWithProfile() &&
+      !runtime->IsSystemServerProfiled() &&
       !runtime->IsJavaDebuggable()) {
+    // Note: this precompilation is currently not running in production because:
+    // - UseProfiledJitCompilation() is not set by default.
+    // - System server dex files are registered *before* we set the runtime as
+    //   system server (though we are in the system server process).
     thread_pool_->AddTask(Thread::Current(), new JitProfileTask(dex_files, class_loader));
   }
 }
@@ -1366,9 +1369,10 @@ bool Jit::CompileMethodFromProfile(Thread* self,
   const void* entry_point = method->GetEntryPointFromQuickCompiledCode();
   if (class_linker->IsQuickToInterpreterBridge(entry_point) ||
       class_linker->IsQuickGenericJniStub(entry_point) ||
-      (entry_point == interpreter::GetNterpEntryPoint()) ||
-      // We explicitly check for the stub. The trampoline is for methods backed by
-      // a .oat file that has a compiled version of the method.
+      class_linker->IsNterpEntryPoint(entry_point) ||
+      // We explicitly check for the resolution stub, and not the resolution trampoline.
+      // The trampoline is for methods backed by a .oat file that has a compiled version of
+      // the method.
       (entry_point == GetQuickResolutionStub())) {
     VLOG(jit) << "JIT Zygote processing method " << ArtMethod::PrettyMethod(method)
               << " from profile";
@@ -1399,7 +1403,7 @@ uint32_t Jit::CompileMethodsFromBootProfile(
     const std::string& profile_file,
     Handle<mirror::ClassLoader> class_loader,
     bool add_to_queue) {
-  unix_file::FdFile profile(profile_file.c_str(), O_RDONLY, true);
+  unix_file::FdFile profile(profile_file, O_RDONLY, true);
 
   if (profile.Fd() == -1) {
     PLOG(WARNING) << "No boot profile: " << profile_file;
@@ -1449,7 +1453,7 @@ uint32_t Jit::CompileMethodsFromProfile(
 
   // We don't generate boot profiles on device, therefore we don't
   // need to lock the file.
-  unix_file::FdFile profile(profile_file.c_str(), O_RDONLY, true);
+  unix_file::FdFile profile(profile_file, O_RDONLY, true);
 
   if (profile.Fd() == -1) {
     PLOG(WARNING) << "No profile: " << profile_file;
@@ -1667,7 +1671,6 @@ void Jit::PostForkChildAction(bool is_system_server, bool is_zygote) {
   // Jit GC for now (b/147208992).
   code_cache_->SetGarbageCollectCode(
       !jit_compiler_->GenerateDebugInfo() &&
-      !runtime->GetInstrumentation()->AreExitStubsInstalled() &&
       !JitAtFirstUse());
 
   if (is_system_server && runtime->HasImageWithProfile()) {
@@ -1799,8 +1802,7 @@ void Jit::MaybeEnqueueCompilation(ArtMethod* method, Thread* self) {
 
   // Check if we have precompiled this method.
   if (UNLIKELY(method->IsPreCompiled())) {
-    if (!NeedsClinitCheckBeforeCall(method) ||
-        method->GetDeclaringClass()->IsVisiblyInitialized()) {
+    if (!method->StillNeedsClinitCheck()) {
       const void* entry_point = code_cache_->GetSavedEntryPointOfPreCompiledMethod(method);
       if (entry_point != nullptr) {
         Runtime::Current()->GetInstrumentation()->UpdateMethodsCode(method, entry_point);
@@ -1809,7 +1811,7 @@ void Jit::MaybeEnqueueCompilation(ArtMethod* method, Thread* self) {
     return;
   }
 
-  static constexpr size_t kIndividualSharedMethodHotnessThreshold = 0xff;
+  static constexpr size_t kIndividualSharedMethodHotnessThreshold = 0x3f;
   if (method->IsMemorySharedMethod()) {
     MutexLock mu(self, lock_);
     auto it = shared_method_counters_.find(method);

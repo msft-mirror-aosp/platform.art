@@ -23,10 +23,32 @@ package {
     default_applicable_licenses: ["art_license"],
 }
 
+// A native library that goes into /system or /system_ext and that depends on
+// a non-public library that is linked from the system namespace.
 cc_library {
-    name: "libnativeloader_testlib",
-    srcs: [],
+    name: "libsystem_testlib",
+    min_sdk_version: "31",
+    stl: "libc++_static",
+    shared_libs: ["liblog"],
+    // It's difficult to add a shared_lib dependency on a non-public library
+    // here, so it dlopens one instead.
+    srcs: ["libsystem_testlib.cc"],
+}
+
+// A native library that goes into /product.
+cc_library {
+    name: "libproduct_testlib",
+    min_sdk_version: "31",
     stl: "none",
+    srcs: [],
+}
+
+// A native library that goes into /vendor.
+cc_library {
+    name: "libvendor_testlib",
+    min_sdk_version: "31",
+    stl: "none",
+    srcs: [],
 }
 
 // This app is just an intermediate container to be able to include the .so
@@ -34,13 +56,19 @@ cc_library {
 android_test_helper_app {
     name: "library_container_app",
     defaults: ["art_module_source_build_java_defaults"],
+    min_sdk_version: "31",
     manifest: "library_container_app_manifest.xml",
     compile_multilib: "both",
-    jni_libs: ["libnativeloader_testlib"],
+    jni_libs: [
+        "libsystem_testlib",
+        "libproduct_testlib",
+        "libvendor_testlib",
+    ],
 }
 
 java_library {
     name: "loadlibrarytest_test_utils",
+    sdk_version: "31",
     static_libs: [
         "androidx.test.ext.junit",
         "androidx.test.ext.truth",
@@ -51,19 +79,52 @@ java_library {
 // Test fixture that represents a shared library in /system/framework.
 java_library {
     name: "libnativeloader_system_shared_lib",
+    sdk_version: "31",
     installable: true,
     srcs: ["src/android/test/systemsharedlib/SystemSharedLib.java"],
+}
+
+// Test fixture that represents a shared library in /system_ext/framework.
+java_library {
+    name: "libnativeloader_system_ext_shared_lib",
+    sdk_version: "31",
+    installable: true,
+    srcs: ["src/android/test/systemextsharedlib/SystemExtSharedLib.java"],
+}
+
+// Test fixture that represents a shared library in /product/framework.
+java_library {
+    name: "libnativeloader_product_shared_lib",
+    product_specific: true,
+    sdk_version: "31",
+    installable: true,
+    srcs: ["src/android/test/productsharedlib/ProductSharedLib.java"],
+}
+
+// Test fixture that represents a shared library in /vendor/framework.
+java_library {
+    name: "libnativeloader_vendor_shared_lib",
+    vendor: true,
+    sdk_version: "31",
+    installable: true,
+    srcs: ["src/android/test/vendorsharedlib/VendorSharedLib.java"],
 }
 
 java_defaults {
     name: "loadlibrarytest_app_defaults",
     defaults: ["art_module_source_build_java_defaults"],
+    sdk_version: "31",
     static_libs: [
         "androidx.test.ext.junit",
         "androidx.test.rules",
         "loadlibrarytest_test_utils",
     ],
-    libs: ["libnativeloader_system_shared_lib"],
+    libs: [
+        "libnativeloader_system_shared_lib",
+        "libnativeloader_system_ext_shared_lib",
+        "libnativeloader_product_shared_lib",
+        "libnativeloader_vendor_shared_lib",
+    ],
 }
 
 android_test_helper_app {
@@ -125,6 +186,9 @@ java_test_host {
     data: [
         ":library_container_app",
         ":libnativeloader_system_shared_lib",
+        ":libnativeloader_system_ext_shared_lib",
+        ":libnativeloader_product_shared_lib",
+        ":libnativeloader_vendor_shared_lib",
         ":loadlibrarytest_system_priv_app",
         ":loadlibrarytest_system_app",
         ":loadlibrarytest_system_ext_app",

@@ -38,6 +38,7 @@
 #include "handle.h"
 #include "handle_scope.h"
 #include "interpreter/interpreter_cache.h"
+#include "interpreter/shadow_frame.h"
 #include "javaheapprof/javaheapsampler.h"
 #include "jvalue.h"
 #include "managed_stack.h"
@@ -48,7 +49,9 @@
 #include "runtime_stats.h"
 #include "thread_state.h"
 
-class BacktraceMap;
+namespace unwindstack {
+class AndroidLocalUnwinder;
+}  // namespace unwindstack
 
 namespace art {
 
@@ -188,7 +191,7 @@ enum class WeakRefAccessState : int32_t {
 // This should match RosAlloc::kNumThreadLocalSizeBrackets.
 static constexpr size_t kNumRosAllocThreadLocalSizeBracketsInThread = 16;
 
-static constexpr size_t kSharedMethodHotnessThreshold = 0xffff;
+static constexpr size_t kSharedMethodHotnessThreshold = 0x1fff;
 
 // Thread's stack layout for implicit stack overflow checks:
 //
@@ -245,6 +248,9 @@ class Thread {
   // TODO: mark as PURE so the compiler may coalesce and remove?
   static Thread* Current();
 
+  // Get the thread from the JNI environment.
+  static Thread* ForEnv(JNIEnv* env);
+
   // On a runnable thread, check for pending thread suspension request and handle if pending.
   void AllowThreadSuspension() REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -270,16 +276,28 @@ class Thread {
   // Dumps a one-line summary of thread state (used for operator<<).
   void ShortDump(std::ostream& os) const;
 
+  // Order of threads for ANRs (ANRs can be trimmed, so we print important ones first).
+  enum class DumpOrder : uint8_t {
+    kMain,     // Always print the main thread first (there might not be one).
+    kBlocked,  // Then print all threads that are blocked due to waiting on lock.
+    kLocked,   // Then print all threads that are holding some lock already.
+    kDefault,  // Print all other threads which might not be interesting for ANR.
+  };
+
   // Dumps the detailed thread state and the thread stack (used for SIGQUIT).
-  void Dump(std::ostream& os,
-            bool dump_native_stack = true,
-            BacktraceMap* backtrace_map = nullptr,
-            bool force_dump_stack = false) const
+  DumpOrder Dump(std::ostream& os,
+                 bool dump_native_stack = true,
+                 bool force_dump_stack = false) const
+      REQUIRES_SHARED(Locks::mutator_lock_);
+  DumpOrder Dump(std::ostream& os,
+                 unwindstack::AndroidLocalUnwinder& unwinder,
+                 bool dump_native_stack = true,
+                 bool force_dump_stack = false) const
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  void DumpJavaStack(std::ostream& os,
-                     bool check_suspended = true,
-                     bool dump_locks = true) const
+  DumpOrder DumpJavaStack(std::ostream& os,
+                          bool check_suspended = true,
+                          bool dump_locks = true) const
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Dumps the SIGQUIT per-thread header. 'thread' can be null for a non-attached thread, in which
@@ -558,8 +576,12 @@ class Thread {
   // that needs to be dealt with, false otherwise.
   bool ObserveAsyncException() REQUIRES_SHARED(Locks::mutator_lock_);
 
-  // Find catch block and perform long jump to appropriate exception handle
-  NO_RETURN void QuickDeliverException() REQUIRES_SHARED(Locks::mutator_lock_);
+  // Find catch block and perform long jump to appropriate exception handle. When
+  // is_method_exit_exception is true, the exception was thrown by the method exit callback and we
+  // should not send method unwind for the method on top of the stack since method exit callback was
+  // already called.
+  NO_RETURN void QuickDeliverException(bool is_method_exit_exception = false)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   Context* GetLongJumpContext();
   void ReleaseLongJumpContext(Context* context) {
@@ -585,8 +607,8 @@ class Thread {
     tlsPtr_.managed_stack.SetTopQuickFrame(top_method);
   }
 
-  void SetTopOfStackTagged(ArtMethod** top_method) {
-    tlsPtr_.managed_stack.SetTopQuickFrameTagged(top_method);
+  void SetTopOfStackGenericJniTagged(ArtMethod** top_method) {
+    tlsPtr_.managed_stack.SetTopQuickFrameGenericJniTagged(top_method);
   }
 
   void SetTopOfShadowStack(ShadowFrame* top) {
@@ -720,6 +742,16 @@ class Thread {
       jobjectArray output_array = nullptr, int* stack_depth = nullptr)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
+  static jint InternalStackTraceToStackFrameInfoArray(
+      const ScopedObjectAccessAlreadyRunnable& soa,
+      jlong mode,  // See java.lang.StackStreamFactory for the mode flags
+      jobject internal,
+      jint startLevel,
+      jint batchSize,
+      jint startIndex,
+      jobjectArray output_array)  // java.lang.StackFrameInfo[]
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
   jobjectArray CreateAnnotatedStackTrace(const ScopedObjectAccessAlreadyRunnable& soa) const
       REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -754,6 +786,13 @@ class Thread {
   }
 
   template<PointerSize pointer_size>
+  static constexpr ThreadOffset<pointer_size> TidOffset() {
+    return ThreadOffset<pointer_size>(
+        OFFSETOF_MEMBER(Thread, tls32_) +
+        OFFSETOF_MEMBER(tls_32bit_sized_values, tid));
+  }
+
+  template<PointerSize pointer_size>
   static constexpr ThreadOffset<pointer_size> InterruptedOffset() {
     return ThreadOffset<pointer_size>(
         OFFSETOF_MEMBER(Thread, tls32_) +
@@ -779,6 +818,13 @@ class Thread {
     return ThreadOffset<pointer_size>(
         OFFSETOF_MEMBER(Thread, tls32_) +
         OFFSETOF_MEMBER(tls_32bit_sized_values, is_gc_marking));
+  }
+
+  template <PointerSize pointer_size>
+  static constexpr ThreadOffset<pointer_size> DeoptCheckRequiredOffset() {
+    return ThreadOffset<pointer_size>(
+        OFFSETOF_MEMBER(Thread, tls32_) +
+        OFFSETOF_MEMBER(tls_32bit_sized_values, is_deopt_check_required));
   }
 
   static constexpr size_t IsGcMarkingSize() {
@@ -970,6 +1016,10 @@ class Thread {
   // Is the given obj in one of this thread's JNI transition frames?
   bool IsJniTransitionReference(jobject obj) const REQUIRES_SHARED(Locks::mutator_lock_);
 
+  // Convert a global (or weak global) jobject into a Object*
+  ObjPtr<mirror::Object> DecodeGlobalJObject(jobject obj) const
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
   void HandleScopeVisitRoots(RootVisitor* visitor, uint32_t thread_id)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -1026,11 +1076,15 @@ class Thread {
   }
 
   bool GetIsGcMarking() const {
-    CHECK(gUseReadBarrier);
+    DCHECK(gUseReadBarrier);
     return tls32_.is_gc_marking;
   }
 
   void SetIsGcMarkingAndUpdateEntrypoints(bool is_marking);
+
+  bool IsDeoptCheckRequired() const { return tls32_.is_deopt_check_required; }
+
+  void SetDeoptCheckRequired(bool flag) { tls32_.is_deopt_check_required = flag; }
 
   bool GetWeakRefAccessEnabled() const;  // Only safe for current thread.
 
@@ -1103,7 +1157,8 @@ class Thread {
   void AssertHasDeoptimizationContext()
       REQUIRES_SHARED(Locks::mutator_lock_);
   void PushStackedShadowFrame(ShadowFrame* sf, StackedShadowFrameType type);
-  ShadowFrame* PopStackedShadowFrame(StackedShadowFrameType type, bool must_be_present = true);
+  ShadowFrame* PopStackedShadowFrame();
+  ShadowFrame* MaybePopDeoptimizedStackedShadowFrame();
 
   // For debugger, find the shadow frame that corresponds to a frame id.
   // Or return null if there is none.
@@ -1123,22 +1178,6 @@ class Thread {
   // Delete the entry that maps from frame_id to shadow_frame.
   void RemoveDebuggerShadowFrameMapping(size_t frame_id)
       REQUIRES_SHARED(Locks::mutator_lock_);
-
-  // While getting this map requires shared the mutator lock, manipulating it
-  // should actually follow these rules:
-  // (1) The owner of this map (the thread) can change it with its mutator lock.
-  // (2) Other threads can read this map when the owner is suspended and they
-  //     hold the mutator lock.
-  // (3) Other threads can change this map when owning the mutator lock exclusively.
-  //
-  // The reason why (3) needs the mutator lock exclusively (and not just having
-  // the owner suspended) is that we don't want other threads to concurrently read the map.
-  //
-  // TODO: Add a class abstraction to express these rules.
-  std::map<uintptr_t, instrumentation::InstrumentationStackFrame>* GetInstrumentationStack()
-      REQUIRES_SHARED(Locks::mutator_lock_) {
-    return tlsPtr_.instrumentation_stack;
-  }
 
   std::vector<ArtMethod*>* GetStackTraceSample() const {
     DCHECK(!IsAotCompiler());
@@ -1162,6 +1201,22 @@ class Thread {
     DCHECK(IsAotCompiler());
     DCHECK(verifier_deps == nullptr || tlsPtr_.deps_or_stack_trace_sample.verifier_deps == nullptr);
     tlsPtr_.deps_or_stack_trace_sample.verifier_deps = verifier_deps;
+  }
+
+  uintptr_t* GetMethodTraceBuffer() { return tlsPtr_.method_trace_buffer; }
+
+  size_t* GetMethodTraceIndexPtr() { return &tlsPtr_.method_trace_buffer_index; }
+
+  uintptr_t* SetMethodTraceBuffer(uintptr_t* buffer) {
+    return tlsPtr_.method_trace_buffer = buffer;
+  }
+
+  void ResetMethodTraceBuffer() {
+    if (tlsPtr_.method_trace_buffer != nullptr) {
+      delete[] tlsPtr_.method_trace_buffer;
+    }
+    tlsPtr_.method_trace_buffer = nullptr;
+    tlsPtr_.method_trace_buffer_index = 0;
   }
 
   uint64_t GetTraceClockBase() const {
@@ -1314,11 +1369,12 @@ class Thread {
 
   bool IncrementMakeVisiblyInitializedCounter() {
     tls32_.make_visibly_initialized_counter += 1u;
-    return tls32_.make_visibly_initialized_counter == kMakeVisiblyInitializedCounterTriggerCount;
-  }
-
-  void ClearMakeVisiblyInitializedCounter() {
-    tls32_.make_visibly_initialized_counter = 0u;
+    DCHECK_LE(tls32_.make_visibly_initialized_counter, kMakeVisiblyInitializedCounterTriggerCount);
+    if (tls32_.make_visibly_initialized_counter == kMakeVisiblyInitializedCounterTriggerCount) {
+      tls32_.make_visibly_initialized_counter = 0u;
+      return true;
+    }
+    return false;
   }
 
   void PushVerifier(verifier::MethodVerifier* verifier);
@@ -1363,10 +1419,9 @@ class Thread {
   // Set to the read barrier marking entrypoints to be non-null.
   void SetReadBarrierEntrypoints();
 
-  static jobject CreateCompileTimePeer(JNIEnv* env,
-                                       const char* name,
-                                       bool as_daemon,
-                                       jobject thread_group)
+  ObjPtr<mirror::Object> CreateCompileTimePeer(const char* name,
+                                               bool as_daemon,
+                                               jobject thread_group)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   ALWAYS_INLINE InterpreterCache* GetInterpreterCache() {
@@ -1446,11 +1501,10 @@ class Thread {
   void CreatePeer(const char* name, bool as_daemon, jobject thread_group);
 
   template<bool kTransactionActive>
-  static void InitPeer(ScopedObjectAccessAlreadyRunnable& soa,
-                       ObjPtr<mirror::Object> peer,
-                       jboolean thread_is_daemon,
-                       jobject thread_group,
-                       jobject thread_name,
+  static void InitPeer(ObjPtr<mirror::Object> peer,
+                       bool as_daemon,
+                       ObjPtr<mirror::Object> thread_group,
+                       ObjPtr<mirror::String> thread_name,
                        jint thread_priority)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -1496,10 +1550,14 @@ class Thread {
   void VerifyStackImpl() REQUIRES_SHARED(Locks::mutator_lock_);
 
   void DumpState(std::ostream& os) const REQUIRES_SHARED(Locks::mutator_lock_);
-  void DumpStack(std::ostream& os,
-                 bool dump_native_stack = true,
-                 BacktraceMap* backtrace_map = nullptr,
-                 bool force_dump_stack = false) const
+  DumpOrder DumpStack(std::ostream& os,
+                      bool dump_native_stack = true,
+                      bool force_dump_stack = false) const
+      REQUIRES_SHARED(Locks::mutator_lock_);
+  DumpOrder DumpStack(std::ostream& os,
+                      unwindstack::AndroidLocalUnwinder& unwinder,
+                      bool dump_native_stack = true,
+                      bool force_dump_stack = false) const
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Out-of-line conveniences for debugging in gdb.
@@ -1512,10 +1570,8 @@ class Thread {
   static NO_INLINE void* CreateCallbackWithUffdGc(void* arg);
   static void* CreateCallback(void* arg);
 
-  void HandleUncaughtExceptions(ScopedObjectAccessAlreadyRunnable& soa)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-  void RemoveFromThreadGroup(ScopedObjectAccessAlreadyRunnable& soa)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+  void HandleUncaughtExceptions() REQUIRES_SHARED(Locks::mutator_lock_);
+  void RemoveFromThreadGroup() REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Initialize a thread.
   //
@@ -1729,6 +1785,7 @@ class Thread {
           thread_exit_check_count(0),
           is_transitioning_to_runnable(false),
           is_gc_marking(false),
+          is_deopt_check_required(false),
           weak_ref_access_enabled(WeakRefAccessState::kVisiblyEnabled),
           disable_thread_flip_count(0),
           user_code_suspend_count(0),
@@ -1782,6 +1839,12 @@ class Thread {
     // thread local so that we can simplify the logic to check for the fast path of read barriers of
     // GC roots.
     bool32_t is_gc_marking;
+
+    // True if we need to check for deoptimization when returning from the runtime functions. This
+    // is required only when a class is redefined to prevent executing code that has field offsets
+    // embedded. For non-debuggable apps redefinition is not allowed and this flag should always be
+    // set to false.
+    bool32_t is_deopt_check_required;
 
     // Thread "interrupted" status; stays raised until queried or thrown.
     Atomic<bool32_t> interrupted;
@@ -1870,19 +1933,18 @@ class Thread {
                                top_handle_scope(nullptr),
                                class_loader_override(nullptr),
                                long_jump_context(nullptr),
-                               instrumentation_stack(nullptr),
                                stacked_shadow_frame_record(nullptr),
                                deoptimization_context_stack(nullptr),
                                frame_id_to_shadow_frame(nullptr),
                                name(nullptr),
                                pthread_self(0),
                                last_no_thread_suspension_cause(nullptr),
-                               checkpoint_function(nullptr),
                                thread_local_start(nullptr),
                                thread_local_pos(nullptr),
                                thread_local_end(nullptr),
                                thread_local_limit(nullptr),
                                thread_local_objects(0),
+                               checkpoint_function(nullptr),
                                thread_local_alloc_stack_top(nullptr),
                                thread_local_alloc_stack_end(nullptr),
                                mutator_lock(nullptr),
@@ -1890,7 +1952,9 @@ class Thread {
                                method_verifier(nullptr),
                                thread_local_mark_stack(nullptr),
                                async_exception(nullptr),
-                               top_reflective_handle_scope(nullptr) {
+                               top_reflective_handle_scope(nullptr),
+                               method_trace_buffer(nullptr),
+                               method_trace_buffer_index(0) {
       std::fill(held_mutexes, held_mutexes + kLockLevelCount, nullptr);
     }
 
@@ -1963,14 +2027,6 @@ class Thread {
     // Thread local, lazily allocated, long jump context. Used to deliver exceptions.
     Context* long_jump_context;
 
-    // Additional stack used by method instrumentation to store method and return pc values.
-    // Stored as a pointer since std::map is not PACKED.
-    // !DO NOT CHANGE! to std::unordered_map: the users of this map require an
-    // ordered iteration on the keys (which are stack addresses).
-    // Also see Thread::GetInstrumentationStack for the requirements on
-    // manipulating and reading this map.
-    std::map<uintptr_t, instrumentation::InstrumentationStackFrame>* instrumentation_stack;
-
     // For gc purpose, a shadow frame record stack that keeps track of:
     // 1) shadow frames under construction.
     // 2) deoptimization shadow frames.
@@ -1996,10 +2052,6 @@ class Thread {
     // If no_thread_suspension_ is > 0, what is causing that assertion.
     const char* last_no_thread_suspension_cause;
 
-    // Pending checkpoint function or null if non-pending. If this checkpoint is set and someone\
-    // requests another checkpoint, it goes to the checkpoint overflow list.
-    Closure* checkpoint_function GUARDED_BY(Locks::thread_suspend_count_lock_);
-
     // Pending barriers that require passing or NULL if non-pending. Installation guarding by
     // Locks::thread_suspend_count_lock_.
     // They work effectively as art::Barrier, but implemented directly using AtomicInteger and futex
@@ -2019,6 +2071,10 @@ class Thread {
     uint8_t* thread_local_limit;
 
     size_t thread_local_objects;
+
+    // Pending checkpoint function or null if non-pending. If this checkpoint is set and someone\
+    // requests another checkpoint, it goes to the checkpoint overflow list.
+    Closure* checkpoint_function GUARDED_BY(Locks::thread_suspend_count_lock_);
 
     // Entrypoint function pointers.
     // TODO: move this to more of a global offset table model to avoid per-thread duplication.
@@ -2057,6 +2113,12 @@ class Thread {
 
     // Top of the linked-list for reflective-handle scopes or null if none.
     BaseReflectiveHandleScope* top_reflective_handle_scope;
+
+    // Pointer to a thread-local buffer for method tracing.
+    uintptr_t* method_trace_buffer;
+
+    // The index of the next free entry in method_trace_buffer.
+    size_t method_trace_buffer_index;
   } tlsPtr_;
 
   // Small thread-local cache to be used from the interpreter.
@@ -2089,8 +2151,10 @@ class Thread {
   SafeMap<std::string, std::unique_ptr<TLSData>, std::less<>> custom_tls_
       GUARDED_BY(Locks::custom_tls_lock_);
 
-#ifndef __BIONIC__
-  __attribute__((tls_model("initial-exec")))
+#if !defined(__BIONIC__)
+#if !defined(ANDROID_HOST_MUSL)
+    __attribute__((tls_model("initial-exec")))
+#endif
   static thread_local Thread* self_tls_;
 #endif
 
@@ -2173,17 +2237,18 @@ class ScopedAllowThreadSuspension {
 
 class ScopedStackedShadowFramePusher {
  public:
-  ScopedStackedShadowFramePusher(Thread* self, ShadowFrame* sf, StackedShadowFrameType type)
-    : self_(self), type_(type) {
-    self_->PushStackedShadowFrame(sf, type);
+  ScopedStackedShadowFramePusher(Thread* self, ShadowFrame* sf) : self_(self), sf_(sf) {
+    DCHECK_EQ(sf->GetLink(), nullptr);
+    self_->PushStackedShadowFrame(sf, StackedShadowFrameType::kShadowFrameUnderConstruction);
   }
   ~ScopedStackedShadowFramePusher() {
-    self_->PopStackedShadowFrame(type_);
+    ShadowFrame* sf = self_->PopStackedShadowFrame();
+    DCHECK_EQ(sf, sf_);
   }
 
  private:
   Thread* const self_;
-  const StackedShadowFrameType type_;
+  ShadowFrame* const sf_;
 
   DISALLOW_COPY_AND_ASSIGN(ScopedStackedShadowFramePusher);
 };

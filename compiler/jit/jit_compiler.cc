@@ -34,11 +34,15 @@
 #include "jit/jit_code_cache.h"
 #include "jit/jit_logger.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace jit {
 
 JitCompiler* JitCompiler::Create() {
   return new JitCompiler();
+}
+
+void JitCompiler::SetDebuggableCompilerOption(bool value) {
+  compiler_options_->SetDebuggable(value);
 }
 
 void JitCompiler::ParseCompilerOptions() {
@@ -121,7 +125,7 @@ void JitCompiler::ParseCompilerOptions() {
   }
 }
 
-extern "C" JitCompilerInterface* jit_load() {
+EXPORT extern "C" JitCompilerInterface* jit_load() {
   VLOG(jit) << "Create jit compiler";
   auto* const jit_compiler = JitCompiler::Create();
   CHECK(jit_compiler != nullptr);
