@@ -290,10 +290,10 @@ class MarkCompact final : public GarbageCollector {
   // GC cycle.
   ALWAYS_INLINE mirror::Object* PostCompactBlackObjAddr(mirror::Object* old_ref) const
       REQUIRES_SHARED(Locks::mutator_lock_);
-  // Identify immune spaces and reset card-table, mod-union-table, and mark
-  // bitmaps.
-  void BindAndResetBitmaps() REQUIRES_SHARED(Locks::mutator_lock_)
-      REQUIRES(Locks::heap_bitmap_lock_);
+  // Clears (for alloc spaces in the beginning of marking phase) or ages the
+  // card table. Also, identifies immune spaces and mark bitmap.
+  void PrepareCardTableForMarking(bool clear_alloc_space_cards)
+      REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(Locks::heap_bitmap_lock_);
 
   // Perform one last round of marking, identifying roots from dirty cards
   // during a stop-the-world (STW) pause.
@@ -356,11 +356,11 @@ class MarkCompact final : public GarbageCollector {
   // Slides (retain the empty holes, which are usually part of some in-use TLAB)
   // black page in the moving space. 'first_obj' is the object that overlaps with
   // the first byte of the page being slid. pre_compact_page is the pre-compact
-  // address of the page being slid. 'page_idx' is used to fetch the first
-  // allocated chunk's size and next page's first_obj. 'dest' is the kPageSize
-  // sized memory where the contents would be copied.
+  // address of the page being slid. 'dest' is the kPageSize sized memory where
+  // the contents would be copied.
   void SlideBlackPage(mirror::Object* first_obj,
-                      const size_t page_idx,
+                      mirror::Object* next_page_first_obj,
+                      uint32_t first_chunk_size,
                       uint8_t* const pre_compact_page,
                       uint8_t* dest,
                       bool needs_memset_zero) REQUIRES_SHARED(Locks::mutator_lock_);
@@ -767,8 +767,8 @@ class MarkCompact final : public GarbageCollector {
   class VerifyRootMarkedVisitor;
   class ScanObjectVisitor;
   class CheckpointMarkThreadRoots;
-  template<size_t kBufferSize> class ThreadRootsVisitor;
-  class CardModifiedVisitor;
+  template <size_t kBufferSize>
+  class ThreadRootsVisitor;
   class RefFieldsVisitor;
   template <bool kCheckBegin, bool kCheckEnd> class RefsUpdateVisitor;
   class ArenaPoolPageUpdater;
