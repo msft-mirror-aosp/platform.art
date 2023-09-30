@@ -57,7 +57,6 @@
 #include "android-base/file.h"
 #include "android-base/logging.h"
 #include "android-base/macros.h"
-#include "android-base/parsebool.h"
 #include "android-base/parseint.h"
 #include "android-base/properties.h"
 #include "android-base/result.h"
@@ -65,34 +64,27 @@
 #include "android-base/stringprintf.h"
 #include "android-base/strings.h"
 #include "android-modules-utils/sdk_level.h"
-#include "android/log.h"
 #include "arch/instruction_set.h"
 #include "base/file_utils.h"
-#include "base/globals.h"
 #include "base/logging.h"
 #include "base/macros.h"
 #include "base/os.h"
 #include "base/stl_util.h"
-#include "base/string_view_cpp20.h"
 #include "base/unix_file/fd_file.h"
 #include "com_android_apex.h"
 #include "com_android_art.h"
 #include "dex/art_dex_file_loader.h"
-#include "dexoptanalyzer.h"
 #include "exec_utils.h"
-#include "fmt/format.h"
 #include "gc/collector/mark_compact.h"
-#include "log/log.h"
 #include "odr_artifacts.h"
 #include "odr_common.h"
-#include "odr_compilation_log.h"
 #include "odr_config.h"
 #include "odr_fs_utils.h"
 #include "odr_metrics.h"
 #include "odrefresh/odrefresh.h"
 #include "palette/palette.h"
 #include "palette/palette_types.h"
-#include "read_barrier_config.h"
+#include "tools/cmdline_builder.h"
 
 namespace art {
 namespace odrefresh {
@@ -104,10 +96,7 @@ namespace art_apex = com::android::art;
 
 using ::android::base::Basename;
 using ::android::base::Dirname;
-using ::android::base::GetProperty;
 using ::android::base::Join;
-using ::android::base::ParseBool;
-using ::android::base::ParseBoolResult;
 using ::android::base::ParseInt;
 using ::android::base::Result;
 using ::android::base::SetProperty;
@@ -116,8 +105,7 @@ using ::android::base::StartsWith;
 using ::android::base::StringPrintf;
 using ::android::base::Timer;
 using ::android::modules::sdklevel::IsAtLeastU;
-
-using ::fmt::literals::operator""_format;  // NOLINT
+using ::art::tools::CmdlineBuilder;
 
 // Name of cache info file in the ART Apex artifact cache.
 constexpr const char* kCacheInfoFile = "cache-info.xml";
@@ -157,7 +145,7 @@ bool MoveOrEraseFiles(const std::vector<std::unique_ptr<File>>& files,
   std::vector<std::unique_ptr<File>> output_files;
   for (auto& file : files) {
     std::string file_basename(Basename(file->GetPath()));
-    std::string output_file_path = "{}/{}"_format(output_directory_path, file_basename);
+    std::string output_file_path = ART_FORMAT("{}/{}", output_directory_path, file_basename);
     std::string input_file_path = file->GetPath();
 
     output_files.emplace_back(OS::CreateEmptyFileWriteOnly(output_file_path.c_str()));
@@ -384,20 +372,20 @@ bool ArtifactsExist(const OdrArtifacts& artifacts,
   return true;
 }
 
-void AddDex2OatCommonOptions(/*inout*/ std::vector<std::string>& args) {
-  args.emplace_back("--android-root=out/empty");
-  args.emplace_back("--abort-on-hard-verifier-error");
-  args.emplace_back("--no-abort-on-soft-verifier-error");
-  args.emplace_back("--compilation-reason=boot");
-  args.emplace_back("--image-format=lz4");
-  args.emplace_back("--force-determinism");
-  args.emplace_back("--resolve-startup-const-strings=true");
+void AddDex2OatCommonOptions(/*inout*/ CmdlineBuilder& args) {
+  args.Add("--android-root=out/empty");
+  args.Add("--abort-on-hard-verifier-error");
+  args.Add("--no-abort-on-soft-verifier-error");
+  args.Add("--compilation-reason=boot");
+  args.Add("--image-format=lz4");
+  args.Add("--force-determinism");
+  args.Add("--resolve-startup-const-strings=true");
 
   // Avoid storing dex2oat cmdline in oat header. We want to be sure that the compiled artifacts
   // are identical regardless of where the compilation happened. But some of the cmdline flags tends
   // to be unstable, e.g. those contains FD numbers. To avoid the problem, the whole cmdline is not
   // added to the oat header.
-  args.emplace_back("--avoid-storing-invocation");
+  args.Add("--avoid-storing-invocation");
 }
 
 bool IsCpuSetSpecValid(const std::string& cpu_set) {
@@ -410,60 +398,55 @@ bool IsCpuSetSpecValid(const std::string& cpu_set) {
   return true;
 }
 
-Result<void> AddDex2OatConcurrencyArguments(/*inout*/ std::vector<std::string>& args,
-                                            bool is_compilation_os) {
+Result<void> AddDex2OatConcurrencyArguments(/*inout*/ CmdlineBuilder& args,
+                                            bool is_compilation_os,
+                                            const OdrSystemProperties& system_properties) {
   std::string threads;
   if (is_compilation_os) {
-    threads = GetProperty("dalvik.vm.background-dex2oat-threads", "");
-    if (threads.empty()) {
-      threads = GetProperty("dalvik.vm.dex2oat-threads", "");
-    }
+    threads = system_properties.GetOrEmpty("dalvik.vm.background-dex2oat-threads",
+                                           "dalvik.vm.dex2oat-threads");
   } else {
-    threads = GetProperty("dalvik.vm.boot-dex2oat-threads", "");
+    threads = system_properties.GetOrEmpty("dalvik.vm.boot-dex2oat-threads");
   }
-  if (!threads.empty()) {
-    args.push_back("-j" + threads);
-  }
+  args.AddIfNonEmpty("-j%s", threads);
 
   std::string cpu_set;
   if (is_compilation_os) {
-    cpu_set = GetProperty("dalvik.vm.background-dex2oat-cpu-set", "");
-    if (cpu_set.empty()) {
-      cpu_set = GetProperty("dalvik.vm.dex2oat-cpu-set", "");
-    }
+    cpu_set = system_properties.GetOrEmpty("dalvik.vm.background-dex2oat-cpu-set",
+                                           "dalvik.vm.dex2oat-cpu-set");
   } else {
-    cpu_set = GetProperty("dalvik.vm.boot-dex2oat-cpu-set", "");
+    cpu_set = system_properties.GetOrEmpty("dalvik.vm.boot-dex2oat-cpu-set");
   }
   if (!cpu_set.empty()) {
     if (!IsCpuSetSpecValid(cpu_set)) {
       return Errorf("Invalid CPU set spec '{}'", cpu_set);
     }
-    args.push_back("--cpu-set=" + cpu_set);
+    args.Add("--cpu-set=%s", cpu_set);
   }
 
   return {};
 }
 
-void AddDex2OatDebugInfo(/*inout*/ std::vector<std::string>& args) {
-  args.emplace_back("--generate-mini-debug-info");
-  args.emplace_back("--strip");
+void AddDex2OatDebugInfo(/*inout*/ CmdlineBuilder& args) {
+  args.Add("--generate-mini-debug-info");
+  args.Add("--strip");
 }
 
-void AddDex2OatInstructionSet(/*inout*/ std::vector<std::string>& args, InstructionSet isa) {
+void AddDex2OatInstructionSet(/*inout*/ CmdlineBuilder& args, InstructionSet isa) {
   const char* isa_str = GetInstructionSetString(isa);
-  args.emplace_back(StringPrintf("--instruction-set=%s", isa_str));
+  args.Add("--instruction-set=%s", isa_str);
 }
 
 // Returns true if any profile has been added.
 bool AddDex2OatProfile(
-    /*inout*/ std::vector<std::string>& args,
+    /*inout*/ CmdlineBuilder& args,
     /*inout*/ std::vector<std::unique_ptr<File>>& output_files,
     const std::vector<std::string>& profile_paths) {
   bool has_any_profile = false;
   for (auto& path : profile_paths) {
     std::unique_ptr<File> profile_file(OS::OpenFileForReading(path.c_str()));
     if (profile_file && profile_file->IsOpened()) {
-      args.emplace_back(StringPrintf("--profile-file-fd=%d", profile_file->Fd()));
+      args.Add("--profile-file-fd=%d", profile_file->Fd());
       output_files.emplace_back(std::move(profile_file));
       has_any_profile = true;
     }
@@ -471,7 +454,7 @@ bool AddDex2OatProfile(
   return has_any_profile;
 }
 
-Result<void> AddBootClasspathFds(/*inout*/ std::vector<std::string>& args,
+Result<void> AddBootClasspathFds(/*inout*/ CmdlineBuilder& args,
                                  /*inout*/ std::vector<std::unique_ptr<File>>& output_files,
                                  const std::vector<std::string>& bcp_jars) {
   std::vector<std::string> bcp_fds;
@@ -491,12 +474,11 @@ Result<void> AddBootClasspathFds(/*inout*/ std::vector<std::string>& args,
       output_files.push_back(std::move(jar_file));
     }
   }
-  args.emplace_back("--runtime-arg");
-  args.emplace_back("-Xbootclasspathfds:" + Join(bcp_fds, ':'));
+  args.AddRuntime("-Xbootclasspathfds:%s", Join(bcp_fds, ':'));
   return {};
 }
 
-Result<void> AddCacheInfoFd(/*inout*/ std::vector<std::string>& args,
+Result<void> AddCacheInfoFd(/*inout*/ CmdlineBuilder& args,
                             /*inout*/ std::vector<std::unique_ptr<File>>& readonly_files_raii,
                             const std::string& cache_info_filename) {
   std::unique_ptr<File> cache_info_file(OS::OpenFileForReading(cache_info_filename.c_str()));
@@ -504,7 +486,7 @@ Result<void> AddCacheInfoFd(/*inout*/ std::vector<std::string>& args,
     return ErrnoErrorf("Failed to open a cache info file '{}'", cache_info_file);
   }
 
-  args.emplace_back("--cache-info-fd=" + std::to_string(cache_info_file->Fd()));
+  args.Add("--cache-info-fd=%d", cache_info_file->Fd());
   readonly_files_raii.push_back(std::move(cache_info_file));
   return {};
 }
@@ -518,7 +500,7 @@ std::string GetBootImageComponentBasename(const std::string& jar_path, bool is_f
 }
 
 void AddCompiledBootClasspathFdsIfAny(
-    /*inout*/ std::vector<std::string>& args,
+    /*inout*/ CmdlineBuilder& args,
     /*inout*/ std::vector<std::unique_ptr<File>>& output_files,
     const std::vector<std::string>& bcp_jars,
     InstructionSet isa,
@@ -576,12 +558,9 @@ void AddCompiledBootClasspathFdsIfAny(
   if (added_any) {
     std::move(opened_files.begin(), opened_files.end(), std::back_inserter(output_files));
 
-    args.emplace_back("--runtime-arg");
-    args.emplace_back("-Xbootclasspathimagefds:" + Join(bcp_image_fds, ':'));
-    args.emplace_back("--runtime-arg");
-    args.emplace_back("-Xbootclasspathoatfds:" + Join(bcp_oat_fds, ':'));
-    args.emplace_back("--runtime-arg");
-    args.emplace_back("-Xbootclasspathvdexfds:" + Join(bcp_vdex_fds, ':'));
+    args.AddRuntime("-Xbootclasspathimagefds:%s", Join(bcp_image_fds, ':'));
+    args.AddRuntime("-Xbootclasspathoatfds:%s", Join(bcp_oat_fds, ':'));
+    args.AddRuntime("-Xbootclasspathvdexfds:%s", Join(bcp_vdex_fds, ':'));
   }
 }
 
@@ -896,7 +875,7 @@ std::string OnDeviceRefresh::GetSystemBootImageFrameworkExtension() const {
   std::string basename =
       GetBootImageComponentBasename(framework_bcp_jars[0], /*is_first_jar=*/false);
   // Typically "/system/framework/boot-framework.art".
-  return "{}/framework/{}"_format(GetAndroidRoot(), basename);
+  return ART_FORMAT("{}/framework/{}", GetAndroidRoot(), basename);
 }
 
 std::string OnDeviceRefresh::GetSystemBootImageFrameworkExtensionPath(InstructionSet isa) const {
@@ -910,10 +889,10 @@ std::string OnDeviceRefresh::GetBootImageMainlineExtension(bool on_system) const
       GetBootImageComponentBasename(mainline_bcp_jars[0], /*is_first_jar=*/false);
   if (on_system) {
     // Typically "/system/framework/boot-framework-adservices.art".
-    return "{}/framework/{}"_format(GetAndroidRoot(), basename);
+    return ART_FORMAT("{}/framework/{}", GetAndroidRoot(), basename);
   } else {
     // Typically "/data/misc/apexdata/com.android.art/dalvik-cache/boot-framework-adservices.art".
-    return "{}/{}"_format(config_.GetArtifactDirectory(), basename);
+    return ART_FORMAT("{}/{}", config_.GetArtifactDirectory(), basename);
   }
 }
 
@@ -964,7 +943,7 @@ std::string OnDeviceRefresh::GetSystemServerImagePath(bool on_system,
     std::string image_name = ReplaceFileExtension(jar_name, "art");
     const char* isa_str = GetInstructionSetString(config_.GetSystemServerIsa());
     // Typically "/system/framework/oat/<isa>/services.art".
-    return "{}/oat/{}/{}"_format(Dirname(jar_path), isa_str, image_name);
+    return ART_FORMAT("{}/oat/{}/{}", Dirname(jar_path), isa_str, image_name);
   } else {
     // Typically
     // "/data/misc/apexdata/.../dalvik-cache/<isa>/system@framework@services.jar@classes.art".
@@ -1043,16 +1022,15 @@ WARN_UNUSED bool OnDeviceRefresh::CheckSystemPropertiesAreDefault() const {
                       std::end(kCheckedSystemPropertyPrefixes),
                       [](const char* prefix) { return StartsWith(prefix, "persist."); }));
 
-  const std::unordered_map<std::string, std::string>& system_properties =
-      config_.GetSystemProperties();
+  const OdrSystemProperties& system_properties = config_.GetSystemProperties();
 
   for (const SystemPropertyConfig& system_property_config : *kSystemProperties.get()) {
-    auto property = system_properties.find(system_property_config.name);
-    DCHECK(property != system_properties.end());
+    std::string property = system_properties.GetOrEmpty(system_property_config.name);
+    DCHECK_NE(property, "");
 
-    if (property->second != system_property_config.default_value) {
+    if (property != system_property_config.default_value) {
       LOG(INFO) << "System property " << system_property_config.name << " has a non-default value ("
-                << property->second << ").";
+                << property << ").";
       return false;
     }
   }
@@ -1078,16 +1056,14 @@ WARN_UNUSED bool OnDeviceRefresh::CheckSystemPropertiesHaveNotChanged(
     checked_properties.insert(pair.getK());
   }
 
-  const std::unordered_map<std::string, std::string>& system_properties =
-      config_.GetSystemProperties();
+  const OdrSystemProperties& system_properties = config_.GetSystemProperties();
 
   for (const auto& [key, value] : system_properties) {
     checked_properties.insert(key);
   }
 
   for (const std::string& name : checked_properties) {
-    auto property_it = system_properties.find(name);
-    std::string property = property_it != system_properties.end() ? property_it->second : "";
+    std::string property = system_properties.GetOrEmpty(name);
     std::string cached_property = cached_system_properties[name];
 
     if (property != cached_property) {
@@ -1101,16 +1077,20 @@ WARN_UNUSED bool OnDeviceRefresh::CheckSystemPropertiesHaveNotChanged(
 }
 
 WARN_UNUSED bool OnDeviceRefresh::CheckBuildUserfaultFdGc() const {
-  auto it = config_.GetSystemProperties().find("ro.dalvik.vm.enable_uffd_gc");
-  bool build_enable_uffd_gc = it != config_.GetSystemProperties().end() ?
-                                  ParseBool(it->second) == ParseBoolResult::kTrue :
-                                  false;
+  bool build_enable_uffd_gc =
+      config_.GetSystemProperties().GetBool("ro.dalvik.vm.enable_uffd_gc", /*default_value=*/false);
+  bool is_at_least_u = IsAtLeastU();
   bool kernel_supports_uffd = KernelSupportsUffd();
-  if (build_enable_uffd_gc && !kernel_supports_uffd) {
+  if (!art::odrefresh::CheckBuildUserfaultFdGc(
+          build_enable_uffd_gc, is_at_least_u, kernel_supports_uffd)) {
     // Normally, this should not happen. If this happens, the system image was probably built with a
     // wrong PRODUCT_ENABLE_UFFD_GC flag.
-    LOG(WARNING) << "Userfaultfd GC check failed (build-time: {}, runtime: {})."_format(
-        build_enable_uffd_gc, kernel_supports_uffd);
+    LOG(WARNING) << ART_FORMAT(
+        "Userfaultfd GC check failed (build_enable_uffd_gc: {}, is_at_least_u: {}, "
+        "kernel_supports_uffd: {}).",
+        build_enable_uffd_gc,
+        is_at_least_u,
+        kernel_supports_uffd);
     return false;
   }
   return true;
@@ -1152,14 +1132,18 @@ WARN_UNUSED PreconditionCheckResult OnDeviceRefresh::CheckPreconditionForSystem(
 WARN_UNUSED static bool CheckModuleInfo(const art_apex::ModuleInfo& cached_info,
                                         const apex::ApexInfo& current_info) {
   if (cached_info.getVersionCode() != current_info.getVersionCode()) {
-    LOG(INFO) << "APEX ({}) version code mismatch (before: {}, now: {})"_format(
-        current_info.getModuleName(), cached_info.getVersionCode(), current_info.getVersionCode());
+    LOG(INFO) << ART_FORMAT("APEX ({}) version code mismatch (before: {}, now: {})",
+                            current_info.getModuleName(),
+                            cached_info.getVersionCode(),
+                            current_info.getVersionCode());
     return false;
   }
 
   if (cached_info.getVersionName() != current_info.getVersionName()) {
-    LOG(INFO) << "APEX ({}) version name mismatch (before: {}, now: {})"_format(
-        current_info.getModuleName(), cached_info.getVersionName(), current_info.getVersionName());
+    LOG(INFO) << ART_FORMAT("APEX ({}) version name mismatch (before: {}, now: {})",
+                            current_info.getModuleName(),
+                            cached_info.getVersionName(),
+                            current_info.getVersionName());
     return false;
   }
 
@@ -1169,10 +1153,10 @@ WARN_UNUSED static bool CheckModuleInfo(const art_apex::ModuleInfo& cached_info,
   const int64_t cached_last_update_millis =
       cached_info.hasLastUpdateMillis() ? cached_info.getLastUpdateMillis() : -1;
   if (cached_last_update_millis != current_info.getLastUpdateMillis()) {
-    LOG(INFO) << "APEX ({}) last update time mismatch (before: {}, now: {})"_format(
-        current_info.getModuleName(),
-        cached_info.getLastUpdateMillis(),
-        current_info.getLastUpdateMillis());
+    LOG(INFO) << ART_FORMAT("APEX ({}) last update time mismatch (before: {}, now: {})",
+                            current_info.getModuleName(),
+                            cached_info.getLastUpdateMillis(),
+                            current_info.getLastUpdateMillis());
     return false;
   }
 
@@ -1356,12 +1340,12 @@ WARN_UNUSED BootImages OnDeviceRefresh::CheckBootClasspathArtifactsAreUpToDate(
   }
 
   if (boot_images_on_system.Count() == BootImages::kMaxCount) {
-    LOG(INFO) << "Boot images on /system OK ({})"_format(isa_str);
+    LOG(INFO) << ART_FORMAT("Boot images on /system OK ({})", isa_str);
     // Nothing to compile.
     return BootImages{.primary_boot_image = false, .boot_image_mainline_extension = false};
   }
 
-  LOG(INFO) << "Checking boot images /data ({})"_format(isa_str);
+  LOG(INFO) << ART_FORMAT("Checking boot images /data ({})", isa_str);
   BootImages boot_images_on_data{.primary_boot_image = false,
                                  .boot_image_mainline_extension = false};
 
@@ -1378,14 +1362,14 @@ WARN_UNUSED BootImages OnDeviceRefresh::CheckBootClasspathArtifactsAreUpToDate(
       // attempt to generate a full boot image even if the minimal one exists.
       if (PrimaryBootImageExist(
               /*on_system=*/false, /*minimal=*/true, isa, &error_msg, checked_artifacts)) {
-        LOG(INFO) << "Found minimal primary boot image ({})"_format(isa_str);
+        LOG(INFO) << ART_FORMAT("Found minimal primary boot image ({})", isa_str);
       }
     }
   } else {
     metrics.SetTrigger(data_result.GetTrigger());
   }
 
-  if (boot_images_on_data.primary_boot_image) {
+  if (boot_images_on_system.primary_boot_image || boot_images_on_data.primary_boot_image) {
     if (data_result.IsBootImageMainlineExtensionOk()) {
       std::string error_msg;
       if (BootImageMainlineExtensionExist(
@@ -1408,7 +1392,7 @@ WARN_UNUSED BootImages OnDeviceRefresh::CheckBootClasspathArtifactsAreUpToDate(
   };
 
   if (boot_images_to_generate.Count() == 0) {
-    LOG(INFO) << "Boot images on /data OK ({})"_format(isa_str);
+    LOG(INFO) << ART_FORMAT("Boot images on /data OK ({})", isa_str);
   }
 
   return boot_images_to_generate;
@@ -1653,15 +1637,16 @@ WARN_UNUSED CompilationResult OnDeviceRefresh::RunDex2oat(
     const std::vector<std::string>& boot_classpath,
     const std::vector<std::string>& input_boot_images,
     const OdrArtifacts& artifacts,
-    const std::vector<std::string>& extra_args,
+    CmdlineBuilder&& extra_args,
     /*inout*/ std::vector<std::unique_ptr<File>>& readonly_files_raii) const {
-  std::vector<std::string> args;
-  args.push_back(config_.GetDex2Oat());
+  CmdlineBuilder args;
+  args.Add(config_.GetDex2Oat());
 
   AddDex2OatCommonOptions(args);
   AddDex2OatDebugInfo(args);
   AddDex2OatInstructionSet(args, isa);
-  Result<void> result = AddDex2OatConcurrencyArguments(args, config_.GetCompilationOsMode());
+  Result<void> result = AddDex2OatConcurrencyArguments(
+      args, config_.GetCompilationOsMode(), config_.GetSystemProperties());
   if (!result.ok()) {
     return CompilationResult::Error(OdrMetrics::Status::kUnknown, result.error().message());
   }
@@ -1674,26 +1659,25 @@ WARN_UNUSED CompilationResult OnDeviceRefresh::RunDex2oat(
 
   for (const std::string& dex_file : dex_files) {
     std::string actual_path = RewriteParentDirectoryIfNeeded(dex_file);
-    args.emplace_back("--dex-file=" + dex_file);
+    args.Add("--dex-file=%s", dex_file);
     std::unique_ptr<File> file(OS::OpenFileForReading(actual_path.c_str()));
-    args.emplace_back(StringPrintf("--dex-fd=%d", file->Fd()));
+    args.Add("--dex-fd=%d", file->Fd());
     readonly_files_raii.push_back(std::move(file));
   }
 
-  args.emplace_back("--runtime-arg");
-  args.emplace_back("-Xbootclasspath:" + Join(boot_classpath, ":"));
+  args.AddRuntime("-Xbootclasspath:%s", Join(boot_classpath, ":"));
   result = AddBootClasspathFds(args, readonly_files_raii, boot_classpath);
   if (!result.ok()) {
     return CompilationResult::Error(OdrMetrics::Status::kIoError, result.error().message());
   }
 
   if (!input_boot_images.empty()) {
-    args.emplace_back("--boot-image=" + Join(input_boot_images, ':'));
+    args.Add("--boot-image=%s", Join(input_boot_images, ':'));
     AddCompiledBootClasspathFdsIfAny(
         args, readonly_files_raii, boot_classpath, isa, input_boot_images);
   }
 
-  args.emplace_back("--oat-location=" + artifacts.OatPath());
+  args.Add("--oat-location=%s", artifacts.OatPath());
   std::pair<std::string, const char*> location_kind_pairs[] = {
       std::make_pair(artifacts.ImagePath(), artifacts.ImageKind()),
       std::make_pair(artifacts.OatPath(), "oat"),
@@ -1705,12 +1689,12 @@ WARN_UNUSED CompilationResult OnDeviceRefresh::RunDex2oat(
     if (staging_file == nullptr) {
       return CompilationResult::Error(
           OdrMetrics::Status::kIoError,
-          "Failed to create {} file '{}'"_format(kind, staging_location));
+          ART_FORMAT("Failed to create {} file '{}'", kind, staging_location));
     }
     // Don't check the state of the staging file. It doesn't need to be flushed because it's removed
     // after the compilation regardless of success or failure.
     staging_file->MarkUnchecked();
-    args.emplace_back(StringPrintf("--%s-fd=%d", kind, staging_file->Fd()));
+    args.Add(StringPrintf("--%s-fd=%d", kind, staging_file->Fd()));
     staging_files.emplace_back(std::move(staging_file));
   }
 
@@ -1718,35 +1702,36 @@ WARN_UNUSED CompilationResult OnDeviceRefresh::RunDex2oat(
   if (!EnsureDirectoryExists(install_location)) {
     return CompilationResult::Error(
         OdrMetrics::Status::kIoError,
-        "Error encountered when preparing directory '{}'"_format(install_location));
+        ART_FORMAT("Error encountered when preparing directory '{}'", install_location));
   }
 
-  std::copy(extra_args.begin(), extra_args.end(), std::back_inserter(args));
+  args.Concat(std::move(extra_args));
 
   Timer timer;
   time_t timeout = GetSubprocessTimeout();
-  std::string cmd_line = Join(args, ' ');
-  LOG(INFO) << "{}: {} [timeout {}s]"_format(debug_message, cmd_line, timeout);
+  std::string cmd_line = Join(args.Get(), ' ');
+  LOG(INFO) << ART_FORMAT("{}: {} [timeout {}s]", debug_message, cmd_line, timeout);
   if (config_.GetDryRun()) {
     LOG(INFO) << "Compilation skipped (dry-run).";
     return CompilationResult::Ok();
   }
 
   std::string error_msg;
-  ExecResult dex2oat_result = exec_utils_->ExecAndReturnResult(args, timeout, &error_msg);
+  ExecResult dex2oat_result = exec_utils_->ExecAndReturnResult(args.Get(), timeout, &error_msg);
 
   if (dex2oat_result.exit_code != 0) {
     return CompilationResult::Dex2oatError(
         dex2oat_result.exit_code < 0 ?
             error_msg :
-            "dex2oat returned an unexpected code: {}"_format(dex2oat_result.exit_code),
+            ART_FORMAT("dex2oat returned an unexpected code: {}", dex2oat_result.exit_code),
         timer.duration().count(),
         dex2oat_result);
   }
 
   if (!MoveOrEraseFiles(staging_files, install_location)) {
-    return CompilationResult::Error(OdrMetrics::Status::kIoError,
-                                    "Failed to commit artifacts to '{}'"_format(install_location));
+    return CompilationResult::Error(
+        OdrMetrics::Status::kIoError,
+        ART_FORMAT("Failed to commit artifacts to '{}'", install_location));
   }
 
   return CompilationResult::Dex2oatOk(timer.duration().count(), dex2oat_result);
@@ -1760,11 +1745,11 @@ OnDeviceRefresh::RunDex2oatForBootClasspath(const std::string& staging_dir,
                                             const std::vector<std::string>& boot_classpath,
                                             const std::vector<std::string>& input_boot_images,
                                             const std::string& output_path) const {
-  std::vector<std::string> args;
+  CmdlineBuilder args;
   std::vector<std::unique_ptr<File>> readonly_files_raii;
 
   // Compile as a single image for fewer files and slightly less memory overhead.
-  args.emplace_back("--single-image");
+  args.Add("--single-image");
 
   if (input_boot_images.empty()) {
     // Primary boot image.
@@ -1777,44 +1762,44 @@ OnDeviceRefresh::RunDex2oatForBootClasspath(const std::string& staging_dir,
     }
     const std::string& compiler_filter = config_.GetBootImageCompilerFilter();
     if (!compiler_filter.empty()) {
-      args.emplace_back("--compiler-filter=" + compiler_filter);
+      args.Add("--compiler-filter=%s", compiler_filter);
     } else {
-      args.emplace_back(StringPrintf("--compiler-filter=%s", kPrimaryCompilerFilter));
+      args.Add("--compiler-filter=%s", kPrimaryCompilerFilter);
     }
 
-    args.emplace_back(StringPrintf("--base=0x%08x", ART_BASE_ADDRESS));
+    args.Add(StringPrintf("--base=0x%08x", ART_BASE_ADDRESS));
 
     std::string dirty_image_objects_file(GetAndroidRoot() + "/etc/dirty-image-objects");
     if (OS::FileExists(dirty_image_objects_file.c_str())) {
       std::unique_ptr<File> file(OS::OpenFileForReading(dirty_image_objects_file.c_str()));
-      args.emplace_back(StringPrintf("--dirty-image-objects-fd=%d", file->Fd()));
+      args.Add("--dirty-image-objects-fd=%d", file->Fd());
       readonly_files_raii.push_back(std::move(file));
     } else {
-      LOG(WARNING) << "Missing dirty objects file: '{}'"_format(dirty_image_objects_file);
+      LOG(WARNING) << ART_FORMAT("Missing dirty objects file: '{}'", dirty_image_objects_file);
     }
 
     std::string preloaded_classes_file(GetAndroidRoot() + "/etc/preloaded-classes");
     if (OS::FileExists(preloaded_classes_file.c_str())) {
       std::unique_ptr<File> file(OS::OpenFileForReading(preloaded_classes_file.c_str()));
-      args.emplace_back(StringPrintf("--preloaded-classes-fds=%d", file->Fd()));
+      args.Add("--preloaded-classes-fds=%d", file->Fd());
       readonly_files_raii.push_back(std::move(file));
     } else {
-      LOG(WARNING) << "Missing preloaded classes file: '{}'"_format(preloaded_classes_file);
+      LOG(WARNING) << ART_FORMAT("Missing preloaded classes file: '{}'", preloaded_classes_file);
     }
   } else {
     // Mainline extension.
-    args.emplace_back(StringPrintf("--compiler-filter=%s", kMainlineCompilerFilter));
+    args.Add("--compiler-filter=%s", kMainlineCompilerFilter);
   }
 
   return RunDex2oat(
       staging_dir,
-      "Compiling boot classpath ({}, {})"_format(GetInstructionSetString(isa), debug_name),
+      ART_FORMAT("Compiling boot classpath ({}, {})", GetInstructionSetString(isa), debug_name),
       isa,
       dex_files,
       boot_classpath,
       input_boot_images,
       OdrArtifacts::ForBootImage(output_path),
-      args,
+      std::move(args),
       readonly_files_raii);
 }
 
@@ -1918,7 +1903,7 @@ WARN_UNUSED CompilationResult OnDeviceRefresh::RunDex2oatForSystemServer(
     const std::string& staging_dir,
     const std::string& dex_file,
     const std::vector<std::string>& classloader_context) const {
-  std::vector<std::string> args;
+  CmdlineBuilder args;
   std::vector<std::unique_ptr<File>> readonly_files_raii;
   InstructionSet isa = config_.GetSystemServerIsa();
   std::string output_path = GetSystemServerImagePath(/*on_system=*/false, dex_file);
@@ -1930,18 +1915,18 @@ WARN_UNUSED CompilationResult OnDeviceRefresh::RunDex2oatForSystemServer(
   bool has_added_profile =
       maybe_add_profile && AddDex2OatProfile(args, readonly_files_raii, {profile});
   if (!compiler_filter.empty()) {
-    args.emplace_back("--compiler-filter=" + compiler_filter);
+    args.Add("--compiler-filter=%s", compiler_filter);
   } else if (has_added_profile) {
-    args.emplace_back("--compiler-filter=speed-profile");
+    args.Add("--compiler-filter=speed-profile");
   } else {
-    args.emplace_back("--compiler-filter=speed");
+    args.Add("--compiler-filter=speed");
   }
 
   std::string context_path = Join(classloader_context, ':');
   if (art::ContainsElement(systemserver_classpath_jars_, dex_file)) {
-    args.emplace_back("--class-loader-context=PCL[" + context_path + "]");
+    args.Add("--class-loader-context=PCL[%s]", context_path);
   } else {
-    args.emplace_back("--class-loader-context=PCL[];PCL[" + context_path + "]");
+    args.Add("--class-loader-context=PCL[];PCL[%s]", context_path);
   }
   if (!classloader_context.empty()) {
     std::vector<int> fds;
@@ -1951,22 +1936,23 @@ WARN_UNUSED CompilationResult OnDeviceRefresh::RunDex2oatForSystemServer(
       if (!file->IsValid()) {
         return CompilationResult::Error(
             OdrMetrics::Status::kIoError,
-            "Failed to open classloader context '{}': {}"_format(actual_path, strerror(errno)));
+            ART_FORMAT(
+                "Failed to open classloader context '{}': {}", actual_path, strerror(errno)));
       }
       fds.emplace_back(file->Fd());
       readonly_files_raii.emplace_back(std::move(file));
     }
-    args.emplace_back("--class-loader-context-fds=" + Join(fds, ':'));
+    args.Add("--class-loader-context-fds=%s", Join(fds, ':'));
   }
 
   return RunDex2oat(staging_dir,
-                    "Compiling {}"_format(Basename(dex_file)),
+                    ART_FORMAT("Compiling {}", Basename(dex_file)),
                     isa,
                     {dex_file},
                     boot_classpath_jars_,
                     GetBestBootImages(isa, /*include_mainline_extension=*/true),
                     OdrArtifacts::ForSystemServer(output_path),
-                    args,
+                    std::move(args),
                     readonly_files_raii);
 }
 
@@ -1993,7 +1979,7 @@ OnDeviceRefresh::CompileSystemServer(const std::string& staging_dir,
       if (current_result.IsOk()) {
         on_dex2oat_success();
       } else {
-        LOG(ERROR) << "Compilation of {} failed: {}"_format(Basename(jar), result.error_msg);
+        LOG(ERROR) << ART_FORMAT("Compilation of {} failed: {}", Basename(jar), result.error_msg);
       }
     }
 

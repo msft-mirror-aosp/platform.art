@@ -421,7 +421,10 @@ Heap::Heap(size_t initial_size,
   }
 
   LOG(INFO) << "Using " << foreground_collector_type_ << " GC.";
-  if (!gUseUserfaultfd) {
+  if (gUseUserfaultfd) {
+    CHECK_EQ(foreground_collector_type_, kCollectorTypeCMC);
+    CHECK_EQ(background_collector_type_, kCollectorTypeCMCBackground);
+  } else {
     // This ensures that userfaultfd syscall is done before any seccomp filter is installed.
     // TODO(b/266731037): Remove this when we no longer need to collect metric on userfaultfd
     // support.
@@ -1562,7 +1565,7 @@ void Heap::DoPendingCollectorTransition() {
       VLOG(gc) << "Homogeneous compaction ignored due to jank perceptible process state";
     }
   } else if (desired_collector_type == kCollectorTypeCCBackground ||
-             desired_collector_type == kCollectorTypeCMC) {
+             desired_collector_type == kCollectorTypeCMCBackground) {
     if (!CareAboutPauseTimes()) {
       // Invoke full compaction.
       CollectGarbageInternal(collector::kGcTypeFull,
@@ -3813,10 +3816,18 @@ void Heap::ClampGrowthLimit() {
       malloc_space->ClampGrowthLimit();
     }
   }
+  if (large_object_space_ != nullptr) {
+    large_object_space_->ClampGrowthLimit(capacity_);
+  }
   if (collector_type_ == kCollectorTypeCC) {
     DCHECK(region_space_ != nullptr);
     // Twice the capacity as CC needs extra space for evacuating objects.
     region_space_->ClampGrowthLimit(2 * capacity_);
+  } else if (collector_type_ == kCollectorTypeCMC) {
+    DCHECK(gUseUserfaultfd);
+    DCHECK_NE(mark_compact_, nullptr);
+    DCHECK_NE(bump_pointer_space_, nullptr);
+    mark_compact_->ClampGrowthLimit(capacity_);
   }
   // This space isn't added for performance reasons.
   if (main_space_backup_.get() != nullptr) {
@@ -3975,7 +3986,12 @@ void Heap::RequestCollectorTransition(CollectorType desired_collector_type, uint
     // doesn't change.
     DCHECK_EQ(desired_collector_type_, kCollectorTypeCCBackground);
   }
+  if (collector_type_ == kCollectorTypeCMC) {
+    // For CMC collector type doesn't change.
+    DCHECK_EQ(desired_collector_type_, kCollectorTypeCMCBackground);
+  }
   DCHECK_NE(collector_type_, kCollectorTypeCCBackground);
+  DCHECK_NE(collector_type_, kCollectorTypeCMCBackground);
   CollectorTransitionTask* added_task = nullptr;
   const uint64_t target_time = NanoTime() + delta_time;
   {
