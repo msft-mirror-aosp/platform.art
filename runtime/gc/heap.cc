@@ -2444,9 +2444,11 @@ void Heap::PreZygoteFork() {
     return;
   }
   Runtime* runtime = Runtime::Current();
+  // Setup linear-alloc pool for post-zygote fork allocations before freezing
+  // snapshots of intern-table and class-table.
+  runtime->SetupLinearAllocForPostZygoteFork(self);
   runtime->GetInternTable()->AddNewTable();
   runtime->GetClassLinker()->MoveClassTableToPreZygote();
-  runtime->SetupLinearAllocForPostZygoteFork(self);
   VLOG(heap) << "Starting PreZygoteFork";
   // The end of the non-moving space may be protected, unprotect it so that we can copy the zygote
   // there.
@@ -3752,7 +3754,10 @@ void Heap::GrowForUtilization(collector::GarbageCollector* collector_ran,
       grow_bytes = 0;
     }
   }
-  CHECK_LE(target_size, std::numeric_limits<size_t>::max());
+  CHECK_LE(target_size, std::numeric_limits<size_t>::max())
+      << " bytes_allocated:" << bytes_allocated
+      << " bytes_freed:" << current_gc_iteration_.GetFreedBytes()
+      << " large_obj_bytes_freed:" << current_gc_iteration_.GetFreedLargeObjectBytes();
   if (!ignore_target_footprint_) {
     SetIdealFootprint(target_size);
     // Store target size (computed with foreground heap growth multiplier) for updating
@@ -4531,10 +4536,9 @@ mirror::Object* Heap::AllocWithNewTLAB(Thread* self,
     }
     // Try allocating a new thread local buffer, if the allocation fails the space must be
     // full so return null.
-    if (!bump_pointer_space_->AllocNewTlab(self, new_tlab_size)) {
+    if (!bump_pointer_space_->AllocNewTlab(self, new_tlab_size, bytes_tl_bulk_allocated)) {
       return nullptr;
     }
-    *bytes_tl_bulk_allocated = new_tlab_size;
     if (CheckPerfettoJHPEnabled()) {
       VLOG(heap) << "JHP:kAllocatorTypeTLAB, New Tlab bytes allocated= " << new_tlab_size;
     }

@@ -46,7 +46,7 @@ void SystemPropertyForeach(std::function<void(const char* name, const char* valu
 
 // Returns true if the build-time UFFD GC matches the runtime's choice.
 bool CheckBuildUserfaultFdGc(bool build_enable_uffd_gc,
-                             bool is_at_least_u,
+                             bool is_at_least_t,
                              bool kernel_supports_uffd);
 
 }  // namespace odrefresh

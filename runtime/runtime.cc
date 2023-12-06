@@ -744,10 +744,77 @@ class UpdateMethodsPreFirstForkVisitor : public ClassVisitor {
   DISALLOW_COPY_AND_ASSIGN(UpdateMethodsPreFirstForkVisitor);
 };
 
+// Wait until the kernel thinks we are single-threaded again.
+static void WaitUntilSingleThreaded() {
+#if defined(__linux__)
+  // Read num_threads field from /proc/self/stat, avoiding higher-level IO libraries that may
+  // break atomicity of the read.
+  static constexpr size_t kNumTries = 1000;
+  static constexpr size_t kNumThreadsIndex = 20;
+  for (size_t tries = 0; tries < kNumTries; ++tries) {
+    static constexpr int BUF_SIZE = 500;
+    char buf[BUF_SIZE];
+    int stat_fd = open("/proc/self/stat", O_RDONLY | O_CLOEXEC);
+    CHECK(stat_fd >= 0) << strerror(errno);
+    ssize_t bytes_read = TEMP_FAILURE_RETRY(read(stat_fd, buf, BUF_SIZE));
+    CHECK(bytes_read >= 0) << strerror(errno);
+    int ret = close(stat_fd);
+    DCHECK(ret == 0) << strerror(errno);
+    ssize_t pos = 0;
+    while (pos < bytes_read && buf[pos++] != ')') {}
+    ++pos;
+    // We're now positioned at the beginning of the third field. Don't count blanks embedded in
+    // second (command) field.
+    size_t blanks_seen = 2;
+    while (pos < bytes_read && blanks_seen < kNumThreadsIndex - 1) {
+      if (buf[pos++] == ' ') {
+        ++blanks_seen;
+      }
+    }
+    CHECK(pos < bytes_read - 2);
+    // pos is first character of num_threads field.
+    CHECK_EQ(buf[pos + 1], ' ');  // We never have more than single-digit threads here.
+    if (buf[pos] == '1') {
+      return;  //  num_threads == 1; success.
+    }
+    usleep(1000);
+  }
+  LOG(FATAL) << "Failed to reach single-threaded state";
+#else  // Not Linux; shouldn't matter, but this has a high probability of working slowly.
+  usleep(20'000);
+#endif
+}
+
 void Runtime::PreZygoteFork() {
   if (GetJit() != nullptr) {
     GetJit()->PreZygoteFork();
   }
+  // All other threads have already been joined, but they may not have finished
+  // removing themselves from the thread list. Wait until the other threads have completely
+  // finished, and are no longer in the thread list.
+  // TODO: Since the threads Unregister() themselves before exiting, the first wait should be
+  // unnecessary. But since we're reading from a /proc entry that's concurrently changing, for
+  // now we play this as safe as possible.
+  ThreadList* tl = GetThreadList();
+  {
+    Thread* self = Thread::Current();
+    MutexLock mu(self, *Locks::thread_list_lock_);
+    tl->WaitForUnregisterToComplete(self);
+    if (kIsDebugBuild) {
+      auto list = tl->GetList();
+      if (list.size() != 1) {
+        for (Thread* t : list) {
+          std::string name;
+          t->GetThreadName(name);
+          LOG(ERROR) << "Remaining pre-fork thread: " << name;
+        }
+      }
+    }
+    CHECK_EQ(tl->Size(), 1u);
+    // And then wait until the kernel thinks the threads are gone.
+    WaitUntilSingleThreaded();
+  }
+
   if (!heap_->HasZygoteSpace()) {
     Thread* self = Thread::Current();
     // This is the first fork. Update ArtMethods in the boot classpath now to
@@ -790,7 +857,11 @@ void Runtime::CallExitHook(jint status) {
 }
 
 void Runtime::SweepSystemWeaks(IsMarkedVisitor* visitor) {
-  GetInternTable()->SweepInternTableWeaks(visitor);
+  // Userfaultfd compaction updates weak intern-table page-by-page via
+  // LinearAlloc.
+  if (!GetHeap()->IsPerformingUffdCompaction()) {
+    GetInternTable()->SweepInternTableWeaks(visitor);
+  }
   GetMonitorList()->SweepMonitorList(visitor);
   GetJavaVM()->SweepJniWeakGlobals(visitor);
   GetHeap()->SweepAllocationRecords(visitor);
@@ -885,7 +956,8 @@ static jobject CreateSystemClassLoader(Runtime* runtime) {
   CHECK(getSystemClassLoader->IsStatic());
 
   ObjPtr<mirror::Object> system_class_loader = getSystemClassLoader->InvokeStatic<'L'>(soa.Self());
-  CHECK(system_class_loader != nullptr);
+  CHECK(system_class_loader != nullptr)
+      << (soa.Self()->IsExceptionPending() ? soa.Self()->GetException()->Dump() : "<null>");
 
   ScopedAssertNoThreadSuspension sants(__FUNCTION__);
   jobject g_system_class_loader =
@@ -2507,8 +2579,14 @@ void Runtime::VisitConstantRoots(RootVisitor* visitor) {
 }
 
 void Runtime::VisitConcurrentRoots(RootVisitor* visitor, VisitRootFlags flags) {
-  intern_table_->VisitRoots(visitor, flags);
-  class_linker_->VisitRoots(visitor, flags);
+  // Userfaultfd compaction updates intern-tables and class-tables page-by-page
+  // via LinearAlloc. So don't visit them here.
+  if (GetHeap()->IsPerformingUffdCompaction()) {
+    class_linker_->VisitRoots(visitor, flags, /*visit_class_roots=*/false);
+  } else {
+    intern_table_->VisitRoots(visitor, flags);
+    class_linker_->VisitRoots(visitor, flags, /*visit_class_roots=*/true);
+  }
   jni_id_manager_->VisitRoots(visitor);
   heap_->VisitAllocationRecords(visitor);
   if (jit_ != nullptr) {
