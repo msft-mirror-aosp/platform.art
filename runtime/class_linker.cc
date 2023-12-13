@@ -2420,17 +2420,9 @@ void ClassLinker::VisitClassRoots(RootVisitor* visitor, VisitRootFlags flags) {
     boot_class_table_->VisitRoots(root_visitor);
     // If tracing is enabled, then mark all the class loaders to prevent unloading.
     if ((flags & kVisitRootFlagClassLoader) != 0 || tracing_enabled) {
-      gc::Heap* const heap = Runtime::Current()->GetHeap();
-      // Don't visit class-loaders if compacting with userfaultfd GC as these
-      // weaks are updated using Runtime::SweepSystemWeaks() and the GC doesn't
-      // tolerate double updates.
-      if (!heap->IsPerformingUffdCompaction()) {
-        for (const ClassLoaderData& data : class_loaders_) {
-          GcRoot<mirror::Object> root(GcRoot<mirror::Object>(self->DecodeJObject(data.weak_root)));
-          root.VisitRoot(visitor, RootInfo(kRootVMInternal));
-        }
-      } else {
-        DCHECK_EQ(heap->CurrentCollectorType(), gc::CollectorType::kCollectorTypeCMC);
+      for (const ClassLoaderData& data : class_loaders_) {
+        GcRoot<mirror::Object> root(GcRoot<mirror::Object>(self->DecodeJObject(data.weak_root)));
+        root.VisitRoot(visitor, RootInfo(kRootVMInternal));
       }
     }
   } else if (!gUseReadBarrier && (flags & kVisitRootFlagNewRoots) != 0) {
@@ -2470,9 +2462,11 @@ void ClassLinker::VisitClassRoots(RootVisitor* visitor, VisitRootFlags flags) {
 // Keep in sync with InitCallback. Anything we visit, we need to
 // reinit references to when reinitializing a ClassLinker from a
 // mapped image.
-void ClassLinker::VisitRoots(RootVisitor* visitor, VisitRootFlags flags) {
+void ClassLinker::VisitRoots(RootVisitor* visitor, VisitRootFlags flags, bool visit_class_roots) {
   class_roots_.VisitRootIfNonNull(visitor, RootInfo(kRootVMInternal));
-  VisitClassRoots(visitor, flags);
+  if (visit_class_roots) {
+    VisitClassRoots(visitor, flags);
+  }
   // Instead of visiting the find_array_class_cache_ drop it so that it doesn't prevent class
   // unloading if we are marking roots.
   DropFindArrayClassCache();
@@ -2625,7 +2619,11 @@ ClassLinker::~ClassLinker() {
   for (const ClassLoaderData& data : class_loaders_) {
     // CHA unloading analysis is not needed. No negative consequences are expected because
     // all the classloaders are deleted at the same time.
-    DeleteClassLoader(self, data, /*cleanup_cha=*/ false);
+    PrepareToDeleteClassLoader(self, data, /*cleanup_cha=*/false);
+  }
+  for (const ClassLoaderData& data : class_loaders_) {
+    delete data.allocator;
+    delete data.class_table;
   }
   class_loaders_.clear();
   while (!running_visibly_initialized_callbacks_.empty()) {
@@ -2635,7 +2633,9 @@ ClassLinker::~ClassLinker() {
   }
 }
 
-void ClassLinker::DeleteClassLoader(Thread* self, const ClassLoaderData& data, bool cleanup_cha) {
+void ClassLinker::PrepareToDeleteClassLoader(Thread* self,
+                                             const ClassLoaderData& data,
+                                             bool cleanup_cha) {
   Runtime* const runtime = Runtime::Current();
   JavaVMExt* const vm = runtime->GetJavaVM();
   vm->DeleteWeakGlobalRef(self, data.weak_root);
@@ -2666,9 +2666,6 @@ void ClassLinker::DeleteClassLoader(Thread* self, const ClassLoaderData& data, b
       }
     }
   }
-
-  delete data.allocator;
-  delete data.class_table;
 }
 
 ObjPtr<mirror::PointerArray> ClassLinker::AllocPointerArray(Thread* self, size_t length) {
@@ -3431,6 +3428,7 @@ ObjPtr<mirror::Class> ClassLinker::DefineClass(Thread* self,
     return sdc.Finish(nullptr);
   }
 
+  ScopedTrace trace(descriptor);
   if (klass == nullptr) {
     // Allocate a class with the status of not ready.
     // Interface object should get the right size here. Regular class will
@@ -7917,9 +7915,9 @@ void ClassLinker::LinkMethodsHelper<kPointerSize>::ReallocMethods(ObjPtr<mirror:
                                                                       kMethodSize,
                                                                       kMethodAlignment);
   const size_t old_methods_ptr_size = (old_methods != nullptr) ? old_size : 0;
-  auto* methods = reinterpret_cast<LengthPrefixedArray<ArtMethod>*>(
-      class_linker_->GetAllocatorForClassLoader(klass->GetClassLoader())->Realloc(
-          self_, old_methods, old_methods_ptr_size, new_size, LinearAllocKind::kArtMethodArray));
+  LinearAlloc* allocator = class_linker_->GetAllocatorForClassLoader(klass->GetClassLoader());
+  auto* methods = reinterpret_cast<LengthPrefixedArray<ArtMethod>*>(allocator->Realloc(
+      self_, old_methods, old_methods_ptr_size, new_size, LinearAllocKind::kArtMethodArray));
   CHECK(methods != nullptr);  // Native allocation failure aborts.
 
   if (methods != old_methods) {
@@ -7932,12 +7930,9 @@ void ClassLinker::LinkMethodsHelper<kPointerSize>::ReallocMethods(ObjPtr<mirror:
         ++out;
       }
     } else if (gUseUserfaultfd) {
-      // Clear the declaring class of the old dangling method array so that GC doesn't
-      // try to update them, which could cause crashes in userfaultfd GC due to
-      // checks in post-compact address computation.
-      for (auto& m : klass->GetMethods(kPointerSize)) {
-        m.SetDeclaringClass(nullptr);
-      }
+      // In order to make compaction code skip updating the declaring_class_ in
+      // old_methods, convert it into a 'no GC-root' array.
+      allocator->ConvertToNoGcRoots(old_methods, LinearAllocKind::kArtMethodArray);
     }
   }
 
@@ -10847,8 +10842,12 @@ void ClassLinker::CleanupClassLoaders() {
     ScopedDebugDisallowReadBarriers sddrb(self);
     for (ClassLoaderData& data : to_delete) {
       // CHA unloading analysis and SingleImplementaion cleanups are required.
-      DeleteClassLoader(self, data, /*cleanup_cha=*/ true);
+      PrepareToDeleteClassLoader(self, data, /*cleanup_cha=*/true);
     }
+  }
+  for (const ClassLoaderData& data : to_delete) {
+    delete data.allocator;
+    delete data.class_table;
   }
   Runtime* runtime = Runtime::Current();
   if (!unregistered_oat_files.empty()) {

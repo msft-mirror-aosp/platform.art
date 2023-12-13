@@ -76,6 +76,7 @@ class MarkCompact final : public GarbageCollector {
 
   void RunPhases() override REQUIRES(!Locks::mutator_lock_, !lock_);
 
+  void ClampGrowthLimit(size_t new_capacity) REQUIRES(Locks::heap_bitmap_lock_);
   // Updated before (or in) pre-compaction pause and is accessed only in the
   // pause or during concurrent compaction. The flag is reset in next GC cycle's
   // InitializePhase(). Therefore, it's safe to update without any memory ordering.
@@ -135,7 +136,7 @@ class MarkCompact final : public GarbageCollector {
 
   mirror::Object* GetFromSpaceAddrFromBarrier(mirror::Object* old_ref) {
     CHECK(compacting_);
-    if (live_words_bitmap_->HasAddress(old_ref)) {
+    if (HasAddress(old_ref)) {
       return GetFromSpaceAddr(old_ref);
     }
     return old_ref;
@@ -166,6 +167,13 @@ class MarkCompact final : public GarbageCollector {
     kProcessedAndMapped = 6     // Processed and mapped. For SIGBUS.
   };
 
+  // Different heap clamping states.
+  enum class ClampInfoStatus : uint8_t {
+    kClampInfoNotDone,
+    kClampInfoPending,
+    kClampInfoFinished
+  };
+
  private:
   using ObjReference = mirror::CompressedReference<mirror::Object>;
   // Number of bits (live-words) covered by a single chunk-info (below)
@@ -191,6 +199,7 @@ class MarkCompact final : public GarbageCollector {
     static constexpr uint32_t kBitmapWordsPerVectorWord =
             kBitsPerVectorWord / Bitmap::kBitsPerBitmapWord;
     static_assert(IsPowerOfTwo(kBitmapWordsPerVectorWord));
+    using MemRangeBitmap::SetBitmapSize;
     static LiveWordsBitmap* Create(uintptr_t begin, uintptr_t end);
 
     // Return offset (within the indexed chunk-info) of the nth live word.
@@ -231,11 +240,19 @@ class MarkCompact final : public GarbageCollector {
     }
   };
 
+  static bool HasAddress(mirror::Object* obj, uint8_t* begin, uint8_t* end) {
+    uint8_t* ptr = reinterpret_cast<uint8_t*>(obj);
+    return ptr >= begin && ptr < end;
+  }
+
+  bool HasAddress(mirror::Object* obj) const {
+    return HasAddress(obj, moving_space_begin_, moving_space_end_);
+  }
   // For a given object address in pre-compact space, return the corresponding
   // address in the from-space, where heap pages are relocated in the compaction
   // pause.
   mirror::Object* GetFromSpaceAddr(mirror::Object* obj) const {
-    DCHECK(live_words_bitmap_->HasAddress(obj)) << " obj=" << obj;
+    DCHECK(HasAddress(obj)) << " obj=" << obj;
     return reinterpret_cast<mirror::Object*>(reinterpret_cast<uintptr_t>(obj)
                                              + from_space_slide_diff_);
   }
@@ -257,9 +274,11 @@ class MarkCompact final : public GarbageCollector {
       REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!Locks::heap_bitmap_lock_);
   // Update the reference at given offset in the given object with post-compact
-  // address.
-  ALWAYS_INLINE void UpdateRef(mirror::Object* obj, MemberOffset offset)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+  // address. [begin, end) is moving-space range.
+  ALWAYS_INLINE void UpdateRef(mirror::Object* obj,
+                               MemberOffset offset,
+                               uint8_t* begin,
+                               uint8_t* end) REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Verify that the gc-root is updated only once. Returns false if the update
   // shouldn't be done.
@@ -267,16 +286,23 @@ class MarkCompact final : public GarbageCollector {
                                             mirror::Object* old_ref,
                                             const RootInfo& info)
       REQUIRES_SHARED(Locks::mutator_lock_);
-  // Update the given root with post-compact address.
+  // Update the given root with post-compact address. [begin, end) is
+  // moving-space range.
   ALWAYS_INLINE void UpdateRoot(mirror::CompressedReference<mirror::Object>* root,
+                                uint8_t* begin,
+                                uint8_t* end,
                                 const RootInfo& info = RootInfo(RootType::kRootUnknown))
       REQUIRES_SHARED(Locks::mutator_lock_);
   ALWAYS_INLINE void UpdateRoot(mirror::Object** root,
+                                uint8_t* begin,
+                                uint8_t* end,
                                 const RootInfo& info = RootInfo(RootType::kRootUnknown))
       REQUIRES_SHARED(Locks::mutator_lock_);
   // Given the pre-compact address, the function returns the post-compact
-  // address of the given object.
-  ALWAYS_INLINE mirror::Object* PostCompactAddress(mirror::Object* old_ref) const
+  // address of the given object. [begin, end) is moving-space range.
+  ALWAYS_INLINE mirror::Object* PostCompactAddress(mirror::Object* old_ref,
+                                                   uint8_t* begin,
+                                                   uint8_t* end) const
       REQUIRES_SHARED(Locks::mutator_lock_);
   // Compute post-compact address of an object in moving space. This function
   // assumes that old_ref is in moving space.
@@ -526,6 +552,19 @@ class MarkCompact final : public GarbageCollector {
                                  uint8_t* shadow_page,
                                  Atomic<PageState>& state,
                                  bool page_touched);
+  // Called for clamping of 'info_map_' and other GC data structures, which are
+  // small and/or in >4GB address space. There is no real benefit of clamping
+  // them synchronously during app forking. It clamps only if clamp_info_map_status_
+  // is set to kClampInfoPending, which is done by ClampGrowthLimit().
+  void MaybeClampGcStructures() REQUIRES(Locks::heap_bitmap_lock_);
+  // Initialize all the info-map related fields of this GC. Returns total size
+  // of all the structures in info-map.
+  size_t InitializeInfoMap(uint8_t* p, size_t moving_space_sz);
+  // Update class-table classes in compaction pause if we are running in debuggable
+  // mode. Only visit class-table in image spaces if 'immune_class_table_only'
+  // is true.
+  void UpdateClassTableClasses(Runtime* runtime, bool immune_class_table_only)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   // For checkpoints
   Barrier gc_barrier_;
@@ -690,6 +729,11 @@ class MarkCompact final : public GarbageCollector {
   size_t black_page_count_;
 
   uint8_t* from_space_begin_;
+  // Cached values of moving-space range to optimize checking if reference
+  // belongs to moving-space or not. May get updated if and when heap is
+  // clamped.
+  uint8_t* const moving_space_begin_;
+  uint8_t* moving_space_end_;
   // moving-space's end pointer at the marking pause. All allocations beyond
   // this will be considered black in the current GC cycle. Aligned up to page
   // size.
@@ -761,6 +805,10 @@ class MarkCompact final : public GarbageCollector {
   // non-zygote processes during first GC, which sets up everyting for using
   // minor-fault from next GC.
   bool map_linear_alloc_shared_;
+  // Clamping statue of `info_map_`. Initialized with 'NotDone'. Once heap is
+  // clamped but info_map_ is delayed, we set it to 'Pending'. Once 'info_map_'
+  // is also clamped, then we set it to 'Finished'.
+  ClampInfoStatus clamp_info_map_status_;
 
   class FlipCallback;
   class ThreadFlipVisitor;
@@ -781,6 +829,7 @@ class MarkCompact final : public GarbageCollector {
 };
 
 std::ostream& operator<<(std::ostream& os, MarkCompact::PageState value);
+std::ostream& operator<<(std::ostream& os, MarkCompact::ClampInfoStatus value);
 
 }  // namespace collector
 }  // namespace gc
