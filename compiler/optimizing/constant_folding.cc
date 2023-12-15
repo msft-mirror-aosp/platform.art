@@ -59,6 +59,8 @@ class HConstantFoldingVisitor final : public HGraphDelegateVisitor {
   // Intrinsics foldings
   void FoldReverseIntrinsic(HInvoke* invoke);
   void FoldReverseBytesIntrinsic(HInvoke* invoke);
+  void FoldBitCountIntrinsic(HInvoke* invoke);
+  void FoldDivideUnsignedIntrinsic(HInvoke* invoke);
   void FoldHighestOneBitIntrinsic(HInvoke* invoke);
   void FoldLowestOneBitIntrinsic(HInvoke* invoke);
   void FoldNumberOfLeadingZerosIntrinsic(HInvoke* invoke);
@@ -374,6 +376,14 @@ void HConstantFoldingVisitor::VisitInvoke(HInvoke* inst) {
     case Intrinsics::kShortReverseBytes:
       FoldReverseBytesIntrinsic(inst);
       break;
+    case Intrinsics::kIntegerBitCount:
+    case Intrinsics::kLongBitCount:
+      FoldBitCountIntrinsic(inst);
+      break;
+    case Intrinsics::kIntegerDivideUnsigned:
+    case Intrinsics::kLongDivideUnsigned:
+      FoldDivideUnsignedIntrinsic(inst);
+      break;
     case Intrinsics::kIntegerHighestOneBit:
     case Intrinsics::kLongHighestOneBit:
       FoldHighestOneBitIntrinsic(inst);
@@ -439,6 +449,72 @@ void HConstantFoldingVisitor::FoldReverseBytesIntrinsic(HInvoke* inst) {
     inst->ReplaceWith(GetGraph()->GetIntConstant(
         BSWAP(dchecked_integral_cast<int16_t>(input->AsIntConstant()->GetValue()))));
   }
+  inst->GetBlock()->RemoveInstruction(inst);
+}
+
+void HConstantFoldingVisitor::FoldBitCountIntrinsic(HInvoke* inst) {
+  DCHECK(inst->GetIntrinsic() == Intrinsics::kIntegerBitCount ||
+         inst->GetIntrinsic() == Intrinsics::kLongBitCount);
+
+  HInstruction* input = inst->InputAt(0);
+  if (!input->IsConstant()) {
+    return;
+  }
+
+  DCHECK_IMPLIES(inst->GetIntrinsic() == Intrinsics::kIntegerBitCount, input->IsIntConstant());
+  DCHECK_IMPLIES(inst->GetIntrinsic() == Intrinsics::kLongBitCount, input->IsLongConstant());
+
+  // Note that both the Integer and Long intrinsics return an int as a result.
+  int result = inst->GetIntrinsic() == Intrinsics::kIntegerBitCount ?
+                   POPCOUNT(input->AsIntConstant()->GetValue()) :
+                   POPCOUNT(input->AsLongConstant()->GetValue());
+  inst->ReplaceWith(GetGraph()->GetIntConstant(result));
+  inst->GetBlock()->RemoveInstruction(inst);
+}
+
+void HConstantFoldingVisitor::FoldDivideUnsignedIntrinsic(HInvoke* inst) {
+  DCHECK(inst->GetIntrinsic() == Intrinsics::kIntegerDivideUnsigned ||
+         inst->GetIntrinsic() == Intrinsics::kLongDivideUnsigned);
+
+  HInstruction* divisor = inst->InputAt(1);
+  if (!divisor->IsConstant()) {
+    return;
+  }
+  DCHECK_IMPLIES(inst->GetIntrinsic() == Intrinsics::kIntegerDivideUnsigned,
+                 divisor->IsIntConstant());
+  DCHECK_IMPLIES(inst->GetIntrinsic() == Intrinsics::kLongDivideUnsigned,
+                 divisor->IsLongConstant());
+  const bool is_int_intrinsic = inst->GetIntrinsic() == Intrinsics::kIntegerDivideUnsigned;
+  if ((is_int_intrinsic && divisor->AsIntConstant()->IsArithmeticZero()) ||
+      (!is_int_intrinsic && divisor->AsLongConstant()->IsArithmeticZero())) {
+    // We will be throwing, don't constant fold.
+    inst->SetAlwaysThrows(true);
+    GetGraph()->SetHasAlwaysThrowingInvokes(true);
+    return;
+  }
+
+  HInstruction* dividend = inst->InputAt(0);
+  if (!dividend->IsConstant()) {
+    return;
+  }
+  DCHECK_IMPLIES(inst->GetIntrinsic() == Intrinsics::kIntegerDivideUnsigned,
+                 dividend->IsIntConstant());
+  DCHECK_IMPLIES(inst->GetIntrinsic() == Intrinsics::kLongDivideUnsigned,
+                 dividend->IsLongConstant());
+
+  if (is_int_intrinsic) {
+    uint32_t dividend_val =
+        dchecked_integral_cast<uint32_t>(dividend->AsIntConstant()->GetValueAsUint64());
+    uint32_t divisor_val =
+        dchecked_integral_cast<uint32_t>(divisor->AsIntConstant()->GetValueAsUint64());
+    inst->ReplaceWith(GetGraph()->GetIntConstant(static_cast<int32_t>(dividend_val / divisor_val)));
+  } else {
+    uint64_t dividend_val = dividend->AsLongConstant()->GetValueAsUint64();
+    uint64_t divisor_val = divisor->AsLongConstant()->GetValueAsUint64();
+    inst->ReplaceWith(
+        GetGraph()->GetLongConstant(static_cast<int64_t>(dividend_val / divisor_val)));
+  }
+
   inst->GetBlock()->RemoveInstruction(inst);
 }
 

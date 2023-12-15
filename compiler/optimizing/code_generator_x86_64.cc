@@ -524,7 +524,6 @@ class ReadBarrierMarkSlowPathX86_64 : public SlowPathCode {
     DCHECK(locations->CanCall());
     DCHECK(!locations->GetLiveRegisters()->ContainsCoreRegister(ref_reg)) << ref_reg;
     DCHECK(instruction_->IsInstanceFieldGet() ||
-           instruction_->IsPredicatedInstanceFieldGet() ||
            instruction_->IsStaticFieldGet() ||
            instruction_->IsArrayGet() ||
            instruction_->IsArraySet() ||
@@ -620,7 +619,9 @@ class ReadBarrierMarkAndUpdateFieldSlowPathX86_64 : public SlowPathCode {
         << "Unexpected instruction in read barrier marking and field updating slow path: "
         << instruction_->DebugName();
     HInvoke* invoke = instruction_->AsInvoke();
-    DCHECK(IsUnsafeCASObject(invoke) || IsVarHandleCASFamily(invoke)) << invoke->GetIntrinsic();
+    DCHECK(IsUnsafeCASReference(invoke) ||
+           IsUnsafeGetAndSetReference(invoke) ||
+           IsVarHandleCASFamily(invoke)) << invoke->GetIntrinsic();
 
     __ Bind(GetEntryLabel());
     if (unpoison_ref_before_marking_) {
@@ -667,7 +668,7 @@ class ReadBarrierMarkAndUpdateFieldSlowPathX86_64 : public SlowPathCode {
     __ cmpl(temp1_, ref_cpu_reg);
     __ j(kEqual, &done);
 
-    // Update the the holder's field atomically.  This may fail if
+    // Update the holder's field atomically.  This may fail if
     // mutator updates before us, but it's OK.  This is achived
     // using a strong compare-and-set (CAS) operation with relaxed
     // memory synchronization ordering, where the expected value is
@@ -784,7 +785,6 @@ class ReadBarrierForHeapReferenceSlowPathX86_64 : public SlowPathCode {
     DCHECK(locations->CanCall());
     DCHECK(!locations->GetLiveRegisters()->ContainsCoreRegister(reg_out.AsRegister())) << out_;
     DCHECK(instruction_->IsInstanceFieldGet() ||
-           instruction_->IsPredicatedInstanceFieldGet() ||
            instruction_->IsStaticFieldGet() ||
            instruction_->IsArrayGet() ||
            instruction_->IsInstanceOf() ||
@@ -857,10 +857,11 @@ class ReadBarrierForHeapReferenceSlowPathX86_64 : public SlowPathCode {
         DCHECK(instruction_->GetLocations()->Intrinsified());
         DCHECK((instruction_->AsInvoke()->GetIntrinsic() == Intrinsics::kUnsafeGetObject) ||
                (instruction_->AsInvoke()->GetIntrinsic() == Intrinsics::kUnsafeGetObjectVolatile) ||
-               (instruction_->AsInvoke()->GetIntrinsic() == Intrinsics::kJdkUnsafeGetObject) ||
+               (instruction_->AsInvoke()->GetIntrinsic() == Intrinsics::kJdkUnsafeGetReference) ||
                (instruction_->AsInvoke()->GetIntrinsic() ==
-                    Intrinsics::kJdkUnsafeGetObjectVolatile) ||
-               (instruction_->AsInvoke()->GetIntrinsic() == Intrinsics::kJdkUnsafeGetObjectAcquire))
+                    Intrinsics::kJdkUnsafeGetReferenceVolatile) ||
+               (instruction_->AsInvoke()->GetIntrinsic() ==
+                    Intrinsics::kJdkUnsafeGetReferenceAcquire))
             << instruction_->AsInvoke()->GetIntrinsic();
         DCHECK_EQ(offset_, 0U);
         DCHECK(index_.IsRegister());
@@ -1008,11 +1009,15 @@ class MethodEntryExitHooksSlowPathX86_64 : public SlowPathCode {
 
 class CompileOptimizedSlowPathX86_64 : public SlowPathCode {
  public:
-  CompileOptimizedSlowPathX86_64() : SlowPathCode(/* instruction= */ nullptr) {}
+  explicit CompileOptimizedSlowPathX86_64(uint64_t counter_address)
+      : SlowPathCode(/* instruction= */ nullptr),
+        counter_address_(counter_address) {}
 
   void EmitNativeCode(CodeGenerator* codegen) override {
     CodeGeneratorX86_64* x86_64_codegen = down_cast<CodeGeneratorX86_64*>(codegen);
     __ Bind(GetEntryLabel());
+    __ movq(CpuRegister(TMP), Immediate(counter_address_));
+    __ movw(Address(CpuRegister(TMP), 0), Immediate(ProfilingInfo::GetOptimizeThreshold()));
     x86_64_codegen->GenerateInvokeRuntime(
         GetThreadOffset<kX86_64PointerSize>(kQuickCompileOptimized).Int32Value());
     __ jmp(GetExitLabel());
@@ -1023,6 +1028,8 @@ class CompileOptimizedSlowPathX86_64 : public SlowPathCode {
   }
 
  private:
+  uint64_t counter_address_;
+
   DISALLOW_COPY_AND_ASSIGN(CompileOptimizedSlowPathX86_64);
 };
 
@@ -1730,20 +1737,20 @@ void CodeGeneratorX86_64::MaybeIncrementHotness(bool is_frame_entry) {
   }
 
   if (GetGraph()->IsCompilingBaseline() && !Runtime::Current()->IsAotCompiler()) {
-    SlowPathCode* slow_path = new (GetScopedAllocator()) CompileOptimizedSlowPathX86_64();
-    AddSlowPath(slow_path);
     ProfilingInfo* info = GetGraph()->GetProfilingInfo();
     DCHECK(info != nullptr);
     CHECK(!HasEmptyFrame());
-    uint64_t address = reinterpret_cast64<uint64_t>(info);
+    uint64_t address = reinterpret_cast64<uint64_t>(info) +
+        ProfilingInfo::BaselineHotnessCountOffset().Int32Value();
+    SlowPathCode* slow_path = new (GetScopedAllocator()) CompileOptimizedSlowPathX86_64(address);
+    AddSlowPath(slow_path);
     // Note: if the address was in the 32bit range, we could use
     // Address::Absolute and avoid this movq.
     __ movq(CpuRegister(TMP), Immediate(address));
     // With multiple threads, this can overflow. This is OK, we will eventually get to see
     // it reaching 0. Also, at this point we have no register available to look
     // at the counter directly.
-    __ addw(Address(CpuRegister(TMP), ProfilingInfo::BaselineHotnessCountOffset().Int32Value()),
-            Immediate(-1));
+    __ addw(Address(CpuRegister(TMP), 0), Immediate(-1));
     __ j(kEqual, slow_path->GetEntryLabel());
     __ Bind(slow_path->GetExitLabel());
   }
@@ -2172,14 +2179,17 @@ void InstructionCodeGeneratorX86_64::GenerateCompareTestAndBranch(HCondition* co
   }
 }
 
-static bool AreEflagsSetFrom(HInstruction* cond, HInstruction* branch) {
+static bool AreEflagsSetFrom(HInstruction* cond,
+                             HInstruction* branch,
+                             const CompilerOptions& compiler_options) {
   // Moves may affect the eflags register (move zero uses xorl), so the EFLAGS
   // are set only strictly before `branch`. We can't use the eflags on long
   // conditions if they are materialized due to the complex branching.
   return cond->IsCondition() &&
          cond->GetNext() == branch &&
          !DataType::IsFloatingPointType(cond->InputAt(0)->GetType()) &&
-         !cond->GetBlock()->GetGraph()->IsCompilingBaseline();
+         !(cond->GetBlock()->GetGraph()->IsCompilingBaseline() &&
+           compiler_options.ProfileBranches());
 }
 
 template<class LabelType>
@@ -2216,7 +2226,7 @@ void InstructionCodeGeneratorX86_64::GenerateTestAndBranch(HInstruction* instruc
   //        - condition true => branch to true_target
   //        - branch to false_target
   if (IsBooleanValueOrMaterializedCondition(cond)) {
-    if (AreEflagsSetFrom(cond, instruction)) {
+    if (AreEflagsSetFrom(cond, instruction, codegen_->GetCompilerOptions())) {
       if (true_target == nullptr) {
         __ j(X86_64IntegerCondition(cond->AsCondition()->GetOppositeCondition()), false_target);
       } else {
@@ -2269,7 +2279,9 @@ void InstructionCodeGeneratorX86_64::GenerateTestAndBranch(HInstruction* instruc
 void LocationsBuilderX86_64::VisitIf(HIf* if_instr) {
   LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(if_instr);
   if (IsBooleanValueOrMaterializedCondition(if_instr->InputAt(0))) {
-    if (GetGraph()->IsCompilingBaseline() && !Runtime::Current()->IsAotCompiler()) {
+    if (GetGraph()->IsCompilingBaseline() &&
+        codegen_->GetCompilerOptions().ProfileBranches() &&
+        !Runtime::Current()->IsAotCompiler()) {
       locations->SetInAt(0, Location::RequiresRegister());
       locations->AddTemp(Location::RequiresRegister());
     } else {
@@ -2286,7 +2298,9 @@ void InstructionCodeGeneratorX86_64::VisitIf(HIf* if_instr) {
   Label* false_target = codegen_->GoesToNextBlock(if_instr->GetBlock(), false_successor) ?
       nullptr : codegen_->GetLabelOf(false_successor);
   if (IsBooleanValueOrMaterializedCondition(if_instr->InputAt(0))) {
-    if (GetGraph()->IsCompilingBaseline() && !Runtime::Current()->IsAotCompiler()) {
+    if (GetGraph()->IsCompilingBaseline() &&
+        codegen_->GetCompilerOptions().ProfileBranches() &&
+        !Runtime::Current()->IsAotCompiler()) {
       DCHECK(if_instr->InputAt(0)->IsCondition());
       CpuRegister temp = if_instr->GetLocations()->GetTemp(0).AsRegister<CpuRegister>();
       ProfilingInfo* info = GetGraph()->GetProfilingInfo();
@@ -2309,8 +2323,6 @@ void InstructionCodeGeneratorX86_64::VisitIf(HIf* if_instr) {
         __ Bind(&done);
       }
     }
-  } else {
-    DCHECK(!GetGraph()->IsCompilingBaseline()) << if_instr->InputAt(0)->DebugName();
   }
   GenerateTestAndBranch(if_instr, /* condition_input_index= */ 0, true_target, false_target);
 }
@@ -2404,7 +2416,7 @@ void InstructionCodeGeneratorX86_64::VisitSelect(HSelect* select) {
       if (!condition->IsEmittedAtUseSite()) {
         // This was a previously materialized condition.
         // Can we use the existing condition code?
-        if (AreEflagsSetFrom(condition, select)) {
+        if (AreEflagsSetFrom(condition, select, codegen_->GetCompilerOptions())) {
           // Materialization was the previous instruction.  Condition codes are right.
           cond = X86_64IntegerCondition(condition->GetCondition());
         } else {
@@ -5177,13 +5189,10 @@ void CodeGeneratorX86_64::GenerateMemoryBarrier(MemBarrierKind kind) {
 }
 
 void LocationsBuilderX86_64::HandleFieldGet(HInstruction* instruction) {
-  DCHECK(instruction->IsInstanceFieldGet() ||
-         instruction->IsStaticFieldGet() ||
-         instruction->IsPredicatedInstanceFieldGet());
+  DCHECK(instruction->IsInstanceFieldGet() || instruction->IsStaticFieldGet());
 
   bool object_field_get_with_read_barrier =
       (instruction->GetType() == DataType::Type::kReference) && codegen_->EmitReadBarrier();
-  bool is_predicated = instruction->IsPredicatedInstanceFieldGet();
   LocationSummary* locations =
       new (GetGraph()->GetAllocator()) LocationSummary(instruction,
                                                        object_field_get_with_read_barrier
@@ -5193,37 +5202,26 @@ void LocationsBuilderX86_64::HandleFieldGet(HInstruction* instruction) {
     locations->SetCustomSlowPathCallerSaves(RegisterSet::Empty());  // No caller-save registers.
   }
   // receiver_input
-  locations->SetInAt(is_predicated ? 1 : 0, Location::RequiresRegister());
-  if (is_predicated) {
-    if (DataType::IsFloatingPointType(instruction->GetType())) {
-      locations->SetInAt(0, Location::RequiresFpuRegister());
-    } else {
-      locations->SetInAt(0, Location::RequiresRegister());
-    }
-  }
+  locations->SetInAt(0, Location::RequiresRegister());
   if (DataType::IsFloatingPointType(instruction->GetType())) {
-    locations->SetOut(is_predicated ? Location::SameAsFirstInput()
-                                    : Location::RequiresFpuRegister());
+    locations->SetOut(Location::RequiresFpuRegister());
   } else {
     // The output overlaps for an object field get when read barriers are
     // enabled: we do not want the move to overwrite the object's location, as
     // we need it to emit the read barrier. For predicated instructions we can
     // always overlap since the output is SameAsFirst and the default value.
-    locations->SetOut(is_predicated ? Location::SameAsFirstInput() : Location::RequiresRegister(),
-                      object_field_get_with_read_barrier || is_predicated
-                          ? Location::kOutputOverlap
-                          : Location::kNoOutputOverlap);
+    locations->SetOut(
+        Location::RequiresRegister(),
+        object_field_get_with_read_barrier ? Location::kOutputOverlap : Location::kNoOutputOverlap);
   }
 }
 
 void InstructionCodeGeneratorX86_64::HandleFieldGet(HInstruction* instruction,
                                                     const FieldInfo& field_info) {
-  DCHECK(instruction->IsInstanceFieldGet() ||
-         instruction->IsStaticFieldGet() ||
-         instruction->IsPredicatedInstanceFieldGet());
+  DCHECK(instruction->IsInstanceFieldGet() || instruction->IsStaticFieldGet());
 
   LocationSummary* locations = instruction->GetLocations();
-  Location base_loc = locations->InAt(instruction->IsPredicatedInstanceFieldGet() ? 1 : 0);
+  Location base_loc = locations->InAt(0);
   CpuRegister base = base_loc.AsRegister<CpuRegister>();
   Location out = locations->Out();
   bool is_volatile = field_info.IsVolatile();
@@ -5499,14 +5497,6 @@ void InstructionCodeGeneratorX86_64::HandleFieldSet(HInstruction* instruction,
   bool is_volatile = field_info.IsVolatile();
   DataType::Type field_type = field_info.GetFieldType();
   uint32_t offset = field_info.GetFieldOffset().Uint32Value();
-  bool is_predicated =
-      instruction->IsInstanceFieldSet() && instruction->AsInstanceFieldSet()->GetIsPredicatedSet();
-
-  NearLabel pred_is_null;
-  if (is_predicated) {
-    __ testl(base, base);
-    __ j(kZero, &pred_is_null);
-  }
 
   HandleFieldSet(instruction,
                  /*value_index=*/ 1,
@@ -5519,10 +5509,6 @@ void InstructionCodeGeneratorX86_64::HandleFieldSet(HInstruction* instruction,
                  value_can_be_null,
                  /*byte_swap=*/ false,
                  write_barrier_kind);
-
-  if (is_predicated) {
-    __ Bind(&pred_is_null);
-  }
 }
 
 void LocationsBuilderX86_64::VisitInstanceFieldSet(HInstanceFieldSet* instruction) {
@@ -5536,24 +5522,8 @@ void InstructionCodeGeneratorX86_64::VisitInstanceFieldSet(HInstanceFieldSet* in
                  instruction->GetWriteBarrierKind());
 }
 
-void LocationsBuilderX86_64::VisitPredicatedInstanceFieldGet(
-    HPredicatedInstanceFieldGet* instruction) {
-  HandleFieldGet(instruction);
-}
-
 void LocationsBuilderX86_64::VisitInstanceFieldGet(HInstanceFieldGet* instruction) {
   HandleFieldGet(instruction);
-}
-
-void InstructionCodeGeneratorX86_64::VisitPredicatedInstanceFieldGet(
-    HPredicatedInstanceFieldGet* instruction) {
-  NearLabel finish;
-  LocationSummary* locations = instruction->GetLocations();
-  CpuRegister target = locations->InAt(1).AsRegister<CpuRegister>();
-  __ testl(target, target);
-  __ j(kZero, &finish);
-  HandleFieldGet(instruction, instruction->GetFieldInfo());
-  __ Bind(&finish);
 }
 
 void InstructionCodeGeneratorX86_64::VisitInstanceFieldGet(HInstanceFieldGet* instruction) {

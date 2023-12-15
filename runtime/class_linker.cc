@@ -39,7 +39,6 @@
 #include "barrier.h"
 #include "base/arena_allocator.h"
 #include "base/arena_bit_vector.h"
-#include "base/membarrier.h"
 #include "base/casts.h"
 #include "base/file_utils.h"
 #include "base/hash_map.h"
@@ -47,6 +46,7 @@
 #include "base/leb128.h"
 #include "base/logging.h"
 #include "base/mem_map_arena_pool.h"
+#include "base/membarrier.h"
 #include "base/metrics/metrics.h"
 #include "base/mutex-inl.h"
 #include "base/os.h"
@@ -118,7 +118,7 @@
 #include "mirror/method.h"
 #include "mirror/method_handle_impl.h"
 #include "mirror/method_handles_lookup.h"
-#include "mirror/method_type.h"
+#include "mirror/method_type-inl.h"
 #include "mirror/object-inl.h"
 #include "mirror/object-refvisitor-inl.h"
 #include "mirror/object.h"
@@ -135,6 +135,7 @@
 #include "mirror/var_handle.h"
 #include "native/dalvik_system_DexFile.h"
 #include "nativehelper/scoped_local_ref.h"
+#include "nterp_helpers-inl.h"
 #include "nterp_helpers.h"
 #include "oat.h"
 #include "oat_file-inl.h"
@@ -1191,8 +1192,9 @@ void ClassLinker::RunRootClinits(Thread* self) {
       WellKnownClasses::java_lang_reflect_InvocationTargetException_init,
       // Ensure `Parameter` class is initialized (avoid check at runtime).
       WellKnownClasses::java_lang_reflect_Parameter_init,
-      // Ensure `MethodHandles` class is initialized (avoid check at runtime).
+      // Ensure `MethodHandles` and `MethodType` classes are initialized (avoid check at runtime).
       WellKnownClasses::java_lang_invoke_MethodHandles_lookup,
+      WellKnownClasses::java_lang_invoke_MethodType_makeImpl,
       // Ensure `DirectByteBuffer` class is initialized (avoid check at runtime).
       WellKnownClasses::java_nio_DirectByteBuffer_init,
       // Ensure `FloatingDecimal` class is initialized (avoid check at runtime).
@@ -2242,11 +2244,14 @@ bool ClassLinker::AddImageSpace(gc::space::ImageSpace* space,
     // If we are profiling the boot classpath, we disable the shared memory
     // optimization to make sure boot classpath methods all get properly
     // profiled.
+    // For debuggable runtimes we don't use AOT code, so don't use shared memory
+    // optimization so the methods can be JITed better.
     //
     // We need to disable the flag before doing ResetCounter below, as counters
     // of shared memory method always hold the "hot" value.
     if (!runtime->IsZygote() ||
-        runtime->GetJITOptions()->GetProfileSaverOptions().GetProfileBootClassPath()) {
+        runtime->GetJITOptions()->GetProfileSaverOptions().GetProfileBootClassPath() ||
+        runtime->IsJavaDebuggable()) {
       header.VisitPackedArtMethods([&](ArtMethod& method) REQUIRES_SHARED(Locks::mutator_lock_) {
         method.ClearMemorySharedMethod();
       }, space->Begin(), image_pointer_size_);
@@ -2400,6 +2405,10 @@ void ClassLinker::VisitClassRoots(RootVisitor* visitor, VisitRootFlags flags) {
   // enabling tracing requires the mutator lock, there are no race conditions here.
   const bool tracing_enabled = Trace::IsTracingEnabled();
   Thread* const self = Thread::Current();
+  // For simplicity, if there is JIT activity, we'll trace all class loaders.
+  // This prevents class unloading while a method is being compiled or is going
+  // to be compiled.
+  const bool is_jit_active = jit::Jit::IsActive(self);
   WriterMutexLock mu(self, *Locks::classlinker_classes_lock_);
   if (gUseReadBarrier) {
     // We do not track new roots for CC.
@@ -2430,8 +2439,8 @@ void ClassLinker::VisitClassRoots(RootVisitor* visitor, VisitRootFlags flags) {
     // these objects.
     UnbufferedRootVisitor root_visitor(visitor, RootInfo(kRootStickyClass));
     boot_class_table_->VisitRoots(root_visitor);
-    // If tracing is enabled, then mark all the class loaders to prevent unloading.
-    if ((flags & kVisitRootFlagClassLoader) != 0 || tracing_enabled) {
+    // If tracing is enabled or jit is active, mark all the class loaders to prevent unloading.
+    if ((flags & kVisitRootFlagClassLoader) != 0 || tracing_enabled || is_jit_active) {
       for (const ClassLoaderData& data : class_loaders_) {
         GcRoot<mirror::Object> root(GcRoot<mirror::Object>(self->DecodeJObject(data.weak_root)));
         root.VisitRoot(visitor, RootInfo(kRootVMInternal));
@@ -3993,25 +4002,7 @@ void ClassLinker::LoadMethod(const DexFile& dex_file,
     }
   }
 
-  // Check for nterp invoke fast-path based on shorty.
-  bool all_parameters_are_reference = true;
-  bool all_parameters_are_reference_or_int = true;
-  for (size_t i = 1; i < shorty.length(); ++i) {
-    if (shorty[i] != 'L') {
-      all_parameters_are_reference = false;
-      if (shorty[i] == 'F' || shorty[i] == 'D' || shorty[i] == 'J') {
-        all_parameters_are_reference_or_int = false;
-        break;
-      }
-    }
-  }
-  if (kRuntimeISA != InstructionSet::kRiscv64 && all_parameters_are_reference_or_int &&
-      shorty[0] != 'F' && shorty[0] != 'D') {
-    access_flags |= kAccNterpInvokeFastPathFlag;
-  } else if (kRuntimeISA == InstructionSet::kRiscv64 && all_parameters_are_reference &&
-             shorty[0] != 'F' && shorty[0] != 'D') {
-    access_flags |= kAccNterpInvokeFastPathFlag;
-  }
+  access_flags |= GetNterpFastPathFlags(shorty, access_flags, kRuntimeISA);
 
   if (UNLIKELY((access_flags & kAccNative) != 0u)) {
     // Check if the native method is annotated with @FastNative or @CriticalNative.
@@ -4034,10 +4025,6 @@ void ClassLinker::LoadMethod(const DexFile& dex_file,
     DCHECK_EQ(method.GetCodeItemOffset(), 0u);
     dst->SetDataPtrSize(nullptr, image_pointer_size_);  // Single implementation not set yet.
   } else {
-    // Check for nterp entry fast-path based on shorty.
-    if (all_parameters_are_reference) {
-      access_flags |= kAccNterpEntryPointFastPathFlag;
-    }
     const dex::ClassDef& class_def = dex_file.GetClassDef(klass->GetDexClassDefIndex());
     if (annotations::MethodIsNeverCompile(dex_file, class_def, dex_method_idx)) {
       access_flags |= kAccCompileDontBother;
@@ -10112,58 +10099,59 @@ ObjPtr<mirror::MethodType> ClassLinker::ResolveMethodType(
     return resolved;
   }
 
-  StackHandleScope<4> hs(self);
+  VariableSizedHandleScope raw_method_type_hs(self);
+  mirror::RawMethodType raw_method_type(&raw_method_type_hs);
+  if (!ResolveMethodType(self, proto_idx, dex_cache, class_loader, raw_method_type)) {
+    DCHECK(self->IsExceptionPending());
+    return nullptr;
+  }
+
+  // The handle scope was filled with return type and paratemer types.
+  DCHECK_EQ(raw_method_type_hs.Size(),
+            dex_cache->GetDexFile()->GetShortyView(proto_idx).length());
+  ObjPtr<mirror::MethodType> method_type = mirror::MethodType::Create(self, raw_method_type);
+  if (method_type != nullptr) {
+    // Ensure all stores for the newly created MethodType are visible, before we attempt to place
+    // it in the DexCache (b/224733324).
+    std::atomic_thread_fence(std::memory_order_release);
+    dex_cache->SetResolvedMethodType(proto_idx, method_type.Ptr());
+  }
+  return method_type;
+}
+
+bool ClassLinker::ResolveMethodType(Thread* self,
+                                    dex::ProtoIndex proto_idx,
+                                    Handle<mirror::DexCache> dex_cache,
+                                    Handle<mirror::ClassLoader> class_loader,
+                                    /*out*/ mirror::RawMethodType method_type) {
+  DCHECK(Runtime::Current()->IsMethodHandlesEnabled());
+  DCHECK(dex_cache != nullptr);
+  DCHECK(dex_cache->GetClassLoader() == class_loader.Get());
 
   // First resolve the return type.
   const DexFile& dex_file = *dex_cache->GetDexFile();
   const dex::ProtoId& proto_id = dex_file.GetProtoId(proto_idx);
-  Handle<mirror::Class> return_type(hs.NewHandle(
-      ResolveType(proto_id.return_type_idx_, dex_cache, class_loader)));
+  ObjPtr<mirror::Class> return_type =
+      ResolveType(proto_id.return_type_idx_, dex_cache, class_loader);
   if (return_type == nullptr) {
     DCHECK(self->IsExceptionPending());
-    return nullptr;
+    return false;
   }
+  method_type.SetRType(return_type);
 
   // Then resolve the argument types.
-  //
-  // TODO: Is there a better way to figure out the number of method arguments
-  // other than by looking at the shorty ?
-  const size_t num_method_args = strlen(dex_file.StringDataByIdx(proto_id.shorty_idx_)) - 1;
-
-  ObjPtr<mirror::Class> array_of_class = GetClassRoot<mirror::ObjectArray<mirror::Class>>(this);
-  Handle<mirror::ObjectArray<mirror::Class>> method_params(hs.NewHandle(
-      mirror::ObjectArray<mirror::Class>::Alloc(self, array_of_class, num_method_args)));
-  if (method_params == nullptr) {
-    DCHECK(self->IsExceptionPending());
-    return nullptr;
-  }
-
   DexFileParameterIterator it(dex_file, proto_id);
-  int32_t i = 0;
-  MutableHandle<mirror::Class> param_class = hs.NewHandle<mirror::Class>(nullptr);
   for (; it.HasNext(); it.Next()) {
     const dex::TypeIndex type_idx = it.GetTypeIdx();
-    param_class.Assign(ResolveType(type_idx, dex_cache, class_loader));
-    if (param_class == nullptr) {
+    ObjPtr<mirror::Class> param_type = ResolveType(type_idx, dex_cache, class_loader);
+    if (param_type == nullptr) {
       DCHECK(self->IsExceptionPending());
-      return nullptr;
+      return false;
     }
-
-    method_params->Set(i++, param_class.Get());
+    method_type.AddPType(param_type);
   }
 
-  DCHECK(!it.HasNext());
-
-  Handle<mirror::MethodType> type = hs.NewHandle(
-      mirror::MethodType::Create(self, return_type, method_params));
-  if (type != nullptr) {
-    // Ensure all stores for the newly created MethodType are visible, before we attempt to place
-    // it in the DexCache (b/224733324).
-    std::atomic_thread_fence(std::memory_order_release);
-    dex_cache->SetResolvedMethodType(proto_idx, type.Get());
-  }
-
-  return type.Get();
+  return true;
 }
 
 ObjPtr<mirror::MethodType> ClassLinker::ResolveMethodType(Thread* self,

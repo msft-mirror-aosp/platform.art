@@ -1,5 +1,10 @@
 [
     {
+        "tests": "2247-checker-write-barrier-elimination",
+        "description": ["Disable 2247- until we fix the WBE issue."],
+        "bug": "http://b/310755375"
+    },
+    {
         "tests": "153-reference-stress",
         "description": ["Disable 153-reference-stress temporarily until a fix",
                         "arrives."],
@@ -434,6 +439,7 @@
     },
     {
         "test_patterns": [
+            ".*const-method-type.*",
             ".*invoke-custom.*",
             ".*invoke-polymorphic.*",
             ".*methodhandle.*",
@@ -571,7 +577,8 @@
             "817-hiddenapi",
             "944-transform-classloaders",
             "999-redefine-hiddenapi",
-            "2038-hiddenapi-jvmti-ext"
+            "2038-hiddenapi-jvmti-ext",
+            "2270-mh-internal-hiddenapi-use"
         ],
         "description": [
             "Tests that use custom class loaders or other features not supported ",
@@ -1236,7 +1243,8 @@
                   "2246-trace-stream",
                   "2254-class-value-before-and-after-u",
                   "2261-badcleaner-in-systemcleaner",
-                  "2263-method-trace-jit"],
+                  "2263-method-trace-jit",
+                  "2270-mh-internal-hiddenapi-use"],
         "variant": "jvm",
         "description": ["Doesn't run on RI."]
     },
@@ -1506,12 +1514,6 @@
         "description": ["Expected failures when compiling without a boot image"]
     },
     {
-        "tests": ["719-varhandle-concurrency"],
-        "variant": "target & ndebug & 64",
-        "bug": "b/224733324",
-        "description": ["segfault in VarHandle::GetMethodTypeMatchForAccessMode"]
-    },
-    {
         "tests": ["2043-reference-pauses"],
         "env_vars": {"ART_TEST_DEBUG_GC": "true"},
         "description": ["Test timing out on debug gc."]
@@ -1541,15 +1543,9 @@
     },
     {
         "tests": ["1921-suspend-native-recursive-monitor"],
-        "description": ["Change of behavior when used with JDK 17."],
+        "description": ["RawMonitorEnter behaves differently on ART and RI since JDK17"],
         "bug": "b/242985234",
         "variant": "jvm"
-    },
-    {
-        "tests": ["2246-trace-stream"],
-        "env_vars": {"ART_TEST_DEBUG_GC": "true"},
-        "bug": "b/264844668",
-        "description": ["Test timing out on debug gc."]
     },
     {
         "tests": ["845-data-image", "846-multidex-data-image"],
