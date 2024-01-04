@@ -91,10 +91,14 @@ double tsc_to_microsec_scaling_factor = -1.0;
 uint64_t GetTimestamp() {
   uint64_t t = 0;
 #if defined(__arm__)
-  // See Architecture Reference Manual ARMv7-A and ARMv7-R edition section B4.1.34
-  // Q and R specify that they should be written to lower and upper halves of 64-bit value.
-  // See: https://llvm.org/docs/LangRef.html#asm-template-argument-modifiers
-  asm volatile("mrrc p15, 1, %Q0, %R0, c14" : "=r"(t));
+  // On ARM 32 bit, we don't always have access to the timestamp counters from user space. There is
+  // no easy way to check if it is safe to read the timestamp counters. There is HWCAP_EVTSTRM which
+  // is set when generic timer is available but not necessarily from the user space. Kernel disables
+  // access to generic timer when there are known problems on the target CPUs. Sometimes access is
+  // disabled only for 32-bit processes even when 64-bit processes can accesses the timer from user
+  // space. These are not reflected in the HWCAP_EVTSTRM capability.So just fallback to
+  // clock_gettime on these processes. See b/289178149 for more discussion.
+  t = MicroTime();
 #elif defined(__aarch64__)
   // See Arm Architecture Registers  Armv8 section System Registers
   asm volatile("mrs %0, cntvct_el0" : "=r"(t));
@@ -109,7 +113,7 @@ uint64_t GetTimestamp() {
   return t;
 }
 
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(__i386__) || defined(__x86_64__) || defined(__aarch64__)
 // Here we compute the scaling factor by sleeping for a millisecond. Alternatively, we could
 // generate raw timestamp counter and also time using clock_gettime at the start and the end of the
 // trace. We can compute the frequency of timestamp counter upadtes in the post processing step
@@ -126,7 +130,9 @@ double computeScalingFactor() {
   DCHECK(scaling_factor > 0.0) << scaling_factor;
   return scaling_factor;
 }
+#endif
 
+#if defined(__i386__) || defined(__x86_64__)
 double GetScalingFactorForX86() {
   uint32_t eax, ebx, ecx;
   asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx) : "a"(0x0), "c"(0));
@@ -173,17 +179,21 @@ void InitializeTimestampCounters() {
   }
 
 #if defined(__arm__)
-  double seconds_to_microseconds = 1000 * 1000;
-  uint64_t freq = 0;
-  // See Architecture Reference Manual ARMv7-A and ARMv7-R edition section B4.1.21
-  asm volatile("mrc p15, 0, %0, c14, c0, 0" : "=r"(freq));
-  tsc_to_microsec_scaling_factor = seconds_to_microseconds / static_cast<double>(freq);
+  // On ARM 32 bit, we don't always have access to the timestamp counters from
+  // user space. Seem comment in GetTimestamp for more details.
+  tsc_to_microsec_scaling_factor = 1.0;
 #elif defined(__aarch64__)
   double seconds_to_microseconds = 1000 * 1000;
   uint64_t freq = 0;
   // See Arm Architecture Registers  Armv8 section System Registers
   asm volatile("mrs %0,  cntfrq_el0" : "=r"(freq));
-  tsc_to_microsec_scaling_factor = seconds_to_microseconds / static_cast<double>(freq);
+  if (freq == 0) {
+    // It is expected that cntfrq_el0 is correctly setup during system initialization but some
+    // devices don't do this. In such cases fall back to computing the frequency. See b/315139000.
+    tsc_to_microsec_scaling_factor = computeScalingFactor();
+  } else {
+    tsc_to_microsec_scaling_factor = seconds_to_microseconds / static_cast<double>(freq);
+  }
 #elif defined(__i386__) || defined(__x86_64__)
   tsc_to_microsec_scaling_factor = GetScalingFactorForX86();
 #else
@@ -631,7 +641,6 @@ void Trace::StopTracing(bool finish_tracing, bool flush_file) {
               instrumentation::Instrumentation::kMethodExited |
               instrumentation::Instrumentation::kMethodUnwind);
       runtime->GetInstrumentation()->DisableMethodTracing(kTracerInstrumentationKey);
-      runtime->GetInstrumentation()->MaybeSwitchRuntimeDebugState(self);
     }
 
     // Flush thread specific buffer from all threads before resetting the_trace_ to nullptr.

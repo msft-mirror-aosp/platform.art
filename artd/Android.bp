@@ -35,6 +35,7 @@ cc_defaults {
         "profman_headers",
     ],
     shared_libs: [
+        "libartservice",
         "libarttools", // Contains "libc++fs".
         "libbase",
         "libbinder_ndk",
@@ -65,8 +66,12 @@ art_cc_binary {
 art_cc_defaults {
     name: "art_artd_tests_defaults",
     defaults: ["artd_defaults"],
+    shared_libs: [
+        "libz", // libziparchive dependency; must be repeated here since it's a static lib.
+    ],
     static_libs: [
         "libgmock",
+        "libziparchive",
     ],
     srcs: [
         "artd_test.cc",

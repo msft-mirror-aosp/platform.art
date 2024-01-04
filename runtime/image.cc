@@ -219,7 +219,14 @@ bool ImageHeader::Block::Decompress(uint8_t* out_ptr,
       if (!ok) {
         return false;
       }
-      CHECK_EQ(decompressed_size, image_size_);
+      if (decompressed_size != image_size_) {
+        if (error_msg != nullptr) {
+          // Maybe some disk / memory corruption, just bail.
+          *error_msg = (std::ostringstream() << "Decompressed size different than image size: "
+                                             << decompressed_size << ", and " << image_size_).str();
+        }
+        return false;
+      }
       break;
     }
     default: {
@@ -421,7 +428,7 @@ bool ImageHeader::WriteData(const ImageFileGuard& image_file,
 
   if (update_checksum) {
       // Calculate the image checksum of the remaining data.
-    image_checksum = adler32(GetImageChecksum(),
+    image_checksum = adler32(image_checksum,
                              reinterpret_cast<const uint8_t*>(bitmap_data),
                              bitmap_section.Size());
     this->SetImageChecksum(image_checksum);
