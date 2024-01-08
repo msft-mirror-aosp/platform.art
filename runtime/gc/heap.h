@@ -550,6 +550,11 @@ class Heap {
     return num_bytes_allocated_.load(std::memory_order_relaxed);
   }
 
+  // Returns bytes_allocated before adding 'bytes' to it.
+  size_t AddBytesAllocated(size_t bytes) {
+    return num_bytes_allocated_.fetch_add(bytes, std::memory_order_relaxed);
+  }
+
   bool GetUseGenerationalCC() const {
     return use_generational_cc_;
   }
@@ -1046,6 +1051,7 @@ class Heap {
         collector_type == kCollectorTypeSS ||
         collector_type == kCollectorTypeCMC ||
         collector_type == kCollectorTypeCCBackground ||
+        collector_type == kCollectorTypeCMCBackground ||
         collector_type == kCollectorTypeHomogeneousSpaceCompact;
   }
   bool ShouldAllocLargeObject(ObjPtr<mirror::Class> c, size_t byte_count) const
@@ -1229,13 +1235,13 @@ class Heap {
   void ClearPendingTrim(Thread* self) REQUIRES(!*pending_task_lock_);
   void ClearPendingCollectorTransition(Thread* self) REQUIRES(!*pending_task_lock_);
 
-  // What kind of concurrency behavior is the runtime after? Currently true for concurrent mark
-  // sweep GC, false for other GC types.
+  // What kind of concurrency behavior is the runtime after?
   bool IsGcConcurrent() const ALWAYS_INLINE {
     return collector_type_ == kCollectorTypeCC ||
         collector_type_ == kCollectorTypeCMC ||
         collector_type_ == kCollectorTypeCMS ||
-        collector_type_ == kCollectorTypeCCBackground;
+        collector_type_ == kCollectorTypeCCBackground ||
+        collector_type_ == kCollectorTypeCMCBackground;
   }
 
   // Trim the managed and native spaces by releasing unused memory back to the OS.

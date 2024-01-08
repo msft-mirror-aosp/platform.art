@@ -39,6 +39,7 @@
 #include "barrier.h"
 #include "base/arena_allocator.h"
 #include "base/arena_bit_vector.h"
+#include "base/membarrier.h"
 #include "base/casts.h"
 #include "base/file_utils.h"
 #include "base/hash_map.h"
@@ -227,8 +228,8 @@ static void UpdateClassAfterVerification(Handle<mirror::Class> klass,
   }
 }
 
-// Callback responsible for making a batch of classes visibly initialized
-// after all threads have called it from a checkpoint, ensuring visibility.
+// Callback responsible for making a batch of classes visibly initialized after ensuring
+// visibility for all threads, either by using `membarrier()` or by running a checkpoint.
 class ClassLinker::VisiblyInitializedCallback final
     : public Closure, public IntrusiveForwardListNode<VisiblyInitializedCallback> {
  public:
@@ -269,9 +270,16 @@ class ClassLinker::VisiblyInitializedCallback final
   }
 
   void MakeVisible(Thread* self) {
-    DCHECK_EQ(thread_visibility_counter_.load(std::memory_order_relaxed), 0);
-    size_t count = Runtime::Current()->GetThreadList()->RunCheckpoint(this);
-    AdjustThreadVisibilityCounter(self, count);
+    if (class_linker_->visibly_initialize_classes_with_membarier_) {
+      // If the associated register command succeeded, this command should never fail.
+      int membarrier_result = art::membarrier(MembarrierCommand::kPrivateExpedited);
+      CHECK_EQ(membarrier_result, 0) << strerror(errno);
+      MarkVisiblyInitialized(self);
+    } else {
+      DCHECK_EQ(thread_visibility_counter_.load(std::memory_order_relaxed), 0);
+      size_t count = Runtime::Current()->GetThreadList()->RunCheckpoint(this);
+      AdjustThreadVisibilityCounter(self, count);
+    }
   }
 
   void Run(Thread* self) override {
@@ -283,27 +291,31 @@ class ClassLinker::VisiblyInitializedCallback final
     ssize_t old = thread_visibility_counter_.fetch_add(adjustment, std::memory_order_relaxed);
     if (old + adjustment == 0) {
       // All threads passed the checkpoint. Mark classes as visibly initialized.
-      {
-        ScopedObjectAccess soa(self);
-        StackHandleScope<1u> hs(self);
-        MutableHandle<mirror::Class> klass = hs.NewHandle<mirror::Class>(nullptr);
-        JavaVMExt* vm = self->GetJniEnv()->GetVm();
-        for (size_t i = 0, num = num_classes_; i != num; ++i) {
-          klass.Assign(ObjPtr<mirror::Class>::DownCast(self->DecodeJObject(classes_[i])));
-          vm->DeleteWeakGlobalRef(self, classes_[i]);
-          if (klass != nullptr) {
-            mirror::Class::SetStatus(klass, ClassStatus::kVisiblyInitialized, self);
-            class_linker_->FixupStaticTrampolines(self, klass.Get());
-          }
-        }
-        num_classes_ = 0u;
-      }
-      class_linker_->VisiblyInitializedCallbackDone(self, this);
+      MarkVisiblyInitialized(self);
     }
   }
 
-  // Making classes initialized in bigger batches helps with app startup for
-  // apps that initialize a lot of classes by running fewer checkpoints.
+  void MarkVisiblyInitialized(Thread* self) {
+    {
+      ScopedObjectAccess soa(self);
+      StackHandleScope<1u> hs(self);
+      MutableHandle<mirror::Class> klass = hs.NewHandle<mirror::Class>(nullptr);
+      JavaVMExt* vm = self->GetJniEnv()->GetVm();
+      for (size_t i = 0, num = num_classes_; i != num; ++i) {
+        klass.Assign(ObjPtr<mirror::Class>::DownCast(self->DecodeJObject(classes_[i])));
+        vm->DeleteWeakGlobalRef(self, classes_[i]);
+        if (klass != nullptr) {
+          mirror::Class::SetStatus(klass, ClassStatus::kVisiblyInitialized, self);
+          class_linker_->FixupStaticTrampolines(self, klass.Get());
+        }
+      }
+      num_classes_ = 0u;
+    }
+    class_linker_->VisiblyInitializedCallbackDone(self, this);
+  }
+
+  // Making classes initialized in bigger batches helps with app startup for apps
+  // that initialize a lot of classes by running fewer synchronization functions.
   // (On the other hand, bigger batches make class initialization checks more
   // likely to take a slow path but that is mitigated by making partially
   // filled buffers visibly initialized if we take the slow path many times.
@@ -319,6 +331,7 @@ class ClassLinker::VisiblyInitializedCallback final
   // to be run) and decremented once for each `Run()` execution. When it reaches 0,
   // whether after the increment or after a decrement, we know that `Run()` was executed
   // for all threads and therefore we can mark the classes as visibly initialized.
+  // Used only if the preferred `membarrier()` command is unsupported.
   std::atomic<ssize_t> thread_visibility_counter_;
 
   // List of barries to `Pass()` for threads that wait for the callback to complete.
@@ -569,6 +582,16 @@ static void WrapExceptionInInitializer(Handle<mirror::Class> klass)
   VlogClassInitializationFailure(klass);
 }
 
+static bool RegisterMemBarrierForClassInitialization() {
+  if (kRuntimeISA == InstructionSet::kX86 || kRuntimeISA == InstructionSet::kX86_64) {
+    // Thanks to the x86 memory model, classes skip the initialized status, so there is no need
+    // to use `membarrier()` or other synchronization for marking classes visibly initialized.
+    return false;
+  }
+  int membarrier_result = art::membarrier(MembarrierCommand::kRegisterPrivateExpedited);
+  return membarrier_result == 0;
+}
+
 ClassLinker::ClassLinker(InternTable* intern_table, bool fast_class_not_found_exceptions)
     : boot_class_table_(new ClassTable()),
       failed_dex_cache_class_lookups_(0),
@@ -588,6 +611,8 @@ ClassLinker::ClassLinker(InternTable* intern_table, bool fast_class_not_found_ex
       image_pointer_size_(kRuntimePointerSize),
       visibly_initialized_callback_lock_("visibly initialized callback lock"),
       visibly_initialized_callback_(nullptr),
+      running_visibly_initialized_callbacks_(),
+      visibly_initialize_classes_with_membarier_(RegisterMemBarrierForClassInitialization()),
       critical_native_code_with_clinit_check_lock_("critical native code with clinit check lock"),
       critical_native_code_with_clinit_check_(),
       cha_(Runtime::Current()->IsAotCompiler() ? nullptr : new ClassHierarchyAnalysis()) {
@@ -2395,17 +2420,9 @@ void ClassLinker::VisitClassRoots(RootVisitor* visitor, VisitRootFlags flags) {
     boot_class_table_->VisitRoots(root_visitor);
     // If tracing is enabled, then mark all the class loaders to prevent unloading.
     if ((flags & kVisitRootFlagClassLoader) != 0 || tracing_enabled) {
-      gc::Heap* const heap = Runtime::Current()->GetHeap();
-      // Don't visit class-loaders if compacting with userfaultfd GC as these
-      // weaks are updated using Runtime::SweepSystemWeaks() and the GC doesn't
-      // tolerate double updates.
-      if (!heap->IsPerformingUffdCompaction()) {
-        for (const ClassLoaderData& data : class_loaders_) {
-          GcRoot<mirror::Object> root(GcRoot<mirror::Object>(self->DecodeJObject(data.weak_root)));
-          root.VisitRoot(visitor, RootInfo(kRootVMInternal));
-        }
-      } else {
-        DCHECK_EQ(heap->CurrentCollectorType(), gc::CollectorType::kCollectorTypeCMC);
+      for (const ClassLoaderData& data : class_loaders_) {
+        GcRoot<mirror::Object> root(GcRoot<mirror::Object>(self->DecodeJObject(data.weak_root)));
+        root.VisitRoot(visitor, RootInfo(kRootVMInternal));
       }
     }
   } else if (!gUseReadBarrier && (flags & kVisitRootFlagNewRoots) != 0) {
@@ -2445,9 +2462,11 @@ void ClassLinker::VisitClassRoots(RootVisitor* visitor, VisitRootFlags flags) {
 // Keep in sync with InitCallback. Anything we visit, we need to
 // reinit references to when reinitializing a ClassLinker from a
 // mapped image.
-void ClassLinker::VisitRoots(RootVisitor* visitor, VisitRootFlags flags) {
+void ClassLinker::VisitRoots(RootVisitor* visitor, VisitRootFlags flags, bool visit_class_roots) {
   class_roots_.VisitRootIfNonNull(visitor, RootInfo(kRootVMInternal));
-  VisitClassRoots(visitor, flags);
+  if (visit_class_roots) {
+    VisitClassRoots(visitor, flags);
+  }
   // Instead of visiting the find_array_class_cache_ drop it so that it doesn't prevent class
   // unloading if we are marking roots.
   DropFindArrayClassCache();
@@ -2600,7 +2619,11 @@ ClassLinker::~ClassLinker() {
   for (const ClassLoaderData& data : class_loaders_) {
     // CHA unloading analysis is not needed. No negative consequences are expected because
     // all the classloaders are deleted at the same time.
-    DeleteClassLoader(self, data, /*cleanup_cha=*/ false);
+    PrepareToDeleteClassLoader(self, data, /*cleanup_cha=*/false);
+  }
+  for (const ClassLoaderData& data : class_loaders_) {
+    delete data.allocator;
+    delete data.class_table;
   }
   class_loaders_.clear();
   while (!running_visibly_initialized_callbacks_.empty()) {
@@ -2610,7 +2633,9 @@ ClassLinker::~ClassLinker() {
   }
 }
 
-void ClassLinker::DeleteClassLoader(Thread* self, const ClassLoaderData& data, bool cleanup_cha) {
+void ClassLinker::PrepareToDeleteClassLoader(Thread* self,
+                                             const ClassLoaderData& data,
+                                             bool cleanup_cha) {
   Runtime* const runtime = Runtime::Current();
   JavaVMExt* const vm = runtime->GetJavaVM();
   vm->DeleteWeakGlobalRef(self, data.weak_root);
@@ -2641,9 +2666,6 @@ void ClassLinker::DeleteClassLoader(Thread* self, const ClassLoaderData& data, b
       }
     }
   }
-
-  delete data.allocator;
-  delete data.class_table;
 }
 
 ObjPtr<mirror::PointerArray> ClassLinker::AllocPointerArray(Thread* self, size_t length) {
@@ -3406,6 +3428,7 @@ ObjPtr<mirror::Class> ClassLinker::DefineClass(Thread* self,
     return sdc.Finish(nullptr);
   }
 
+  ScopedTrace trace(descriptor);
   if (klass == nullptr) {
     // Allocate a class with the status of not ready.
     // Interface object should get the right size here. Regular class will
@@ -7892,9 +7915,9 @@ void ClassLinker::LinkMethodsHelper<kPointerSize>::ReallocMethods(ObjPtr<mirror:
                                                                       kMethodSize,
                                                                       kMethodAlignment);
   const size_t old_methods_ptr_size = (old_methods != nullptr) ? old_size : 0;
-  auto* methods = reinterpret_cast<LengthPrefixedArray<ArtMethod>*>(
-      class_linker_->GetAllocatorForClassLoader(klass->GetClassLoader())->Realloc(
-          self_, old_methods, old_methods_ptr_size, new_size, LinearAllocKind::kArtMethodArray));
+  LinearAlloc* allocator = class_linker_->GetAllocatorForClassLoader(klass->GetClassLoader());
+  auto* methods = reinterpret_cast<LengthPrefixedArray<ArtMethod>*>(allocator->Realloc(
+      self_, old_methods, old_methods_ptr_size, new_size, LinearAllocKind::kArtMethodArray));
   CHECK(methods != nullptr);  // Native allocation failure aborts.
 
   if (methods != old_methods) {
@@ -7907,12 +7930,9 @@ void ClassLinker::LinkMethodsHelper<kPointerSize>::ReallocMethods(ObjPtr<mirror:
         ++out;
       }
     } else if (gUseUserfaultfd) {
-      // Clear the declaring class of the old dangling method array so that GC doesn't
-      // try to update them, which could cause crashes in userfaultfd GC due to
-      // checks in post-compact address computation.
-      for (auto& m : klass->GetMethods(kPointerSize)) {
-        m.SetDeclaringClass(nullptr);
-      }
+      // In order to make compaction code skip updating the declaring_class_ in
+      // old_methods, convert it into a 'no GC-root' array.
+      allocator->ConvertToNoGcRoots(old_methods, LinearAllocKind::kArtMethodArray);
     }
   }
 
@@ -7999,6 +8019,7 @@ void ClassLinker::LinkMethodsHelper<kPointerSize>::ReallocMethods(ObjPtr<mirror:
         constexpr uint32_t kSetFlags = kAccDefault | kAccAbstract | kAccCopied;
         constexpr uint32_t kMaskFlags = ~(kAccSkipAccessChecks | kAccSingleImplementation);
         new_method.SetAccessFlags((access_flags | kSetFlags) & kMaskFlags);
+        new_method.SetDataPtrSize(nullptr, kPointerSize);
         DCHECK(new_method.IsDefaultConflicting());
         DCHECK(!new_method.IsAbstract());
         // The actual method might or might not be marked abstract since we just copied it from
@@ -10821,8 +10842,12 @@ void ClassLinker::CleanupClassLoaders() {
     ScopedDebugDisallowReadBarriers sddrb(self);
     for (ClassLoaderData& data : to_delete) {
       // CHA unloading analysis and SingleImplementaion cleanups are required.
-      DeleteClassLoader(self, data, /*cleanup_cha=*/ true);
+      PrepareToDeleteClassLoader(self, data, /*cleanup_cha=*/true);
     }
+  }
+  for (const ClassLoaderData& data : to_delete) {
+    delete data.allocator;
+    delete data.class_table;
   }
   Runtime* runtime = Runtime::Current();
   if (!unregistered_oat_files.empty()) {

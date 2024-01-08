@@ -23,6 +23,7 @@ import static com.android.server.art.PrimaryDexUtils.PrimaryDexInfo;
 import static com.android.server.art.ReasonMapping.BatchDexoptReason;
 import static com.android.server.art.ReasonMapping.BootReason;
 import static com.android.server.art.Utils.Abi;
+import static com.android.server.art.Utils.InitProfileResult;
 import static com.android.server.art.model.ArtFlags.GetStatusFlags;
 import static com.android.server.art.model.ArtFlags.ScheduleStatus;
 import static com.android.server.art.model.Config.Callback;
@@ -83,8 +84,10 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -455,7 +458,9 @@ public final class ArtManagerLocal {
      * @param reason determines the default list of packages and options
      * @param cancellationSignal provides the ability to cancel this operation
      * @param processCallbackExecutor the executor to call {@code progressCallback}
-     * @param progressCallback called repeatedly whenever there is an update on the progress
+     * @param progressCallbacks a mapping from an integer, in {@link ArtFlags.BatchDexoptPass}, to
+     *         the callback that is called repeatedly whenever there is an update on the progress
+     * @return a mapping from an integer, in {@link ArtFlags.BatchDexoptPass}, to the dexopt result.
      * @throws IllegalStateException if the operation encounters an error that should never happen
      *         (e.g., an internal logic error), or the callback set by {@link
      *         #setBatchDexoptStartCallback(Executor, BatchDexoptStartCallback)} provides invalid
@@ -465,11 +470,12 @@ public final class ArtManagerLocal {
      */
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @NonNull
-    public DexoptResult dexoptPackages(@NonNull PackageManagerLocal.FilteredSnapshot snapshot,
+    public Map<Integer, DexoptResult> dexoptPackages(
+            @NonNull PackageManagerLocal.FilteredSnapshot snapshot,
             @NonNull @BatchDexoptReason String reason,
             @NonNull CancellationSignal cancellationSignal,
             @Nullable @CallbackExecutor Executor progressCallbackExecutor,
-            @Nullable Consumer<OperationProgress> progressCallback) {
+            @Nullable Map<Integer, Consumer<OperationProgress>> progressCallbacks) {
         List<String> defaultPackages =
                 Collections.unmodifiableList(getDefaultPackages(snapshot, reason));
         DexoptParams defaultDexoptParams = new DexoptParams.Builder(reason).build();
@@ -487,16 +493,37 @@ public final class ArtManagerLocal {
 
         ExecutorService dexoptExecutor =
                 Executors.newFixedThreadPool(ReasonMapping.getConcurrencyForReason(reason));
+        Map<Integer, DexoptResult> dexoptResults = new HashMap<>();
         try {
             if (reason.equals(ReasonMapping.REASON_BG_DEXOPT)) {
-                maybeDowngradePackages(snapshot,
+                DexoptResult downgradeResult = maybeDowngradePackages(snapshot,
                         new HashSet<>(params.getPackages()) /* excludedPackages */,
-                        cancellationSignal, dexoptExecutor);
+                        cancellationSignal, dexoptExecutor, progressCallbackExecutor,
+                        progressCallbacks != null ? progressCallbacks.get(ArtFlags.PASS_DOWNGRADE)
+                                                  : null);
+                if (downgradeResult != null) {
+                    dexoptResults.put(ArtFlags.PASS_DOWNGRADE, downgradeResult);
+                }
             }
-            Log.i(TAG, "Dexopting packages");
-            return mInjector.getDexoptHelper().dexopt(snapshot, params.getPackages(),
-                    params.getDexoptParams(), cancellationSignal, dexoptExecutor,
-                    progressCallbackExecutor, progressCallback);
+            Log.i(TAG,
+                    "Dexopting " + params.getPackages().size() + " packages with reason=" + reason);
+            DexoptResult mainResult = mInjector.getDexoptHelper().dexopt(snapshot,
+                    params.getPackages(), params.getDexoptParams(), cancellationSignal,
+                    dexoptExecutor, progressCallbackExecutor,
+                    progressCallbacks != null ? progressCallbacks.get(ArtFlags.PASS_MAIN) : null);
+            dexoptResults.put(ArtFlags.PASS_MAIN, mainResult);
+            if (reason.equals(ReasonMapping.REASON_BG_DEXOPT)) {
+                DexoptResult supplementaryResult = maybeDexoptPackagesSupplementaryPass(snapshot,
+                        mainResult, params.getDexoptParams(), cancellationSignal, dexoptExecutor,
+                        progressCallbackExecutor,
+                        progressCallbacks != null
+                                ? progressCallbacks.get(ArtFlags.PASS_SUPPLEMENTARY)
+                                : null);
+                if (supplementaryResult != null) {
+                    dexoptResults.put(ArtFlags.PASS_SUPPLEMENTARY, supplementaryResult);
+                }
+            }
+            return dexoptResults;
         } finally {
             dexoptExecutor.shutdown();
         }
@@ -738,12 +765,18 @@ public final class ArtManagerLocal {
 
             List<ProfilePath> profiles = new ArrayList<>();
 
-            Pair<ProfilePath, Boolean> pair = Utils.getOrInitReferenceProfile(mInjector.getArtd(),
+            InitProfileResult result = Utils.getOrInitReferenceProfile(mInjector.getArtd(),
                     dexInfo.dexPath(), PrimaryDexUtils.buildRefProfilePath(pkgState, dexInfo),
                     PrimaryDexUtils.getExternalProfiles(dexInfo),
                     PrimaryDexUtils.buildOutputProfile(pkgState, dexInfo, Process.SYSTEM_UID,
                             Process.SYSTEM_UID, false /* isPublic */));
-            ProfilePath refProfile = pair != null ? pair.first : null;
+            if (!result.externalProfileErrors().isEmpty()) {
+                Log.e(TAG,
+                        "Error occurred when initializing from external profiles: "
+                                + result.externalProfileErrors());
+            }
+
+            ProfilePath refProfile = result.profile();
 
             if (refProfile != null) {
                 profiles.add(refProfile);
@@ -850,7 +883,7 @@ public final class ArtManagerLocal {
             @Nullable Consumer<OperationProgress> progressCallback) {
         try (var snapshot = mInjector.getPackageManagerLocal().withFilteredSnapshot()) {
             dexoptPackages(snapshot, bootReason, new CancellationSignal(), progressCallbackExecutor,
-                    progressCallback);
+                    progressCallback != null ? Map.of(ArtFlags.PASS_MAIN, progressCallback) : null);
         }
     }
 
@@ -1002,26 +1035,31 @@ public final class ArtManagerLocal {
     }
 
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
-    private void maybeDowngradePackages(@NonNull PackageManagerLocal.FilteredSnapshot snapshot,
+    @Nullable
+    private DexoptResult maybeDowngradePackages(
+            @NonNull PackageManagerLocal.FilteredSnapshot snapshot,
             @NonNull Set<String> excludedPackages, @NonNull CancellationSignal cancellationSignal,
-            @NonNull Executor executor) {
+            @NonNull Executor executor,
+            @Nullable @CallbackExecutor Executor progressCallbackExecutor,
+            @Nullable Consumer<OperationProgress> progressCallback) {
         if (shouldDowngrade()) {
             List<String> packages = getDefaultPackages(snapshot, ReasonMapping.REASON_INACTIVE)
                                             .stream()
                                             .filter(pkg -> !excludedPackages.contains(pkg))
                                             .collect(Collectors.toList());
             if (!packages.isEmpty()) {
-                Log.i(TAG, "Storage is low. Downgrading inactive packages");
+                Log.i(TAG, "Storage is low. Downgrading " + packages.size() + " inactive packages");
                 DexoptParams params =
                         new DexoptParams.Builder(ReasonMapping.REASON_INACTIVE).build();
-                mInjector.getDexoptHelper().dexopt(snapshot, packages, params, cancellationSignal,
-                        executor, null /* processCallbackExecutor */, null /* progressCallback */);
+                return mInjector.getDexoptHelper().dexopt(snapshot, packages, params,
+                        cancellationSignal, executor, progressCallbackExecutor, progressCallback);
             } else {
                 Log.i(TAG,
                         "Storage is low, but downgrading is disabled or there's nothing to "
                                 + "downgrade");
             }
         }
+        return null;
     }
 
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
@@ -1033,6 +1071,48 @@ public final class ArtManagerLocal {
             Log.e(TAG, "Failed to check storage. Assuming storage not low", e);
             return false;
         }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    @Nullable
+    private DexoptResult maybeDexoptPackagesSupplementaryPass(
+            @NonNull PackageManagerLocal.FilteredSnapshot snapshot,
+            @NonNull DexoptResult mainResult, @NonNull DexoptParams mainParams,
+            @NonNull CancellationSignal cancellationSignal, @NonNull Executor dexoptExecutor,
+            @Nullable @CallbackExecutor Executor progressCallbackExecutor,
+            @Nullable Consumer<OperationProgress> progressCallback) {
+        if ((mainParams.getFlags() & ArtFlags.FLAG_FORCE_MERGE_PROFILE) != 0) {
+            return null;
+        }
+
+        // Only pick packages that used a profile-guided filter and were skipped in the main pass.
+        // This is a very coarse filter to reduce unnecessary iterations on a best-effort basis.
+        // Packages included in the list may still be skipped by dexopter if the profiles don't have
+        // any change.
+        List<String> packageNames =
+                mainResult.getPackageDexoptResults()
+                        .stream()
+                        .filter(packageResult
+                                -> packageResult.getDexContainerFileDexoptResults()
+                                           .stream()
+                                           .anyMatch(fileResult
+                                                   -> DexFile.isProfileGuidedCompilerFilter(
+                                                              fileResult.getActualCompilerFilter())
+                                                           && fileResult.getStatus()
+                                                                   == DexoptResult.DEXOPT_SKIPPED))
+                        .map(packageResult -> packageResult.getPackageName())
+                        .collect(Collectors.toList());
+
+        DexoptParams dexoptParams = mainParams.toBuilder()
+                                            .setFlags(ArtFlags.FLAG_FORCE_MERGE_PROFILE,
+                                                    ArtFlags.FLAG_FORCE_MERGE_PROFILE)
+                                            .build();
+
+        Log.i(TAG,
+                "Dexopting " + packageNames.size() + " packages with reason="
+                        + dexoptParams.getReason() + " (supplementary pass)");
+        return mInjector.getDexoptHelper().dexopt(snapshot, packageNames, dexoptParams,
+                cancellationSignal, dexoptExecutor, progressCallbackExecutor, progressCallback);
     }
 
     /** Returns the list of packages to process for the given reason. */

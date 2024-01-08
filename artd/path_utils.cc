@@ -26,10 +26,11 @@
 #include "android-base/strings.h"
 #include "arch/instruction_set.h"
 #include "base/file_utils.h"
+#include "base/macros.h"
 #include "file_utils.h"
-#include "fmt/format.h"
 #include "fstab/fstab.h"
 #include "oat_file_assistant.h"
+#include "service.h"
 #include "tools/tools.h"
 
 namespace art {
@@ -47,8 +48,9 @@ using ::android::base::StartsWith;
 using ::android::fs_mgr::Fstab;
 using ::android::fs_mgr::FstabEntry;
 using ::android::fs_mgr::ReadFstabFromProcMounts;
-
-using ::fmt::literals::operator""_format;  // NOLINT
+using ::art::service::ValidateDexPath;
+using ::art::service::ValidatePathElement;
+using ::art::service::ValidatePathElementSubstring;
 
 using PrebuiltProfilePath = ProfilePath::PrebuiltProfilePath;
 using PrimaryCurProfilePath = ProfilePath::PrimaryCurProfilePath;
@@ -57,45 +59,6 @@ using SecondaryCurProfilePath = ProfilePath::SecondaryCurProfilePath;
 using SecondaryRefProfilePath = ProfilePath::SecondaryRefProfilePath;
 using TmpProfilePath = ProfilePath::TmpProfilePath;
 using WritableProfilePath = ProfilePath::WritableProfilePath;
-
-Result<void> ValidateAbsoluteNormalPath(const std::string& path_str) {
-  if (path_str.empty()) {
-    return Errorf("Path is empty");
-  }
-  if (path_str.find('\0') != std::string::npos) {
-    return Errorf("Path '{}' has invalid character '\\0'", path_str);
-  }
-  std::filesystem::path path(path_str);
-  if (!path.is_absolute()) {
-    return Errorf("Path '{}' is not an absolute path", path_str);
-  }
-  if (path.lexically_normal() != path_str) {
-    return Errorf("Path '{}' is not in normal form", path_str);
-  }
-  return {};
-}
-
-Result<void> ValidatePathElementSubstring(const std::string& path_element_substring,
-                                          const std::string& name) {
-  if (path_element_substring.empty()) {
-    return Errorf("{} is empty", name);
-  }
-  if (path_element_substring.find('/') != std::string::npos) {
-    return Errorf("{} '{}' has invalid character '/'", name, path_element_substring);
-  }
-  if (path_element_substring.find('\0') != std::string::npos) {
-    return Errorf("{} '{}' has invalid character '\\0'", name, path_element_substring);
-  }
-  return {};
-}
-
-Result<void> ValidatePathElement(const std::string& path_element, const std::string& name) {
-  OR_RETURN(ValidatePathElementSubstring(path_element, name));
-  if (path_element == "." || path_element == "..") {
-    return Errorf("Invalid {} '{}'", name, path_element);
-  }
-  return {};
-}
 
 Result<std::string> GetAndroidDataOrError() {
   std::string error_msg;
@@ -157,13 +120,8 @@ Result<std::vector<std::string>> ListManagedFiles() {
   return tools::Glob(patterns);
 }
 
-Result<void> ValidateDexPath(const std::string& dex_path) {
-  OR_RETURN(ValidateAbsoluteNormalPath(dex_path));
-  return {};
-}
-
 Result<std::string> BuildArtBinPath(const std::string& binary_name) {
-  return "{}/bin/{}"_format(OR_RETURN(GetArtRootOrError()), binary_name);
+  return ART_FORMAT("{}/bin/{}", OR_RETURN(GetArtRootOrError()), binary_name);
 }
 
 Result<std::string> BuildOatPath(const ArtifactsPath& artifacts_path) {
@@ -196,9 +154,10 @@ Result<std::string> BuildPrimaryRefProfilePath(
     const PrimaryRefProfilePath& primary_ref_profile_path) {
   OR_RETURN(ValidatePathElement(primary_ref_profile_path.packageName, "packageName"));
   OR_RETURN(ValidatePathElementSubstring(primary_ref_profile_path.profileName, "profileName"));
-  return "{}/misc/profiles/ref/{}/{}.prof"_format(OR_RETURN(GetAndroidDataOrError()),
-                                                  primary_ref_profile_path.packageName,
-                                                  primary_ref_profile_path.profileName);
+  return ART_FORMAT("{}/misc/profiles/ref/{}/{}.prof",
+                    OR_RETURN(GetAndroidDataOrError()),
+                    primary_ref_profile_path.packageName,
+                    primary_ref_profile_path.profileName);
 }
 
 Result<std::string> BuildPrebuiltProfilePath(const PrebuiltProfilePath& prebuilt_profile_path) {
@@ -210,24 +169,27 @@ Result<std::string> BuildPrimaryCurProfilePath(
     const PrimaryCurProfilePath& primary_cur_profile_path) {
   OR_RETURN(ValidatePathElement(primary_cur_profile_path.packageName, "packageName"));
   OR_RETURN(ValidatePathElementSubstring(primary_cur_profile_path.profileName, "profileName"));
-  return "{}/misc/profiles/cur/{}/{}/{}.prof"_format(OR_RETURN(GetAndroidDataOrError()),
-                                                     primary_cur_profile_path.userId,
-                                                     primary_cur_profile_path.packageName,
-                                                     primary_cur_profile_path.profileName);
+  return ART_FORMAT("{}/misc/profiles/cur/{}/{}/{}.prof",
+                    OR_RETURN(GetAndroidDataOrError()),
+                    primary_cur_profile_path.userId,
+                    primary_cur_profile_path.packageName,
+                    primary_cur_profile_path.profileName);
 }
 
 Result<std::string> BuildSecondaryRefProfilePath(
     const SecondaryRefProfilePath& secondary_ref_profile_path) {
   OR_RETURN(ValidateDexPath(secondary_ref_profile_path.dexPath));
   std::filesystem::path dex_path(secondary_ref_profile_path.dexPath);
-  return "{}/oat/{}.prof"_format(dex_path.parent_path().string(), dex_path.filename().string());
+  return ART_FORMAT(
+      "{}/oat/{}.prof", dex_path.parent_path().string(), dex_path.filename().string());
 }
 
 Result<std::string> BuildSecondaryCurProfilePath(
     const SecondaryCurProfilePath& secondary_cur_profile_path) {
   OR_RETURN(ValidateDexPath(secondary_cur_profile_path.dexPath));
   std::filesystem::path dex_path(secondary_cur_profile_path.dexPath);
-  return "{}/oat/{}.cur.prof"_format(dex_path.parent_path().string(), dex_path.filename().string());
+  return ART_FORMAT(
+      "{}/oat/{}.cur.prof", dex_path.parent_path().string(), dex_path.filename().string());
 }
 
 Result<std::string> BuildFinalProfilePath(const TmpProfilePath& tmp_profile_path) {
@@ -240,7 +202,7 @@ Result<std::string> BuildFinalProfilePath(const TmpProfilePath& tmp_profile_path
       // No default. All cases should be explicitly handled, or the compilation will fail.
   }
   // This should never happen. Just in case we get a non-enumerator value.
-  LOG(FATAL) << "Unexpected writable profile path type {}"_format(final_path.getTag());
+  LOG(FATAL) << ART_FORMAT("Unexpected writable profile path type {}", final_path.getTag());
 }
 
 Result<std::string> BuildTmpProfilePath(const TmpProfilePath& tmp_profile_path) {
@@ -273,7 +235,7 @@ Result<std::string> BuildProfileOrDmPath(const ProfilePath& profile_path) {
       // No default. All cases should be explicitly handled, or the compilation will fail.
   }
   // This should never happen. Just in case we get a non-enumerator value.
-  LOG(FATAL) << "Unexpected profile path type {}"_format(profile_path.getTag());
+  LOG(FATAL) << ART_FORMAT("Unexpected profile path type {}", profile_path.getTag());
 }
 
 Result<std::string> BuildVdexPath(const VdexPath& vdex_path) {
