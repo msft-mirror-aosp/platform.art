@@ -676,7 +676,10 @@ void Trace::StopTracing(bool flush_entries) {
       MutexLock tl_lock(Thread::Current(), *Locks::thread_list_lock_);
       for (Thread* thread : Runtime::Current()->GetThreadList()->GetList()) {
         if (thread->GetMethodTraceBuffer() != nullptr) {
-          the_trace->trace_writer_->FlushBuffer(thread, /* is_sync= */ true);
+          // We may have pending requests to flush the data. So just enqueue a
+          // request to flush the current buffer so all the requests are
+          // processed in order.
+          the_trace->trace_writer_->FlushBuffer(thread, /* is_sync= */ false);
           thread->ResetMethodTraceBuffer();
         }
       }
@@ -809,7 +812,7 @@ TraceWriter::TraceWriter(File* trace_file,
   // to stop and start this thread pool. Method tracing on zygote isn't a frequent use case and
   // it is okay to flush on the main thread in such cases.
   if (!Runtime::Current()->IsZygote()) {
-    thread_pool_.reset(new ThreadPool("Trace writer pool", 1));
+    thread_pool_.reset(ThreadPool::Create("Trace writer pool", 1));
     thread_pool_->StartWorkers(Thread::Current());
   }
 }
@@ -843,8 +846,9 @@ void TraceWriter::FinishTracing(int flags, bool flush_entries) {
       // down.
       thread_pool_->WaitForWorkersToBeCreated();
       // Wait for any outstanding writer tasks to finish.
-      thread_pool_->StopWorkers(self);
       thread_pool_->Wait(self, /* do_work= */ true, /* may_hold_locks= */ true);
+      DCHECK_EQ(thread_pool_->GetTaskCount(self), 0u);
+      thread_pool_->StopWorkers(self);
     }
 
     size_t final_offset = 0;

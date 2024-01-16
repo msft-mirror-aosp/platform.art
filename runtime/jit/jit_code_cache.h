@@ -185,17 +185,15 @@ class JitCodeCache {
 
   // Default initial capacity of the JIT code cache.
   static size_t GetInitialCapacity() {
+    // This function is called during static initialization
+    // when gPageSize might not be available yet.
+    const size_t page_size = GetPageSizeSlow();
+
     // Put the default to a very low amount for debug builds to stress the code cache
     // collection. It should be at least two pages, however, as the storage is split
     // into data and code sections with sizes that should be aligned to page size each
     // as that's the unit mspaces use. See also: JitMemoryRegion::Initialize.
-    return std::max(kIsDebugBuild ? 8 * KB : 64 * KB, 2 * gPageSize);
-  }
-
-  // Reserved capacity of the JIT code cache.
-  // By default, do not GC until reaching four times the initial capacity.
-  static size_t GetReservedCapacity() {
-    return GetInitialCapacity() * 4;
+    return std::max(kIsDebugBuild ? 8 * KB : 64 * KB, 2 * page_size);
   }
 
   // Create the code cache with a code + data capacity equal to "capacity", error message is passed
@@ -425,20 +423,6 @@ class JitCodeCache {
                               Thread* self)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  void VisitRoots(RootVisitor* visitor);
-
-  // Return whether `method` is being compiled with the given mode.
-  bool IsMethodBeingCompiled(ArtMethod* method, CompilationKind compilation_kind)
-      REQUIRES(Locks::jit_lock_);
-
-  // Remove `method` from the list of methods meing compiled with the given mode.
-  void RemoveMethodBeingCompiled(ArtMethod* method, CompilationKind compilation_kind)
-      REQUIRES(Locks::jit_lock_);
-
-  // Record that `method` is being compiled with the given mode.
-  void AddMethodBeingCompiled(ArtMethod* method, CompilationKind compilation_kind)
-      REQUIRES(Locks::jit_lock_);
-
  private:
   JitCodeCache();
 
@@ -519,13 +503,14 @@ class JitCodeCache {
     return shared_region_.IsInDataSpace(ptr);
   }
 
+  size_t GetReservedCapacity() {
+    return reserved_capacity_;
+  }
+
   bool IsWeakAccessEnabled(Thread* self) const;
   void WaitUntilInlineCacheAccessible(Thread* self)
       REQUIRES(!Locks::jit_lock_)
       REQUIRES_SHARED(Locks::mutator_lock_);
-
-  // Return whether `method` is being compiled in any mode.
-  bool IsMethodBeingCompiled(ArtMethod* method) REQUIRES(Locks::jit_lock_);
 
   class JniStubKey;
   class JniStubData;
@@ -537,6 +522,12 @@ class JitCodeCache {
 
   // Condition to wait on for accessing inline caches.
   ConditionVariable inline_cache_cond_ GUARDED_BY(Locks::jit_lock_);
+
+  // Reserved capacity of the JIT code cache.
+  const size_t reserved_capacity_;
+
+  // By default, do not GC until reaching four times the initial capacity.
+  static constexpr size_t kReservedCapacityMultiplier = 4;
 
   // -------------- JIT memory regions ------------------------------------- //
 
@@ -571,11 +562,6 @@ class JitCodeCache {
 
   // ProfilingInfo objects we have allocated.
   SafeMap<ArtMethod*, ProfilingInfo*> profiling_infos_ GUARDED_BY(Locks::jit_lock_);
-
-  // Methods we are currently compiling, one set for each kind of compilation.
-  std::set<ArtMethod*> current_optimized_compilations_ GUARDED_BY(Locks::jit_lock_);
-  std::set<ArtMethod*> current_osr_compilations_ GUARDED_BY(Locks::jit_lock_);
-  std::set<ArtMethod*> current_baseline_compilations_ GUARDED_BY(Locks::jit_lock_);
 
   // Methods that the zygote has compiled and can be shared across processes
   // forked from the zygote.

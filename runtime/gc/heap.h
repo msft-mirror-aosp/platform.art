@@ -693,9 +693,9 @@ class Heap {
 
   // Mark all the objects in the allocation stack in the specified bitmap.
   // TODO: Refactor?
-  void MarkAllocStack(accounting::SpaceBitmap<kObjectAlignment>* bitmap1,
-                      accounting::SpaceBitmap<kObjectAlignment>* bitmap2,
-                      accounting::SpaceBitmap<kLargeObjectAlignment>* large_objects,
+  void MarkAllocStack(accounting::ContinuousSpaceBitmap* bitmap1,
+                      accounting::ContinuousSpaceBitmap* bitmap2,
+                      accounting::LargeObjectBitmap* large_objects,
                       accounting::ObjectStack* stack)
       REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(Locks::heap_bitmap_lock_);
@@ -1011,6 +1011,25 @@ class Heap {
   void TraceHeapSize(size_t heap_size);
 
   bool AddHeapTask(gc::HeapTask* task);
+
+  // TODO: Kernels for arm and x86 in both, 32-bit and 64-bit modes use 512 entries per page-table
+  // page. Find a way to confirm that in userspace.
+  // Address range covered by 1 Page Middle Directory (PMD) entry in the page table
+  static inline ALWAYS_INLINE size_t GetPMDSize() {
+    return (gPageSize / sizeof(uint64_t)) * gPageSize;
+  }
+  // Address range covered by 1 Page Upper Directory (PUD) entry in the page table
+  static inline ALWAYS_INLINE size_t GetPUDSize() {
+    return (gPageSize / sizeof(uint64_t)) * GetPMDSize();
+  }
+
+  // Returns the ideal alignment corresponding to page-table levels for the
+  // given size.
+  static inline size_t BestPageTableAlignment(size_t size) {
+    const size_t pud_size = GetPUDSize();
+    const size_t pmd_size = GetPMDSize();
+    return size < pud_size ? pmd_size : pud_size;
+  }
 
  private:
   class ConcurrentGCTask;

@@ -42,6 +42,9 @@ public class Main {
             // This method is below the inline cache threshold.
             Method method1 = Main.class.getDeclaredMethod("$noinline$method1", Base.class);
             ensureJitBaselineCompiled(method1);
+            // The baseline code doesn't update the inline cache if we are marking. Force a GC now
+            // so that GC will unlikely take place during the method calls below.
+            Runtime.getRuntime().gc();
             $noinline$method1(derived1);
             for (int i = 0; i < 2998; i++) {
                 $noinline$method1(derived2);
@@ -51,6 +54,9 @@ public class Main {
             // This method is right on the inline cache threshold.
             Method method2 = Main.class.getDeclaredMethod("$noinline$method2", Base.class);
             ensureJitBaselineCompiled(method2);
+            // The baseline code doesn't update the inline cache if we are marking. Force a GC now
+            // so that GC will unlikely take place during the method calls below.
+            Runtime.getRuntime().gc();
             $noinline$method2(derived1);
             for (int i = 0; i < 2999; i++) {
                 $noinline$method2(derived2);
@@ -60,6 +66,9 @@ public class Main {
             // This method is above the inline cache threshold.
             Method method3 = Main.class.getDeclaredMethod("$noinline$method3", Base.class);
             ensureJitBaselineCompiled(method3);
+            // The baseline code doesn't update the inline cache if we are marking. Force a GC now
+            // so that GC will unlikely take place during the method calls below.
+            Runtime.getRuntime().gc();
             for (int i = 0; i < 10000; i++) {
                 $noinline$method3(derived1);
             }
@@ -71,6 +80,9 @@ public class Main {
             // This method is above the JIT threshold.
             Method method4 = Main.class.getDeclaredMethod("$noinline$method4", Base.class);
             ensureJitBaselineCompiled(method4);
+            // The baseline code doesn't update the inline cache if we are marking. Force a GC now
+            // so that GC will unlikely take place during the method calls below.
+            Runtime.getRuntime().gc();
             $noinline$method4(derived1);
             $noinline$method4(derived2);
             ensureMethodJitCompiled(method4);
@@ -155,6 +167,13 @@ public class Main {
                 System.setProperty("java.io.tmpdir", "/sdcard");
                 return File.createTempFile(TEMP_FILE_NAME_PREFIX, TEMP_FILE_NAME_SUFFIX);
             }
+        }
+    }
+
+    private static void sleep(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException ignored) {
         }
     }
 
