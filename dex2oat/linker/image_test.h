@@ -17,7 +17,7 @@
 #ifndef ART_DEX2OAT_LINKER_IMAGE_TEST_H_
 #define ART_DEX2OAT_LINKER_IMAGE_TEST_H_
 
-#include "image.h"
+#include "oat/image.h"
 
 #include <memory>
 #include <string>
@@ -48,7 +48,7 @@
 #include "linker/multi_oat_relative_patcher.h"
 #include "lock_word.h"
 #include "mirror/object-inl.h"
-#include "oat.h"
+#include "oat/oat.h"
 #include "oat_writer.h"
 #include "read_barrier_config.h"
 #include "scoped_thread_state_change-inl.h"
@@ -81,6 +81,14 @@ class ImageTest : public CommonCompilerDriverTest {
   void SetUp() override {
     ReserveImageSpace();
     CommonCompilerDriverTest::SetUp();
+  }
+
+  CompilerFilter::Filter GetCompilerFilter() const override {
+    return compiler_filter_;
+  }
+
+  void SetCompilerFilter(CompilerFilter::Filter compiler_filter) {
+    compiler_filter_ = compiler_filter;
   }
 
   void Compile(ImageHeader::StorageMode storage_mode,
@@ -120,6 +128,9 @@ class ImageTest : public CommonCompilerDriverTest {
   void DoCompile(ImageHeader::StorageMode storage_mode, /*out*/ CompilationHelper& out_helper);
 
   HashSet<std::string> image_classes_;
+
+  // By default we compile with "speed-profile" and an empty profile. This compiles only JNI stubs.
+  CompilerFilter::Filter compiler_filter_ = CompilerFilter::kSpeedProfile;
 };
 
 inline CompilationHelper::~CompilationHelper() {
@@ -224,8 +235,9 @@ inline void ImageTest::DoCompile(ImageHeader::StorageMode storage_mode,
       key_value_store.Put(OatHeader::kBootClassPathKey,
                           android::base::Join(out_helper.dex_file_locations, ':'));
       key_value_store.Put(OatHeader::kApexVersionsKey, Runtime::Current()->GetApexVersions());
-      key_value_store.Put(OatHeader::kConcurrentCopying,
-                          gUseReadBarrier ? OatHeader::kTrueValue : OatHeader::kFalseValue);
+      key_value_store.Put(
+          OatHeader::kConcurrentCopying,
+          compiler_options_->EmitReadBarrier() ? OatHeader::kTrueValue : OatHeader::kFalseValue);
 
       std::vector<std::unique_ptr<ElfWriter>> elf_writers;
       std::vector<std::unique_ptr<OatWriter>> oat_writers;
@@ -246,10 +258,8 @@ inline void ImageTest::DoCompile(ImageHeader::StorageMode storage_mode,
       for (size_t i = 0, size = oat_writers.size(); i != size; ++i) {
         const DexFile* dex_file = class_path[i];
         rodata.push_back(elf_writers[i]->StartRoData());
-        ArrayRef<const uint8_t> raw_dex_file(
-            reinterpret_cast<const uint8_t*>(&dex_file->GetHeader()),
-            dex_file->GetHeader().file_size_);
-        oat_writers[i]->AddRawDexFileSource(raw_dex_file,
+        oat_writers[i]->AddRawDexFileSource(dex_file->GetContainer(),
+                                            dex_file->Begin(),
                                             dex_file->GetLocation().c_str(),
                                             dex_file->GetLocationChecksum());
 
@@ -371,7 +381,7 @@ inline void ImageTest::Compile(
   }
   DoCompile(storage_mode, helper);
   if (image_classes.begin() != image_classes.end()) {
-    // Make sure the class got initialized.
+    // Make sure all explicitly specified classes got initialized.
     ScopedObjectAccess soa(Thread::Current());
     ClassLinker* const class_linker = Runtime::Current()->GetClassLinker();
     for (const std::string& image_class : image_classes) {

@@ -25,7 +25,7 @@
 #include "mirror/object_array-inl.h"
 #include "mirror/reference.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace gc {
 namespace collector {
 
@@ -40,7 +40,7 @@ inline void MarkSweep::ScanObjectVisit(mirror::Object* obj,
     uint32_t class_flags = klass->GetClassFlags();
     if ((class_flags & mirror::kClassFlagNoReferenceFields) != 0) {
       ++no_reference_class_count_;
-    } else if (class_flags == mirror::kClassFlagNormal) {
+    } else if (class_flags == mirror::kClassFlagNormal || class_flags == mirror::kClassFlagRecord) {
       ++normal_count_;
     } else if (class_flags == mirror::kClassFlagObjectArray) {
       ++object_array_count_;

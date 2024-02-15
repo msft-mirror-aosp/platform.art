@@ -18,6 +18,8 @@
 
 #include "entrypoints/quick/quick_entrypoints.h"
 #include "indirect_reference_table.h"
+#include "jni/jni_env_ext.h"
+#include "jni/local_reference_table.h"
 #include "lock_word.h"
 #include "managed_register_arm64.h"
 #include "offsets.h"
@@ -705,7 +707,7 @@ void Arm64JNIMacroAssembler::DecodeJNITransitionOrLocalJObject(ManagedRegister m
 }
 
 void Arm64JNIMacroAssembler::TryToTransitionFromRunnableToNative(
-    JNIMacroLabel* label, ArrayRef<const ManagedRegister> scratch_regs ATTRIBUTE_UNUSED) {
+    JNIMacroLabel* label, [[maybe_unused]] ArrayRef<const ManagedRegister> scratch_regs) {
   constexpr uint32_t kNativeStateValue = Thread::StoredThreadStateValue(ThreadState::kNative);
   constexpr uint32_t kRunnableStateValue = Thread::StoredThreadStateValue(ThreadState::kRunnable);
   constexpr ThreadOffset64 thread_flags_offset = Thread::ThreadFlagsOffset<kArm64PointerSize>();
@@ -734,8 +736,8 @@ void Arm64JNIMacroAssembler::TryToTransitionFromRunnableToNative(
 
 void Arm64JNIMacroAssembler::TryToTransitionFromNativeToRunnable(
     JNIMacroLabel* label,
-    ArrayRef<const ManagedRegister> scratch_regs ATTRIBUTE_UNUSED,
-    ManagedRegister return_reg ATTRIBUTE_UNUSED) {
+    [[maybe_unused]] ArrayRef<const ManagedRegister> scratch_regs,
+    [[maybe_unused]] ManagedRegister return_reg) {
   constexpr uint32_t kNativeStateValue = Thread::StoredThreadStateValue(ThreadState::kNative);
   constexpr uint32_t kRunnableStateValue = Thread::StoredThreadStateValue(ThreadState::kRunnable);
   constexpr ThreadOffset64 thread_flags_offset = Thread::ThreadFlagsOffset<kArm64PointerSize>();
@@ -811,7 +813,6 @@ void Arm64JNIMacroAssembler::TestGcMarking(JNIMacroLabel* label, JNIMacroUnaryCo
   UseScratchRegisterScope temps(asm_.GetVIXLAssembler());
   Register test_reg;
   DCHECK_EQ(Thread::IsGcMarkingSize(), 4u);
-  DCHECK(gUseReadBarrier);
   if (kUseBakerReadBarrier) {
     // TestGcMarking() is used in the JNI stub entry when the marking register is up to date.
     if (kIsDebugBuild && emit_run_time_checks_in_debug_mode_) {
@@ -978,6 +979,39 @@ void Arm64JNIMacroAssembler::RemoveFrame(size_t frame_size,
   // The CFI should be restored for any code that follows the exit block.
   cfi().RestoreState();
   cfi().DefCFAOffset(frame_size);
+}
+
+void Arm64JNIMacroAssembler::LoadLocalReferenceTableStates(ManagedRegister jni_env_reg,
+                                                           ManagedRegister previous_state_reg,
+                                                           ManagedRegister current_state_reg) {
+  constexpr size_t kLRTSegmentStateSize = sizeof(jni::LRTSegmentState);
+  DCHECK_EQ(kLRTSegmentStateSize, kWRegSizeInBytes);
+  const MemberOffset previous_state_offset = JNIEnvExt::LrtPreviousStateOffset(kArm64PointerSize);
+  const MemberOffset current_state_offset = JNIEnvExt::LrtSegmentStateOffset(kArm64PointerSize);
+  DCHECK_EQ(previous_state_offset.SizeValue() + kLRTSegmentStateSize,
+            current_state_offset.SizeValue());
+
+  ___ Ldp(
+      reg_w(previous_state_reg.AsArm64().AsWRegister()),
+      reg_w(current_state_reg.AsArm64().AsWRegister()),
+      MemOperand(reg_x(jni_env_reg.AsArm64().AsXRegister()), previous_state_offset.Int32Value()));
+}
+
+void Arm64JNIMacroAssembler::StoreLocalReferenceTableStates(ManagedRegister jni_env_reg,
+                                                            ManagedRegister previous_state_reg,
+                                                            ManagedRegister current_state_reg) {
+  constexpr size_t kLRTSegmentStateSize = sizeof(jni::LRTSegmentState);
+  DCHECK_EQ(kLRTSegmentStateSize, kWRegSizeInBytes);
+  const MemberOffset previous_state_offset = JNIEnvExt::LrtPreviousStateOffset(kArm64PointerSize);
+  const MemberOffset current_state_offset = JNIEnvExt::LrtSegmentStateOffset(kArm64PointerSize);
+  DCHECK_EQ(previous_state_offset.SizeValue() + kLRTSegmentStateSize,
+            current_state_offset.SizeValue());
+
+  // Set the current segment state together with restoring the cookie.
+  ___ Stp(
+      reg_w(previous_state_reg.AsArm64().AsWRegister()),
+      reg_w(current_state_reg.AsArm64().AsWRegister()),
+      MemOperand(reg_x(jni_env_reg.AsArm64().AsXRegister()), previous_state_offset.Int32Value()));
 }
 
 #undef ___

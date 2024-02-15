@@ -34,7 +34,7 @@ JIT_DEBUG_REGISTER_CODE_LDFLAGS = [
 
 // These are defaults for native shared libaries that are expected to be
 // in stack traces often.
-libart_cc_defaults {
+cc_defaults {
     name: "libart_nativeunwind_defaults",
     target: {
         host: {
@@ -42,37 +42,6 @@ libart_cc_defaults {
                 "-fsanitize-address-use-after-return=never",
                 "-Wno-unused-command-line-argument",
             ],
-        },
-        android_arm: {
-            // Arm 32 bit does not produce complete exidx unwind information
-            // so keep the .debug_frame which is relatively small and does
-            // include needed unwind information.
-            // See b/132992102 and b/145790995 for details.
-            strip: {
-                keep_symbols_and_debug_frame: true,
-            },
-        },
-        // For all other architectures, leave the symbols in the shared library
-        // so that stack unwinders can produce meaningful name resolution.
-        android_arm64: {
-            strip: {
-                keep_symbols: true,
-            },
-        },
-        android_riscv64: {
-            strip: {
-                keep_symbols: true,
-            },
-        },
-        android_x86: {
-            strip: {
-                keep_symbols: true,
-            },
-        },
-        android_x86_64: {
-            strip: {
-                keep_symbols: true,
-            },
         },
     },
 }
@@ -87,8 +56,14 @@ cc_library_headers {
     // ART's macros.h depends on libbase's macros.h.
     // Note: runtime_options.h depends on cmdline. But we don't really want to export this
     //       generically. dex2oat takes care of it itself.
-    header_libs: ["art_libartbase_headers"],
-    export_header_lib_headers: ["art_libartbase_headers"],
+    header_libs: [
+        "art_libartbase_headers",
+        "dlmalloc",
+    ],
+    export_header_lib_headers: [
+        "art_libartbase_headers",
+        "dlmalloc",
+    ],
 
     // We optimize Thread::Current() with a direct TLS access. This requires
     // access to a platform specific Bionic header.
@@ -109,15 +84,156 @@ cc_library_headers {
     ],
 }
 
-libart_cc_defaults {
-    name: "libart_defaults",
+// Generated headers target required by libart.
+cc_library_headers {
+    name: "libart_generated_headers",
     defaults: ["art_defaults"],
     host_supported: true,
+
+    // asm_support_gen.h (used by asm_support.h) is generated with cpp-define-generator
+    generated_headers: ["cpp-define-generator-asm-support"],
+    // export our headers so the libart(d)-gtest targets can use it as well.
+    export_generated_headers: ["cpp-define-generator-asm-support"],
+
+    apex_available: [
+        "com.android.art",
+        "com.android.art.debug",
+    ],
+}
+
+// Common dependencies for `libart-runtime_deps` and `libartd-runtime_deps`.
+cc_defaults {
+    name: "libart-runtime_common_deps",
+    defaults: ["art_defaults"],
+    host_supported: true,
+    target: {
+        android: {
+            header_libs: [
+                "libnativeloader-headers", // For dlext_namespaces.h
+            ],
+            shared_libs: [
+                "libdl_android",
+                "libstatspull", // for pulled atoms
+                "libstatssocket", // for pulled atoms
+                "libz", // For adler32.
+                "heapprofd_client_api",
+            ],
+            static_libs: [
+                "libmodules-utils-build",
+                "libstatslog_art",
+            ],
+        },
+        host: {
+            shared_libs: [
+                "libz", // For adler32.
+            ],
+        },
+    },
+    header_libs: [
+        "art_cmdlineparser_headers",
+        "cpp-define-generator-definitions",
+        "jni_platform_headers",
+        "libart_headers",
+        "libnativehelper_header_only",
+        "libart_generated_headers",
+        // `libart-runtime` doesn't depend on all `libart-compiler` headers, it only requires
+        // `jit_create` to initialize the JIT compiler.
+        "libart-compiler_jit_headers",
+    ],
+    export_header_lib_headers: [
+        "libart_headers",
+        "libart_generated_headers",
+    ],
+    shared_libs: [
+        "libartpalette",
+        "libbase", // For common macros.
+        "liblog",
+        "liblz4",
+        "liblzma", // libelffile(d) dependency; must be repeated here since it's a static lib.
+        "libnativebridge",
+        "libnativeloader",
+        "libsigchain",
+        "libunwindstack",
+    ],
+    static_libs: ["libodrstatslog"],
+}
+
+cc_defaults {
+    name: "libart-runtime_deps",
+    defaults: ["libart-runtime_common_deps"],
+    static_libs: [
+        "libelffile",
+    ],
+    shared_libs: [
+        "libartbase",
+        "libdexfile",
+        "libprofile",
+    ],
+    export_shared_lib_headers: [
+        "libdexfile",
+    ],
+}
+
+cc_defaults {
+    name: "libartd-runtime_deps",
+    defaults: ["libart-runtime_common_deps"],
+    static_libs: [
+        "libelffiled",
+    ],
+    shared_libs: [
+        "libartbased",
+        "libdexfiled",
+        "libprofiled",
+    ],
+    export_shared_lib_headers: [
+        "libdexfiled",
+    ],
+}
+
+// Common defaults for `libart_defaults`, `libartd_defaults` and `libart-runtime_common_defaults`.
+cc_defaults {
+    name: "libart_common_defaults",
+    defaults: [
+        "art_defaults",
+        "libart_nativeunwind_defaults",
+        "art_hugepage_defaults",
+    ],
+    host_supported: true,
+    target: {
+        android_arm: {
+            ldflags: JIT_DEBUG_REGISTER_CODE_LDFLAGS,
+        },
+        android_arm64: {
+            ldflags: JIT_DEBUG_REGISTER_CODE_LDFLAGS,
+        },
+        android_x86: {
+            ldflags: JIT_DEBUG_REGISTER_CODE_LDFLAGS,
+        },
+        android_x86_64: {
+            ldflags: JIT_DEBUG_REGISTER_CODE_LDFLAGS,
+        },
+    },
+    runtime_libs: [
+        // Libraries loaded at runtime. Exceptions:
+        // - libart(d)-compiler.so and libopenjdk(d).so cannot be listed here
+        //   due to cyclic dependency.
+        // - libicu_jni.so is only loaded to handle dependency order in VM
+        //   startup (see Runtime::InitNativeMethods), but its API is internal
+        //   to com.android.i18n and not used by ART/libcore. Therefore it's not
+        //   listed here to avoid visibility issues. Instead it's linked from
+        //   the ART module namespace through an entry in requireNativeLibs in
+        //   manifest-art.json.
+        "libjavacore",
+    ],
+}
+
+// Common defaults for `libart-runtime_defaults` and `libartd-runtime_defaults`.
+cc_defaults {
+    name: "libart-runtime_common_defaults",
+    defaults: ["libart_common_defaults"],
     srcs: [
         "app_info.cc",
-        "aot_class_linker.cc",
         "art_field.cc",
-        "sdk_checker.cc",
         "art_method.cc",
         "backtrace_helper.cc",
         "barrier.cc",
@@ -138,18 +254,17 @@ libart_cc_defaults {
         "debugger.cc",
         "dex/dex_file_annotations.cc",
         "dex_register_location.cc",
-        "elf_file.cc",
         "exec_utils.cc",
         "fault_handler.cc",
-        "gc/allocation_record.cc",
-        "gc/allocator/art-dlmalloc.cc",
-        "gc/allocator/rosalloc.cc",
         "gc/accounting/bitmap.cc",
         "gc/accounting/card_table.cc",
         "gc/accounting/heap_bitmap.cc",
         "gc/accounting/mod_union_table.cc",
         "gc/accounting/remembered_set.cc",
         "gc/accounting/space_bitmap.cc",
+        "gc/allocation_record.cc",
+        "gc/allocator/art-dlmalloc.cc",
+        "gc/allocator/rosalloc.cc",
         "gc/collector/concurrent_copying.cc",
         "gc/collector/garbage_collector.cc",
         "gc/collector/immune_region.cc",
@@ -178,8 +293,6 @@ libart_cc_defaults {
         "handle.cc",
         "hidden_api.cc",
         "hprof/hprof.cc",
-        "image.cc",
-        "index_bss_mapping.cc",
         "indirect_reference_table.cc",
         "instrumentation.cc",
         "intern_table.cc",
@@ -197,8 +310,10 @@ libart_cc_defaults {
         "jit/jit.cc",
         "jit/jit_code_cache.cc",
         "jit/jit_memory_region.cc",
-        "jit/profiling_info.cc",
+        "jit/jit_options.cc",
         "jit/profile_saver.cc",
+        "jit/profiling_info.cc",
+        "jit/small_pattern_matcher.cc",
         "jni/check_jni.cc",
         "jni/java_vm_ext.cc",
         "jni/jni_env_ext.cc",
@@ -226,10 +341,8 @@ libart_cc_defaults {
         "mirror/var_handle.cc",
         "monitor.cc",
         "monitor_objects_stack_visitor.cc",
-        "native_bridge_art_interface.cc",
-        "native_stack_dump.cc",
-        "native/dalvik_system_DexFile.cc",
         "native/dalvik_system_BaseDexClassLoader.cc",
+        "native/dalvik_system_DexFile.cc",
         "native/dalvik_system_VMDebug.cc",
         "native/dalvik_system_VMRuntime.cc",
         "native/dalvik_system_VMStack.cc",
@@ -255,20 +368,27 @@ libart_cc_defaults {
         "native/java_lang_reflect_Parameter.cc",
         "native/java_lang_reflect_Proxy.cc",
         "native/java_util_concurrent_atomic_AtomicLong.cc",
+        "native/jdk_internal_misc_Unsafe.cc",
         "native/libcore_io_Memory.cc",
         "native/libcore_util_CharsetUtils.cc",
         "native/org_apache_harmony_dalvik_ddmc_DdmServer.cc",
         "native/org_apache_harmony_dalvik_ddmc_DdmVmInternal.cc",
         "native/sun_misc_Unsafe.cc",
-        "native/jdk_internal_misc_Unsafe.cc",
+        "native_bridge_art_interface.cc",
+        "native_stack_dump.cc",
         "non_debuggable_classes.cc",
         "nterp_helpers.cc",
-        "oat.cc",
-        "oat_file.cc",
-        "oat_file_assistant.cc",
-        "oat_file_assistant_context.cc",
-        "oat_file_manager.cc",
-        "oat_quick_method_header.cc",
+        "oat/aot_class_linker.cc",
+        "oat/elf_file.cc",
+        "oat/image.cc",
+        "oat/index_bss_mapping.cc",
+        "oat/oat.cc",
+        "oat/oat_file.cc",
+        "oat/oat_file_assistant.cc",
+        "oat/oat_file_assistant_context.cc",
+        "oat/oat_file_manager.cc",
+        "oat/oat_quick_method_header.cc",
+        "oat/stack_map.cc",
         "object_lock.cc",
         "offsets.cc",
         "parsed_options.cc",
@@ -286,9 +406,9 @@ libart_cc_defaults {
         "runtime_intrinsics.cc",
         "runtime_options.cc",
         "scoped_thread_state_change.cc",
+        "sdk_checker.cc",
         "signal_catcher.cc",
         "stack.cc",
-        "stack_map.cc",
         "startup_completed_task.cc",
         "string_builder_append.cc",
         "thread.cc",
@@ -344,7 +464,6 @@ libart_cc_defaults {
         arm: {
             srcs: [
                 "interpreter/mterp/nterp.cc",
-                "interpreter/mterp/nterp_impl.cc",
                 ":libart_mterp.armng",
                 "arch/arm/context_arm.cc",
                 "arch/arm/entrypoints_init_arm.cc",
@@ -360,7 +479,6 @@ libart_cc_defaults {
         arm64: {
             srcs: [
                 "interpreter/mterp/nterp.cc",
-                "interpreter/mterp/nterp_impl.cc",
                 ":libart_mterp.arm64ng",
                 "arch/arm64/context_arm64.cc",
                 "arch/arm64/entrypoints_init_arm64.cc",
@@ -382,14 +500,12 @@ libart_cc_defaults {
                 "arch/riscv64/quick_entrypoints_riscv64.S",
                 "arch/riscv64/thread_riscv64.cc",
                 "interpreter/mterp/nterp.cc",
-                "interpreter/mterp/nterp_impl.cc",
                 "monitor_pool.cc",
             ],
         },
         x86: {
             srcs: [
                 "interpreter/mterp/nterp.cc",
-                "interpreter/mterp/nterp_impl.cc",
                 ":libart_mterp.x86ng",
                 "arch/x86/context_x86.cc",
                 "arch/x86/entrypoints_init_x86.cc",
@@ -411,7 +527,6 @@ libart_cc_defaults {
                 // Note that the fault_handler_x86.cc is not a mistake.  This file is
                 // shared between the x86 and x86_64 architectures.
                 "interpreter/mterp/nterp.cc",
-                "interpreter/mterp/nterp_impl.cc",
                 ":libart_mterp.x86_64ng",
                 "arch/x86_64/context_x86_64.cc",
                 "arch/x86_64/entrypoints_init_x86_64.cc",
@@ -439,35 +554,11 @@ libart_cc_defaults {
                 "thread_android.cc",
                 "metrics/statsd.cc",
             ],
-            header_libs: [
-                "libnativeloader-headers", // For dlext_namespaces.h
-            ],
-            shared_libs: [
-                "libdl_android",
-                "libstatssocket",
-                "libz", // For adler32.
-                "heapprofd_client_api",
-            ],
-            static_libs: [
-                "libstatslog_art",
-            ],
             generated_sources: [
                 "apex-info-list-tinyxml",
                 "art-apex-cache-info",
             ],
             tidy_disabled_srcs: [":art-apex-cache-info"],
-        },
-        android_arm: {
-            ldflags: JIT_DEBUG_REGISTER_CODE_LDFLAGS,
-        },
-        android_arm64: {
-            ldflags: JIT_DEBUG_REGISTER_CODE_LDFLAGS,
-        },
-        android_x86: {
-            ldflags: JIT_DEBUG_REGISTER_CODE_LDFLAGS,
-        },
-        android_x86_64: {
-            ldflags: JIT_DEBUG_REGISTER_CODE_LDFLAGS,
         },
         host: {
             srcs: [
@@ -479,63 +570,56 @@ libart_cc_defaults {
                 "-fsanitize-address-use-after-return=never",
                 "-Wno-unused-command-line-argument",
             ],
-            shared_libs: [
-                "libz", // For adler32.
-            ],
         },
     },
-
     generated_sources: [
         "art_operator_srcs",
-    ],
-    // asm_support_gen.h (used by asm_support.h) is generated with cpp-define-generator
-    generated_headers: ["cpp-define-generator-asm-support"],
-    // export our headers so the libart(d)-gtest targets can use it as well.
-    export_generated_headers: ["cpp-define-generator-asm-support"],
-
-    header_libs: [
-        "art_cmdlineparser_headers",
-        "cpp-define-generator-definitions",
-        "dlmalloc",
-        "jni_platform_headers",
-        "libart_headers",
-        "libnativehelper_header_only",
-    ],
-    export_header_lib_headers: [
-        "dlmalloc",
-        "libart_headers",
     ],
     whole_static_libs: [
         "libcpu_features",
     ],
-    shared_libs: [
-        "libartpalette",
-        "libbase", // For common macros.
-        "liblog",
-        "liblz4",
-        "liblzma", // libelffile(d) dependency; must be repeated here since it's a static lib.
-        "libnativebridge",
-        "libnativeloader",
-        "libsigchain",
-        "libunwindstack",
-    ],
-    static_libs: ["libodrstatslog"],
-
-    runtime_libs: [
-        // Libraries loaded at runtime. Exceptions:
-        // - libart(d)-compiler.so and libopenjdk(d).so cannot be listed here
-        //   due to cyclic dependency.
-        // - libicu_jni.so is only loaded to handle dependency order in VM
-        //   startup (see Runtime::InitNativeMethods), but its API is internal
-        //   to com.android.i18n and not used by ART/libcore. Therefore it's not
-        //   listed here to avoid visibility issues. Instead it's linked from
-        //   the ART module namespace through an entry in requireNativeLibs in
-        //   manifest-art.json.
-        "libjavacore",
+    cflags: [
+        "-DBUILDING_LIBART",
     ],
 }
 
-libart_static_cc_defaults {
+cc_defaults {
+    name: "libart-runtime_defaults",
+    defaults: [
+        "libart-runtime_common_defaults",
+        "libart-runtime_deps",
+    ],
+}
+
+cc_defaults {
+    name: "libartd-runtime_defaults",
+    defaults: [
+        "art_debug_defaults",
+        "libart-runtime_common_defaults",
+        "libartd-runtime_deps",
+    ],
+}
+
+cc_defaults {
+    name: "libart_defaults",
+    defaults: [
+        "libart_common_defaults",
+        "libart-runtime_deps",
+        "libart-compiler_deps",
+    ],
+}
+
+cc_defaults {
+    name: "libartd_defaults",
+    defaults: [
+        "art_debug_defaults",
+        "libart_common_defaults",
+        "libartd-runtime_deps",
+        "libartd-compiler_deps",
+    ],
+}
+
+cc_defaults {
     name: "libart_static_base_defaults",
     whole_static_libs: [
         "libartpalette",
@@ -544,10 +628,11 @@ libart_static_cc_defaults {
         "liblz4",
         "liblzma", // libelffile dependency; must be repeated here since it's a static lib.
         "libnativebridge",
-        "libnativeloader",
         "libodrstatslog",
-        "libsigchain_fake",
         "libunwindstack",
+    ],
+    exclude_static_libs: [
+        // This library comes from the static version of libunwindstack.
         "libz",
     ],
     target: {
@@ -573,10 +658,13 @@ cc_defaults {
         "libdexfile_static_defaults",
         "libdexfile_support_static_defaults",
         "libprofile_static_defaults",
+        "libart-compiler_static_defaults",
     ],
     whole_static_libs: [
-        "libart",
+        "libart-runtime",
         "libelffile",
+        "libsigchain_fake",
+        "libnativeloader",
     ],
 }
 
@@ -588,9 +676,51 @@ cc_defaults {
         "libdexfiled_static_defaults",
         "libdexfiled_support_static_defaults",
         "libprofiled_static_defaults",
+        "libartd-compiler_static_defaults",
     ],
     whole_static_libs: [
-        "libartd",
+        "libartd-runtime",
+        "libelffiled",
+        "libsigchain_fake",
+        "libnativeloader",
+    ],
+}
+
+// libart_static_defaults for standalone gtests.
+// Doesn't link libsigchain_fake.
+// Uses libart-(runtime/compiler)-for-test instead of libart-runtime/compiler.
+cc_defaults {
+    name: "libart-for-test_static_defaults",
+    defaults: [
+        "libart_static_base_defaults",
+        "libartbase_static_defaults",
+        "libdexfile_static_defaults",
+        "libdexfile_support_static_defaults",
+        "libprofile_static_defaults",
+        "libart-compiler-for-test_static_defaults",
+    ],
+    whole_static_libs: [
+        "libart-runtime-for-test",
+        "libelffile",
+    ],
+}
+
+// libartd_static_defaults for gtests.
+// Doesn't link libsigchain_fake.
+// Note that `libartd-runtime-for-test` is not required here, because `libartd-runtime`
+// doesn't use LTO.
+cc_defaults {
+    name: "libartd-for-test_static_defaults",
+    defaults: [
+        "libart_static_base_defaults",
+        "libartbased_static_defaults",
+        "libdexfiled_static_defaults",
+        "libdexfiled_support_static_defaults",
+        "libprofiled_static_defaults",
+        "libartd-compiler-for-test_static_defaults",
+    ],
+    whole_static_libs: [
+        "libartd-runtime",
         "libelffiled",
     ],
 }
@@ -604,24 +734,24 @@ gensrcs {
         "base/locks.h",
         "class_status.h",
         "compilation_kind.h",
-        "gc_root.h",
-        "gc/allocator_type.h",
         "gc/allocator/rosalloc.h",
-        "gc/collector_type.h",
+        "gc/allocator_type.h",
         "gc/collector/gc_type.h",
         "gc/collector/mark_compact.h",
+        "gc/collector_type.h",
         "gc/space/region_space.h",
         "gc/space/space.h",
         "gc/weak_root_state.h",
-        "image.h",
-        "instrumentation.h",
+        "gc_root.h",
         "indirect_reference_table.h",
+        "instrumentation.h",
         "jdwp_provider.h",
         "jni_id_type.h",
         "linear_alloc.h",
         "lock_word.h",
-        "oat.h",
-        "oat_file.h",
+        "oat/image.h",
+        "oat/oat.h",
+        "oat/oat_file.h",
         "process_state.h",
         "reflective_value_visitor.h",
         "stack.h",
@@ -637,26 +767,19 @@ gensrcs {
 // We always build dex2oat and dependencies, even if the host build is otherwise disabled, since
 // they are used to cross compile for the target.
 
-// Properties common to `libart` and `libart-broken`.
-art_cc_defaults {
-    name: "libart_common_defaults",
-    defaults: [
-        "libart_defaults",
-        "libart_nativeunwind_defaults",
-        "art_hugepage_defaults",
-    ],
-    whole_static_libs: [
-    ],
-    static_libs: [
-        "libelffile",
-    ],
-    shared_libs: [
-        "libartbase",
-        "libdexfile",
-        "libprofile",
-    ],
-    export_shared_lib_headers: [
-        "libdexfile",
+// Release version of the ART runtime library.
+art_cc_library_static {
+    name: "libart-runtime",
+    defaults: ["libart-runtime_defaults"],
+    apex_available: [
+        "com.android.art",
+        "com.android.art.debug",
+        // This lib doesn't go into test_broken_com.android.art, but the libart-broken
+        // needs to have the same apex_available list as its dependencies in order
+        // to compile against their sources. Then that change comes back up to affect
+        // libart as well, because it also needs to have the same apex_available as its
+        // dependencies.
+        "test_broken_com.android.art",
     ],
     target: {
         android: {
@@ -667,14 +790,39 @@ art_cc_defaults {
     },
 }
 
-// Release version of the ART runtime library.
+// For static linking with gtests. Same as `libart-runtime`, but without LTO.
+// When gtests static link a library with LTO enabled, they are also built with LTO.
+// This makes the build process use a lot of memory. b/277207452
+art_cc_library_static {
+    name: "libart-runtime-for-test",
+    defaults: ["libart-runtime_defaults"],
+}
+
+// Debug version of the ART runtime library.
+art_cc_library_static {
+    name: "libartd-runtime",
+    defaults: ["libartd-runtime_defaults"],
+    apex_available: [
+        "com.android.art.debug",
+        // TODO(b/183882457): This lib doesn't go into com.android.art, but
+        // apex_available lists need to be the same for internal libs to avoid
+        // stubs, and this depends on libsigchain.
+        "com.android.art",
+    ],
+}
+
+// Release version of the ART runtime library, bundled with `libart-compiler` for JIT support.
 art_cc_library {
     name: "libart",
-    defaults: ["libart_common_defaults"],
+    defaults: ["libart_defaults"],
+    whole_static_libs: [
+        "libart-compiler",
+        "libart-runtime",
+    ],
     apex_available: [
-        "com.android.art",
         "com.android.art.debug",
-        // libart doesn't go into test_broken_com.android.art, but the libart-broken
+        "com.android.art",
+        // This lib doesn't go into test_broken_com.android.art, but the libart-broken
         // needs to have the same apex_available list as its dependencies in order
         // to compile against their sources. Then that change comes back up to affect
         // libart as well, because it also needs to have the same apex_available as its
@@ -682,15 +830,50 @@ art_cc_library {
         "test_broken_com.android.art",
     ],
     afdo: true,
+    target: {
+        android: {
+            lto: {
+                thin: true,
+            },
+        },
+    },
 }
 
-// "Broken" version of the ART runtime library, used only for testing.
+art_cc_library {
+    name: "libart-unstripped",
+    defaults: ["libart_defaults"],
+    whole_static_libs: [
+        "libart-compiler",
+        "libart-runtime",
+    ],
+    apex_available: [
+        "com.android.art",
+        "com.android.art.debug",
+        // This lib doesn't go into test_broken_com.android.art, but the libart-broken
+        // needs to have the same apex_available list as its dependencies in order
+        // to compile against their sources. Then that change comes back up to affect
+        // libart as well, because it also needs to have the same apex_available as its
+        // dependencies.
+        "test_broken_com.android.art",
+    ],
+    strip: {
+        none: true,
+    },
+}
+
+// "Broken" version of the libart, used only for testing.
 art_cc_test_library {
     name: "libart-broken",
-    defaults: ["libart_common_defaults"],
+    defaults: [
+        "libart-runtime_defaults",
+        "libart_defaults",
+    ],
+    cflags: ["-DART_CRASH_RUNTIME_DELIBERATELY"],
     stem: "libart",
     gtest: false,
-    cflags: ["-DART_CRASH_RUNTIME_DELIBERATELY"],
+    whole_static_libs: [
+        "libart-compiler",
+    ],
     apex_available: [
         // libart-broken only goes into test_broken_com.android.art, but the libart-broken
         // needs to have the same apex_available list as its dependencies in order
@@ -701,25 +884,13 @@ art_cc_test_library {
     ],
 }
 
-// Debug version of the ART runtime library.
+// Debug version of the ART runtime library, bundled with `libartd-compiler` for JIT support.
 art_cc_library {
     name: "libartd",
-    defaults: [
-        "art_debug_defaults",
-        "libart_defaults",
-    ],
+    defaults: ["libartd_defaults"],
     whole_static_libs: [
-    ],
-    static_libs: [
-        "libelffiled",
-    ],
-    shared_libs: [
-        "libartbased",
-        "libdexfiled",
-        "libprofiled",
-    ],
-    export_shared_lib_headers: [
-        "libdexfiled",
+        "libartd-compiler",
+        "libartd-runtime",
     ],
     apex_available: [
         "com.android.art.debug",
@@ -748,40 +919,30 @@ art_cc_defaults {
         "common_runtime_test.cc",
         "dexopt_test.cc",
     ],
-    shared_libs: [
-        "libbase",
-        "libz", // libziparchive dependency; must be repeated here since it's a static lib.
-    ],
     static_libs: [
         "libprocinfo",
-        "libziparchive",
     ],
     header_libs: [
         "libnativehelper_header_only",
     ],
 }
 
-art_cc_library {
+art_cc_library_static {
     name: "libart-runtime-gtest",
     defaults: [
         "libart-runtime-gtest-defaults",
         "libart-gtest-defaults",
-    ],
-    shared_libs: [
-        "libart",
-        "libartbase-art-gtest",
+        "libart-for-test_static_defaults",
     ],
 }
 
-art_cc_library {
+art_cc_library_static {
     name: "libartd-runtime-gtest",
     defaults: [
+        "art_debug_defaults",
         "libart-runtime-gtest-defaults",
-        "libartd-gtest-defaults",
-    ],
-    shared_libs: [
-        "libartd",
-        "libartbased-art-gtest",
+        "libart-gtest-defaults",
+        "libartd-for-test_static_defaults",
     ],
 }
 
@@ -846,7 +1007,7 @@ art_cc_defaults {
         "method_handles_test.cc",
         "mirror/object_test.cc",
         "mirror/var_handle_test.cc",
-        "oat_file_assistant_test.cc",
+        "oat/oat_file_assistant_test.cc",
         "runtime_callbacks_test.cc",
         "subtype_check_test.cc",
         "transaction_test.cc",
@@ -901,7 +1062,6 @@ art_cc_defaults {
         "intern_table_test.cc",
         "interpreter/safe_math_test.cc",
         "interpreter/unstarted_runtime_test.cc",
-        "jit/jit_load_test.cc",
         "jit/jit_memory_region_test.cc",
         "jit/profile_saver_test.cc",
         "jit/profiling_info_test.cc",
@@ -917,8 +1077,8 @@ art_cc_defaults {
         "monitor_pool_test.cc",
         "monitor_test.cc",
         "native_stack_dump_test.cc",
-        "oat_file_assistant_test.cc",
-        "oat_file_test.cc",
+        "oat/oat_file_assistant_test.cc",
+        "oat/oat_file_test.cc",
         "parsed_options_test.cc",
         "prebuilt_tools_test.cc",
         "proxy_test.cc",
@@ -929,6 +1089,7 @@ art_cc_defaults {
         "subtype_check_info_test.cc",
         "subtype_check_test.cc",
         "thread_pool_test.cc",
+        "thread_test.cc",
         "transaction_test.cc",
         "two_runtimes_test.cc",
         "vdex_file_test.cc",
@@ -937,11 +1098,9 @@ art_cc_defaults {
     ],
     shared_libs: [
         "libunwindstack",
-        "libz", // libziparchive dependency; must be repeated here since it's a static lib.
     ],
     static_libs: [
         "libgmock",
-        "libziparchive",
     ],
     header_libs: [
         "art_cmdlineparser_headers", // For parsed_options_test.
@@ -1061,6 +1220,7 @@ cc_library_static {
     export_generated_headers: ["statslog_art.h"],
     shared_libs: [
         "liblog",
+        "libstatspull",
         "libstatssocket",
         "libutils",
     ],

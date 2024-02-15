@@ -20,6 +20,7 @@
 #include <stddef.h>  // for size_t
 #include <unistd.h>  // for TEMP_FAILURE_RETRY
 
+#include "android-base/format.h"
 #include "android-base/macros.h"
 #include "android-base/thread_annotations.h"
 
@@ -31,6 +32,9 @@ friend class test_set_name##_##individual_test##_Test
 // Declare a friend relationship in a class with a typed test.
 #define ART_FRIEND_TYPED_TEST(test_set_name, individual_test)\
 template<typename T> ART_FRIEND_TEST(test_set_name, individual_test)
+
+// Shorthand for formatting with compile time checking of the format string
+#define ART_FORMAT(str, ...) ::fmt::format(FMT_STRING(str), __VA_ARGS__)
 
 // A macro to disallow new and delete operators for a class. It goes in the private: declarations.
 // NOTE: Providing placement new (and matching delete) for constructing container elements.
@@ -106,7 +110,33 @@ template<typename T> ART_FRIEND_TEST(test_set_name, individual_test)
 #define LOCKABLE CAPABILITY("mutex")
 #define SHARED_LOCKABLE SHARED_CAPABILITY("mutex")
 
+// Some of the libs (e.g. libarttest(d)) require more public symbols when built
+// in debug configuration.
+// Using symbol visibility only for release builds allows to reduce the list of
+// exported symbols and eliminates the need to check debug build configurations
+// when changing the exported symbols.
+#ifdef NDEBUG
 #define HIDDEN __attribute__((visibility("hidden")))
+#define PROTECTED __attribute__((visibility("protected")))
 #define EXPORT __attribute__((visibility("default")))
+#else
+#define HIDDEN
+#define PROTECTED
+#define EXPORT
+#endif
+
+// Protected symbols must be declared with "protected" visibility attribute when
+// building the library and "default" visibility when referred to from external
+// libraries/binaries. Otherwise, the external code will expect the symbol to be
+// defined locally and fail to link.
+#ifdef BUILDING_LIBART
+#define LIBART_PROTECTED PROTECTED
+#else
+#define LIBART_PROTECTED EXPORT
+#endif
+
+// Some global variables shouldn't be visible outside libraries declaring them.
+// The attribute allows hiding them, so preventing direct access.
+#define ALWAYS_HIDDEN __attribute__((visibility("hidden")))
 
 #endif  // ART_LIBARTBASE_BASE_MACROS_H_

@@ -19,10 +19,11 @@
 
 #include "base/bit_utils.h"
 #include "base/enums.h"
+#include "base/macros.h"
 #include "obj_ptr.h"
 #include "object.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace gc {
 enum AllocatorType : char;
@@ -127,23 +128,23 @@ class MANAGED Array : public Object {
   template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
   ALWAYS_INLINE bool CheckIsValidIndex(int32_t index) REQUIRES_SHARED(Locks::mutator_lock_);
 
-  static ObjPtr<Array> CopyOf(Handle<Array> h_this, Thread* self, int32_t new_length)
+  EXPORT static ObjPtr<Array> CopyOf(Handle<Array> h_this, Thread* self, int32_t new_length)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
 
  protected:
-  void ThrowArrayStoreException(ObjPtr<Object> object) REQUIRES_SHARED(Locks::mutator_lock_)
+  EXPORT void ThrowArrayStoreException(ObjPtr<Object> object) REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!Roles::uninterruptible_);
 
  private:
-  void ThrowArrayIndexOutOfBoundsException(int32_t index)
+  EXPORT void ThrowArrayIndexOutOfBoundsException(int32_t index)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // The number of array elements.
   // We only use the field indirectly using the LengthOffset() method.
-  int32_t length_ ATTRIBUTE_UNUSED;
+  [[maybe_unused]] int32_t length_;
   // Marker for the data (used by generated code)
   // We only use the field indirectly using the DataOffset() method.
-  uint32_t first_element_[0] ATTRIBUTE_UNUSED;
+  [[maybe_unused]] uint32_t first_element_[0];
 
   DISALLOW_IMPLICIT_CONSTRUCTORS(Array);
 };
@@ -162,12 +163,13 @@ class MANAGED PrimitiveArray : public Array {
 
   using ElementType = T;
 
-  static ObjPtr<PrimitiveArray<T>> Alloc(Thread* self, size_t length)
+  EXPORT static ObjPtr<PrimitiveArray<T>> Alloc(Thread* self, size_t length)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
 
-  static ObjPtr<PrimitiveArray<T>> AllocateAndFill(Thread* self, const T* data, size_t length)
+  EXPORT static ObjPtr<PrimitiveArray<T>> AllocateAndFill(Thread* self,
+                                                          const T* data,
+                                                          size_t length)
       REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Roles::uninterruptible_);
-
 
   const T* GetData() const ALWAYS_INLINE  REQUIRES_SHARED(Locks::mutator_lock_) {
     return reinterpret_cast<const T*>(GetRawData<sizeof(T)>(0));
@@ -211,7 +213,7 @@ class MANAGED PrimitiveArray : public Array {
    * smaller than element size copies). Arguments are assumed to be within the bounds of the array
    * and the arrays non-null.
    */
-  void Memcpy(int32_t dst_pos, ObjPtr<PrimitiveArray<T>> src, int32_t src_pos, int32_t count)
+  EXPORT void Memcpy(int32_t dst_pos, ObjPtr<PrimitiveArray<T>> src, int32_t src_pos, int32_t count)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
  private:

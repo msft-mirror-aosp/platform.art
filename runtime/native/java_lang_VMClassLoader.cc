@@ -38,7 +38,7 @@
 #include "thread-inl.h"
 #include "well_known_classes-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 // A class so we can be friends with ClassLinker and access internal methods.
 class VMClassLoader {
@@ -134,7 +134,7 @@ static jobjectArray VMClassLoader_getBootClassPathEntries(JNIEnv* env, jclass) {
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
   const std::vector<const DexFile*>& path = class_linker->GetBootClassPath();
   auto is_base_dex = [](const DexFile* dex_file) {
-    return !DexFileLoader::IsMultiDexLocation(dex_file->GetLocation().c_str());
+    return !DexFileLoader::IsMultiDexLocation(dex_file->GetLocation());
   };
   size_t jar_count = std::count_if(path.begin(), path.end(), is_base_dex);
 

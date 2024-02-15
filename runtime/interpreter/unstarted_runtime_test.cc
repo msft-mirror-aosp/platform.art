@@ -45,7 +45,7 @@
 #include "transaction.h"
 #include "unstarted_runtime_list.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace interpreter {
 
 // Deleter to be used with ShadowFrame::CreateDeoptimizedFrame objects.
@@ -125,7 +125,7 @@ class UnstartedRuntimeTest : public CommonRuntimeTest {
                                const StackHandleScope<3>& data)
       REQUIRES_SHARED(Locks::mutator_lock_) {
     CHECK_EQ(array->GetLength(), 3);
-    CHECK_EQ(data.NumberOfReferences(), 3U);
+    CHECK_EQ(data.Size(), 3U);
     for (size_t i = 0; i < 3; ++i) {
       EXPECT_OBJ_PTR_EQ(data.GetReference(i), array->Get(static_cast<int32_t>(i))) << i;
     }
@@ -1305,7 +1305,9 @@ TEST_F(UnstartedRuntimeTest, ClassGetSignatureAnnotation) {
     oss << elem->AsString()->ToModifiedUtf8();
   }
   std::string output_string = oss.str();
-  ASSERT_EQ(output_string, "<E:Ljava/lang/Object;>Ljava/lang/Object;Ljava/util/Collection<TE;>;");
+  ASSERT_EQ(output_string,
+            "<E:Ljava/lang/Object;>Ljava/lang/Object;Ljava/util/SequencedCollection<TE;>;"
+            "Ljava/util/Collection<TE;>;");
 }
 
 TEST_F(UnstartedRuntimeTest, ConstructorNewInstance0) {

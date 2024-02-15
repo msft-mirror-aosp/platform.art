@@ -25,6 +25,8 @@
 #include <string>
 
 #include "android-base/thread_annotations.h"
+#include "bit_utils.h"
+#include "globals.h"
 #include "macros.h"
 
 namespace art {
@@ -139,9 +141,11 @@ class MemMap {
                              /*out*/std::string* error_msg,
                              bool use_debug_name = true);
 
-  // Request an aligned anonymous region. We can't directly ask for a MAP_SHARED (anonymous or
-  // otherwise) mapping to be aligned as in that case file offset is involved and could make
-  // the starting offset to be out of sync with another mapping of the same file.
+  // Request an aligned anonymous region, where the alignment must be higher
+  // than the runtime gPageSize. We can't directly ask for a MAP_SHARED
+  // (anonymous or otherwise) mapping to be aligned as in that case file offset
+  // is involved and could make the starting offset to be out of sync with
+  // another mapping of the same file.
   static MemMap MapAnonymousAligned(const char* name,
                                     size_t byte_count,
                                     int prot,
@@ -242,7 +246,10 @@ class MemMap {
 
   bool Protect(int prot);
 
-  void MadviseDontNeedAndZero();
+  void FillWithZero(bool release_eagerly);
+  void MadviseDontNeedAndZero() {
+    FillWithZero(/* release_eagerly= */ true);
+  }
   int MadviseDontFork();
 
   int GetProtect() const {
@@ -339,6 +346,17 @@ class MemMap {
   // 'redzone_size_ == 0' indicates that we are not using memory-tool on this mapping.
   size_t GetRedzoneSize() const { return redzone_size_; }
 
+#ifdef ART_PAGE_SIZE_AGNOSTIC
+  static inline size_t GetPageSize() {
+    DCHECK_NE(page_size_, 0u);
+    return page_size_;
+  }
+#else
+  static constexpr size_t GetPageSize() {
+    return GetPageSizeSlow();
+  }
+#endif
+
  private:
   MemMap(const std::string& name,
          uint8_t* begin,
@@ -428,6 +446,10 @@ class MemMap {
 
   static std::mutex* mem_maps_lock_;
 
+#ifdef ART_PAGE_SIZE_AGNOSTIC
+  static size_t page_size_;
+#endif
+
   friend class MemMapTest;  // To allow access to base_begin_ and base_size_.
 };
 
@@ -437,8 +459,11 @@ inline void swap(MemMap& lhs, MemMap& rhs) {
 
 std::ostream& operator<<(std::ostream& os, const MemMap& mem_map);
 
-// Zero and release pages if possible, no requirements on alignments.
-void ZeroAndReleasePages(void* address, size_t length);
+// Zero and maybe release memory if possible, no requirements on alignments.
+void ZeroMemory(void* address, size_t length, bool release_eagerly);
+inline void ZeroAndReleaseMemory(void* address, size_t length) {
+  ZeroMemory(address, length, /* release_eagerly= */ true);
+}
 
 }  // namespace art
 

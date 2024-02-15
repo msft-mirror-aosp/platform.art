@@ -19,7 +19,9 @@
 
 #include <iosfwd>
 
-namespace art {
+#include "base/macros.h"
+
+namespace art HIDDEN {
 namespace gc {
 
 // Which types of collections are able to be performed.
@@ -32,6 +34,8 @@ enum CollectorType {
   kCollectorTypeCMS,
   // Concurrent mark-compact.
   kCollectorTypeCMC,
+  // The background compaction of the Concurrent mark-compact GC.
+  kCollectorTypeCMCBackground,
   // Semi-space / mark-sweep hybrid, enables compaction.
   kCollectorTypeSS,
   // Heap trimming collector, doesn't do any actual collecting.

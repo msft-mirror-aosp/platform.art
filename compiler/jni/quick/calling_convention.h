@@ -178,14 +178,18 @@ class CallingConvention : public DeletableArenaObject<kArenaAllocCallingConventi
   size_t NumReferenceArgs() const {
     return num_ref_args_;
   }
-  size_t ParamSize(unsigned int param) const {
+  size_t ParamSize(size_t param, size_t reference_size) const {
     DCHECK_LT(param, NumArgs());
     if (IsStatic()) {
       param++;  // 0th argument must skip return value at start of the shorty
     } else if (param == 0) {
-      return sizeof(mirror::HeapReference<mirror::Object>);  // this argument
+      return reference_size;  // this argument
     }
-    size_t result = Primitive::ComponentSize(Primitive::GetType(shorty_[param]));
+    Primitive::Type type = Primitive::GetType(shorty_[param]);
+    if (type == Primitive::kPrimNot) {
+      return reference_size;
+    }
+    size_t result = Primitive::ComponentSize(type);
     if (result >= 1 && result < 4) {
       result = 4;
     }
@@ -320,9 +324,11 @@ class JniCallingConvention : public CallingConvention {
   virtual ArrayRef<const ManagedRegister> CalleeSaveRegisters() const = 0;
 
   // Subset of core callee save registers that can be used for arbitrary purposes after
-  // constructing the JNI transition frame. These should be managed callee-saves as well.
+  // constructing the JNI transition frame. These should be both managed and native callee-saves.
   // These should not include special purpose registers such as thread register.
-  // JNI compiler currently requires at least 3 callee save scratch registers.
+  // JNI compiler currently requires at least 4 callee save scratch registers, except for x86
+  // where we have only 3 such registers but all args are passed on stack, so the method register
+  // is never clobbered by argument moves and does not need to be preserved elsewhere.
   virtual ArrayRef<const ManagedRegister> CalleeSaveScratchRegisters() const = 0;
 
   // Subset of core argument registers that can be used for arbitrary purposes after
@@ -344,17 +350,13 @@ class JniCallingConvention : public CallingConvention {
     return IsCurrentParamALong() || IsCurrentParamADouble();
   }
   bool IsCurrentParamJniEnv();
-  size_t CurrentParamSize() const;
+  virtual size_t CurrentParamSize() const;
   virtual bool IsCurrentParamInRegister() = 0;
   virtual bool IsCurrentParamOnStack() = 0;
   virtual ManagedRegister CurrentParamRegister() = 0;
   virtual FrameOffset CurrentParamStackOffset() = 0;
 
   virtual ~JniCallingConvention() {}
-
-  static constexpr size_t SavedLocalReferenceCookieSize() {
-    return 4u;
-  }
 
   bool IsFastNative() const {
     return is_fast_native_;
@@ -432,7 +434,7 @@ class JniCallingConvention : public CallingConvention {
   bool HasSelfClass() const;
 
   // Returns the position of itr_args_, fixed up by removing the offset of extra JNI arguments.
-  unsigned int GetIteratorPositionWithinShorty() const;
+  size_t GetIteratorPositionWithinShorty() const;
 
   // Is the current argument (at the iterator) an extra argument for JNI?
   bool IsCurrentArgExtraForJni() const;

@@ -60,9 +60,7 @@ class ConstantFoldingTest : public CommonCompilerTest, public OptimizingUnitTest
     std::string actual_before = printer_before.str();
     EXPECT_EQ(expected_before, actual_before);
 
-    HConstantFolding constant_folding(
-        graph_, /* stats= */ nullptr, "constant_folding", /* use_all_optimizations= */ true);
-    constant_folding.Run();
+    HConstantFolding(graph_, /* stats= */ nullptr, "constant_folding").Run();
     GraphChecker graph_checker_cf(graph_);
     graph_checker_cf.Run();
     ASSERT_TRUE(graph_checker_cf.IsValid());
@@ -551,7 +549,7 @@ TEST_F(ConstantFoldingTest, LongConstantFoldingOnSubtraction) {
  *
  * The intent of this test is to ensure that all constant expressions
  * are actually evaluated at compile-time, thanks to the reverse
- * (forward) post-order traversal of the the dominator tree.
+ * (forward) post-order traversal of the dominator tree.
  *
  *                              16-bit
  *                              offset

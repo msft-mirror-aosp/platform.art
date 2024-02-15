@@ -37,7 +37,7 @@
 #include "mirror/class_loader.h"
 #include "mirror/dex_cache.h"
 #include "mirror/object-inl.h"
-#include "oat_quick_method_header.h"
+#include "oat/oat_quick_method_header.h"
 #include "scoped_thread_state_change-inl.h"
 #include "thread-current-inl.h"
 #include "utils/atomic_dex_ref_map-inl.h"
@@ -51,15 +51,16 @@ class CommonCompilerTestImpl::CodeAndMetadata {
   CodeAndMetadata(ArrayRef<const uint8_t> code,
                   ArrayRef<const uint8_t> vmap_table,
                   InstructionSet instruction_set) {
+    const size_t page_size = MemMap::GetPageSize();
     const uint32_t code_size = code.size();
     CHECK_NE(code_size, 0u);
     const uint32_t vmap_table_offset = vmap_table.empty() ? 0u
         : sizeof(OatQuickMethodHeader) + vmap_table.size();
     OatQuickMethodHeader method_header(vmap_table_offset);
     const size_t code_alignment = GetInstructionSetCodeAlignment(instruction_set);
-    DCHECK_ALIGNED_PARAM(kPageSize, code_alignment);
+    DCHECK_ALIGNED_PARAM(page_size, code_alignment);
     const uint32_t code_offset = RoundUp(vmap_table.size() + sizeof(method_header), code_alignment);
-    const uint32_t capacity = RoundUp(code_offset + code_size, kPageSize);
+    const uint32_t capacity = RoundUp(code_offset + code_size, page_size);
 
     // Create a memfd handle with sufficient capacity.
     android::base::unique_fd mem_fd(art::memfd_create_compat("test code", /*flags=*/ 0));
@@ -133,9 +134,9 @@ class CommonCompilerTestImpl::OneCompiledMethodStorage final : public CompiledCo
   CompiledMethod* CreateCompiledMethod(InstructionSet instruction_set,
                                        ArrayRef<const uint8_t> code,
                                        ArrayRef<const uint8_t> stack_map,
-                                       ArrayRef<const uint8_t> cfi ATTRIBUTE_UNUSED,
+                                       [[maybe_unused]] ArrayRef<const uint8_t> cfi,
                                        ArrayRef<const linker::LinkerPatch> patches,
-                                       bool is_intrinsic ATTRIBUTE_UNUSED) override {
+                                       [[maybe_unused]] bool is_intrinsic) override {
     // Supports only one method at a time.
     CHECK_EQ(instruction_set_, InstructionSet::kNone);
     CHECK_NE(instruction_set, InstructionSet::kNone);
@@ -150,15 +151,15 @@ class CommonCompilerTestImpl::OneCompiledMethodStorage final : public CompiledCo
     return reinterpret_cast<CompiledMethod*>(this);
   }
 
-  ArrayRef<const uint8_t> GetThunkCode(const linker::LinkerPatch& patch ATTRIBUTE_UNUSED,
-                                       /*out*/ std::string* debug_name  ATTRIBUTE_UNUSED) override {
+  ArrayRef<const uint8_t> GetThunkCode([[maybe_unused]] const linker::LinkerPatch& patch,
+                                       [[maybe_unused]] /*out*/ std::string* debug_name) override {
     LOG(FATAL) << "Unsupported.";
     UNREACHABLE();
   }
 
-  void SetThunkCode(const linker::LinkerPatch& patch ATTRIBUTE_UNUSED,
-                    ArrayRef<const uint8_t> code ATTRIBUTE_UNUSED,
-                    const std::string& debug_name ATTRIBUTE_UNUSED) override {
+  void SetThunkCode([[maybe_unused]] const linker::LinkerPatch& patch,
+                    [[maybe_unused]] ArrayRef<const uint8_t> code,
+                    [[maybe_unused]] const std::string& debug_name) override {
     LOG(FATAL) << "Unsupported.";
     UNREACHABLE();
   }
@@ -187,6 +188,7 @@ class CommonCompilerTestImpl::OneCompiledMethodStorage final : public CompiledCo
 std::unique_ptr<CompilerOptions> CommonCompilerTestImpl::CreateCompilerOptions(
     InstructionSet instruction_set, const std::string& variant) {
   std::unique_ptr<CompilerOptions> compiler_options = std::make_unique<CompilerOptions>();
+  compiler_options->emit_read_barrier_ = gUseReadBarrier;
   compiler_options->instruction_set_ = instruction_set;
   std::string error_msg;
   compiler_options->instruction_set_features_ =
@@ -249,7 +251,7 @@ void CommonCompilerTestImpl::OverrideInstructionSetFeatures(InstructionSet instr
 }
 
 void CommonCompilerTestImpl::SetUpRuntimeOptionsImpl() {
-  compiler_options_.reset(new CompilerOptions);
+  compiler_options_ = CreateCompilerOptions(instruction_set_, "default");
   ApplyInstructionSet();
 }
 

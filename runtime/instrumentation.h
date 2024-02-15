@@ -35,7 +35,7 @@
 #include "jvalue.h"
 #include "offsets.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace mirror {
 class Class;
 class Object;
@@ -149,8 +149,8 @@ struct InstrumentationListener {
   // Call-back when a shadow_frame with the needs_notify_pop_ boolean set is popped off the stack by
   // either return or exceptions. Normally instrumentation listeners should ensure that there are
   // shadow-frames by deoptimizing stacks.
-  virtual void WatchedFramePop(Thread* thread ATTRIBUTE_UNUSED,
-                               const ShadowFrame& frame ATTRIBUTE_UNUSED)
+  virtual void WatchedFramePop([[maybe_unused]] Thread* thread,
+                               [[maybe_unused]] const ShadowFrame& frame)
       REQUIRES_SHARED(Locks::mutator_lock_) = 0;
 };
 
@@ -199,6 +199,9 @@ class Instrumentation {
     kInstrumentWithInterpreter      // execute with interpreter
   };
 
+  static constexpr uint8_t kFastTraceListeners = 0b01;
+  static constexpr uint8_t kSlowMethodEntryExitListeners = 0b10;
+
   Instrumentation();
 
   static constexpr MemberOffset RunExitHooksOffset() {
@@ -219,7 +222,7 @@ class Instrumentation {
   }
 
   static constexpr MemberOffset HaveMethodExitListenersOffset() {
-    // Assert that have_method_exit_listeners_ is 8bits wide. If the size changes
+    // Assert that have_method_exit_slow_listeners_ is 8bits wide. If the size changes
     // update the compare instructions in the code generator when generating checks for
     // MethodEntryExitHooks.
     static_assert(sizeof(have_method_exit_listeners_) == 1,
@@ -231,25 +234,30 @@ class Instrumentation {
   // suspend the runtime to install stubs. You are expected to hold the mutator lock as a proxy
   // for saying you should have suspended all threads (installing stubs while threads are running
   // will break).
-  void AddListener(InstrumentationListener* listener, uint32_t events)
+  EXPORT void AddListener(InstrumentationListener* listener,
+                          uint32_t events,
+                          bool is_trace_listener = false)
       REQUIRES(Locks::mutator_lock_, !Locks::thread_list_lock_, !Locks::classlinker_classes_lock_);
 
   // Removes listeners for the specified events.
-  void RemoveListener(InstrumentationListener* listener, uint32_t events)
+  EXPORT void RemoveListener(InstrumentationListener* listener,
+                             uint32_t events,
+                             bool is_trace_listener = false)
       REQUIRES(Locks::mutator_lock_, !Locks::thread_list_lock_, !Locks::classlinker_classes_lock_);
 
   // Calls UndeoptimizeEverything which may visit class linker classes through ConfigureStubs.
-  void DisableDeoptimization(const char* key)
+  // try_switch_to_non_debuggable specifies if we can switch the runtime back to non-debuggable.
+  // When a debugger is attached to a non-debuggable app, we switch the runtime to debuggable and
+  // when we are detaching the debugger we move back to non-debuggable. If we are disabling
+  // deoptimization for other reasons (ex: removing the last breakpoint) while the debugger is still
+  // connected, we pass false to stay in debuggable. Switching runtimes is expensive so we only want
+  // to switch when we know debug features aren't needed anymore.
+  EXPORT void DisableDeoptimization(const char* key, bool try_switch_to_non_debuggable)
       REQUIRES(Locks::mutator_lock_, Roles::uninterruptible_);
 
   // Enables entry exit hooks support. This is called in preparation for debug requests that require
   // calling method entry / exit hooks.
-  void EnableEntryExitHooks(const char* key)
-      REQUIRES(Locks::mutator_lock_, Roles::uninterruptible_);
-
-  // Switches the runtime state to non-java debuggable if entry / exit hooks are no longer required
-  // and the runtime did not start off as java debuggable.
-  void MaybeSwitchRuntimeDebugState(Thread* self)
+  EXPORT void EnableEntryExitHooks(const char* key)
       REQUIRES(Locks::mutator_lock_, Roles::uninterruptible_);
 
   bool AreAllMethodsDeoptimized() const {
@@ -258,48 +266,47 @@ class Instrumentation {
   bool ShouldNotifyMethodEnterExitEvents() const REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Executes everything with interpreter.
-  void DeoptimizeEverything(const char* key)
+  EXPORT void DeoptimizeEverything(const char* key)
       REQUIRES(Locks::mutator_lock_, Roles::uninterruptible_)
-      REQUIRES(!Locks::thread_list_lock_,
-               !Locks::classlinker_classes_lock_);
+          REQUIRES(!Locks::thread_list_lock_, !Locks::classlinker_classes_lock_);
 
   // Executes everything with compiled code (or interpreter if there is no code). May visit class
   // linker classes through ConfigureStubs.
-  void UndeoptimizeEverything(const char* key)
+  EXPORT void UndeoptimizeEverything(const char* key)
       REQUIRES(Locks::mutator_lock_, Roles::uninterruptible_)
-      REQUIRES(!Locks::thread_list_lock_,
-               !Locks::classlinker_classes_lock_);
+          REQUIRES(!Locks::thread_list_lock_, !Locks::classlinker_classes_lock_);
 
   // Deoptimize a method by forcing its execution with the interpreter. Nevertheless, a static
   // method (except a class initializer) set to the resolution trampoline will be deoptimized only
   // once its declaring class is initialized.
-  void Deoptimize(ArtMethod* method) REQUIRES(Locks::mutator_lock_, !Locks::thread_list_lock_);
+  EXPORT void Deoptimize(ArtMethod* method)
+      REQUIRES(Locks::mutator_lock_, !Locks::thread_list_lock_);
 
   // Undeoptimze the method by restoring its entrypoints. Nevertheless, a static method
   // (except a class initializer) set to the resolution trampoline will be updated only once its
   // declaring class is initialized.
-  void Undeoptimize(ArtMethod* method) REQUIRES(Locks::mutator_lock_, !Locks::thread_list_lock_);
+  EXPORT void Undeoptimize(ArtMethod* method)
+      REQUIRES(Locks::mutator_lock_, !Locks::thread_list_lock_);
 
   // Indicates whether the method has been deoptimized so it is executed with the interpreter.
-  bool IsDeoptimized(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT bool IsDeoptimized(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Indicates if any method needs to be deoptimized. This is used to avoid walking the stack to
   // determine if a deoptimization is required.
   bool IsDeoptimizedMethodsEmpty() const REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Enable method tracing by installing instrumentation entry/exit stubs or interpreter.
-  void EnableMethodTracing(const char* key,
-                           InstrumentationListener* listener,
-                           bool needs_interpreter = kDeoptimizeForAccurateMethodEntryExitListeners)
+  EXPORT void EnableMethodTracing(
+      const char* key,
+      InstrumentationListener* listener,
+      bool needs_interpreter = kDeoptimizeForAccurateMethodEntryExitListeners)
       REQUIRES(Locks::mutator_lock_, Roles::uninterruptible_)
           REQUIRES(!Locks::thread_list_lock_, !Locks::classlinker_classes_lock_);
 
   // Disable method tracing by uninstalling instrumentation entry/exit stubs or interpreter.
-  void DisableMethodTracing(const char* key)
+  EXPORT void DisableMethodTracing(const char* key)
       REQUIRES(Locks::mutator_lock_, Roles::uninterruptible_)
-      REQUIRES(!Locks::thread_list_lock_,
-               !Locks::classlinker_classes_lock_);
-
+          REQUIRES(!Locks::thread_list_lock_, !Locks::classlinker_classes_lock_);
 
   void InstrumentQuickAllocEntryPoints() REQUIRES(!Locks::instrument_entrypoints_lock_);
   void UninstrumentQuickAllocEntryPoints() REQUIRES(!Locks::instrument_entrypoints_lock_);
@@ -315,7 +322,7 @@ class Instrumentation {
   static std::string EntryPointString(const void* code);
 
   // Initialize the entrypoint of the method .`aot_code` is the AOT code.
-  void InitializeMethodsCode(ArtMethod* method, const void* aot_code)
+  EXPORT void InitializeMethodsCode(ArtMethod* method, const void* aot_code)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Update the code of a method respecting any installed stubs.
@@ -327,7 +334,7 @@ class Instrumentation {
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Return the code that we can execute for an invoke including from the JIT.
-  const void* GetCodeForInvoke(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT const void* GetCodeForInvoke(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Return the code that we can execute considering the current instrumentation level.
   // If interpreter stubs are installed return interpreter bridge. If the entry exit stubs
@@ -364,11 +371,19 @@ class Instrumentation {
   }
 
   bool HasMethodEntryListeners() const REQUIRES_SHARED(Locks::mutator_lock_) {
-    return have_method_entry_listeners_;
+    return have_method_entry_listeners_ != 0;
   }
 
   bool HasMethodExitListeners() const REQUIRES_SHARED(Locks::mutator_lock_) {
-    return have_method_exit_listeners_;
+    return have_method_exit_listeners_ != 0;
+  }
+
+  bool HasFastMethodEntryListenersOnly() const REQUIRES_SHARED(Locks::mutator_lock_) {
+    return have_method_entry_listeners_ == kFastTraceListeners;
+  }
+
+  bool HasFastMethodExitListenersOnly() const REQUIRES_SHARED(Locks::mutator_lock_) {
+    return have_method_exit_listeners_ == kFastTraceListeners;
   }
 
   bool HasMethodUnwindListeners() const REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -542,7 +557,7 @@ class Instrumentation {
 
   void InstallStubsForMethod(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_);
 
-  void UpdateEntrypointsForDebuggable() REQUIRES(art::Locks::mutator_lock_);
+  EXPORT void UpdateEntrypointsForDebuggable() REQUIRES(art::Locks::mutator_lock_);
 
   // Install instrumentation exit stub on every method of the stack of the given thread.
   // This is used by:
@@ -550,14 +565,15 @@ class Instrumentation {
   //    example, after updating local variables)
   //  - to call method entry / exit hooks for tracing. For this we instrument
   //    the stack frame to run entry / exit hooks but we don't need to deoptimize.
-  // deopt_all_frames indicates whether the frames need to deoptimize or not.
-  void InstrumentThreadStack(Thread* thread, bool deopt_all_frames) REQUIRES(Locks::mutator_lock_);
-  void InstrumentAllThreadStacks(bool deopt_all_frames) REQUIRES(Locks::mutator_lock_)
+  // force_deopt indicates whether the frames need to deoptimize or not.
+  EXPORT void InstrumentThreadStack(Thread* thread, bool force_deopt)
+      REQUIRES(Locks::mutator_lock_);
+  void InstrumentAllThreadStacks(bool force_deopt) REQUIRES(Locks::mutator_lock_)
       REQUIRES(!Locks::thread_list_lock_);
 
   // Force all currently running frames to be deoptimized back to interpreter. This should only be
   // used in cases where basically all compiled code has been invalidated.
-  void DeoptimizeAllThreadFrames() REQUIRES(art::Locks::mutator_lock_);
+  EXPORT void DeoptimizeAllThreadFrames() REQUIRES(art::Locks::mutator_lock_);
 
   static size_t ComputeFrameId(Thread* self,
                                size_t frame_depth,
@@ -575,16 +591,12 @@ class Instrumentation {
                                     MutableHandle<mirror::Throwable>& exception)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  InstrumentationLevel GetCurrentInstrumentationLevel() const;
+  EXPORT InstrumentationLevel GetCurrentInstrumentationLevel() const;
 
   bool MethodSupportsExitEvents(ArtMethod* method, const OatQuickMethodHeader* header)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
  private:
-  // Returns true if moving to the given instrumentation level requires the installation of stubs.
-  // False otherwise.
-  bool RequiresInstrumentationInstallation(InstrumentationLevel new_level) const;
-
   // Update the current instrumentation_level_.
   void UpdateInstrumentationLevel(InstrumentationLevel level);
 
@@ -593,18 +605,24 @@ class Instrumentation {
   // the caller must pass a unique key (a string) identifying it so we remind which
   // instrumentation level it needs. Therefore the current instrumentation level
   // becomes the highest instrumentation level required by a client.
-  void ConfigureStubs(const char* key, InstrumentationLevel desired_instrumentation_level)
+  void ConfigureStubs(const char* key,
+                      InstrumentationLevel desired_instrumentation_level,
+                      bool try_switch_to_non_debuggable)
       REQUIRES(Locks::mutator_lock_, Roles::uninterruptible_)
-      REQUIRES(!Locks::thread_list_lock_,
-               !Locks::classlinker_classes_lock_);
-  void UpdateStubs() REQUIRES(Locks::mutator_lock_, Roles::uninterruptible_)
-      REQUIRES(!Locks::thread_list_lock_,
-               !Locks::classlinker_classes_lock_);
+      REQUIRES(!Locks::thread_list_lock_, !Locks::classlinker_classes_lock_);
+  void UpdateStubs(bool try_switch_to_non_debuggable)
+      REQUIRES(Locks::mutator_lock_, Roles::uninterruptible_)
+      REQUIRES(!Locks::thread_list_lock_, !Locks::classlinker_classes_lock_);
 
   // If there are no pending deoptimizations restores the stack to the normal state by updating the
   // return pcs to actual return addresses from the instrumentation stack and clears the
   // instrumentation stack.
   void MaybeRestoreInstrumentationStack() REQUIRES(Locks::mutator_lock_);
+
+  // Switches the runtime state to non-java debuggable if entry / exit hooks are no longer required
+  // and the runtime did not start off as java debuggable.
+  void MaybeSwitchRuntimeDebugState(Thread* self)
+      REQUIRES(Locks::mutator_lock_, Roles::uninterruptible_);
 
   // No thread safety analysis to get around SetQuickAllocEntryPointsInstrumented requiring
   // exclusive access to mutator lock which you can't get if the runtime isn't started.
@@ -678,41 +696,37 @@ class Instrumentation {
   // Did the runtime request we only run in the interpreter? ie -Xint mode.
   bool forced_interpret_only_;
 
-  // Do we have any listeners for method entry events? Short-cut to avoid taking the
-  // instrumentation_lock_.
-  bool have_method_entry_listeners_ GUARDED_BY(Locks::mutator_lock_);
+  // For method entry / exit events, we maintain fast trace listeners in a separate list to make
+  // implementation of fast trace listeners more efficient by JITing the code to handle fast trace
+  // events. We use a uint8_t (and not bool) to encode if there are none / fast / slow listeners.
+  // Do we have any listeners for method entry events.
+  uint8_t have_method_entry_listeners_ GUARDED_BY(Locks::mutator_lock_);
 
-  // Do we have any listeners for method exit events? Short-cut to avoid taking the
-  // instrumentation_lock_.
-  bool have_method_exit_listeners_ GUARDED_BY(Locks::mutator_lock_);
+  // Do we have any listeners for method exit events.
+  uint8_t have_method_exit_listeners_ GUARDED_BY(Locks::mutator_lock_);
 
-  // Do we have any listeners for method unwind events? Short-cut to avoid taking the
-  // instrumentation_lock_.
+  // Do we have any listeners for method unwind events?
   bool have_method_unwind_listeners_ GUARDED_BY(Locks::mutator_lock_);
 
-  // Do we have any listeners for dex move events? Short-cut to avoid taking the
-  // instrumentation_lock_.
+  // Do we have any listeners for dex move events?
   bool have_dex_pc_listeners_ GUARDED_BY(Locks::mutator_lock_);
 
-  // Do we have any listeners for field read events? Short-cut to avoid taking the
-  // instrumentation_lock_.
+  // Do we have any listeners for field read events?
   bool have_field_read_listeners_ GUARDED_BY(Locks::mutator_lock_);
 
-  // Do we have any listeners for field write events? Short-cut to avoid taking the
-  // instrumentation_lock_.
+  // Do we have any listeners for field write events?
   bool have_field_write_listeners_ GUARDED_BY(Locks::mutator_lock_);
 
-  // Do we have any exception thrown listeners? Short-cut to avoid taking the instrumentation_lock_.
+  // Do we have any exception thrown listeners?
   bool have_exception_thrown_listeners_ GUARDED_BY(Locks::mutator_lock_);
 
-  // Do we have any frame pop listeners? Short-cut to avoid taking the instrumentation_lock_.
+  // Do we have any frame pop listeners?
   bool have_watched_frame_pop_listeners_ GUARDED_BY(Locks::mutator_lock_);
 
-  // Do we have any branch listeners? Short-cut to avoid taking the instrumentation_lock_.
+  // Do we have any branch listeners?
   bool have_branch_listeners_ GUARDED_BY(Locks::mutator_lock_);
 
-  // Do we have any exception handled listeners? Short-cut to avoid taking the
-  // instrumentation_lock_.
+  // Do we have any exception handled listeners?
   bool have_exception_handled_listeners_ GUARDED_BY(Locks::mutator_lock_);
 
   // Contains the instrumentation level required by each client of the instrumentation identified
@@ -730,8 +744,12 @@ class Instrumentation {
   // listeners can also be deleted concurrently.
   // As a result, these lists are never trimmed. That's acceptable given the low number of
   // listeners we have.
-  std::list<InstrumentationListener*> method_entry_listeners_ GUARDED_BY(Locks::mutator_lock_);
-  std::list<InstrumentationListener*> method_exit_listeners_ GUARDED_BY(Locks::mutator_lock_);
+  std::list<InstrumentationListener*> method_entry_slow_listeners_ GUARDED_BY(Locks::mutator_lock_);
+  std::list<InstrumentationListener*> method_entry_fast_trace_listeners_
+      GUARDED_BY(Locks::mutator_lock_);
+  std::list<InstrumentationListener*> method_exit_slow_listeners_ GUARDED_BY(Locks::mutator_lock_);
+  std::list<InstrumentationListener*> method_exit_fast_trace_listeners_
+      GUARDED_BY(Locks::mutator_lock_);
   std::list<InstrumentationListener*> method_unwind_listeners_ GUARDED_BY(Locks::mutator_lock_);
   std::list<InstrumentationListener*> branch_listeners_ GUARDED_BY(Locks::mutator_lock_);
   std::list<InstrumentationListener*> dex_pc_listeners_ GUARDED_BY(Locks::mutator_lock_);

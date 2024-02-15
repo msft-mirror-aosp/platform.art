@@ -40,14 +40,12 @@ icu_data_file := $(firstword $(wildcard external/icu/icu4c/source/stubdata/icu*.
 my_files += $(foreach infix,_ _VDEX_,$(foreach suffix,$(HOST_ARCH) $(HOST_2ND_ARCH), \
   $(DEXPREOPT_IMAGE$(infix)BUILT_INSTALLED_art_host_$(suffix))))
 # `dexpreopt_bootjars.go` uses a single source of input regardless of variants, so we should use the
-# same source for `CORE_IMG_JARS` to avoid checksum mismatches on the oat files. We can still use
-# the host variant of `conscrypt` and `core-icu4j` because they don't go into the primary boot image
-# that is used in host gtests, and hence can't lead to checksum mismatches.
+# same source to avoid checksum mismatches on the oat files.
 my_files += \
   $(foreach jar,$(CORE_IMG_JARS),\
     $(OUT_DIR)/soong/dexpreopt_$(TARGET_ARCH)/dex_artjars_input/$(jar).jar:apex/com.android.art/javalib/$(jar).jar) \
-  $(HOST_OUT_JAVA_LIBRARIES)/conscrypt-hostdex.jar:apex/com.android.conscrypt/javalib/conscrypt.jar\
-  $(HOST_OUT_JAVA_LIBRARIES)/core-icu4j-hostdex.jar:apex/com.android.i18n/javalib/core-icu4j.jar \
+  $(OUT_DIR)/soong/dexpreopt_$(TARGET_ARCH)/dex_artjars_input/conscrypt.jar:apex/com.android.conscrypt/javalib/conscrypt.jar\
+  $(OUT_DIR)/soong/dexpreopt_$(TARGET_ARCH)/dex_artjars_input/core-icu4j.jar:apex/com.android.i18n/javalib/core-icu4j.jar \
   $(icu_data_file):com.android.i18n/etc/icu/$(notdir $(icu_data_file))
 
 # Create phony module that will copy all the data files into testcases directory.
@@ -138,6 +136,7 @@ endif
 
 ART_TEST_MODULES_TARGET := $(ART_TEST_MODULES_COMMON) \
     art_artd_tests \
+    art_dexopt_chroot_setup_tests \
     art_odrefresh_tests \
 
 ART_TEST_MODULES_HOST := $(ART_TEST_MODULES_COMMON)
@@ -147,6 +146,7 @@ ifneq (,$(wildcard frameworks/native/libs/binder))
   # can build the libbinder_ndk dependency. It is not available as a prebuilt on
   # master-art.
   ART_TEST_MODULES_HOST += art_artd_tests
+  ART_TEST_MODULES_HOST += art_dexopt_chroot_setup_tests
 endif
 
 ART_TARGET_GTEST_NAMES := $(foreach tm,$(ART_TEST_MODULES_TARGET),\

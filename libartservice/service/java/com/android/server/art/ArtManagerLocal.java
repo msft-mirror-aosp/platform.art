@@ -16,13 +16,15 @@
 
 package com.android.server.art;
 
-import static com.android.server.art.DexUseManagerLocal.DetailedSecondaryDexInfo;
-import static com.android.server.art.DexUseManagerLocal.SecondaryDexInfo;
+import static com.android.server.art.ArtFileManager.ProfileLists;
+import static com.android.server.art.ArtFileManager.UsableArtifactLists;
+import static com.android.server.art.ArtFileManager.WritableArtifactLists;
 import static com.android.server.art.PrimaryDexUtils.DetailedPrimaryDexInfo;
 import static com.android.server.art.PrimaryDexUtils.PrimaryDexInfo;
 import static com.android.server.art.ReasonMapping.BatchDexoptReason;
 import static com.android.server.art.ReasonMapping.BootReason;
 import static com.android.server.art.Utils.Abi;
+import static com.android.server.art.Utils.InitProfileResult;
 import static com.android.server.art.model.ArtFlags.GetStatusFlags;
 import static com.android.server.art.model.ArtFlags.ScheduleStatus;
 import static com.android.server.art.model.Config.Callback;
@@ -57,6 +59,7 @@ import androidx.annotation.RequiresApi;
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.server.LocalManagerRegistry;
 import com.android.server.art.model.ArtFlags;
+import com.android.server.art.model.ArtManagedFileStats;
 import com.android.server.art.model.BatchDexoptParams;
 import com.android.server.art.model.Config;
 import com.android.server.art.model.DeleteResult;
@@ -83,8 +86,10 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -122,7 +127,7 @@ public final class ArtManagerLocal {
 
     @Deprecated
     public ArtManagerLocal() {
-        mInjector = new Injector(this, null /* context */);
+        mInjector = new Injector();
     }
 
     /**
@@ -178,6 +183,8 @@ public final class ArtManagerLocal {
      * Deletes dexopt artifacts of a package, including the artifacts for primary dex files and the
      * ones for secondary dex files. This includes VDEX, ODEX, and ART files.
      *
+     * Also deletes runtime artifacts of the package, though they are not dexopt artifacts.
+     *
      * @throws IllegalArgumentException if the package is not found or the flags are illegal
      * @throws IllegalStateException if the operation encounters an error that should never happen
      *         (e.g., an internal logic error).
@@ -189,28 +196,16 @@ public final class ArtManagerLocal {
         PackageState pkgState = Utils.getPackageStateOrThrow(snapshot, packageName);
         AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
 
-        try {
+        try (var pin = mInjector.createArtdPin()) {
             long freedBytes = 0;
-
-            boolean isInDalvikCache = Utils.isInDalvikCache(pkgState, mInjector.getArtd());
-            for (PrimaryDexInfo dexInfo : PrimaryDexUtils.getDexInfo(pkg)) {
-                if (!dexInfo.hasCode()) {
-                    continue;
-                }
-                for (Abi abi : Utils.getAllAbis(pkgState)) {
-                    freedBytes += mInjector.getArtd().deleteArtifacts(AidlUtils.buildArtifactsPath(
-                            dexInfo.dexPath(), abi.isa(), isInDalvikCache));
-                }
+            WritableArtifactLists list =
+                    mInjector.getArtFileManager().getWritableArtifacts(pkgState, pkg);
+            for (ArtifactsPath artifacts : list.artifacts()) {
+                freedBytes += mInjector.getArtd().deleteArtifacts(artifacts);
             }
-
-            for (SecondaryDexInfo dexInfo :
-                    mInjector.getDexUseManager().getSecondaryDexInfo(packageName)) {
-                for (Abi abi : Utils.getAllAbisForNames(dexInfo.abiNames(), pkgState)) {
-                    freedBytes += mInjector.getArtd().deleteArtifacts(AidlUtils.buildArtifactsPath(
-                            dexInfo.dexPath(), abi.isa(), false /* isInDalvikCache */));
-                }
+            for (RuntimeArtifactsPath runtimeArtifacts : list.runtimeArtifacts()) {
+                freedBytes += mInjector.getArtd().deleteRuntimeArtifacts(runtimeArtifacts);
             }
-
             return DeleteResult.create(freedBytes);
         } catch (RemoteException e) {
             Utils.logArtdException(e);
@@ -219,7 +214,8 @@ public final class ArtManagerLocal {
     }
 
     /**
-     * Returns the dexopt status of a package.
+     * Returns the dexopt status of all known dex container files of a package, even if some of them
+     * aren't readable.
      *
      * Uses the default flags ({@link ArtFlags#defaultGetStatusFlags()}).
      *
@@ -250,31 +246,12 @@ public final class ArtManagerLocal {
 
         PackageState pkgState = Utils.getPackageStateOrThrow(snapshot, packageName);
         AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
+        List<Pair<DetailedDexInfo, Abi>> dexAndAbis = mInjector.getArtFileManager().getDexAndAbis(
+                pkgState, pkg, (flags & ArtFlags.FLAG_FOR_PRIMARY_DEX) != 0,
+                (flags & ArtFlags.FLAG_FOR_SECONDARY_DEX) != 0,
+                false /* excludeObsoleteDexesAndLoaders */);
 
-        List<Pair<DetailedDexInfo, Abi>> dexAndAbis = new ArrayList<>();
-
-        if ((flags & ArtFlags.FLAG_FOR_PRIMARY_DEX) != 0) {
-            for (DetailedPrimaryDexInfo dexInfo :
-                    PrimaryDexUtils.getDetailedDexInfo(pkgState, pkg)) {
-                if (!dexInfo.hasCode()) {
-                    continue;
-                }
-                for (Abi abi : Utils.getAllAbis(pkgState)) {
-                    dexAndAbis.add(Pair.create(dexInfo, abi));
-                }
-            }
-        }
-
-        if ((flags & ArtFlags.FLAG_FOR_SECONDARY_DEX) != 0) {
-            for (SecondaryDexInfo dexInfo :
-                    mInjector.getDexUseManager().getSecondaryDexInfo(packageName)) {
-                for (Abi abi : Utils.getAllAbisForNames(dexInfo.abiNames(), pkgState)) {
-                    dexAndAbis.add(Pair.create(dexInfo, abi));
-                }
-            }
-        }
-
-        try {
+        try (var pin = mInjector.createArtdPin()) {
             List<DexContainerFileDexoptStatus> statuses = new ArrayList<>();
 
             for (Pair<DetailedDexInfo, Abi> pair : dexAndAbis) {
@@ -325,27 +302,14 @@ public final class ArtManagerLocal {
         PackageState pkgState = Utils.getPackageStateOrThrow(snapshot, packageName);
         AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
 
-        try {
-            for (PrimaryDexInfo dexInfo : PrimaryDexUtils.getDexInfo(pkg)) {
-                if (!dexInfo.hasCode()) {
-                    continue;
-                }
-                mInjector.getArtd().deleteProfile(
-                        PrimaryDexUtils.buildRefProfilePath(pkgState, dexInfo));
-                for (ProfilePath profile : PrimaryDexUtils.getCurProfiles(
-                             mInjector.getUserManager(), pkgState, dexInfo)) {
-                    mInjector.getArtd().deleteProfile(profile);
-                }
-            }
-
-            // This only deletes the profiles of known secondary dex files. If there are unknown
-            // secondary dex files, their profiles will be deleted by `cleanup`.
-            for (SecondaryDexInfo dexInfo :
-                    mInjector.getDexUseManager().getSecondaryDexInfo(packageName)) {
-                mInjector.getArtd().deleteProfile(
-                        AidlUtils.buildProfilePathForSecondaryRef(dexInfo.dexPath()));
-                mInjector.getArtd().deleteProfile(
-                        AidlUtils.buildProfilePathForSecondaryCur(dexInfo.dexPath()));
+        try (var pin = mInjector.createArtdPin()) {
+            // We want to delete as many profiles as possible, so this deletes profiles of all known
+            // secondary dex files. If there are unknown secondary dex files, their profiles will be
+            // deleted by `cleanup`.
+            ProfileLists list = mInjector.getArtFileManager().getProfiles(pkgState, pkg,
+                    true /* alsoForSecondaryDex */, false /* excludeForObsoleteDexesAndLoaders */);
+            for (ProfilePath profile : list.allProfiles()) {
+                mInjector.getArtd().deleteProfile(profile);
             }
         } catch (RemoteException e) {
             Utils.logArtdException(e);
@@ -355,6 +319,10 @@ public final class ArtManagerLocal {
     /**
      * Dexopts a package. The time this operation takes ranges from a few milliseconds to several
      * minutes, depending on the params and the code size of the package.
+     *
+     * When dexopt is successfully performed for a dex container file, this operation also deletes
+     * the corresponding runtime artifacts (the ART files in the package's data directory, which are
+     * generated by the runtime, not by dexopt).
      *
      * When this operation ends (either completed or cancelled), callbacks added by {@link
      * #addDexoptDoneCallback(Executor, DexoptDoneCallback)} are called.
@@ -381,16 +349,18 @@ public final class ArtManagerLocal {
     public DexoptResult dexoptPackage(@NonNull PackageManagerLocal.FilteredSnapshot snapshot,
             @NonNull String packageName, @NonNull DexoptParams params,
             @NonNull CancellationSignal cancellationSignal) {
-        return mInjector.getDexoptHelper().dexopt(
-                snapshot, List.of(packageName), params, cancellationSignal, Runnable::run);
+        try (var pin = mInjector.createArtdPin()) {
+            return mInjector.getDexoptHelper().dexopt(
+                    snapshot, List.of(packageName), params, cancellationSignal, Runnable::run);
+        }
     }
 
     /**
      * Resets the dexopt state of the package as if the package is newly installed.
      *
-     * More specifically, it clears reference profiles, current profiles, and any code compiled from
-     * those local profiles. If there is an external profile (e.g., a cloud profile), the code
-     * compiled from that profile will be kept.
+     * More specifically, it clears reference profiles, current profiles, any code compiled from
+     * those local profiles, and runtime artifacts. If there is an external profile (e.g., a cloud
+     * profile), the code compiled from that profile will be kept.
      *
      * For secondary dex files, it also clears all dexopt artifacts.
      *
@@ -455,7 +425,9 @@ public final class ArtManagerLocal {
      * @param reason determines the default list of packages and options
      * @param cancellationSignal provides the ability to cancel this operation
      * @param processCallbackExecutor the executor to call {@code progressCallback}
-     * @param progressCallback called repeatedly whenever there is an update on the progress
+     * @param progressCallbacks a mapping from an integer, in {@link ArtFlags.BatchDexoptPass}, to
+     *         the callback that is called repeatedly whenever there is an update on the progress
+     * @return a mapping from an integer, in {@link ArtFlags.BatchDexoptPass}, to the dexopt result.
      * @throws IllegalStateException if the operation encounters an error that should never happen
      *         (e.g., an internal logic error), or the callback set by {@link
      *         #setBatchDexoptStartCallback(Executor, BatchDexoptStartCallback)} provides invalid
@@ -465,11 +437,12 @@ public final class ArtManagerLocal {
      */
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @NonNull
-    public DexoptResult dexoptPackages(@NonNull PackageManagerLocal.FilteredSnapshot snapshot,
+    public Map<Integer, DexoptResult> dexoptPackages(
+            @NonNull PackageManagerLocal.FilteredSnapshot snapshot,
             @NonNull @BatchDexoptReason String reason,
             @NonNull CancellationSignal cancellationSignal,
             @Nullable @CallbackExecutor Executor progressCallbackExecutor,
-            @Nullable Consumer<OperationProgress> progressCallback) {
+            @Nullable Map<Integer, Consumer<OperationProgress>> progressCallbacks) {
         List<String> defaultPackages =
                 Collections.unmodifiableList(getDefaultPackages(snapshot, reason));
         DexoptParams defaultDexoptParams = new DexoptParams.Builder(reason).build();
@@ -487,16 +460,37 @@ public final class ArtManagerLocal {
 
         ExecutorService dexoptExecutor =
                 Executors.newFixedThreadPool(ReasonMapping.getConcurrencyForReason(reason));
-        try {
+        Map<Integer, DexoptResult> dexoptResults = new HashMap<>();
+        try (var pin = mInjector.createArtdPin()) {
             if (reason.equals(ReasonMapping.REASON_BG_DEXOPT)) {
-                maybeDowngradePackages(snapshot,
+                DexoptResult downgradeResult = maybeDowngradePackages(snapshot,
                         new HashSet<>(params.getPackages()) /* excludedPackages */,
-                        cancellationSignal, dexoptExecutor);
+                        cancellationSignal, dexoptExecutor, progressCallbackExecutor,
+                        progressCallbacks != null ? progressCallbacks.get(ArtFlags.PASS_DOWNGRADE)
+                                                  : null);
+                if (downgradeResult != null) {
+                    dexoptResults.put(ArtFlags.PASS_DOWNGRADE, downgradeResult);
+                }
             }
-            Log.i(TAG, "Dexopting packages");
-            return mInjector.getDexoptHelper().dexopt(snapshot, params.getPackages(),
-                    params.getDexoptParams(), cancellationSignal, dexoptExecutor,
-                    progressCallbackExecutor, progressCallback);
+            Log.i(TAG,
+                    "Dexopting " + params.getPackages().size() + " packages with reason=" + reason);
+            DexoptResult mainResult = mInjector.getDexoptHelper().dexopt(snapshot,
+                    params.getPackages(), params.getDexoptParams(), cancellationSignal,
+                    dexoptExecutor, progressCallbackExecutor,
+                    progressCallbacks != null ? progressCallbacks.get(ArtFlags.PASS_MAIN) : null);
+            dexoptResults.put(ArtFlags.PASS_MAIN, mainResult);
+            if (reason.equals(ReasonMapping.REASON_BG_DEXOPT)) {
+                DexoptResult supplementaryResult = maybeDexoptPackagesSupplementaryPass(snapshot,
+                        mainResult, params.getDexoptParams(), cancellationSignal, dexoptExecutor,
+                        progressCallbackExecutor,
+                        progressCallbacks != null
+                                ? progressCallbacks.get(ArtFlags.PASS_SUPPLEMENTARY)
+                                : null);
+                if (supplementaryResult != null) {
+                    dexoptResults.put(ArtFlags.PASS_SUPPLEMENTARY, supplementaryResult);
+                }
+            }
+            return dexoptResults;
         } finally {
             dexoptExecutor.shutdown();
         }
@@ -548,9 +542,8 @@ public final class ArtManagerLocal {
      *
      * When the job is running, it may be cancelled by the job scheduler immediately whenever one of
      * the constraints above is no longer met or cancelled by the {@link
-     * #cancelBackgroundDexoptJob()} API. The job scheduler retries it in the next <i>maintenance
-     * window</i>. For information about <i>maintenance window</i>, see
-     * https://developer.android.com/training/monitoring-device-state/doze-standby.
+     * #cancelBackgroundDexoptJob()} API. The job scheduler retries it with the default retry policy
+     * (30 seconds, exponential, capped at 5hrs).
      *
      * See {@link #dexoptPackages} for how to customize the behavior of the job.
      *
@@ -731,19 +724,25 @@ public final class ArtManagerLocal {
             @NonNull PackageManagerLocal.FilteredSnapshot snapshot, @NonNull String packageName,
             @Nullable String splitName, @NonNull MergeProfileOptions options)
             throws SnapshotProfileException {
-        try {
+        try (var pin = mInjector.createArtdPin()) {
             PackageState pkgState = Utils.getPackageStateOrThrow(snapshot, packageName);
             AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
             PrimaryDexInfo dexInfo = PrimaryDexUtils.getDexInfoBySplitName(pkg, splitName);
 
             List<ProfilePath> profiles = new ArrayList<>();
 
-            Pair<ProfilePath, Boolean> pair = Utils.getOrInitReferenceProfile(mInjector.getArtd(),
+            InitProfileResult result = Utils.getOrInitReferenceProfile(mInjector.getArtd(),
                     dexInfo.dexPath(), PrimaryDexUtils.buildRefProfilePath(pkgState, dexInfo),
                     PrimaryDexUtils.getExternalProfiles(dexInfo),
                     PrimaryDexUtils.buildOutputProfile(pkgState, dexInfo, Process.SYSTEM_UID,
                             Process.SYSTEM_UID, false /* isPublic */));
-            ProfilePath refProfile = pair != null ? pair.first : null;
+            if (!result.externalProfileErrors().isEmpty()) {
+                Log.e(TAG,
+                        "Error occurred when initializing from external profiles: "
+                                + result.externalProfileErrors());
+            }
+
+            ProfilePath refProfile = result.profile();
 
             if (refProfile != null) {
                 profiles.add(refProfile);
@@ -807,14 +806,10 @@ public final class ArtManagerLocal {
             // check.
             if (Utils.canDexoptPackage(appPkgState, null /* appHibernationManager */)) {
                 AndroidPackage appPkg = Utils.getPackageOrThrow(appPkgState);
-                for (PrimaryDexInfo appDexInfo : PrimaryDexUtils.getDexInfo(appPkg)) {
-                    if (!appDexInfo.hasCode()) {
-                        continue;
-                    }
-                    profiles.add(PrimaryDexUtils.buildRefProfilePath(appPkgState, appDexInfo));
-                    profiles.addAll(PrimaryDexUtils.getCurProfiles(
-                            mInjector.getUserManager(), appPkgState, appDexInfo));
-                }
+                ProfileLists list = mInjector.getArtFileManager().getProfiles(appPkgState, appPkg,
+                        false /* alsoForSecondaryDex */,
+                        true /* excludeForObsoleteDexesAndLoaders */);
+                profiles.addAll(list.allProfiles());
             }
         });
 
@@ -831,7 +826,10 @@ public final class ArtManagerLocal {
         var options = new MergeProfileOptions();
         options.forceMerge = true;
         options.forBootImage = true;
-        return mergeProfilesAndGetFd(profiles, output, dexPaths, options);
+
+        try (var pin = mInjector.createArtdPin()) {
+            return mergeProfilesAndGetFd(profiles, output, dexPaths, options);
+        }
     }
 
     /**
@@ -850,8 +848,27 @@ public final class ArtManagerLocal {
             @Nullable Consumer<OperationProgress> progressCallback) {
         try (var snapshot = mInjector.getPackageManagerLocal().withFilteredSnapshot()) {
             dexoptPackages(snapshot, bootReason, new CancellationSignal(), progressCallbackExecutor,
-                    progressCallback);
+                    progressCallback != null ? Map.of(ArtFlags.PASS_MAIN, progressCallback) : null);
         }
+    }
+
+    /**
+     * Notifies ART Service that there are apexes staged for installation on next reboot (see
+     * <a href="https://source.android.com/docs/core/ota/apex#apex-manager">the update sequence of
+     * an APEX</a>). ART Service may use this to schedule a pre-reboot dexopt job. This might change
+     * in the future.
+     *
+     * This immediately returns after scheduling the job and doesn't wait for the job to run.
+     *
+     * @param stagedApexModuleNames The <b>module names</b> of the staged apexes, corresponding to
+     *         the directory beneath /apex, e.g., {@code com.android.art} (not the <b>package
+     *         names</b>, e.g., {@code com.google.android.art}).
+     */
+    @SuppressLint("UnflaggedApi") // Flag support for mainline is not available.
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    public void onApexStaged(@NonNull String[] stagedApexModuleNames) {
+        // TODO(b/311377497): Check system requirements.
+        mInjector.getPreRebootDexoptJob().schedule();
     }
 
     /**
@@ -865,7 +882,9 @@ public final class ArtManagerLocal {
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public void dump(
             @NonNull PrintWriter pw, @NonNull PackageManagerLocal.FilteredSnapshot snapshot) {
-        new DumpHelper(this).dump(pw, snapshot);
+        try (var pin = mInjector.createArtdPin()) {
+            new DumpHelper(this).dump(pw, snapshot);
+        }
     }
 
     /**
@@ -880,8 +899,82 @@ public final class ArtManagerLocal {
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public void dumpPackage(@NonNull PrintWriter pw,
             @NonNull PackageManagerLocal.FilteredSnapshot snapshot, @NonNull String packageName) {
-        new DumpHelper(this).dumpPackage(
-                pw, snapshot, Utils.getPackageStateOrThrow(snapshot, packageName));
+        try (var pin = mInjector.createArtdPin()) {
+            new DumpHelper(this).dumpPackage(
+                    pw, snapshot, Utils.getPackageStateOrThrow(snapshot, packageName));
+        }
+    }
+
+    /**
+     * Returns the statistics of the files managed by ART of a package.
+     *
+     * @throws IllegalArgumentException if the package is not found
+     * @throws IllegalStateException if the operation encounters an error that should never happen
+     *         (e.g., an internal logic error).
+     */
+    @SuppressLint("UnflaggedApi") // Flag support for mainline is not available.
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    @NonNull
+    public ArtManagedFileStats getArtManagedFileStats(
+            @NonNull PackageManagerLocal.FilteredSnapshot snapshot, @NonNull String packageName) {
+        PackageState pkgState = Utils.getPackageStateOrThrow(snapshot, packageName);
+        AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
+
+        try (var pin = mInjector.createArtdPin()) {
+            long artifactsSize = 0;
+            long refProfilesSize = 0;
+            long curProfilesSize = 0;
+            IArtd artd = mInjector.getArtd();
+
+            UsableArtifactLists artifactLists =
+                    mInjector.getArtFileManager().getUsableArtifacts(pkgState, pkg);
+            for (ArtifactsPath artifacts : artifactLists.artifacts()) {
+                artifactsSize += artd.getArtifactsSize(artifacts);
+            }
+            for (VdexPath vdexFile : artifactLists.vdexFiles()) {
+                artifactsSize += artd.getVdexFileSize(vdexFile);
+            }
+            for (RuntimeArtifactsPath runtimeArtifacts : artifactLists.runtimeArtifacts()) {
+                artifactsSize += artd.getRuntimeArtifactsSize(runtimeArtifacts);
+            }
+
+            ProfileLists profileLists = mInjector.getArtFileManager().getProfiles(pkgState, pkg,
+                    true /* alsoForSecondaryDex */, true /* excludeForObsoleteDexesAndLoaders */);
+            for (ProfilePath profile : profileLists.refProfiles()) {
+                refProfilesSize += artd.getProfileSize(profile);
+            }
+            for (ProfilePath profile : profileLists.curProfiles()) {
+                curProfilesSize += artd.getProfileSize(profile);
+            }
+
+            return new ArtManagedFileStats(artifactsSize, refProfilesSize, curProfilesSize);
+        } catch (RemoteException e) {
+            Utils.logArtdException(e);
+            return new ArtManagedFileStats(
+                    0 /* artifactsSize */, 0 /* refProfilesSize */, 0 /* curProfilesSize */);
+        }
+    }
+
+    /**
+     * Overrides the compiler filter of a package. The callback is called whenever a package is
+     * going to be dexopted. This method is thread-safe.
+     */
+    @SuppressLint("UnflaggedApi") // Flag support for mainline is not available.
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    public void setAdjustCompilerFilterCallback(@NonNull @CallbackExecutor Executor executor,
+            @NonNull AdjustCompilerFilterCallback callback) {
+        mInjector.getConfig().setAdjustCompilerFilterCallback(executor, callback);
+    }
+
+    /**
+     * Clears the callback set by {@link
+     * #setAdjustCompilerFilterCallback(Executor, AdjustCompilerFilterCallback)}. This
+     * method is thread-safe.
+     */
+    @SuppressLint("UnflaggedApi") // Flag support for mainline is not available.
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    public void clearAdjustCompilerFilterCallback() {
+        mInjector.getConfig().clearAdjustCompilerFilterCallback();
     }
 
     /**
@@ -894,9 +987,9 @@ public final class ArtManagerLocal {
      */
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public long cleanup(@NonNull PackageManagerLocal.FilteredSnapshot snapshot) {
-        mInjector.getDexUseManager().cleanup();
+        try (var pin = mInjector.createArtdPin()) {
+            mInjector.getDexUseManager().cleanup();
 
-        try {
             // For every primary dex container file or secondary dex container file of every app, if
             // it has code, we keep the following types of files:
             // - The reference profile and the current profiles, regardless of the hibernation state
@@ -904,89 +997,38 @@ public final class ArtManagerLocal {
             // - The dexopt artifacts, if they are up-to-date and the app is not hibernating.
             // - Only the VDEX part of the dexopt artifacts, if the dexopt artifacts are outdated
             //   but the VDEX part is still usable and the app is not hibernating.
+            // - The runtime artifacts, if dexopt artifacts are fully or partially usable and the
+            //   usable parts don't contain AOT-compiled code. (This logic must be aligned with the
+            //   one that determines when runtime images can be loaded in
+            //   `OatFileManager::OpenDexFilesFromOat` in `art/runtime/oat_file_manager.cc`.)
             List<ProfilePath> profilesToKeep = new ArrayList<>();
             List<ArtifactsPath> artifactsToKeep = new ArrayList<>();
             List<VdexPath> vdexFilesToKeep = new ArrayList<>();
+            List<RuntimeArtifactsPath> runtimeArtifactsToKeep = new ArrayList<>();
 
             for (PackageState pkgState : snapshot.getPackageStates().values()) {
                 if (!Utils.canDexoptPackage(pkgState, null /* appHibernationManager */)) {
                     continue;
                 }
                 AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
-                boolean isInDalvikCache = Utils.isInDalvikCache(pkgState, mInjector.getArtd());
-                boolean keepArtifacts = !Utils.shouldSkipDexoptDueToHibernation(
-                        pkgState, mInjector.getAppHibernationManager());
-                for (DetailedPrimaryDexInfo dexInfo :
-                        PrimaryDexUtils.getDetailedDexInfo(pkgState, pkg)) {
-                    if (!dexInfo.hasCode()) {
-                        continue;
-                    }
-                    profilesToKeep.add(PrimaryDexUtils.buildRefProfilePath(pkgState, dexInfo));
-                    profilesToKeep.addAll(PrimaryDexUtils.getCurProfiles(
-                            mInjector.getUserManager(), pkgState, dexInfo));
-                    if (keepArtifacts) {
-                        for (Abi abi : Utils.getAllAbis(pkgState)) {
-                            maybeKeepArtifacts(artifactsToKeep, vdexFilesToKeep, pkgState, dexInfo,
-                                    abi, isInDalvikCache);
-                        }
-                    }
-                }
-                for (DetailedSecondaryDexInfo dexInfo :
-                        mInjector.getDexUseManager().getFilteredDetailedSecondaryDexInfo(
-                                pkgState.getPackageName())) {
-                    profilesToKeep.add(
-                            AidlUtils.buildProfilePathForSecondaryRef(dexInfo.dexPath()));
-                    profilesToKeep.add(
-                            AidlUtils.buildProfilePathForSecondaryCur(dexInfo.dexPath()));
-                    if (keepArtifacts) {
-                        for (Abi abi : Utils.getAllAbisForNames(dexInfo.abiNames(), pkgState)) {
-                            maybeKeepArtifacts(artifactsToKeep, vdexFilesToKeep, pkgState, dexInfo,
-                                    abi, false /* isInDalvikCache */);
-                        }
-                    }
+                ProfileLists profileLists = mInjector.getArtFileManager().getProfiles(pkgState, pkg,
+                        true /* alsoForSecondaryDex */,
+                        true /* excludeForObsoleteDexesAndLoaders */);
+                profilesToKeep.addAll(profileLists.allProfiles());
+                if (!Utils.shouldSkipDexoptDueToHibernation(
+                            pkgState, mInjector.getAppHibernationManager())) {
+                    UsableArtifactLists artifactLists =
+                            mInjector.getArtFileManager().getUsableArtifacts(pkgState, pkg);
+                    artifactsToKeep.addAll(artifactLists.artifacts());
+                    vdexFilesToKeep.addAll(artifactLists.vdexFiles());
+                    runtimeArtifactsToKeep.addAll(artifactLists.runtimeArtifacts());
                 }
             }
-            return mInjector.getArtd().cleanup(profilesToKeep, artifactsToKeep, vdexFilesToKeep);
+            return mInjector.getArtd().cleanup(
+                    profilesToKeep, artifactsToKeep, vdexFilesToKeep, runtimeArtifactsToKeep);
         } catch (RemoteException e) {
             Utils.logArtdException(e);
             return 0;
-        }
-    }
-
-    /**
-     * Checks if the artifacts are up-to-date, and maybe adds them to {@code artifactsToKeep} or
-     * {@code vdexFilesToKeep} based on the result.
-     */
-    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
-    private void maybeKeepArtifacts(@NonNull List<ArtifactsPath> artifactsToKeep,
-            @NonNull List<VdexPath> vdexFilesToKeep, @NonNull PackageState pkgState,
-            @NonNull DetailedDexInfo dexInfo, @NonNull Abi abi, boolean isInDalvikCache)
-            throws RemoteException {
-        try {
-            GetDexoptStatusResult result = mInjector.getArtd().getDexoptStatus(
-                    dexInfo.dexPath(), abi.isa(), dexInfo.classLoaderContext());
-            if (DexFile.isValidCompilerFilter(result.compilerFilter)) {
-                // TODO(b/263579377): This is a bit inaccurate. We may be keeping the artifacts in
-                // dalvik-cache while OatFileAssistant actually picks the ones not in dalvik-cache.
-                // However, this isn't a big problem because it is an edge case and it only causes
-                // us to delete less rather than deleting more.
-                ArtifactsPath artifacts =
-                        AidlUtils.buildArtifactsPath(dexInfo.dexPath(), abi.isa(), isInDalvikCache);
-                if (result.compilationReason.equals(ArtConstants.REASON_VDEX)) {
-                    // Only the VDEX file is usable.
-                    vdexFilesToKeep.add(VdexPath.artifactsPath(artifacts));
-                } else {
-                    artifactsToKeep.add(artifacts);
-                }
-            }
-        } catch (ServiceSpecificException e) {
-            // Don't add the artifacts to the lists. They should be cleaned up.
-            Log.e(TAG,
-                    String.format("Failed to get dexopt status [packageName = %s, dexPath = %s, "
-                                    + "isa = %s, classLoaderContext = %s]",
-                            pkgState.getPackageName(), dexInfo.dexPath(), abi.isa(),
-                            dexInfo.classLoaderContext()),
-                    e);
         }
     }
 
@@ -1001,27 +1043,43 @@ public final class ArtManagerLocal {
         return mInjector.getBackgroundDexoptJob();
     }
 
+    /**
+     * Should be used by {@link BackgroundDexoptJobService} ONLY.
+     *
+     * @hide
+     */
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
-    private void maybeDowngradePackages(@NonNull PackageManagerLocal.FilteredSnapshot snapshot,
+    @NonNull
+    PreRebootDexoptJob getPreRebootDexoptJob() {
+        return mInjector.getPreRebootDexoptJob();
+    }
+
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    @Nullable
+    private DexoptResult maybeDowngradePackages(
+            @NonNull PackageManagerLocal.FilteredSnapshot snapshot,
             @NonNull Set<String> excludedPackages, @NonNull CancellationSignal cancellationSignal,
-            @NonNull Executor executor) {
+            @NonNull Executor executor,
+            @Nullable @CallbackExecutor Executor progressCallbackExecutor,
+            @Nullable Consumer<OperationProgress> progressCallback) {
         if (shouldDowngrade()) {
             List<String> packages = getDefaultPackages(snapshot, ReasonMapping.REASON_INACTIVE)
                                             .stream()
                                             .filter(pkg -> !excludedPackages.contains(pkg))
                                             .collect(Collectors.toList());
             if (!packages.isEmpty()) {
-                Log.i(TAG, "Storage is low. Downgrading inactive packages");
+                Log.i(TAG, "Storage is low. Downgrading " + packages.size() + " inactive packages");
                 DexoptParams params =
                         new DexoptParams.Builder(ReasonMapping.REASON_INACTIVE).build();
-                mInjector.getDexoptHelper().dexopt(snapshot, packages, params, cancellationSignal,
-                        executor, null /* processCallbackExecutor */, null /* progressCallback */);
+                return mInjector.getDexoptHelper().dexopt(snapshot, packages, params,
+                        cancellationSignal, executor, progressCallbackExecutor, progressCallback);
             } else {
                 Log.i(TAG,
                         "Storage is low, but downgrading is disabled or there's nothing to "
                                 + "downgrade");
             }
         }
+        return null;
     }
 
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
@@ -1033,6 +1091,48 @@ public final class ArtManagerLocal {
             Log.e(TAG, "Failed to check storage. Assuming storage not low", e);
             return false;
         }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    @Nullable
+    private DexoptResult maybeDexoptPackagesSupplementaryPass(
+            @NonNull PackageManagerLocal.FilteredSnapshot snapshot,
+            @NonNull DexoptResult mainResult, @NonNull DexoptParams mainParams,
+            @NonNull CancellationSignal cancellationSignal, @NonNull Executor dexoptExecutor,
+            @Nullable @CallbackExecutor Executor progressCallbackExecutor,
+            @Nullable Consumer<OperationProgress> progressCallback) {
+        if ((mainParams.getFlags() & ArtFlags.FLAG_FORCE_MERGE_PROFILE) != 0) {
+            return null;
+        }
+
+        // Only pick packages that used a profile-guided filter and were skipped in the main pass.
+        // This is a very coarse filter to reduce unnecessary iterations on a best-effort basis.
+        // Packages included in the list may still be skipped by dexopter if the profiles don't have
+        // any change.
+        List<String> packageNames =
+                mainResult.getPackageDexoptResults()
+                        .stream()
+                        .filter(packageResult
+                                -> packageResult.getDexContainerFileDexoptResults()
+                                           .stream()
+                                           .anyMatch(fileResult
+                                                   -> DexFile.isProfileGuidedCompilerFilter(
+                                                              fileResult.getActualCompilerFilter())
+                                                           && fileResult.getStatus()
+                                                                   == DexoptResult.DEXOPT_SKIPPED))
+                        .map(packageResult -> packageResult.getPackageName())
+                        .collect(Collectors.toList());
+
+        DexoptParams dexoptParams = mainParams.toBuilder()
+                                            .setFlags(ArtFlags.FLAG_FORCE_MERGE_PROFILE,
+                                                    ArtFlags.FLAG_FORCE_MERGE_PROFILE)
+                                            .build();
+
+        Log.i(TAG,
+                "Dexopting " + packageNames.size() + " packages with reason="
+                        + dexoptParams.getReason() + " (supplementary pass)");
+        return mInjector.getDexoptHelper().dexopt(snapshot, packageNames, dexoptParams,
+                cancellationSignal, dexoptExecutor, progressCallbackExecutor, progressCallback);
     }
 
     /** Returns the list of packages to process for the given reason. */
@@ -1157,9 +1257,8 @@ public final class ArtManagerLocal {
          *
          * Additionally, {@code cancellationSignal.cancel()} can be called to cancel this operation.
          * If this operation is initiated by the job scheduler and the {@code reason} is {@link
-         * ReasonMapping#REASON_BG_DEXOPT}, the job will be retried in the next <i>maintenance
-         * window</i>. For information about <i>maintenance window</i>, see
-         * https://developer.android.com/training/monitoring-device-state/doze-standby.
+         * ReasonMapping#REASON_BG_DEXOPT}, the job will be retried with the default retry policy
+         * (30 seconds, exponential, capped at 5hrs).
          *
          * Changing the reason is not allowed. Doing so will result in {@link IllegalStateException}
          * when {@link #dexoptPackages} is called.
@@ -1181,6 +1280,12 @@ public final class ArtManagerLocal {
          * ArtManagerLocal#scheduleBackgroundDexoptJob()} is passed to the callback as the {@code
          * builder} argument.
          *
+         * Setting {@link JobInfo.Builder#setBackoffCriteria} is not allowed. Doing so will result
+         * in {@link IllegalArgumentException} when {@link #scheduleBackgroundDexoptJob()} is
+         * called. The job is retried with the default retry policy (30 seconds, exponential, capped
+         * at 5hrs). Unfortunately, due to the limitation of the job scheduler API, this retry
+         * policy cannot be changed.
+         *
          * Setting {@link JobInfo.Builder#setRequiresStorageNotLow(boolean)} is not allowed. Doing
          * so will result in {@link IllegalStateException} when {@link
          * #scheduleBackgroundDexoptJob()} is called. ART Service has its own storage check, which
@@ -1197,6 +1302,55 @@ public final class ArtManagerLocal {
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public interface DexoptDoneCallback {
         void onDexoptDone(@NonNull DexoptResult result);
+    }
+
+    /** @hide */
+    @SuppressLint("UnflaggedApi") // Flag support for mainline is not available.
+    @SystemApi(client = SystemApi.Client.SYSTEM_SERVER)
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    public interface AdjustCompilerFilterCallback {
+        /**
+         * Returns the adjusted compiler filter for the given package. If a package doesn't need
+         * adjustment, this callback must return {@code originalCompilerFilter}. The callback must
+         * be able to handle unknown {@code originalCompilerFilter} and unknown {@code reason}
+         * because more compiler filters and reasons may be added in the future.
+         *
+         * The returned compiler filter overrides any compiler filter set by {@link
+         * DexoptParams.Builder#setCompilerFilter}, no matter the dexopt is initiated by a
+         * {@link #dexoptPackage} API call or any automatic batch dexopt (e.g., dexopt on boot and
+         * background dexopt).
+         *
+         * This callback is useful for:
+         * - Consistently overriding the compiler filter regardless of the dexopt initiator, for
+         *   some performance-sensitive packages.
+         * - Providing a compiler filter for specific packages during batch dexopt.
+         *
+         * The actual compiler filter to be used for dexopt will be determined in the following
+         * order:
+         *
+         * 1. The default compiler filter for the given reason.
+         * 2. The compiler filter set explicitly by {@link DexoptParams.Builder#setCompilerFilter}.
+         * 3. ART Service's internal adjustments to upgrade the compiler filter, based on whether
+         *    the package is System UI, etc.
+         * 4. The adjustments made by this callback.
+         * 5. ART Service's internal adjustments to downgrade the compiler filter, based on whether
+         *    the profile is available, etc.
+         *
+         * @param packageName the name of the package to be dexopted
+         * @param originalCompilerFilter the compiler filter before adjustment. This is the result
+         *         of step 3 described above. It would be the input to step 5 described above if
+         *         it wasn't for this callback.
+         * @param reason the compilation reason of this dexopt operation. It is a string defined in
+         *         {@link ReasonMapping} or a custom string passed to {@link
+         *         DexoptParams.Builder#Builder(String)}
+         *
+         * @return the compiler filter after adjustment. This will be the input to step 5 described
+         *         above
+         */
+        @SuppressLint("UnflaggedApi") // Flag support for mainline is not available.
+        @NonNull
+        String onAdjustCompilerFilter(@NonNull String packageName,
+                @NonNull String originalCompilerFilter, @NonNull String reason);
     }
 
     /**
@@ -1230,30 +1384,33 @@ public final class ArtManagerLocal {
         @Nullable private final PackageManagerLocal mPackageManagerLocal;
         @Nullable private final Config mConfig;
         @Nullable private BackgroundDexoptJob mBgDexoptJob = null;
+        @Nullable private PreRebootDexoptJob mPrDexoptJob = null;
 
-        // TODO(jiakaiz): Remove @SuppressLint and check `Build.VERSION.SDK_INT >=
-        // Build.VERSION_CODES.UPSIDE_DOWN_CAKE` once the SDK is finalized.
-        @SuppressLint("NewApi")
+        /** For compatibility with S and T. New code should not use this. */
+        @Deprecated
+        Injector() {
+            mArtManagerLocal = null;
+            mContext = null;
+            mPackageManagerLocal = null;
+            mConfig = null;
+        }
+
+        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
         Injector(@NonNull ArtManagerLocal artManagerLocal, @Nullable Context context) {
+            // We only need them on Android U and above, where a context is passed.
             mArtManagerLocal = artManagerLocal;
             mContext = context;
-            if (context != null) {
-                // We only need them on Android U and above, where a context is passed.
-                mPackageManagerLocal = Objects.requireNonNull(
-                        LocalManagerRegistry.getManager(PackageManagerLocal.class));
-                mConfig = new Config();
+            mPackageManagerLocal = Objects.requireNonNull(
+                    LocalManagerRegistry.getManager(PackageManagerLocal.class));
+            mConfig = new Config();
 
-                // Call the getters for the dependencies that aren't optional, to ensure correct
-                // initialization order.
-                getDexoptHelper();
-                getUserManager();
-                getDexUseManager();
-                getStorageManager();
-                ArtModuleServiceInitializer.getArtModuleServiceManager();
-            } else {
-                mPackageManagerLocal = null;
-                mConfig = null;
-            }
+            // Call the getters for the dependencies that aren't optional, to ensure correct
+            // initialization order.
+            getDexoptHelper();
+            getUserManager();
+            getDexUseManager();
+            getStorageManager();
+            ArtModuleServiceInitializer.getArtModuleServiceManager();
         }
 
         @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
@@ -1271,7 +1428,13 @@ public final class ArtManagerLocal {
         @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
         @NonNull
         public IArtd getArtd() {
-            return Utils.getArtd();
+            return ArtdRefCache.getInstance().getArtd();
+        }
+
+        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+        @NonNull
+        public ArtdRefCache.Pin createArtdPin() {
+            return ArtdRefCache.getInstance().new Pin();
         }
 
         /** Returns a new {@link DexoptHelper} instance. */
@@ -1307,6 +1470,15 @@ public final class ArtManagerLocal {
                 mBgDexoptJob = new BackgroundDexoptJob(mContext, mArtManagerLocal, mConfig);
             }
             return mBgDexoptJob;
+        }
+
+        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+        @NonNull
+        public synchronized PreRebootDexoptJob getPreRebootDexoptJob() {
+            if (mPrDexoptJob == null) {
+                mPrDexoptJob = new PreRebootDexoptJob(mContext);
+            }
+            return mPrDexoptJob;
         }
 
         @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
@@ -1348,6 +1520,12 @@ public final class ArtManagerLocal {
         public String getTempDir() {
             // This is a path that system_server is known to have full access to.
             return "/data/system";
+        }
+
+        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+        @NonNull
+        public ArtFileManager getArtFileManager() {
+            return new ArtFileManager(getContext());
         }
     }
 }

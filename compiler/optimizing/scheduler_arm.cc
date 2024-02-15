@@ -17,6 +17,7 @@
 #include "scheduler_arm.h"
 
 #include "arch/arm/instruction_set_features_arm.h"
+#include "code_generator_arm_vixl.h"
 #include "code_generator_utils.h"
 #include "common_arm.h"
 #include "heap_poisoning.h"
@@ -28,6 +29,116 @@ namespace arm {
 
 using helpers::Int32ConstantFrom;
 using helpers::Uint64ConstantFrom;
+
+// AArch32 instruction latencies.
+// We currently assume that all ARM CPUs share the same instruction latency list.
+// The following latencies were tuned based on performance experiments and
+// automatic tuning using differential evolution approach on various benchmarks.
+static constexpr uint32_t kArmIntegerOpLatency = 2;
+static constexpr uint32_t kArmFloatingPointOpLatency = 11;
+static constexpr uint32_t kArmDataProcWithShifterOpLatency = 4;
+static constexpr uint32_t kArmMulIntegerLatency = 6;
+static constexpr uint32_t kArmMulFloatingPointLatency = 11;
+static constexpr uint32_t kArmDivIntegerLatency = 10;
+static constexpr uint32_t kArmDivFloatLatency = 20;
+static constexpr uint32_t kArmDivDoubleLatency = 25;
+static constexpr uint32_t kArmTypeConversionFloatingPointIntegerLatency = 11;
+static constexpr uint32_t kArmMemoryLoadLatency = 9;
+static constexpr uint32_t kArmMemoryStoreLatency = 9;
+static constexpr uint32_t kArmMemoryBarrierLatency = 6;
+static constexpr uint32_t kArmBranchLatency = 4;
+static constexpr uint32_t kArmCallLatency = 5;
+static constexpr uint32_t kArmCallInternalLatency = 29;
+static constexpr uint32_t kArmLoadStringInternalLatency = 10;
+static constexpr uint32_t kArmNopLatency = 2;
+static constexpr uint32_t kArmLoadWithBakerReadBarrierLatency = 18;
+static constexpr uint32_t kArmRuntimeTypeCheckLatency = 46;
+
+class SchedulingLatencyVisitorARM final : public SchedulingLatencyVisitor {
+ public:
+  explicit SchedulingLatencyVisitorARM(CodeGenerator* codegen)
+      : codegen_(down_cast<CodeGeneratorARMVIXL*>(codegen)) {}
+
+  // Default visitor for instructions not handled specifically below.
+  void VisitInstruction([[maybe_unused]] HInstruction*) override {
+    last_visited_latency_ = kArmIntegerOpLatency;
+  }
+
+// We add a second unused parameter to be able to use this macro like the others
+// defined in `nodes.h`.
+#define FOR_EACH_SCHEDULED_ARM_INSTRUCTION(M) \
+  M(ArrayGet, unused)                         \
+  M(ArrayLength, unused)                      \
+  M(ArraySet, unused)                         \
+  M(Add, unused)                              \
+  M(Sub, unused)                              \
+  M(And, unused)                              \
+  M(Or, unused)                               \
+  M(Ror, unused)                              \
+  M(Xor, unused)                              \
+  M(Shl, unused)                              \
+  M(Shr, unused)                              \
+  M(UShr, unused)                             \
+  M(Mul, unused)                              \
+  M(Div, unused)                              \
+  M(Condition, unused)                        \
+  M(Compare, unused)                          \
+  M(BoundsCheck, unused)                      \
+  M(InstanceFieldGet, unused)                 \
+  M(InstanceFieldSet, unused)                 \
+  M(InstanceOf, unused)                       \
+  M(Invoke, unused)                           \
+  M(LoadString, unused)                       \
+  M(NewArray, unused)                         \
+  M(NewInstance, unused)                      \
+  M(Rem, unused)                              \
+  M(StaticFieldGet, unused)                   \
+  M(StaticFieldSet, unused)                   \
+  M(SuspendCheck, unused)                     \
+  M(TypeConversion, unused)
+
+#define FOR_EACH_SCHEDULED_SHARED_INSTRUCTION(M) \
+  M(BitwiseNegatedRight, unused)                 \
+  M(MultiplyAccumulate, unused)                  \
+  M(IntermediateAddress, unused)                 \
+  M(IntermediateAddressIndex, unused)            \
+  M(DataProcWithShifterOp, unused)
+
+#define DECLARE_VISIT_INSTRUCTION(type, unused)  \
+  void Visit##type(H##type* instruction) override;
+
+  FOR_EACH_SCHEDULED_ARM_INSTRUCTION(DECLARE_VISIT_INSTRUCTION)
+  FOR_EACH_SCHEDULED_SHARED_INSTRUCTION(DECLARE_VISIT_INSTRUCTION)
+  FOR_EACH_CONCRETE_INSTRUCTION_ARM(DECLARE_VISIT_INSTRUCTION)
+
+#undef DECLARE_VISIT_INSTRUCTION
+
+ private:
+  bool CanGenerateTest(HCondition* cond);
+  void HandleGenerateConditionWithZero(IfCondition cond);
+  void HandleGenerateLongTestConstant(HCondition* cond);
+  void HandleGenerateLongTest(HCondition* cond);
+  void HandleGenerateLongComparesAndJumps();
+  void HandleGenerateTest(HCondition* cond);
+  void HandleGenerateConditionGeneric(HCondition* cond);
+  void HandleGenerateEqualLong(HCondition* cond);
+  void HandleGenerateConditionLong(HCondition* cond);
+  void HandleGenerateConditionIntegralOrNonPrimitive(HCondition* cond);
+  void HandleCondition(HCondition* instr);
+  void HandleBinaryOperationLantencies(HBinaryOperation* instr);
+  void HandleBitwiseOperationLantencies(HBinaryOperation* instr);
+  void HandleShiftLatencies(HBinaryOperation* instr);
+  void HandleDivRemConstantIntegralLatencies(int32_t imm);
+  void HandleFieldSetLatencies(HInstruction* instruction, const FieldInfo& field_info);
+  void HandleFieldGetLatencies(HInstruction* instruction, const FieldInfo& field_info);
+  void HandleGenerateDataProcInstruction(bool internal_latency = false);
+  void HandleGenerateDataProc(HDataProcWithShifterOp* instruction);
+  void HandleGenerateLongDataProc(HDataProcWithShifterOp* instruction);
+
+  // The latency setting for each HInstruction depends on how CodeGenerator may generate code,
+  // latency visitors may query CodeGenerator for such information for accurate latency settings.
+  CodeGeneratorARMVIXL* codegen_;
+};
 
 void SchedulingLatencyVisitorARM::HandleBinaryOperationLantencies(HBinaryOperation* instr) {
   switch (instr->GetResultType()) {
@@ -610,7 +721,7 @@ void SchedulingLatencyVisitorARM::VisitDataProcWithShifterOp(HDataProcWithShifte
   }
 }
 
-void SchedulingLatencyVisitorARM::VisitIntermediateAddress(HIntermediateAddress* ATTRIBUTE_UNUSED) {
+void SchedulingLatencyVisitorARM::VisitIntermediateAddress([[maybe_unused]] HIntermediateAddress*) {
   // Although the code generated is a simple `add` instruction, we found through empirical results
   // that spacing it from its use in memory accesses was beneficial.
   last_visited_internal_latency_ = kArmNopLatency;
@@ -618,11 +729,11 @@ void SchedulingLatencyVisitorARM::VisitIntermediateAddress(HIntermediateAddress*
 }
 
 void SchedulingLatencyVisitorARM::VisitIntermediateAddressIndex(
-    HIntermediateAddressIndex* ATTRIBUTE_UNUSED) {
+    [[maybe_unused]] HIntermediateAddressIndex*) {
   UNIMPLEMENTED(FATAL) << "IntermediateAddressIndex is not implemented for ARM";
 }
 
-void SchedulingLatencyVisitorARM::VisitMultiplyAccumulate(HMultiplyAccumulate* ATTRIBUTE_UNUSED) {
+void SchedulingLatencyVisitorARM::VisitMultiplyAccumulate([[maybe_unused]] HMultiplyAccumulate*) {
   last_visited_latency_ = kArmMulIntegerLatency;
 }
 
@@ -669,7 +780,7 @@ void SchedulingLatencyVisitorARM::VisitArrayGet(HArrayGet* instruction) {
     }
 
     case DataType::Type::kReference: {
-      if (gUseReadBarrier && kUseBakerReadBarrier) {
+      if (codegen_->EmitBakerReadBarrier()) {
         last_visited_latency_ = kArmLoadWithBakerReadBarrierLatency;
       } else {
         if (index->IsConstant()) {
@@ -806,7 +917,7 @@ void SchedulingLatencyVisitorARM::VisitArraySet(HArraySet* instruction) {
   }
 }
 
-void SchedulingLatencyVisitorARM::VisitBoundsCheck(HBoundsCheck* ATTRIBUTE_UNUSED) {
+void SchedulingLatencyVisitorARM::VisitBoundsCheck([[maybe_unused]] HBoundsCheck*) {
   last_visited_internal_latency_ = kArmIntegerOpLatency;
   // Users do not use any data results.
   last_visited_latency_ = 0;
@@ -853,11 +964,6 @@ void SchedulingLatencyVisitorARM::VisitDiv(HDiv* instruction) {
   }
 }
 
-void SchedulingLatencyVisitorARM::VisitPredicatedInstanceFieldGet(
-    HPredicatedInstanceFieldGet* instruction) {
-  HandleFieldGetLatencies(instruction, instruction->GetFieldInfo());
-}
-
 void SchedulingLatencyVisitorARM::VisitInstanceFieldGet(HInstanceFieldGet* instruction) {
   HandleFieldGetLatencies(instruction, instruction->GetFieldInfo());
 }
@@ -866,22 +972,22 @@ void SchedulingLatencyVisitorARM::VisitInstanceFieldSet(HInstanceFieldSet* instr
   HandleFieldSetLatencies(instruction, instruction->GetFieldInfo());
 }
 
-void SchedulingLatencyVisitorARM::VisitInstanceOf(HInstanceOf* ATTRIBUTE_UNUSED) {
+void SchedulingLatencyVisitorARM::VisitInstanceOf([[maybe_unused]] HInstanceOf*) {
   last_visited_internal_latency_ = kArmCallInternalLatency;
   last_visited_latency_ = kArmIntegerOpLatency;
 }
 
-void SchedulingLatencyVisitorARM::VisitInvoke(HInvoke* ATTRIBUTE_UNUSED) {
+void SchedulingLatencyVisitorARM::VisitInvoke([[maybe_unused]] HInvoke*) {
   last_visited_internal_latency_ = kArmCallInternalLatency;
   last_visited_latency_ = kArmCallLatency;
 }
 
-void SchedulingLatencyVisitorARM::VisitLoadString(HLoadString* ATTRIBUTE_UNUSED) {
+void SchedulingLatencyVisitorARM::VisitLoadString([[maybe_unused]] HLoadString*) {
   last_visited_internal_latency_ = kArmLoadStringInternalLatency;
   last_visited_latency_ = kArmMemoryLoadLatency;
 }
 
-void SchedulingLatencyVisitorARM::VisitNewArray(HNewArray* ATTRIBUTE_UNUSED) {
+void SchedulingLatencyVisitorARM::VisitNewArray([[maybe_unused]] HNewArray*) {
   last_visited_internal_latency_ = kArmIntegerOpLatency + kArmCallInternalLatency;
   last_visited_latency_ = kArmCallLatency;
 }
@@ -918,9 +1024,7 @@ void SchedulingLatencyVisitorARM::VisitRem(HRem* instruction) {
 
 void SchedulingLatencyVisitorARM::HandleFieldGetLatencies(HInstruction* instruction,
                                                           const FieldInfo& field_info) {
-  DCHECK(instruction->IsInstanceFieldGet() ||
-         instruction->IsStaticFieldGet() ||
-         instruction->IsPredicatedInstanceFieldGet());
+  DCHECK(instruction->IsInstanceFieldGet() || instruction->IsStaticFieldGet());
   DCHECK(codegen_ != nullptr);
   bool is_volatile = field_info.IsVolatile();
   DataType::Type field_type = field_info.GetFieldType();
@@ -937,7 +1041,7 @@ void SchedulingLatencyVisitorARM::HandleFieldGetLatencies(HInstruction* instruct
       break;
 
     case DataType::Type::kReference:
-      if (gUseReadBarrier && kUseBakerReadBarrier) {
+      if (codegen_->EmitBakerReadBarrier()) {
         last_visited_internal_latency_ = kArmMemoryLoadLatency + kArmIntegerOpLatency;
         last_visited_latency_ = kArmMemoryLoadLatency;
       } else {
@@ -984,8 +1088,6 @@ void SchedulingLatencyVisitorARM::HandleFieldSetLatencies(HInstruction* instruct
   DCHECK(codegen_ != nullptr);
   bool is_volatile = field_info.IsVolatile();
   DataType::Type field_type = field_info.GetFieldType();
-  bool needs_write_barrier =
-      CodeGenerator::StoreNeedsWriteBarrier(field_type, instruction->InputAt(1));
   bool atomic_ldrd_strd = codegen_->GetInstructionSetFeatures().HasAtomicLdrdAndStrd();
 
   switch (field_type) {
@@ -1004,7 +1106,7 @@ void SchedulingLatencyVisitorARM::HandleFieldSetLatencies(HInstruction* instruct
 
     case DataType::Type::kInt32:
     case DataType::Type::kReference:
-      if (kPoisonHeapReferences && needs_write_barrier) {
+      if (kPoisonHeapReferences && field_type == DataType::Type::kReference) {
         last_visited_internal_latency_ += kArmIntegerOpLatency * 2;
       }
       last_visited_latency_ = kArmMemoryStoreLatency;
@@ -1160,6 +1262,29 @@ void SchedulingLatencyVisitorARM::VisitTypeConversion(HTypeConversion* instr) {
       last_visited_latency_ = kArmTypeConversionFloatingPointIntegerLatency;
       break;
   }
+}
+
+bool HSchedulerARM::IsSchedulable(const HInstruction* instruction) const {
+  switch (instruction->GetKind()) {
+#define SCHEDULABLE_CASE(type, unused)            \
+    case HInstruction::InstructionKind::k##type:  \
+      return true;
+    FOR_EACH_SCHEDULED_SHARED_INSTRUCTION(SCHEDULABLE_CASE)
+    FOR_EACH_CONCRETE_INSTRUCTION_ARM(SCHEDULABLE_CASE)
+#undef SCHEDULABLE_CASE
+
+    default:
+      return HScheduler::IsSchedulable(instruction);
+  }
+}
+
+std::pair<SchedulingGraph, ScopedArenaVector<SchedulingNode*>> HSchedulerARM::BuildSchedulingGraph(
+    HBasicBlock* block,
+    ScopedArenaAllocator* allocator,
+    const HeapLocationCollector* heap_location_collector) {
+  SchedulingLatencyVisitorARM latency_visitor(codegen_);
+  return HScheduler::BuildSchedulingGraph(
+      block, allocator, heap_location_collector, &latency_visitor);
 }
 
 }  // namespace arm

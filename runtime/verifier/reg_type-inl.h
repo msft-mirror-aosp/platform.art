@@ -25,7 +25,7 @@
 #include "mirror/class.h"
 #include "verifier_deps.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace verifier {
 
 inline bool RegType::CanAccess(const RegType& other) const {
@@ -152,72 +152,6 @@ inline bool RegType::IsAssignableFrom(const RegType& src, MethodVerifier* verifi
 
 inline bool RegType::IsStrictlyAssignableFrom(const RegType& src, MethodVerifier* verifier) const {
   return AssignableFrom(*this, src, true, verifier);
-}
-
-inline const DoubleHiType* DoubleHiType::GetInstance() {
-  DCHECK(instance_ != nullptr);
-  return instance_;
-}
-
-inline const DoubleLoType* DoubleLoType::GetInstance() {
-  DCHECK(instance_ != nullptr);
-  return instance_;
-}
-
-inline const LongHiType* LongHiType::GetInstance() {
-  DCHECK(instance_ != nullptr);
-  return instance_;
-}
-
-inline const LongLoType* LongLoType::GetInstance() {
-  DCHECK(instance_ != nullptr);
-  return instance_;
-}
-
-inline const FloatType* FloatType::GetInstance() {
-  DCHECK(instance_ != nullptr);
-  return instance_;
-}
-
-inline const CharType* CharType::GetInstance() {
-  DCHECK(instance_ != nullptr);
-  return instance_;
-}
-
-inline const ShortType* ShortType::GetInstance() {
-  DCHECK(instance_ != nullptr);
-  return instance_;
-}
-
-inline const ByteType* ByteType::GetInstance() {
-  DCHECK(instance_ != nullptr);
-  return instance_;
-}
-
-
-inline const IntegerType* IntegerType::GetInstance() {
-  DCHECK(instance_ != nullptr);
-  return instance_;
-}
-
-inline const BooleanType* BooleanType::GetInstance() {
-  DCHECK(BooleanType::instance_ != nullptr);
-  return BooleanType::instance_;
-}
-
-inline const ConflictType* ConflictType::GetInstance() {
-  DCHECK(instance_ != nullptr);
-  return instance_;
-}
-
-inline const UndefinedType* UndefinedType::GetInstance() {
-  DCHECK(instance_ != nullptr);
-  return instance_;
-}
-
-inline const NullType* NullType::GetInstance() {
-  DCHECK(instance_ != nullptr);
-  return instance_;
 }
 
 inline void* RegType::operator new(size_t size, ScopedArenaAllocator* allocator) {

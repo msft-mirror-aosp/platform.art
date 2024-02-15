@@ -19,7 +19,7 @@
 #include "gtest/gtest.h"
 #include "android-base/logging.h"
 
-namespace art {
+namespace art HIDDEN {
 
 constexpr size_t BitString::kBitSizeAtPosition[BitString::kCapacity];
 constexpr size_t BitString::kCapacity;
@@ -89,8 +89,8 @@ struct MockClass {
   bool CasField32(art::MemberOffset offset,
                   int32_t old_value,
                   int32_t new_value,
-                  CASMode mode ATTRIBUTE_UNUSED,
-                  std::memory_order memory_order ATTRIBUTE_UNUSED)
+                  [[maybe_unused]] CASMode mode,
+                  [[maybe_unused]] std::memory_order memory_order)
       REQUIRES_SHARED(Locks::mutator_lock_) {
     UNUSED(offset);
     if (old_value == GetField32Volatile(offset)) {

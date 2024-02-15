@@ -38,9 +38,53 @@
 #include "thread-current-inl.h"
 #include "thread_list.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace gc {
 namespace collector {
+
+namespace {
+
+// Report a GC metric via the ATrace interface.
+void TraceGCMetric(const char* name, int64_t value) {
+  // ART's interface with systrace (through libartpalette) only supports
+  // reporting 32-bit (signed) integer values at the moment. Upon
+  // underflows/overflows, clamp metric values at `int32_t` min/max limits and
+  // report these events via a corresponding underflow/overflow counter; also
+  // log a warning about the first underflow/overflow occurrence.
+  //
+  // TODO(b/300015145): Consider extending libarpalette to allow reporting this
+  // value as a 64-bit (signed) integer (instead of a 32-bit (signed) integer).
+  // Note that this is likely unnecessary at the moment (November 2023) for any
+  // size-related GC metric, given the maximum theoretical size of a managed
+  // heap (4 GiB).
+  if (UNLIKELY(value < std::numeric_limits<int32_t>::min())) {
+    ATraceIntegerValue(name, std::numeric_limits<int32_t>::min());
+    std::string underflow_counter_name = std::string(name) + " int32_t underflow";
+    ATraceIntegerValue(underflow_counter_name.c_str(), 1);
+    static bool int32_underflow_reported = false;
+    if (!int32_underflow_reported) {
+      LOG(WARNING) << "GC Metric \"" << name << "\" with value " << value
+                   << " causing a 32-bit integer underflow";
+      int32_underflow_reported = true;
+    }
+    return;
+  }
+  if (UNLIKELY(value > std::numeric_limits<int32_t>::max())) {
+    ATraceIntegerValue(name, std::numeric_limits<int32_t>::max());
+    std::string overflow_counter_name = std::string(name) + " int32_t overflow";
+    ATraceIntegerValue(overflow_counter_name.c_str(), 1);
+    static bool int32_overflow_reported = false;
+    if (!int32_overflow_reported) {
+      LOG(WARNING) << "GC Metric \"" << name << "\" with value " << value
+                   << " causing a 32-bit integer overflow";
+      int32_overflow_reported = true;
+    }
+    return;
+  }
+  ATraceIntegerValue(name, value);
+}
+
+}  // namespace
 
 Iteration::Iteration()
     : duration_ns_(0), timings_("GC iteration timing logger", true, VLOG_IS_ON(heap)) {
@@ -87,24 +131,11 @@ GarbageCollector::GarbageCollector(Heap* heap, const std::string& name)
       pause_histogram_lock_("pause histogram lock", kDefaultMutexLevel, true),
       is_transaction_active_(false),
       are_metrics_initialized_(false) {
-  ResetCumulativeStatistics();
+  ResetMeasurements();
 }
 
 void GarbageCollector::RegisterPause(uint64_t nano_length) {
   GetCurrentIteration()->pause_times_.push_back(nano_length);
-}
-
-void GarbageCollector::ResetCumulativeStatistics() {
-  cumulative_timings_.Reset();
-  total_thread_cpu_time_ns_ = 0u;
-  total_time_ns_ = 0u;
-  total_freed_objects_ = 0u;
-  total_freed_bytes_ = 0;
-  total_scanned_bytes_ = 0;
-  rss_histogram_.Reset();
-  freed_bytes_histogram_.Reset();
-  MutexLock mu(Thread::Current(), pause_histogram_lock_);
-  pause_histogram_.Reset();
 }
 
 uint64_t GarbageCollector::ExtractRssFromMincore(
@@ -137,13 +168,13 @@ uint64_t GarbageCollector::ExtractRssFromMincore(
     }
     size_t length = static_cast<uint8_t*>(it->second) - static_cast<uint8_t*>(it->first);
     // Compute max length for vector allocation later.
-    vec_len = std::max(vec_len, length / kPageSize);
+    vec_len = std::max(vec_len, DivideByPageSize(length));
   }
   std::unique_ptr<unsigned char[]> vec(new unsigned char[vec_len]);
   for (const auto it : *gc_ranges) {
     size_t length = static_cast<uint8_t*>(it.second) - static_cast<uint8_t*>(it.first);
     if (mincore(it.first, length, vec.get()) == 0) {
-      for (size_t i = 0; i < length / kPageSize; i++) {
+      for (size_t i = 0; i < DivideByPageSize(length); i++) {
         // Least significant bit represents residency of a page. Other bits are
         // reserved.
         rss += vec[i] & 0x1;
@@ -153,7 +184,7 @@ uint64_t GarbageCollector::ExtractRssFromMincore(
                    << ", 0x" << it.second << std::dec << ") failed: " << strerror(errno);
     }
   }
-  rss *= kPageSize;
+  rss *= gPageSize;
   rss_histogram_.AddValue(rss / KB);
 #endif
   return rss;
@@ -238,6 +269,12 @@ void GarbageCollector::Run(GcCause gc_cause, bool clear_soft_references) {
     gc_duration_->Add(NsToMs(current_iteration->GetDurationNs()));
     gc_duration_delta_->Add(NsToMs(current_iteration->GetDurationNs()));
   }
+
+  // Report some metrics via the ATrace interface, to surface them in Perfetto.
+  TraceGCMetric("freed_normal_object_bytes", current_iteration->GetFreedBytes());
+  TraceGCMetric("freed_large_object_bytes", current_iteration->GetFreedLargeObjectBytes());
+  TraceGCMetric("freed_bytes", freed_bytes);
+
   is_transaction_active_ = false;
 }
 
@@ -315,6 +352,23 @@ const Iteration* GarbageCollector::GetCurrentIteration() const {
   return heap_->GetCurrentGcIteration();
 }
 
+bool GarbageCollector::ShouldEagerlyReleaseMemoryToOS() const {
+  Runtime* runtime = Runtime::Current();
+  // Zygote isn't a memory heavy process, we should always instantly release memory to the OS.
+  if (runtime->IsZygote()) {
+    return true;
+  }
+  if (GetCurrentIteration()->GetGcCause() == kGcCauseExplicit &&
+      !runtime->IsEagerlyReleaseExplicitGcDisabled()) {
+    // Our behavior with explicit GCs is to always release any available memory.
+    return true;
+  }
+  // Keep on the memory if the app is in foreground. If it is in background or
+  // goes into the background (see invocation with cause kGcCauseCollectorTransition),
+  // release the memory.
+  return !runtime->InJankPerceptibleProcessState();
+}
+
 void GarbageCollector::RecordFree(const ObjectBytePair& freed) {
   GetCurrentIteration()->freed_.Add(freed);
   heap_->RecordFree(freed.objects, freed.bytes);
@@ -339,7 +393,6 @@ void GarbageCollector::DumpPerformanceInfo(std::ostream& os) {
   const uint64_t total_ns = logger.GetTotalNs();
   const double seconds = NsToMs(total_ns) / 1000.0;
   const uint64_t freed_bytes = GetTotalFreedBytes();
-  const uint64_t freed_objects = GetTotalFreedObjects();
   const uint64_t scanned_bytes = GetTotalScannedBytes();
   {
     MutexLock mu(Thread::Current(), pause_histogram_lock_);
@@ -372,10 +425,8 @@ void GarbageCollector::DumpPerformanceInfo(std::ostream& os) {
   const double cpu_seconds = NsToMs(GetTotalCpuTime()) / 1000.0;
   os << GetName() << " total time: " << PrettyDuration(total_ns)
      << " mean time: " << PrettyDuration(total_ns / iterations) << "\n"
-     << GetName() << " freed: " << freed_objects
-     << " objects with total size " << PrettySize(freed_bytes) << "\n"
-     << GetName() << " throughput: " << freed_objects / seconds << "/s / "
-     << PrettySize(freed_bytes / seconds) << "/s"
+     << GetName() << " freed: " << PrettySize(freed_bytes) << "\n"
+     << GetName() << " throughput: " << PrettySize(freed_bytes / seconds) << "/s"
      << "  per cpu-time: "
      << static_cast<uint64_t>(freed_bytes / cpu_seconds) << "/s / "
      << PrettySize(freed_bytes / cpu_seconds) << "/s\n"

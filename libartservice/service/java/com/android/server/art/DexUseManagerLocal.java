@@ -77,6 +77,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -229,23 +230,30 @@ public class DexUseManagerLocal {
      * method doesn't take dex file visibility into account, so it can only be used for debugging
      * purpose, such as dumpsys.
      *
-     * @see #getFilteredDetailedSecondaryDexInfo(String)
+     * @see #getCheckedSecondaryDexInfo(String)
      * @hide
      */
     public @NonNull List<? extends SecondaryDexInfo> getSecondaryDexInfo(
             @NonNull String packageName) {
-        return getSecondaryDexInfoImpl(packageName, false /* checkDexFile */);
+        return getSecondaryDexInfoImpl(
+                packageName, false /* checkDexFile */, false /* excludeObsoleteDexesAndLoaders */);
     }
 
     /**
      * Same as above, but requires disk IO, and returns the detailed information, including dex file
-     * visibility, filtered by dex file existence and visibility.
+     * visibility.
+     *
+     * @param excludeObsoleteDexesAndLoaders If true, excludes secondary dex files and loaders based
+     *         on file visibility. More specifically, excludes loaders that can no longer load a
+     *         secondary dex file due to a file visibility change, and excludes secondary dex files
+     *         that are not found or only have obsolete loaders
      *
      * @hide
      */
-    public @NonNull List<DetailedSecondaryDexInfo> getFilteredDetailedSecondaryDexInfo(
-            @NonNull String packageName) {
-        return getSecondaryDexInfoImpl(packageName, true /* checkDexFile */);
+    public @NonNull List<CheckedSecondaryDexInfo> getCheckedSecondaryDexInfo(
+            @NonNull String packageName, boolean excludeObsoleteDexesAndLoaders) {
+        return getSecondaryDexInfoImpl(
+                packageName, true /* checkDexFile */, excludeObsoleteDexesAndLoaders);
     }
 
     /**
@@ -281,20 +289,22 @@ public class DexUseManagerLocal {
     }
 
     /**
-     * @param checkDexFile if true, check the existence and visibility of the dex files, and filter
-     *         the results accordingly. Note that the value of the {@link
-     *         DetailedSecondaryDexInfo#isDexFilePublic()} field is undefined if this argument is
-     *         false.
+     * @param checkDexFile if true, check the existence and visibility of the dex files. Note that
+     *         the value of the {@link CheckedSecondaryDexInfo#fileVisibility()} field is undefined
+     *         if this argument is false
+     * @param excludeObsoleteDexesAndLoaders see {@link #getCheckedSecondaryDexInfo}. Only takes
+     *         effect if {@code checkDexFile} is true
      */
-    private @NonNull List<DetailedSecondaryDexInfo> getSecondaryDexInfoImpl(
-            @NonNull String packageName, boolean checkDexFile) {
+    private @NonNull List<CheckedSecondaryDexInfo> getSecondaryDexInfoImpl(
+            @NonNull String packageName, boolean checkDexFile,
+            boolean excludeObsoleteDexesAndLoaders) {
         synchronized (mLock) {
             PackageDexUse packageDexUse =
                     mDexUse.mPackageDexUseByOwningPackageName.get(packageName);
             if (packageDexUse == null) {
                 return List.of();
             }
-            var results = new ArrayList<DetailedSecondaryDexInfo>();
+            var results = new ArrayList<CheckedSecondaryDexInfo>();
             for (var entry : packageDexUse.mSecondaryDexUseByDexFile.entrySet()) {
                 String dexPath = entry.getKey();
                 SecondaryDexUse secondaryDexUse = entry.getValue();
@@ -302,12 +312,13 @@ public class DexUseManagerLocal {
                 @FileVisibility
                 int visibility = checkDexFile ? getDexFileVisibility(dexPath)
                                               : FileVisibility.OTHER_READABLE;
-                if (visibility == FileVisibility.NOT_FOUND) {
+                if (visibility == FileVisibility.NOT_FOUND && excludeObsoleteDexesAndLoaders) {
                     continue;
                 }
 
                 Map<DexLoader, SecondaryDexUseRecord> filteredRecordByLoader;
-                if (visibility == FileVisibility.OTHER_READABLE) {
+                if (visibility == FileVisibility.OTHER_READABLE
+                        || !excludeObsoleteDexesAndLoaders) {
                     filteredRecordByLoader = secondaryDexUse.mRecordByLoader;
                 } else {
                     // Only keep the entry that belongs to the same app.
@@ -346,10 +357,9 @@ public class DexUseManagerLocal {
                                 .map(record -> Utils.assertNonEmpty(record.mAbiName))
                                 .collect(Collectors.toSet());
                 Set<DexLoader> loaders = Set.copyOf(filteredRecordByLoader.keySet());
-                results.add(DetailedSecondaryDexInfo.create(dexPath,
+                results.add(CheckedSecondaryDexInfo.create(dexPath,
                         Objects.requireNonNull(secondaryDexUse.mUserHandle), clc, distinctAbiNames,
-                        loaders, isUsedByOtherApps(loaders, packageName),
-                        visibility == FileVisibility.OTHER_READABLE));
+                        loaders, isUsedByOtherApps(loaders, packageName), visibility));
             }
             return Collections.unmodifiableList(results);
         }
@@ -440,7 +450,10 @@ public class DexUseManagerLocal {
 
     private static boolean isOwningPackageForPrimaryDex(
             @NonNull PackageState pkgState, @NonNull String dexPath) {
-        AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
+        AndroidPackage pkg = pkgState.getAndroidPackage();
+        if (pkg == null) {
+            return false;
+        }
         List<AndroidPackageSplit> splits = pkg.getSplits();
         for (int i = 0; i < splits.size(); i++) {
             if (splits.get(i).getPath().equals(dexPath)) {
@@ -562,7 +575,8 @@ public class DexUseManagerLocal {
             }
             mDexUse = new DexUse();
             if (proto != null) {
-                mDexUse.fromProto(proto);
+                mDexUse.fromProto(
+                        proto, ArtJni::validateDexPath, ArtJni::validateClassLoaderContext);
             }
         }
     }
@@ -587,7 +601,7 @@ public class DexUseManagerLocal {
         return !loader.loadingPackageName().equals(owningPackageName) || loader.isolatedProcess();
     }
 
-    private static void validateInputs(@NonNull PackageManagerLocal.FilteredSnapshot snapshot,
+    private void validateInputs(@NonNull PackageManagerLocal.FilteredSnapshot snapshot,
             @NonNull String loadingPackageName,
             @NonNull Map<String, String> classLoaderContextByDexContainerFile) {
         if (classLoaderContextByDexContainerFile.isEmpty()) {
@@ -596,11 +610,15 @@ public class DexUseManagerLocal {
 
         for (var entry : classLoaderContextByDexContainerFile.entrySet()) {
             Utils.assertNonEmpty(entry.getKey());
-            if (!Paths.get(entry.getKey()).isAbsolute()) {
-                throw new IllegalArgumentException(String.format(
-                        "Dex container file path must be absolute, got '%s'", entry.getKey()));
+            String errorMsg = ArtJni.validateDexPath(entry.getKey());
+            if (errorMsg != null) {
+                throw new IllegalArgumentException(errorMsg);
             }
             Utils.assertNonEmpty(entry.getValue());
+            errorMsg = ArtJni.validateClassLoaderContext(entry.getKey(), entry.getValue());
+            if (errorMsg != null) {
+                throw new IllegalArgumentException(errorMsg);
+            }
         }
 
         // TODO(b/253570365): Make the validation more strict.
@@ -848,22 +866,19 @@ public class DexUseManagerLocal {
      */
     @Immutable
     @AutoValue
-    public abstract static class DetailedSecondaryDexInfo
+    public abstract static class CheckedSecondaryDexInfo
             extends SecondaryDexInfo implements DetailedDexInfo {
-        static DetailedSecondaryDexInfo create(@NonNull String dexPath,
+        static CheckedSecondaryDexInfo create(@NonNull String dexPath,
                 @NonNull UserHandle userHandle, @NonNull String displayClassLoaderContext,
                 @NonNull Set<String> abiNames, @NonNull Set<DexLoader> loaders,
-                boolean isUsedByOtherApps, boolean isDexFilePublic) {
-            return new AutoValue_DexUseManagerLocal_DetailedSecondaryDexInfo(dexPath, userHandle,
+                boolean isUsedByOtherApps, @FileVisibility int fileVisibility) {
+            return new AutoValue_DexUseManagerLocal_CheckedSecondaryDexInfo(dexPath, userHandle,
                     displayClassLoaderContext, Collections.unmodifiableSet(abiNames),
-                    Collections.unmodifiableSet(loaders), isUsedByOtherApps, isDexFilePublic);
+                    Collections.unmodifiableSet(loaders), isUsedByOtherApps, fileVisibility);
         }
 
-        /**
-         * Returns true if the filesystem permission of the dex file has the "read" bit for "others"
-         * (S_IROTH).
-         */
-        public abstract boolean isDexFilePublic();
+        /** Indicates the visibility of the dex file. */
+        public abstract @FileVisibility int fileVisibility();
     }
 
     private static class DexUse {
@@ -878,10 +893,12 @@ public class DexUseManagerLocal {
             }
         }
 
-        void fromProto(@NonNull DexUseProto proto) {
+        void fromProto(@NonNull DexUseProto proto,
+                @NonNull Function<String, String> validateDexPath,
+                @NonNull BiFunction<String, String, String> validateClassLoaderContext) {
             for (PackageDexUseProto packageProto : proto.getPackageDexUseList()) {
                 var packageDexUse = new PackageDexUse();
-                packageDexUse.fromProto(packageProto);
+                packageDexUse.fromProto(packageProto, validateDexPath, validateClassLoaderContext);
                 mPackageDexUseByOwningPackageName.put(
                         Utils.assertNonEmpty(packageProto.getOwningPackageName()), packageDexUse);
             }
@@ -914,7 +931,9 @@ public class DexUseManagerLocal {
             }
         }
 
-        void fromProto(@NonNull PackageDexUseProto proto) {
+        void fromProto(@NonNull PackageDexUseProto proto,
+                @NonNull Function<String, String> validateDexPath,
+                @NonNull BiFunction<String, String, String> validateClassLoaderContext) {
             for (PrimaryDexUseProto primaryProto : proto.getPrimaryDexUseList()) {
                 var primaryDexUse = new PrimaryDexUse();
                 primaryDexUse.fromProto(primaryProto);
@@ -922,10 +941,20 @@ public class DexUseManagerLocal {
                         Utils.assertNonEmpty(primaryProto.getDexFile()), primaryDexUse);
             }
             for (SecondaryDexUseProto secondaryProto : proto.getSecondaryDexUseList()) {
+                String dexFile = Utils.assertNonEmpty(secondaryProto.getDexFile());
+
+                // Skip invalid dex paths persisted by previous versions.
+                String errorMsg = validateDexPath.apply(dexFile);
+                if (errorMsg != null) {
+                    Log.e(TAG, errorMsg);
+                    continue;
+                }
+
                 var secondaryDexUse = new SecondaryDexUse();
-                secondaryDexUse.fromProto(secondaryProto);
-                mSecondaryDexUseByDexFile.put(
-                        Utils.assertNonEmpty(secondaryProto.getDexFile()), secondaryDexUse);
+                secondaryDexUse.fromProto(secondaryProto,
+                        classLoaderContext
+                        -> validateClassLoaderContext.apply(dexFile, classLoaderContext));
+                mSecondaryDexUseByDexFile.put(dexFile, secondaryDexUse);
             }
         }
     }
@@ -972,10 +1001,19 @@ public class DexUseManagerLocal {
             }
         }
 
-        void fromProto(@NonNull SecondaryDexUseProto proto) {
+        void fromProto(@NonNull SecondaryDexUseProto proto,
+                @NonNull Function<String, String> validateClassLoaderContext) {
             Utils.check(proto.hasUserId());
             mUserHandle = UserHandle.of(proto.getUserId().getValue());
             for (SecondaryDexUseRecordProto recordProto : proto.getRecordList()) {
+                // Skip invalid class loader context persisted by previous versions.
+                String errorMsg = validateClassLoaderContext.apply(
+                        Utils.assertNonEmpty(recordProto.getClassLoaderContext()));
+                if (errorMsg != null) {
+                    Log.e(TAG, errorMsg);
+                    continue;
+                }
+
                 var record = new SecondaryDexUseRecord();
                 record.fromProto(recordProto);
                 mRecordByLoader.put(
@@ -1058,7 +1096,11 @@ public class DexUseManagerLocal {
 
         public @NonNull List<Path> getLocations(
                 @NonNull PackageState pkgState, @NonNull UserHandle userHandle) {
-            AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
+            AndroidPackage pkg = pkgState.getAndroidPackage();
+            if (pkg == null) {
+                return List.of();
+            }
+
             UUID storageUuid = pkg.getStorageUuid();
             String packageName = pkgState.getPackageName();
 
@@ -1123,7 +1165,7 @@ public class DexUseManagerLocal {
 
         @NonNull
         public IArtd getArtd() {
-            return Utils.getArtd();
+            return ArtdRefCache.getInstance().getArtd();
         }
 
         public long getCurrentTimeMillis() {
@@ -1137,7 +1179,7 @@ public class DexUseManagerLocal {
 
         @NonNull
         public ScheduledExecutorService createScheduledExecutor() {
-            return Executors.newSingleThreadScheduledExecutor();
+            return Executors.newScheduledThreadPool(1 /* corePoolSize */);
         }
 
         @NonNull

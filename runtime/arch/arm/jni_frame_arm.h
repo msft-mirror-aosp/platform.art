@@ -23,8 +23,9 @@
 #include "base/bit_utils.h"
 #include "base/globals.h"
 #include "base/logging.h"
+#include "base/macros.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace arm {
 
 constexpr size_t kFramePointerSize = static_cast<size_t>(PointerSize::k32);
@@ -85,4 +86,3 @@ inline size_t GetCriticalNativeDirectCallFrameSize(const char* shorty, uint32_t 
 }  // namespace art
 
 #endif  // ART_RUNTIME_ARCH_ARM_JNI_FRAME_ARM_H_
-

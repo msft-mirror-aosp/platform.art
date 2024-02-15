@@ -23,18 +23,18 @@
 #include <android-base/thread_annotations.h>
 
 #include "base/locks.h"
+#include "base/macros.h"
 #include "handle.h"
 #include "obj_ptr.h"
 #include "verifier/method_verifier.h"
 #include "verifier/reg_type_cache.h"
 #include "verifier_enums.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class ClassLinker;
 class CompilerCallbacks;
 class DexFile;
-class RootVisitor;
 class Thread;
 
 namespace dex {
@@ -56,24 +56,17 @@ class ClassVerifier {
  public:
   // The main entrypoint for class verification. During AOT, `klass` can be
   // null.
-  static FailureKind VerifyClass(Thread* self,
-                                 VerifierDeps* verifier_deps,
-                                 const DexFile* dex_file,
-                                 Handle<mirror::Class> klass,
-                                 Handle<mirror::DexCache> dex_cache,
-                                 Handle<mirror::ClassLoader> class_loader,
-                                 const dex::ClassDef& class_def,
-                                 CompilerCallbacks* callbacks,
-                                 HardFailLogMode log_level,
-                                 uint32_t api_level,
-                                 std::string* error)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-
-  static void Init(ClassLinker* class_linker) REQUIRES_SHARED(Locks::mutator_lock_);
-  static void Shutdown();
-
-  static void VisitStaticRoots(RootVisitor* visitor)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT static FailureKind VerifyClass(Thread* self,
+                                        VerifierDeps* verifier_deps,
+                                        const DexFile* dex_file,
+                                        Handle<mirror::Class> klass,
+                                        Handle<mirror::DexCache> dex_cache,
+                                        Handle<mirror::ClassLoader> class_loader,
+                                        const dex::ClassDef& class_def,
+                                        CompilerCallbacks* callbacks,
+                                        HardFailLogMode log_level,
+                                        uint32_t api_level,
+                                        std::string* error) REQUIRES_SHARED(Locks::mutator_lock_);
 
  private:
   DISALLOW_COPY_AND_ASSIGN(ClassVerifier);

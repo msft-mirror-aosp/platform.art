@@ -17,7 +17,7 @@
 #include "arch/context.h"
 #include "art_method-inl.h"
 #include "jni.h"
-#include "oat_quick_method_header.h"
+#include "oat/oat_quick_method_header.h"
 #include "scoped_thread_state_change-inl.h"
 #include "stack.h"
 #include "thread.h"
@@ -104,7 +104,7 @@ jobject GetProxyReferenceArgument(size_t arg_pos, size_t proxy_method_frame_dept
 }
 
 extern "C" JNIEXPORT jobject JNICALL Java_TestInvocationHandler_getArgument(
-    JNIEnv* env ATTRIBUTE_UNUSED, jobject thiz ATTRIBUTE_UNUSED, int arg_pos, int frame_depth) {
+    [[maybe_unused]] JNIEnv* env, [[maybe_unused]] jobject thiz, int arg_pos, int frame_depth) {
   return GetProxyReferenceArgument(arg_pos, frame_depth);
 }
 

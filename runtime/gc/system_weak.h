@@ -17,11 +17,12 @@
 #ifndef ART_RUNTIME_GC_SYSTEM_WEAK_H_
 #define ART_RUNTIME_GC_SYSTEM_WEAK_H_
 
+#include "base/macros.h"
 #include "base/mutex.h"
 #include "object_callbacks.h"
 #include "thread-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace gc {
 
 class AbstractSystemWeakHolder {
@@ -62,7 +63,7 @@ class SystemWeakHolder : public AbstractSystemWeakHolder {
     allow_new_system_weak_ = false;
   }
 
-  void Broadcast(bool broadcast_for_checkpoint ATTRIBUTE_UNUSED) override
+  void Broadcast([[maybe_unused]] bool broadcast_for_checkpoint) override
       REQUIRES(!allow_disallow_lock_) {
     MutexLock mu(Thread::Current(), allow_disallow_lock_);
     new_weak_condition_.Broadcast(Thread::Current());

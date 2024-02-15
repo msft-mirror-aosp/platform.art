@@ -34,7 +34,7 @@
 #include <cpuinfo_x86.h>
 #endif
 
-namespace art {
+namespace art HIDDEN {
 
 using android::base::StringPrintf;
 
@@ -46,6 +46,7 @@ static constexpr const char* x86_known_variants[] = {
     "silvermont",
     "goldmont",
     "goldmont-plus",
+    "goldmont-without-sha-xsaves",
     "tremont",
     "kabylake",
     "default",
@@ -57,6 +58,7 @@ static constexpr const char* x86_variants_with_ssse3[] = {
     "silvermont",
     "goldmont",
     "goldmont-plus",
+    "goldmont-without-sha-xsaves",
     "tremont",
     "kabylake",
 };
@@ -66,6 +68,7 @@ static constexpr const char* x86_variants_with_sse4_1[] = {
     "silvermont",
     "goldmont",
     "goldmont-plus",
+    "goldmont-without-sha-xsaves",
     "tremont",
     "kabylake",
 };
@@ -75,6 +78,7 @@ static constexpr const char* x86_variants_with_sse4_2[] = {
     "silvermont",
     "goldmont",
     "goldmont-plus",
+    "goldmont-without-sha-xsaves",
     "tremont",
     "kabylake",
 };
@@ -84,6 +88,7 @@ static constexpr const char* x86_variants_with_popcnt[] = {
     "silvermont",
     "goldmont",
     "goldmont-plus",
+    "goldmont-without-sha-xsaves",
     "tremont",
     "kabylake",
 };
@@ -119,9 +124,9 @@ X86FeaturesUniquePtr X86InstructionSetFeatures::Create(bool x86_64,
   }
 }
 
-X86FeaturesUniquePtr X86InstructionSetFeatures::FromVariant(
-    const std::string& variant, std::string* error_msg ATTRIBUTE_UNUSED,
-    bool x86_64) {
+X86FeaturesUniquePtr X86InstructionSetFeatures::FromVariant(const std::string& variant,
+                                                            [[maybe_unused]] std::string* error_msg,
+                                                            bool x86_64) {
   const bool is_runtime_isa =
       kRuntimeISA == (x86_64 ? InstructionSet::kX86_64 : InstructionSet::kX86);
   if (is_runtime_isa && variant == "default") {

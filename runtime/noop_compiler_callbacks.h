@@ -17,18 +17,19 @@
 #ifndef ART_RUNTIME_NOOP_COMPILER_CALLBACKS_H_
 #define ART_RUNTIME_NOOP_COMPILER_CALLBACKS_H_
 
+#include "base/macros.h"
 #include "compiler_callbacks.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class NoopCompilerCallbacks final : public CompilerCallbacks {
  public:
   NoopCompilerCallbacks() : CompilerCallbacks(CompilerCallbacks::CallbackMode::kCompileApp) {}
   ~NoopCompilerCallbacks() {}
 
-  void AddUncompilableMethod(MethodReference ref ATTRIBUTE_UNUSED) override {}
-  void AddUncompilableClass(ClassReference ref ATTRIBUTE_UNUSED) override {}
-  void ClassRejected(ClassReference ref ATTRIBUTE_UNUSED) override {}
+  void AddUncompilableMethod([[maybe_unused]] MethodReference ref) override {}
+  void AddUncompilableClass([[maybe_unused]] ClassReference ref) override {}
+  void ClassRejected([[maybe_unused]] ClassReference ref) override {}
 
   verifier::VerifierDeps* GetVerifierDeps() const override { return nullptr; }
 

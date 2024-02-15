@@ -38,6 +38,7 @@ import androidx.annotation.RequiresApi;
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.modules.utils.pm.PackageStateModulesUtils;
 import com.android.server.art.model.ArtFlags;
+import com.android.server.art.model.Config;
 import com.android.server.art.model.DexoptParams;
 import com.android.server.art.model.DexoptResult;
 import com.android.server.pm.PackageManagerLocal;
@@ -59,10 +60,10 @@ public class PrimaryDexopter extends Dexopter<DetailedPrimaryDexInfo> {
 
     private final int mSharedGid;
 
-    public PrimaryDexopter(@NonNull Context context, @NonNull PackageState pkgState,
-            @NonNull AndroidPackage pkg, @NonNull DexoptParams params,
-            @NonNull CancellationSignal cancellationSignal) {
-        this(new Injector(context), pkgState, pkg, params, cancellationSignal);
+    public PrimaryDexopter(@NonNull Context context, @NonNull Config config,
+            @NonNull PackageState pkgState, @NonNull AndroidPackage pkg,
+            @NonNull DexoptParams params, @NonNull CancellationSignal cancellationSignal) {
+        this(new Injector(context, config), pkgState, pkg, params, cancellationSignal);
     }
 
     @VisibleForTesting
@@ -149,16 +150,6 @@ public class PrimaryDexopter extends Dexopter<DetailedPrimaryDexInfo> {
     @NonNull
     protected ProfilePath buildRefProfilePath(@NonNull DetailedPrimaryDexInfo dexInfo) {
         return PrimaryDexUtils.buildRefProfilePath(mPkgState, dexInfo);
-    }
-
-    @Override
-    protected boolean isAppImageAllowed(@NonNull DetailedPrimaryDexInfo dexInfo) {
-        // Only allow app image for the base APK because having multiple app images is not
-        // supported.
-        // Additionally, disable app images if the app requests for the splits to be loaded in
-        // isolation because app images are unsupported for multiple class loaders (b/72696798).
-        // TODO(jiakaiz): Investigate whether this is still the best choice today.
-        return dexInfo.splitName() == null && !PrimaryDexUtils.isIsolatedSplitLoading(mPkg);
     }
 
     @Override

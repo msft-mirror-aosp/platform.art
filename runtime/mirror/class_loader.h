@@ -18,11 +18,13 @@
 #define ART_RUNTIME_MIRROR_CLASS_LOADER_H_
 
 #include "base/locks.h"
+#include "base/macros.h"
 #include "obj_ptr.h"
 #include "object.h"
 #include "object_reference.h"
+#include "string.h"
 
-namespace art {
+namespace art HIDDEN {
 
 struct ClassLoaderOffsets;
 class ClassTable;
@@ -77,11 +79,10 @@ class MANAGED ClassLoader : public Object {
       REQUIRES(!Locks::classlinker_classes_lock_);
 
   // Field order required by test "ValidateFieldOrderOfJavaCppUnionClasses".
+  HeapReference<String> name_;
   HeapReference<Object> packages_;
   HeapReference<ClassLoader> parent_;
   HeapReference<Object> proxyCache_;
-  // Native pointer to class table, need to zero this out when image writing.
-  uint32_t padding_ ATTRIBUTE_UNUSED;
   uint64_t allocator_;
   uint64_t class_table_;
 

@@ -36,7 +36,7 @@
     }                                                    \
   }
 
-namespace art {
+namespace art HIDDEN {
 
 extern "C" int artMethodExitHook(Thread* self,
                                  ArtMethod* method,
@@ -81,13 +81,14 @@ static void PopLocalReferences(uint32_t saved_local_ref_cookie, Thread* self)
   if (UNLIKELY(env->IsCheckJniEnabled())) {
     env->CheckNoHeldMonitors();
   }
-  env->SetLocalSegmentState(env->GetLocalRefCookie());
-  env->SetLocalRefCookie(bit_cast<jni::LRTSegmentState>(saved_local_ref_cookie));
+  env->PopLocalReferenceFrame(bit_cast<jni::LRTSegmentState>(saved_local_ref_cookie));
 }
 
 // TODO: annotalysis disabled as monitor semantics are maintained in Java code.
-extern "C" void artJniUnlockObject(mirror::Object* locked, Thread* self)
-    NO_THREAD_SAFETY_ANALYSIS REQUIRES(!Roles::uninterruptible_) {
+__attribute__((no_sanitize("memtag")))  // TODO(b/305919664)
+extern "C" void
+artJniUnlockObject(mirror::Object* locked, Thread* self) NO_THREAD_SAFETY_ANALYSIS
+    REQUIRES(!Roles::uninterruptible_) {
   // Note: No thread suspension is allowed for successful unlocking, otherwise plain
   // `mirror::Object*` return value saved by the assembly stub would need to be updated.
   uintptr_t old_poison_object_cookie = kIsDebugBuild ? self->GetPoisonObjectCookie() : 0u;

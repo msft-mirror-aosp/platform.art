@@ -42,6 +42,7 @@ class VerifierDepsTest;
 
 namespace linker {
 class Arm64RelativePatcherTest;
+class Thumb2RelativePatcherTest;
 }  // namespace linker
 
 class ArtMethod;
@@ -59,15 +60,16 @@ enum class ProfileMethodsCheck : uint8_t {
 
 class CompilerOptions final {
  public:
-  // Guide heuristics to determine whether to compile method if profile data not available.
-  static const size_t kDefaultHugeMethodThreshold = 10000;
-  static const size_t kDefaultLargeMethodThreshold = 600;
-  static const size_t kDefaultNumDexMethodsThreshold = 900;
-  static constexpr double kDefaultTopKProfileThreshold = 90.0;
-  static const bool kDefaultGenerateDebugInfo = false;
-  static const bool kDefaultGenerateMiniDebugInfo = true;
-  static const size_t kDefaultInlineMaxCodeUnits = 32;
+  // Default values for parameters set via flags.
+  static constexpr bool kDefaultGenerateDebugInfo = false;
+  static constexpr bool kDefaultGenerateMiniDebugInfo = true;
+  static constexpr size_t kDefaultHugeMethodThreshold = 10000;
+  static constexpr size_t kDefaultInlineMaxCodeUnits = 32;
+  // Token to represent no value set for `inline_max_code_units_`.
   static constexpr size_t kUnsetInlineMaxCodeUnits = -1;
+  // We set a lower inlining threshold for baseline to reduce code size and compilation time. This
+  // cannot be changed via flags.
+  static constexpr size_t kBaselineInlineMaxCodeUnits = 14;
 
   enum class CompilerType : uint8_t {
     kAotCompiler,             // AOT compiler.
@@ -115,29 +117,15 @@ class CompilerOptions final {
   }
 
   bool IsAnyCompilationEnabled() const {
-    return CompilerFilter::IsAnyCompilationEnabled(compiler_filter_) &&
-           // TODO(riscv64): remove this when we have compiler support for RISC-V
-           GetInstructionSet() != InstructionSet::kRiscv64;
+    return CompilerFilter::IsAnyCompilationEnabled(compiler_filter_);
   }
 
   size_t GetHugeMethodThreshold() const {
     return huge_method_threshold_;
   }
 
-  size_t GetLargeMethodThreshold() const {
-    return large_method_threshold_;
-  }
-
   bool IsHugeMethod(size_t num_dalvik_instructions) const {
     return num_dalvik_instructions > huge_method_threshold_;
-  }
-
-  bool IsLargeMethod(size_t num_dalvik_instructions) const {
-    return num_dalvik_instructions > large_method_threshold_;
-  }
-
-  size_t GetNumDexMethodsThreshold() const {
-    return num_dex_methods_threshold_;
   }
 
   size_t GetInlineMaxCodeUnits() const {
@@ -147,8 +135,8 @@ class CompilerOptions final {
     inline_max_code_units_ = units;
   }
 
-  double GetTopKProfileThreshold() const {
-    return top_k_profile_threshold_;
+  bool EmitReadBarrier() const {
+    return emit_read_barrier_;
   }
 
   bool GetDebuggable() const {
@@ -225,6 +213,10 @@ class CompilerOptions final {
 
   bool IsBaseline() const {
     return baseline_;
+  }
+
+  bool ProfileBranches() const {
+    return profile_branches_;
   }
 
   // Are we compiling an app image?
@@ -395,8 +387,6 @@ class CompilerOptions final {
 
   CompilerFilter::Filter compiler_filter_;
   size_t huge_method_threshold_;
-  size_t large_method_threshold_;
-  size_t num_dex_methods_threshold_;
   size_t inline_max_code_units_;
 
   InstructionSet instruction_set_;
@@ -422,6 +412,7 @@ class CompilerOptions final {
   ImageType image_type_;
   bool multi_image_;
   bool compile_art_test_;
+  bool emit_read_barrier_;
   bool baseline_;
   bool debuggable_;
   bool generate_debug_info_;
@@ -434,9 +425,7 @@ class CompilerOptions final {
   bool dump_timings_;
   bool dump_pass_timings_;
   bool dump_stats_;
-
-  // When using a profile file only the top K% of the profiled samples will be compiled.
-  double top_k_profile_threshold_;
+  bool profile_branches_;
 
   // Info for profile guided compilation.
   const ProfileCompilationInfo* profile_compilation_info_;
@@ -504,6 +493,7 @@ class CompilerOptions final {
   friend class jit::JitCompiler;
   friend class verifier::VerifierDepsTest;
   friend class linker::Arm64RelativePatcherTest;
+  friend class linker::Thumb2RelativePatcherTest;
 
   template <class Base>
   friend bool ReadCompilerOptions(Base& map, CompilerOptions* options, std::string* error_msg);

@@ -36,9 +36,8 @@
 #include "mirror/object_array-inl.h"
 #include "obj_ptr-inl.h"
 #include "scoped_thread_state_change-inl.h"
-#include "well_known_classes.h"
 
-namespace art {
+namespace art HIDDEN {
 
 inline ObjPtr<mirror::Class> ClassLinker::FindArrayClass(Thread* self,
                                                          ObjPtr<mirror::Class> element_class) {

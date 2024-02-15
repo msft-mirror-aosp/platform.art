@@ -30,12 +30,13 @@
 
 #include "base/allocator.h"
 #include "base/bit_utils.h"
+#include "base/macros.h"
 #include "base/mem_map.h"
 #include "base/mutex.h"
 #include "runtime_globals.h"
 #include "thread.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace gc {
 namespace allocator {
@@ -56,12 +57,12 @@ class RosAlloc {
       size_t pm_idx = rosalloc->ToPageMapIndex(fpr_base);
       size_t byte_size = rosalloc->free_page_run_size_map_[pm_idx];
       DCHECK_GE(byte_size, static_cast<size_t>(0));
-      DCHECK_ALIGNED(byte_size, kPageSize);
+      DCHECK_ALIGNED_PARAM(byte_size, gPageSize);
       return byte_size;
     }
     void SetByteSize(RosAlloc* rosalloc, size_t byte_size)
         REQUIRES(rosalloc->lock_) {
-      DCHECK_EQ(byte_size % kPageSize, static_cast<size_t>(0));
+      DCHECK_EQ(ModuloPageSize(byte_size), static_cast<size_t>(0));
       uint8_t* fpr_base = reinterpret_cast<uint8_t*>(this);
       size_t pm_idx = rosalloc->ToPageMapIndex(fpr_base);
       rosalloc->free_page_run_size_map_[pm_idx] = byte_size;
@@ -102,7 +103,7 @@ class RosAlloc {
     void ReleasePages(RosAlloc* rosalloc) REQUIRES(rosalloc->lock_) {
       uint8_t* start = reinterpret_cast<uint8_t*>(this);
       size_t byte_size = ByteSize(rosalloc);
-      DCHECK_EQ(byte_size % kPageSize, static_cast<size_t>(0));
+      DCHECK_EQ(ModuloPageSize(byte_size), static_cast<size_t>(0));
       if (ShouldReleasePages(rosalloc)) {
         rosalloc->ReleasePageRange(start, start + byte_size);
       }
@@ -303,7 +304,7 @@ class RosAlloc {
     // The number of slots in the list. This is used to make it fast to check if a free list is all
     // free without traversing the whole free list.
     uint32_t size_;
-    uint32_t padding_ ATTRIBUTE_UNUSED;
+    [[maybe_unused]] uint32_t padding_;
     friend class RosAlloc;
   };
 
@@ -354,7 +355,7 @@ class RosAlloc {
     uint8_t is_thread_local_;           // True if this run is used as a thread-local run.
     bool to_be_bulk_freed_;             // Used within BulkFree() to flag a run that's involved with
                                         // a bulk free.
-    uint32_t padding_ ATTRIBUTE_UNUSED;
+    [[maybe_unused]] uint32_t padding_;
     // Use a tailless free list for free_list_ so that the alloc fast path does not manage the tail.
     SlotFreeList<false> free_list_;
     SlotFreeList<true> bulk_free_list_;
@@ -390,7 +391,7 @@ class RosAlloc {
       return &thread_local_free_list_;
     }
     void* End() {
-      return reinterpret_cast<uint8_t*>(this) + kPageSize * numOfPages[size_bracket_idx_];
+      return reinterpret_cast<uint8_t*>(this) + gPageSize * numOfPages[size_bracket_idx_];
     }
     void SetIsThreadLocal(bool is_thread_local) {
       is_thread_local_  = is_thread_local ? 1 : 0;
@@ -500,7 +501,7 @@ class RosAlloc {
   // The numbers of pages that are used for runs for each size bracket.
   static size_t numOfPages[kNumOfSizeBrackets];
   // The numbers of slots of the runs for each size bracket.
-  static size_t numOfSlots[kNumOfSizeBrackets];
+  EXPORT static size_t numOfSlots[kNumOfSizeBrackets];
   // The header sizes in bytes of the runs for each size bracket.
   static size_t headerSizes[kNumOfSizeBrackets];
 
@@ -610,13 +611,13 @@ class RosAlloc {
     DCHECK_LE(base_, addr);
     DCHECK_LT(addr, base_ + capacity_);
     size_t byte_offset = reinterpret_cast<const uint8_t*>(addr) - base_;
-    DCHECK_EQ(byte_offset % static_cast<size_t>(kPageSize), static_cast<size_t>(0));
-    return byte_offset / kPageSize;
+    DCHECK_EQ(ModuloPageSize(byte_offset), static_cast<size_t>(0));
+    return DivideByPageSize(byte_offset);
   }
   // Returns the page map index from an address with rounding.
   size_t RoundDownToPageMapIndex(const void* addr) const {
     DCHECK(base_ <= addr && addr < reinterpret_cast<uint8_t*>(base_) + capacity_);
-    return (reinterpret_cast<uintptr_t>(addr) - reinterpret_cast<uintptr_t>(base_)) / kPageSize;
+    return DivideByPageSize(reinterpret_cast<uintptr_t>(addr) - reinterpret_cast<uintptr_t>(base_));
   }
 
   // A memory allocation request larger than this size is treated as a large object and allocated
@@ -783,9 +784,11 @@ class RosAlloc {
   size_t FreePages(Thread* self, void* ptr, bool already_zero) REQUIRES(lock_);
 
   // Allocate/free a run slot.
-  void* AllocFromRun(Thread* self, size_t size, size_t* bytes_allocated, size_t* usable_size,
-                     size_t* bytes_tl_bulk_allocated)
-      REQUIRES(!lock_);
+  EXPORT void* AllocFromRun(Thread* self,
+                            size_t size,
+                            size_t* bytes_allocated,
+                            size_t* usable_size,
+                            size_t* bytes_tl_bulk_allocated) REQUIRES(!lock_);
   // Allocate/free a run slot without acquiring locks.
   // TODO: REQUIRES(Locks::mutator_lock_)
   void* AllocFromRunThreadUnsafe(Thread* self, size_t size, size_t* bytes_allocated,
@@ -808,9 +811,11 @@ class RosAlloc {
   size_t FreeInternal(Thread* self, void* ptr) REQUIRES(!lock_);
 
   // Allocates large objects.
-  void* AllocLargeObject(Thread* self, size_t size, size_t* bytes_allocated,
-                         size_t* usable_size, size_t* bytes_tl_bulk_allocated)
-      REQUIRES(!lock_);
+  EXPORT void* AllocLargeObject(Thread* self,
+                                size_t size,
+                                size_t* bytes_allocated,
+                                size_t* usable_size,
+                                size_t* bytes_tl_bulk_allocated) REQUIRES(!lock_);
 
   // Revoke a run by adding it to non_full_runs_ or freeing the pages.
   void RevokeRun(Thread* self, size_t idx, Run* run) REQUIRES(!lock_);
@@ -872,7 +877,7 @@ class RosAlloc {
   // Returns the size of the allocated slot for a given size.
   size_t UsableSize(size_t bytes) {
     if (UNLIKELY(bytes > kLargeSizeThreshold)) {
-      return RoundUp(bytes, kPageSize);
+      return RoundUp(bytes, gPageSize);
     } else {
       return RoundToBracketSize(bytes);
     }
@@ -911,7 +916,7 @@ class RosAlloc {
     return dedicated_full_run_;
   }
   bool IsFreePage(size_t idx) const {
-    DCHECK_LT(idx, capacity_ / kPageSize);
+    DCHECK_LT(idx, DivideByPageSize(capacity_));
     uint8_t pm_type = page_map_[idx];
     return pm_type == kPageMapReleased || pm_type == kPageMapEmpty;
   }

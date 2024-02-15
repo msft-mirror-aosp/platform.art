@@ -18,10 +18,11 @@
 #define ART_RUNTIME_MIRROR_EXECUTABLE_H_
 
 #include "accessible_object.h"
+#include "base/macros.h"
 #include "object.h"
 #include "read_barrier_option.h"
 
-namespace art {
+namespace art HIDDEN {
 
 struct ExecutableOffsets;
 class ArtMethod;
@@ -64,7 +65,7 @@ class MANAGED Executable : public AccessibleObject {
   uint8_t has_real_parameter_data_;
 
   // Padding required for matching alignment with the Java peer.
-  uint8_t padding_[2] ATTRIBUTE_UNUSED;
+  [[maybe_unused]] uint8_t padding_[2];
 
   HeapReference<mirror::Class> declaring_class_;
   HeapReference<mirror::Class> declaring_class_of_overridden_method_;

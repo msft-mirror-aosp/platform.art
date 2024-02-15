@@ -17,15 +17,16 @@
 #ifndef ART_RUNTIME_INTRINSICS_ENUM_H_
 #define ART_RUNTIME_INTRINSICS_ENUM_H_
 
-namespace art {
+#include "base/macros.h"
+#include "intrinsics_list.h"
+
+namespace art HIDDEN {
 
 enum class Intrinsics {
 #define OPTIMIZING_INTRINSICS(Name, ...) \
   k ## Name,
-#include "intrinsics_list.h"
   kNone,
-  INTRINSICS_LIST(OPTIMIZING_INTRINSICS)
-#undef INTRINSICS_LIST
+  ART_INTRINSICS_LIST(OPTIMIZING_INTRINSICS)
 #undef OPTIMIZING_INTRINSICS
 };
 std::ostream& operator<<(std::ostream& os, const Intrinsics& intrinsic);

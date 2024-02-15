@@ -164,9 +164,7 @@ class AdjacencyListGraph {
       HBasicBlock* dest_blk = name_to_block_.GetOrCreate(dest, create_block);
       src_blk->AddSuccessor(dest_blk);
     }
-    graph_->ClearReachabilityInformation();
     graph_->ComputeDominanceInformation();
-    graph_->ComputeReachabilityInformation();
     for (auto [name, blk] : name_to_block_) {
       block_to_name_.Put(blk, name);
     }
@@ -244,7 +242,6 @@ class OptimizingUnitTestHelper {
     auto container =
         std::make_shared<MemoryDexFileContainer>(dex_data, sizeof(StandardDexFile::Header));
     dex_files_.emplace_back(new StandardDexFile(dex_data,
-                                                sizeof(StandardDexFile::Header),
                                                 "no_location",
                                                 /*location_checksum*/ 0,
                                                 /*oat_dex_file*/ nullptr,

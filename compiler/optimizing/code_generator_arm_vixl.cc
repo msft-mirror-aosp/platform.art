@@ -22,6 +22,7 @@
 #include "art_method-inl.h"
 #include "base/bit_utils.h"
 #include "base/bit_utils_iterator.h"
+#include "base/globals.h"
 #include "class_root-inl.h"
 #include "class_table.h"
 #include "code_generator_utils.h"
@@ -33,13 +34,17 @@
 #include "interpreter/mterp/nterp.h"
 #include "intrinsics.h"
 #include "intrinsics_arm_vixl.h"
+#include "intrinsics_list.h"
 #include "intrinsics_utils.h"
+#include "jit/profiling_info.h"
 #include "linker/linker_patch.h"
 #include "mirror/array-inl.h"
 #include "mirror/class-inl.h"
 #include "mirror/var_handle.h"
+#include "profiling_info_builder.h"
 #include "scoped_thread_state_change-inl.h"
 #include "thread.h"
+#include "trace.h"
 #include "utils/arm/assembler_arm_vixl.h"
 #include "utils/arm/managed_register_arm.h"
 #include "utils/assembler.h"
@@ -147,7 +152,7 @@ static RegisterSet OneRegInReferenceOutSaveEverythingCallerSaves() {
   RegisterSet caller_saves = RegisterSet::Empty();
   caller_saves.Add(LocationFrom(calling_convention.GetRegisterAt(0)));
   // TODO: Add GetReturnLocation() to the calling convention so that we can DCHECK()
-  // that the the kPrimNot result register is the same as the first argument register.
+  // that the kPrimNot result register is the same as the first argument register.
   return caller_saves;
 }
 
@@ -289,31 +294,6 @@ static LoadOperandType GetLoadOperandType(DataType::Type type) {
       return kLoadSWord;
     case DataType::Type::kFloat64:
       return kLoadDWord;
-    default:
-      LOG(FATAL) << "Unreachable type " << type;
-      UNREACHABLE();
-  }
-}
-
-static StoreOperandType GetStoreOperandType(DataType::Type type) {
-  switch (type) {
-    case DataType::Type::kReference:
-      return kStoreWord;
-    case DataType::Type::kBool:
-    case DataType::Type::kUint8:
-    case DataType::Type::kInt8:
-      return kStoreByte;
-    case DataType::Type::kUint16:
-    case DataType::Type::kInt16:
-      return kStoreHalfword;
-    case DataType::Type::kInt32:
-      return kStoreWord;
-    case DataType::Type::kInt64:
-      return kStoreWordPair;
-    case DataType::Type::kFloat32:
-      return kStoreSWord;
-    case DataType::Type::kFloat64:
-      return kStoreDWord;
     default:
       LOG(FATAL) << "Unreachable type " << type;
       UNREACHABLE();
@@ -743,7 +723,6 @@ class ReadBarrierForHeapReferenceSlowPathARMVIXL : public SlowPathCodeARMVIXL {
         obj_(obj),
         offset_(offset),
         index_(index) {
-    DCHECK(gUseReadBarrier);
     // If `obj` is equal to `out` or `ref`, it means the initial object
     // has been overwritten by (or after) the heap object reference load
     // to be instrumented, e.g.:
@@ -758,13 +737,13 @@ class ReadBarrierForHeapReferenceSlowPathARMVIXL : public SlowPathCodeARMVIXL {
   }
 
   void EmitNativeCode(CodeGenerator* codegen) override {
+    DCHECK(codegen->EmitReadBarrier());
     CodeGeneratorARMVIXL* arm_codegen = down_cast<CodeGeneratorARMVIXL*>(codegen);
     LocationSummary* locations = instruction_->GetLocations();
     vixl32::Register reg_out = RegisterFrom(out_);
     DCHECK(locations->CanCall());
     DCHECK(!locations->GetLiveRegisters()->ContainsCoreRegister(reg_out.GetCode()));
     DCHECK(instruction_->IsInstanceFieldGet() ||
-           instruction_->IsPredicatedInstanceFieldGet() ||
            instruction_->IsStaticFieldGet() ||
            instruction_->IsArrayGet() ||
            instruction_->IsInstanceOf() ||
@@ -840,7 +819,9 @@ class ReadBarrierForHeapReferenceSlowPathARMVIXL : public SlowPathCodeARMVIXL {
         DCHECK(instruction_->IsInvoke()) << instruction_->DebugName();
         DCHECK(instruction_->GetLocations()->Intrinsified());
         HInvoke* invoke = instruction_->AsInvoke();
-        DCHECK(IsUnsafeGetObject(invoke) || IsVarHandleGet(invoke) || IsVarHandleCASFamily(invoke))
+        DCHECK(IsUnsafeGetReference(invoke) ||
+               IsVarHandleGet(invoke) ||
+               IsVarHandleCASFamily(invoke))
             << invoke->GetIntrinsic();
         DCHECK_EQ(offset_, 0U);
         // Though UnsafeGet's offset location is a register pair, we only pass the low
@@ -921,10 +902,10 @@ class ReadBarrierForRootSlowPathARMVIXL : public SlowPathCodeARMVIXL {
  public:
   ReadBarrierForRootSlowPathARMVIXL(HInstruction* instruction, Location out, Location root)
       : SlowPathCodeARMVIXL(instruction), out_(out), root_(root) {
-    DCHECK(gUseReadBarrier);
   }
 
   void EmitNativeCode(CodeGenerator* codegen) override {
+    DCHECK(codegen->EmitReadBarrier());
     LocationSummary* locations = instruction_->GetLocations();
     vixl32::Register reg_out = RegisterFrom(out_);
     DCHECK(locations->CanCall());
@@ -992,12 +973,21 @@ class MethodEntryExitHooksSlowPathARMVIXL : public SlowPathCodeARMVIXL {
 
 class CompileOptimizedSlowPathARMVIXL : public SlowPathCodeARMVIXL {
  public:
-  CompileOptimizedSlowPathARMVIXL() : SlowPathCodeARMVIXL(/* instruction= */ nullptr) {}
+  CompileOptimizedSlowPathARMVIXL(HSuspendCheck* suspend_check,
+                                  vixl32::Register profiling_info)
+      : SlowPathCodeARMVIXL(suspend_check),
+        profiling_info_(profiling_info) {}
 
   void EmitNativeCode(CodeGenerator* codegen) override {
     uint32_t entry_point_offset =
         GetThreadOffset<kArmPointerSize>(kQuickCompileOptimized).Int32Value();
     __ Bind(GetEntryLabel());
+    CodeGeneratorARMVIXL* arm_codegen = down_cast<CodeGeneratorARMVIXL*>(codegen);
+    UseScratchRegisterScope temps(arm_codegen->GetVIXLAssembler());
+    vixl32::Register tmp = temps.Acquire();
+    __ Mov(tmp, ProfilingInfo::GetOptimizeThreshold());
+    __ Strh(tmp,
+            MemOperand(profiling_info_, ProfilingInfo::BaselineHotnessCountOffset().Int32Value()));
     __ Ldr(lr, MemOperand(tr, entry_point_offset));
     // Note: we don't record the call here (and therefore don't generate a stack
     // map), as the entrypoint should never be suspended.
@@ -1010,6 +1000,8 @@ class CompileOptimizedSlowPathARMVIXL : public SlowPathCodeARMVIXL {
   }
 
  private:
+  vixl32::Register profiling_info_;
+
   DISALLOW_COPY_AND_ASSIGN(CompileOptimizedSlowPathARMVIXL);
 };
 
@@ -1102,27 +1094,27 @@ static uint32_t ComputeSRegisterListMask(const SRegisterList& regs) {
 }
 
 // Saves the register in the stack. Returns the size taken on stack.
-size_t CodeGeneratorARMVIXL::SaveCoreRegister(size_t stack_index ATTRIBUTE_UNUSED,
-                                              uint32_t reg_id ATTRIBUTE_UNUSED) {
+size_t CodeGeneratorARMVIXL::SaveCoreRegister([[maybe_unused]] size_t stack_index,
+                                              [[maybe_unused]] uint32_t reg_id) {
   TODO_VIXL32(FATAL);
   UNREACHABLE();
 }
 
 // Restores the register from the stack. Returns the size taken on stack.
-size_t CodeGeneratorARMVIXL::RestoreCoreRegister(size_t stack_index ATTRIBUTE_UNUSED,
-                                                 uint32_t reg_id ATTRIBUTE_UNUSED) {
+size_t CodeGeneratorARMVIXL::RestoreCoreRegister([[maybe_unused]] size_t stack_index,
+                                                 [[maybe_unused]] uint32_t reg_id) {
   TODO_VIXL32(FATAL);
   UNREACHABLE();
 }
 
-size_t CodeGeneratorARMVIXL::SaveFloatingPointRegister(size_t stack_index ATTRIBUTE_UNUSED,
-                                                       uint32_t reg_id ATTRIBUTE_UNUSED) {
+size_t CodeGeneratorARMVIXL::SaveFloatingPointRegister([[maybe_unused]] size_t stack_index,
+                                                       [[maybe_unused]] uint32_t reg_id) {
   TODO_VIXL32(FATAL);
   UNREACHABLE();
 }
 
-size_t CodeGeneratorARMVIXL::RestoreFloatingPointRegister(size_t stack_index ATTRIBUTE_UNUSED,
-                                                          uint32_t reg_id ATTRIBUTE_UNUSED) {
+size_t CodeGeneratorARMVIXL::RestoreFloatingPointRegister([[maybe_unused]] size_t stack_index,
+                                                          [[maybe_unused]] uint32_t reg_id) {
   TODO_VIXL32(FATAL);
   UNREACHABLE();
 }
@@ -1908,6 +1900,7 @@ vixl32::Label* CodeGeneratorARMVIXL::GetFinalLabel(HInstruction* instruction,
 }
 
 namespace detail {
+
 // Mark which intrinsics we don't have handcrafted code for.
 template <Intrinsics T>
 struct IsUnimplemented {
@@ -1922,15 +1915,13 @@ struct IsUnimplemented {
 UNIMPLEMENTED_INTRINSIC_LIST_ARM(TRUE_OVERRIDE)
 #undef TRUE_OVERRIDE
 
-#include "intrinsics_list.h"
 static constexpr bool kIsIntrinsicUnimplemented[] = {
-  false,  // kNone
+    false,  // kNone
 #define IS_UNIMPLEMENTED(Intrinsic, ...) \
-  IsUnimplemented<Intrinsics::k##Intrinsic>().is_unimplemented,
-  INTRINSICS_LIST(IS_UNIMPLEMENTED)
+    IsUnimplemented<Intrinsics::k##Intrinsic>().is_unimplemented,
+    ART_INTRINSICS_LIST(IS_UNIMPLEMENTED)
 #undef IS_UNIMPLEMENTED
 };
-#undef INTRINSICS_LIST
 
 }  // namespace detail
 
@@ -2024,7 +2015,7 @@ void CodeGeneratorARMVIXL::FixJumpTables() {
 
 #define __ reinterpret_cast<ArmVIXLAssembler*>(GetAssembler())->GetVIXLAssembler()->  // NOLINT
 
-void CodeGeneratorARMVIXL::Finalize(CodeAllocator* allocator) {
+void CodeGeneratorARMVIXL::Finalize() {
   FixJumpTables();
 
   // Emit JIT baker read barrier slow paths.
@@ -2037,11 +2028,11 @@ void CodeGeneratorARMVIXL::Finalize(CodeAllocator* allocator) {
   }
 
   GetAssembler()->FinalizeCode();
-  CodeGenerator::Finalize(allocator);
+  CodeGenerator::Finalize();
 
   // Verify Baker read barrier linker patches.
   if (kIsDebugBuild) {
-    ArrayRef<const uint8_t> code = allocator->GetMemory();
+    ArrayRef<const uint8_t> code(GetCode());
     for (const BakerReadBarrierPatchInfo& info : baker_read_barrier_patches_) {
       DCHECK(info.label.IsBound());
       uint32_t literal_offset = info.label.GetLocation();
@@ -2188,11 +2179,16 @@ void LocationsBuilderARMVIXL::VisitMethodExitHook(HMethodExitHook* method_hook) 
   LocationSummary* locations = new (GetGraph()->GetAllocator())
       LocationSummary(method_hook, LocationSummary::kCallOnSlowPath);
   locations->SetInAt(0, parameter_visitor_.GetReturnLocation(method_hook->InputAt(0)->GetType()));
+  // We need three temporary registers, two to load the timestamp counter (64-bit value) and one to
+  // compute the address to store the timestamp counter.
+  locations->AddRegisterTemps(3);
 }
 
 void InstructionCodeGeneratorARMVIXL::GenerateMethodEntryExitHook(HInstruction* instruction) {
-  UseScratchRegisterScope temps(GetVIXLAssembler());
-  vixl32::Register temp = temps.Acquire();
+  LocationSummary* locations = instruction->GetLocations();
+  vixl32::Register addr = RegisterFrom(locations->GetTemp(0));
+  vixl32::Register value = RegisterFrom(locations->GetTemp(1));
+  vixl32::Register tmp = RegisterFrom(locations->GetTemp(2));
 
   SlowPathCodeARMVIXL* slow_path =
       new (codegen_->GetScopedAllocator()) MethodEntryExitHooksSlowPathARMVIXL(instruction);
@@ -2204,20 +2200,61 @@ void InstructionCodeGeneratorARMVIXL::GenerateMethodEntryExitHook(HInstruction* 
     // if it is just non-zero. kCHA bit isn't used in debuggable runtimes as cha optimization is
     // disabled in debuggable runtime. The other bit is used when this method itself requires a
     // deoptimization due to redefinition. So it is safe to just check for non-zero value here.
-    GetAssembler()->LoadFromOffset(kLoadWord,
-                                   temp,
-                                   sp,
-                                   codegen_->GetStackOffsetOfShouldDeoptimizeFlag());
-    __ CompareAndBranchIfNonZero(temp, slow_path->GetEntryLabel());
+    GetAssembler()->LoadFromOffset(
+        kLoadWord, value, sp, codegen_->GetStackOffsetOfShouldDeoptimizeFlag());
+    __ CompareAndBranchIfNonZero(value, slow_path->GetEntryLabel());
   }
 
   MemberOffset  offset = instruction->IsMethodExitHook() ?
       instrumentation::Instrumentation::HaveMethodExitListenersOffset() :
       instrumentation::Instrumentation::HaveMethodEntryListenersOffset();
   uint32_t address = reinterpret_cast32<uint32_t>(Runtime::Current()->GetInstrumentation());
-  __ Mov(temp, address + offset.Int32Value());
-  __ Ldrb(temp, MemOperand(temp, 0));
-  __ CompareAndBranchIfNonZero(temp, slow_path->GetEntryLabel());
+  __ Mov(addr, address + offset.Int32Value());
+  __ Ldrb(value, MemOperand(addr, 0));
+  __ Cmp(value, instrumentation::Instrumentation::kFastTraceListeners);
+  // Check if there are any trace method entry / exit listeners. If no, continue.
+  __ B(lt, slow_path->GetExitLabel());
+  // Check if there are any slow (jvmti / trace with thread cpu time) method entry / exit listeners.
+  // If yes, just take the slow path.
+  __ B(gt, slow_path->GetEntryLabel());
+
+  // Check if there is place in the buffer to store a new entry, if no, take slow path.
+  uint32_t trace_buffer_index_offset =
+      Thread::TraceBufferIndexOffset<kArmPointerSize>().Int32Value();
+  vixl32::Register index = value;
+  __ Ldr(index, MemOperand(tr, trace_buffer_index_offset));
+  __ Subs(index, index, kNumEntriesForWallClock);
+  __ B(lt, slow_path->GetEntryLabel());
+
+  // Update the index in the `Thread`.
+  __ Str(index, MemOperand(tr, trace_buffer_index_offset));
+  // Calculate the entry address in the buffer.
+  // addr = base_addr + sizeof(void*) * index
+  __ Ldr(addr, MemOperand(tr, Thread::TraceBufferPtrOffset<kArmPointerSize>().SizeValue()));
+  __ Add(addr, addr, Operand(index, LSL, TIMES_4));
+
+  // Record method pointer and trace action.
+  __ Ldr(tmp, MemOperand(sp, 0));
+  // Use last two bits to encode trace method action. For MethodEntry it is 0
+  // so no need to set the bits since they are 0 already.
+  if (instruction->IsMethodExitHook()) {
+    DCHECK_GE(ArtMethod::Alignment(kRuntimePointerSize), static_cast<size_t>(4));
+    static_assert(enum_cast<int32_t>(TraceAction::kTraceMethodEnter) == 0);
+    static_assert(enum_cast<int32_t>(TraceAction::kTraceMethodExit) == 1);
+    __ Orr(tmp, tmp, Operand(enum_cast<int32_t>(TraceAction::kTraceMethodExit)));
+  }
+  __ Str(tmp, MemOperand(addr, kMethodOffsetInBytes));
+
+  vixl32::Register tmp1 = index;
+  // See Architecture Reference Manual ARMv7-A and ARMv7-R edition section B4.1.34.
+  __ Mrrc(/* lower 32-bit */ tmp,
+          /* higher 32-bit */ tmp1,
+          /* coproc= */ 15,
+          /* opc1= */ 1,
+          /* crm= */ 14);
+  static_assert(kHighTimestampOffsetInBytes ==
+                kTimestampOffsetInBytes + static_cast<uint32_t>(kRuntimePointerSize));
+  __ Strd(tmp, tmp1, MemOperand(addr, kTimestampOffsetInBytes));
   __ Bind(slow_path->GetExitLabel());
 }
 
@@ -2228,7 +2265,11 @@ void InstructionCodeGeneratorARMVIXL::VisitMethodExitHook(HMethodExitHook* instr
 }
 
 void LocationsBuilderARMVIXL::VisitMethodEntryHook(HMethodEntryHook* method_hook) {
-  new (GetGraph()->GetAllocator()) LocationSummary(method_hook, LocationSummary::kCallOnSlowPath);
+  LocationSummary* locations = new (GetGraph()->GetAllocator())
+      LocationSummary(method_hook, LocationSummary::kCallOnSlowPath);
+  // We need three temporary registers, two to load the timestamp counter (64-bit value) and one to
+  // compute the address to store the timestamp counter.
+  locations->AddRegisterTemps(3);
 }
 
 void InstructionCodeGeneratorARMVIXL::VisitMethodEntryHook(HMethodEntryHook* instruction) {
@@ -2237,7 +2278,8 @@ void InstructionCodeGeneratorARMVIXL::VisitMethodEntryHook(HMethodEntryHook* ins
   GenerateMethodEntryExitHook(instruction);
 }
 
-void CodeGeneratorARMVIXL::MaybeIncrementHotness(bool is_frame_entry) {
+void CodeGeneratorARMVIXL::MaybeIncrementHotness(HSuspendCheck* suspend_check,
+                                                 bool is_frame_entry) {
   if (GetCompilerOptions().CountHotnessInCompiledCode()) {
     UseScratchRegisterScope temps(GetVIXLAssembler());
     vixl32::Register temp = temps.Acquire();
@@ -2261,15 +2303,18 @@ void CodeGeneratorARMVIXL::MaybeIncrementHotness(bool is_frame_entry) {
     }
   }
 
-  if (GetGraph()->IsCompilingBaseline() && !Runtime::Current()->IsAotCompiler()) {
-    SlowPathCodeARMVIXL* slow_path = new (GetScopedAllocator()) CompileOptimizedSlowPathARMVIXL();
-    AddSlowPath(slow_path);
+  if (GetGraph()->IsCompilingBaseline() &&
+      GetGraph()->IsUsefulOptimizing() &&
+      !Runtime::Current()->IsAotCompiler()) {
     ProfilingInfo* info = GetGraph()->GetProfilingInfo();
     DCHECK(info != nullptr);
     DCHECK(!HasEmptyFrame());
     uint32_t address = reinterpret_cast32<uint32_t>(info);
     UseScratchRegisterScope temps(GetVIXLAssembler());
     vixl32::Register tmp = temps.Acquire();
+    SlowPathCodeARMVIXL* slow_path = new (GetScopedAllocator()) CompileOptimizedSlowPathARMVIXL(
+        suspend_check, /* profiling_info= */ lr);
+    AddSlowPath(slow_path);
     __ Mov(lr, address);
     __ Ldrh(tmp, MemOperand(lr, ProfilingInfo::BaselineHotnessCountOffset().Int32Value()));
     __ Adds(tmp, tmp, -1);
@@ -2343,9 +2388,12 @@ void CodeGeneratorARMVIXL::GenerateFrameEntry() {
   if (HasEmptyFrame()) {
     // Ensure that the CFI opcode list is not empty.
     GetAssembler()->cfi().Nop();
-    MaybeIncrementHotness(/* is_frame_entry= */ true);
+    MaybeIncrementHotness(/* suspend_check= */ nullptr, /* is_frame_entry= */ true);
     return;
   }
+
+  // Make sure the frame size isn't unreasonably large.
+  DCHECK_LE(GetFrameSize(), GetMaximumFrameSize());
 
   if (!skip_overflow_check) {
     // Using r4 instead of IP saves 2 bytes.
@@ -2443,7 +2491,7 @@ void CodeGeneratorARMVIXL::GenerateFrameEntry() {
     GetAssembler()->StoreToOffset(kStoreWord, temp, sp, GetStackOffsetOfShouldDeoptimizeFlag());
   }
 
-  MaybeIncrementHotness(/* is_frame_entry= */ true);
+  MaybeIncrementHotness(/* suspend_check= */ nullptr, /* is_frame_entry= */ true);
   MaybeGenerateMarkingRegisterCheck(/* code= */ 1);
 }
 
@@ -2788,7 +2836,7 @@ void InstructionCodeGeneratorARMVIXL::HandleGoto(HInstruction* got, HBasicBlock*
   HLoopInformation* info = block->GetLoopInformation();
 
   if (info != nullptr && info->IsBackEdge(*block) && info->HasSuspendCheck()) {
-    codegen_->MaybeIncrementHotness(/* is_frame_entry= */ false);
+    codegen_->MaybeIncrementHotness(info->GetSuspendCheck(), /* is_frame_entry= */ false);
     GenerateSuspendCheck(info->GetSuspendCheck(), successor);
     return;
   }
@@ -2824,8 +2872,7 @@ void LocationsBuilderARMVIXL::VisitExit(HExit* exit) {
   exit->SetLocations(nullptr);
 }
 
-void InstructionCodeGeneratorARMVIXL::VisitExit(HExit* exit ATTRIBUTE_UNUSED) {
-}
+void InstructionCodeGeneratorARMVIXL::VisitExit([[maybe_unused]] HExit* exit) {}
 
 void InstructionCodeGeneratorARMVIXL::GenerateCompareTestAndBranch(HCondition* condition,
                                                                    vixl32::Label* true_target,
@@ -2963,6 +3010,11 @@ void LocationsBuilderARMVIXL::VisitIf(HIf* if_instr) {
   LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(if_instr);
   if (IsBooleanValueOrMaterializedCondition(if_instr->InputAt(0))) {
     locations->SetInAt(0, Location::RequiresRegister());
+    if (GetGraph()->IsCompilingBaseline() &&
+        codegen_->GetCompilerOptions().ProfileBranches() &&
+        !Runtime::Current()->IsAotCompiler()) {
+      locations->AddTemp(Location::RequiresRegister());
+    }
   }
 }
 
@@ -2973,6 +3025,36 @@ void InstructionCodeGeneratorARMVIXL::VisitIf(HIf* if_instr) {
       nullptr : codegen_->GetLabelOf(true_successor);
   vixl32::Label* false_target = codegen_->GoesToNextBlock(if_instr->GetBlock(), false_successor) ?
       nullptr : codegen_->GetLabelOf(false_successor);
+  if (IsBooleanValueOrMaterializedCondition(if_instr->InputAt(0))) {
+    if (GetGraph()->IsCompilingBaseline() &&
+        codegen_->GetCompilerOptions().ProfileBranches() &&
+        !Runtime::Current()->IsAotCompiler()) {
+      DCHECK(if_instr->InputAt(0)->IsCondition());
+      ProfilingInfo* info = GetGraph()->GetProfilingInfo();
+      DCHECK(info != nullptr);
+      BranchCache* cache = info->GetBranchCache(if_instr->GetDexPc());
+      // Currently, not all If branches are profiled.
+      if (cache != nullptr) {
+        uint32_t address =
+            reinterpret_cast32<uint32_t>(cache) + BranchCache::FalseOffset().Int32Value();
+        static_assert(
+            BranchCache::TrueOffset().Int32Value() - BranchCache::FalseOffset().Int32Value() == 2,
+            "Unexpected offsets for BranchCache");
+        vixl32::Label done;
+        UseScratchRegisterScope temps(GetVIXLAssembler());
+        vixl32::Register temp = temps.Acquire();
+        vixl32::Register counter = RegisterFrom(if_instr->GetLocations()->GetTemp(0));
+        vixl32::Register condition = InputRegisterAt(if_instr, 0);
+        __ Mov(temp, address);
+        __ Ldrh(counter, MemOperand(temp, condition, LSL, 1));
+        __ Adds(counter, counter, 1);
+        __ Uxth(counter, counter);
+        __ CompareAndBranchIfZero(counter, &done);
+        __ Strh(counter, MemOperand(temp, condition, LSL, 1));
+        __ Bind(&done);
+      }
+    }
+  }
   GenerateTestAndBranch(if_instr, /* condition_input_index= */ 0, true_target, false_target);
 }
 
@@ -3422,7 +3504,7 @@ void LocationsBuilderARMVIXL::VisitIntConstant(HIntConstant* constant) {
   locations->SetOut(Location::ConstantLocation(constant));
 }
 
-void InstructionCodeGeneratorARMVIXL::VisitIntConstant(HIntConstant* constant ATTRIBUTE_UNUSED) {
+void InstructionCodeGeneratorARMVIXL::VisitIntConstant([[maybe_unused]] HIntConstant* constant) {
   // Will be generated at use site.
 }
 
@@ -3432,7 +3514,7 @@ void LocationsBuilderARMVIXL::VisitNullConstant(HNullConstant* constant) {
   locations->SetOut(Location::ConstantLocation(constant));
 }
 
-void InstructionCodeGeneratorARMVIXL::VisitNullConstant(HNullConstant* constant ATTRIBUTE_UNUSED) {
+void InstructionCodeGeneratorARMVIXL::VisitNullConstant([[maybe_unused]] HNullConstant* constant) {
   // Will be generated at use site.
 }
 
@@ -3442,7 +3524,7 @@ void LocationsBuilderARMVIXL::VisitLongConstant(HLongConstant* constant) {
   locations->SetOut(Location::ConstantLocation(constant));
 }
 
-void InstructionCodeGeneratorARMVIXL::VisitLongConstant(HLongConstant* constant ATTRIBUTE_UNUSED) {
+void InstructionCodeGeneratorARMVIXL::VisitLongConstant([[maybe_unused]] HLongConstant* constant) {
   // Will be generated at use site.
 }
 
@@ -3453,7 +3535,7 @@ void LocationsBuilderARMVIXL::VisitFloatConstant(HFloatConstant* constant) {
 }
 
 void InstructionCodeGeneratorARMVIXL::VisitFloatConstant(
-    HFloatConstant* constant ATTRIBUTE_UNUSED) {
+    [[maybe_unused]] HFloatConstant* constant) {
   // Will be generated at use site.
 }
 
@@ -3464,7 +3546,7 @@ void LocationsBuilderARMVIXL::VisitDoubleConstant(HDoubleConstant* constant) {
 }
 
 void InstructionCodeGeneratorARMVIXL::VisitDoubleConstant(
-    HDoubleConstant* constant ATTRIBUTE_UNUSED) {
+    [[maybe_unused]] HDoubleConstant* constant) {
   // Will be generated at use site.
 }
 
@@ -3473,7 +3555,7 @@ void LocationsBuilderARMVIXL::VisitConstructorFence(HConstructorFence* construct
 }
 
 void InstructionCodeGeneratorARMVIXL::VisitConstructorFence(
-    HConstructorFence* constructor_fence ATTRIBUTE_UNUSED) {
+    [[maybe_unused]] HConstructorFence* constructor_fence) {
   codegen_->GenerateMemoryBarrier(MemBarrierKind::kStoreStore);
 }
 
@@ -3489,7 +3571,7 @@ void LocationsBuilderARMVIXL::VisitReturnVoid(HReturnVoid* ret) {
   ret->SetLocations(nullptr);
 }
 
-void InstructionCodeGeneratorARMVIXL::VisitReturnVoid(HReturnVoid* ret ATTRIBUTE_UNUSED) {
+void InstructionCodeGeneratorARMVIXL::VisitReturnVoid([[maybe_unused]] HReturnVoid* ret) {
   codegen_->GenerateFrameExit();
 }
 
@@ -3612,26 +3694,28 @@ void LocationsBuilderARMVIXL::VisitInvokeInterface(HInvokeInterface* invoke) {
 void CodeGeneratorARMVIXL::MaybeGenerateInlineCacheCheck(HInstruction* instruction,
                                                          vixl32::Register klass) {
   DCHECK_EQ(r0.GetCode(), klass.GetCode());
-  // We know the destination of an intrinsic, so no need to record inline
-  // caches.
-  if (!instruction->GetLocations()->Intrinsified() &&
-      GetGraph()->IsCompilingBaseline() &&
-      !Runtime::Current()->IsAotCompiler()) {
-    DCHECK(!instruction->GetEnvironment()->IsFromInlinedInvoke());
+  if (ProfilingInfoBuilder::IsInlineCacheUseful(instruction->AsInvoke(), this)) {
     ProfilingInfo* info = GetGraph()->GetProfilingInfo();
-    DCHECK(info != nullptr);
-    InlineCache* cache = info->GetInlineCache(instruction->GetDexPc());
-    uint32_t address = reinterpret_cast32<uint32_t>(cache);
-    vixl32::Label done;
-    UseScratchRegisterScope temps(GetVIXLAssembler());
-    temps.Exclude(ip);
-    __ Mov(r4, address);
-    __ Ldr(ip, MemOperand(r4, InlineCache::ClassesOffset().Int32Value()));
-    // Fast path for a monomorphic cache.
-    __ Cmp(klass, ip);
-    __ B(eq, &done, /* is_far_target= */ false);
-    InvokeRuntime(kQuickUpdateInlineCache, instruction, instruction->GetDexPc());
-    __ Bind(&done);
+    InlineCache* cache = ProfilingInfoBuilder::GetInlineCache(
+        info, GetCompilerOptions(), instruction->AsInvoke());
+    if (cache != nullptr) {
+      uint32_t address = reinterpret_cast32<uint32_t>(cache);
+      vixl32::Label done;
+      UseScratchRegisterScope temps(GetVIXLAssembler());
+      temps.Exclude(ip);
+      __ Mov(r4, address);
+      __ Ldr(ip, MemOperand(r4, InlineCache::ClassesOffset().Int32Value()));
+      // Fast path for a monomorphic cache.
+      __ Cmp(klass, ip);
+      __ B(eq, &done, /* is_far_target= */ false);
+      InvokeRuntime(kQuickUpdateInlineCache, instruction, instruction->GetDexPc());
+      __ Bind(&done);
+    } else {
+      // This is unexpected, but we don't guarantee stable compilation across
+      // JIT runs so just warn about it.
+      ScopedObjectAccess soa(Thread::Current());
+      LOG(WARNING) << "Missing inline cache for " << GetGraph()->GetArtMethod()->PrettyMethod();
+    }
   }
 }
 
@@ -5617,7 +5701,7 @@ void LocationsBuilderARMVIXL::VisitParameterValue(HParameterValue* instruction) 
 }
 
 void InstructionCodeGeneratorARMVIXL::VisitParameterValue(
-    HParameterValue* instruction ATTRIBUTE_UNUSED) {
+    [[maybe_unused]] HParameterValue* instruction) {
   // Nothing to do, the parameter is already at its location.
 }
 
@@ -5628,7 +5712,7 @@ void LocationsBuilderARMVIXL::VisitCurrentMethod(HCurrentMethod* instruction) {
 }
 
 void InstructionCodeGeneratorARMVIXL::VisitCurrentMethod(
-    HCurrentMethod* instruction ATTRIBUTE_UNUSED) {
+    [[maybe_unused]] HCurrentMethod* instruction) {
   // Nothing to do, the method is already at its location.
 }
 
@@ -5769,7 +5853,7 @@ void LocationsBuilderARMVIXL::VisitPhi(HPhi* instruction) {
   locations->SetOut(Location::Any());
 }
 
-void InstructionCodeGeneratorARMVIXL::VisitPhi(HPhi* instruction ATTRIBUTE_UNUSED) {
+void InstructionCodeGeneratorARMVIXL::VisitPhi([[maybe_unused]] HPhi* instruction) {
   LOG(FATAL) << "Unreachable";
 }
 
@@ -5856,16 +5940,15 @@ void LocationsBuilderARMVIXL::HandleFieldSet(HInstruction* instruction,
       && is_wide
       && !codegen_->GetInstructionSetFeatures().HasAtomicLdrdAndStrd();
   bool needs_write_barrier =
-      CodeGenerator::StoreNeedsWriteBarrier(field_type, instruction->InputAt(1));
+      codegen_->StoreNeedsWriteBarrier(field_type, instruction->InputAt(1), write_barrier_kind);
+  bool check_gc_card =
+      codegen_->ShouldCheckGCCard(field_type, instruction->InputAt(1), write_barrier_kind);
+
   // Temporary registers for the write barrier.
   // TODO: consider renaming StoreNeedsWriteBarrier to StoreNeedsGCMark.
-  if (needs_write_barrier) {
-    if (write_barrier_kind != WriteBarrierKind::kDontEmit) {
-      locations->AddTemp(Location::RequiresRegister());
-      locations->AddTemp(Location::RequiresRegister());
-    } else if (kPoisonHeapReferences) {
-      locations->AddTemp(Location::RequiresRegister());
-    }
+  if (needs_write_barrier || check_gc_card) {
+    locations->AddTemp(Location::RequiresRegister());
+    locations->AddTemp(Location::RequiresRegister());
   } else if (generate_volatile) {
     // ARM encoding have some additional constraints for ldrexd/strexd:
     // - registers need to be consecutive
@@ -5881,6 +5964,8 @@ void LocationsBuilderARMVIXL::HandleFieldSet(HInstruction* instruction,
       locations->AddTemp(LocationFrom(r2));
       locations->AddTemp(LocationFrom(r3));
     }
+  } else if (kPoisonHeapReferences && field_type == DataType::Type::kReference) {
+    locations->AddTemp(Location::RequiresRegister());
   }
 }
 
@@ -5893,21 +5978,13 @@ void InstructionCodeGeneratorARMVIXL::HandleFieldSet(HInstruction* instruction,
   LocationSummary* locations = instruction->GetLocations();
   vixl32::Register base = InputRegisterAt(instruction, 0);
   Location value = locations->InAt(1);
-  std::optional<vixl::aarch32::Label> pred_is_null;
 
-  bool is_predicated =
-      instruction->IsInstanceFieldSet() && instruction->AsInstanceFieldSet()->GetIsPredicatedSet();
   bool is_volatile = field_info.IsVolatile();
   bool atomic_ldrd_strd = codegen_->GetInstructionSetFeatures().HasAtomicLdrdAndStrd();
   DataType::Type field_type = field_info.GetFieldType();
   uint32_t offset = field_info.GetFieldOffset().Uint32Value();
   bool needs_write_barrier =
-      CodeGenerator::StoreNeedsWriteBarrier(field_type, instruction->InputAt(1));
-
-  if (is_predicated) {
-    pred_is_null.emplace();
-    __ CompareAndBranchIfZero(base, &*pred_is_null, /* is_far_target= */ false);
-  }
+      codegen_->StoreNeedsWriteBarrier(field_type, instruction->InputAt(1), write_barrier_kind);
 
   if (is_volatile) {
     codegen_->GenerateMemoryBarrier(MemBarrierKind::kAnyStore);
@@ -5930,10 +6007,7 @@ void InstructionCodeGeneratorARMVIXL::HandleFieldSet(HInstruction* instruction,
 
     case DataType::Type::kReference: {
       vixl32::Register value_reg = RegisterFrom(value);
-      if (kPoisonHeapReferences && needs_write_barrier) {
-        // Note that in the case where `value` is a null reference,
-        // we do not enter this block, as a null reference does not
-        // need poisoning.
+      if (kPoisonHeapReferences) {
         DCHECK_EQ(field_type, DataType::Type::kReference);
         value_reg = RegisterFrom(locations->GetTemp(0));
         __ Mov(value_reg, RegisterFrom(value));
@@ -6003,36 +6077,32 @@ void InstructionCodeGeneratorARMVIXL::HandleFieldSet(HInstruction* instruction,
       UNREACHABLE();
   }
 
-  if (CodeGenerator::StoreNeedsWriteBarrier(field_type, instruction->InputAt(1)) &&
-      write_barrier_kind != WriteBarrierKind::kDontEmit) {
+  if (needs_write_barrier) {
     vixl32::Register temp = RegisterFrom(locations->GetTemp(0));
     vixl32::Register card = RegisterFrom(locations->GetTemp(1));
-    codegen_->MarkGCCard(
+    codegen_->MaybeMarkGCCard(
         temp,
         card,
         base,
         RegisterFrom(value),
-        value_can_be_null && write_barrier_kind == WriteBarrierKind::kEmitWithNullCheck);
+        value_can_be_null && write_barrier_kind == WriteBarrierKind::kEmitNotBeingReliedOn);
+  } else if (codegen_->ShouldCheckGCCard(field_type, instruction->InputAt(1), write_barrier_kind)) {
+    vixl32::Register temp = RegisterFrom(locations->GetTemp(0));
+    vixl32::Register card = RegisterFrom(locations->GetTemp(1));
+    codegen_->CheckGCCardIsValid(temp, card, base);
   }
 
   if (is_volatile) {
     codegen_->GenerateMemoryBarrier(MemBarrierKind::kAnyAny);
   }
-
-  if (is_predicated) {
-    __ Bind(&*pred_is_null);
-  }
 }
 
 void LocationsBuilderARMVIXL::HandleFieldGet(HInstruction* instruction,
                                              const FieldInfo& field_info) {
-  DCHECK(instruction->IsInstanceFieldGet() ||
-         instruction->IsStaticFieldGet() ||
-         instruction->IsPredicatedInstanceFieldGet());
+  DCHECK(instruction->IsInstanceFieldGet() || instruction->IsStaticFieldGet());
 
   bool object_field_get_with_read_barrier =
-      gUseReadBarrier && (field_info.GetFieldType() == DataType::Type::kReference);
-  bool is_predicated = instruction->IsPredicatedInstanceFieldGet();
+      (field_info.GetFieldType() == DataType::Type::kReference) && codegen_->EmitReadBarrier();
   LocationSummary* locations =
       new (GetGraph()->GetAllocator()) LocationSummary(instruction,
                                                        object_field_get_with_read_barrier
@@ -6042,7 +6112,7 @@ void LocationsBuilderARMVIXL::HandleFieldGet(HInstruction* instruction,
     locations->SetCustomSlowPathCallerSaves(RegisterSet::Empty());  // No caller-save registers.
   }
   // Input for object receiver.
-  locations->SetInAt(is_predicated ? 1 : 0, Location::RequiresRegister());
+  locations->SetInAt(0, Location::RequiresRegister());
 
   bool volatile_for_double = field_info.IsVolatile()
       && (field_info.GetFieldType() == DataType::Type::kFloat64)
@@ -6057,20 +6127,10 @@ void LocationsBuilderARMVIXL::HandleFieldGet(HInstruction* instruction,
       object_field_get_with_read_barrier;
 
   if (DataType::IsFloatingPointType(instruction->GetType())) {
-    if (is_predicated) {
-      locations->SetInAt(0, Location::RequiresFpuRegister());
-      locations->SetOut(Location::SameAsFirstInput());
-    } else {
-      locations->SetOut(Location::RequiresFpuRegister());
-    }
+    locations->SetOut(Location::RequiresFpuRegister());
   } else {
-    if (is_predicated) {
-      locations->SetInAt(0, Location::RequiresRegister());
-      locations->SetOut(Location::SameAsFirstInput());
-    } else {
-      locations->SetOut(Location::RequiresRegister(),
-                        (overlap ? Location::kOutputOverlap : Location::kNoOutputOverlap));
-    }
+    locations->SetOut(Location::RequiresRegister(),
+                      (overlap ? Location::kOutputOverlap : Location::kNoOutputOverlap));
   }
   if (volatile_for_double) {
     // ARM encoding have some additional constraints for ldrexd/strexd:
@@ -6104,8 +6164,7 @@ Location LocationsBuilderARMVIXL::ArithmeticZeroOrFpuRegister(HInstruction* inpu
 Location LocationsBuilderARMVIXL::ArmEncodableConstantOrRegister(HInstruction* constant,
                                                                  Opcode opcode) {
   DCHECK(!DataType::IsFloatingPointType(constant->GetType()));
-  if (constant->IsConstant() &&
-      CanEncodeConstantAsImmediate(constant->AsConstant(), opcode)) {
+  if (constant->IsConstant() && CanEncodeConstantAsImmediate(constant->AsConstant(), opcode)) {
     return Location::ConstantLocation(constant);
   }
   return Location::RequiresRegister();
@@ -6171,12 +6230,10 @@ bool LocationsBuilderARMVIXL::CanEncodeConstantAsImmediate(HConstant* input_cst,
 
 void InstructionCodeGeneratorARMVIXL::HandleFieldGet(HInstruction* instruction,
                                                      const FieldInfo& field_info) {
-  DCHECK(instruction->IsInstanceFieldGet() ||
-         instruction->IsStaticFieldGet() ||
-         instruction->IsPredicatedInstanceFieldGet());
+  DCHECK(instruction->IsInstanceFieldGet() || instruction->IsStaticFieldGet());
 
   LocationSummary* locations = instruction->GetLocations();
-  uint32_t receiver_input = instruction->IsPredicatedInstanceFieldGet() ? 1 : 0;
+  uint32_t receiver_input = 0;
   vixl32::Register base = InputRegisterAt(instruction, receiver_input);
   Location out = locations->Out();
   bool is_volatile = field_info.IsVolatile();
@@ -6202,7 +6259,7 @@ void InstructionCodeGeneratorARMVIXL::HandleFieldGet(HInstruction* instruction,
 
     case DataType::Type::kReference: {
       // /* HeapReference<Object> */ out = *(base + offset)
-      if (gUseReadBarrier && kUseBakerReadBarrier) {
+      if (codegen_->EmitBakerReadBarrier()) {
         Location maybe_temp = (locations->GetTempCount() != 0) ? locations->GetTemp(0) : Location();
         // Note that a potential implicit null check is handled in this
         // CodeGeneratorARMVIXL::GenerateFieldLoadWithBakerReadBarrier call.
@@ -6297,19 +6354,6 @@ void InstructionCodeGeneratorARMVIXL::VisitInstanceFieldSet(HInstanceFieldSet* i
 
 void LocationsBuilderARMVIXL::VisitInstanceFieldGet(HInstanceFieldGet* instruction) {
   HandleFieldGet(instruction, instruction->GetFieldInfo());
-}
-
-void LocationsBuilderARMVIXL::VisitPredicatedInstanceFieldGet(
-    HPredicatedInstanceFieldGet* instruction) {
-  HandleFieldGet(instruction, instruction->GetFieldInfo());
-}
-
-void InstructionCodeGeneratorARMVIXL::VisitPredicatedInstanceFieldGet(
-    HPredicatedInstanceFieldGet* instruction) {
-  vixl::aarch32::Label finish;
-  __ CompareAndBranchIfZero(InputRegisterAt(instruction, 1), &finish, false);
-  HandleFieldGet(instruction, instruction->GetFieldInfo());
-  __ Bind(&finish);
 }
 
 void InstructionCodeGeneratorARMVIXL::VisitInstanceFieldGet(HInstanceFieldGet* instruction) {
@@ -6512,7 +6556,7 @@ void CodeGeneratorARMVIXL::StoreToShiftedRegOffset(DataType::Type type,
 
 void LocationsBuilderARMVIXL::VisitArrayGet(HArrayGet* instruction) {
   bool object_array_get_with_read_barrier =
-      gUseReadBarrier && (instruction->GetType() == DataType::Type::kReference);
+      (instruction->GetType() == DataType::Type::kReference) && codegen_->EmitReadBarrier();
   LocationSummary* locations =
       new (GetGraph()->GetAllocator()) LocationSummary(instruction,
                                                        object_array_get_with_read_barrier
@@ -6660,14 +6704,14 @@ void InstructionCodeGeneratorARMVIXL::VisitArrayGet(HArrayGet* instruction) {
       // The read barrier instrumentation of object ArrayGet
       // instructions does not support the HIntermediateAddress
       // instruction.
-      DCHECK(!(has_intermediate_address && gUseReadBarrier));
+      DCHECK(!(has_intermediate_address && codegen_->EmitReadBarrier()));
 
       static_assert(
           sizeof(mirror::HeapReference<mirror::Object>) == sizeof(int32_t),
           "art::mirror::HeapReference<art::mirror::Object> and int32_t have different sizes.");
       // /* HeapReference<Object> */ out =
       //     *(obj + data_offset + index * sizeof(HeapReference<Object>))
-      if (gUseReadBarrier && kUseBakerReadBarrier) {
+      if (codegen_->EmitBakerReadBarrier()) {
         // Note that a potential implicit null check is handled in this
         // CodeGeneratorARMVIXL::GenerateArrayLoadWithBakerReadBarrier call.
         DCHECK(!instruction->CanDoImplicitNullCheckOn(instruction->InputAt(0)));
@@ -6798,8 +6842,12 @@ void InstructionCodeGeneratorARMVIXL::VisitArrayGet(HArrayGet* instruction) {
 void LocationsBuilderARMVIXL::VisitArraySet(HArraySet* instruction) {
   DataType::Type value_type = instruction->GetComponentType();
 
+  const WriteBarrierKind write_barrier_kind = instruction->GetWriteBarrierKind();
   bool needs_write_barrier =
-      CodeGenerator::StoreNeedsWriteBarrier(value_type, instruction->GetValue());
+      codegen_->StoreNeedsWriteBarrier(value_type, instruction->GetValue(), write_barrier_kind);
+  bool check_gc_card =
+      codegen_->ShouldCheckGCCard(value_type, instruction->GetValue(), write_barrier_kind);
+
   bool needs_type_check = instruction->NeedsTypeCheck();
 
   LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(
@@ -6813,11 +6861,12 @@ void LocationsBuilderARMVIXL::VisitArraySet(HArraySet* instruction) {
   } else {
     locations->SetInAt(2, Location::RequiresRegister());
   }
-  if (needs_write_barrier) {
-    // Temporary registers for the write barrier or register poisoning.
-    // TODO(solanes): We could reduce the temp usage but it requires some non-trivial refactoring of
-    // InstructionCodeGeneratorARMVIXL::VisitArraySet.
+  if (needs_write_barrier || check_gc_card || instruction->NeedsTypeCheck()) {
+    // Temporary registers for type checking, write barrier, checking the dirty bit, or register
+    // poisoning.
     locations->AddTemp(Location::RequiresRegister());
+    locations->AddTemp(Location::RequiresRegister());
+  } else if (kPoisonHeapReferences && value_type == DataType::Type::kReference) {
     locations->AddTemp(Location::RequiresRegister());
   }
 }
@@ -6828,8 +6877,9 @@ void InstructionCodeGeneratorARMVIXL::VisitArraySet(HArraySet* instruction) {
   Location index = locations->InAt(1);
   DataType::Type value_type = instruction->GetComponentType();
   bool needs_type_check = instruction->NeedsTypeCheck();
+  const WriteBarrierKind write_barrier_kind = instruction->GetWriteBarrierKind();
   bool needs_write_barrier =
-      CodeGenerator::StoreNeedsWriteBarrier(value_type, instruction->GetValue());
+      codegen_->StoreNeedsWriteBarrier(value_type, instruction->GetValue(), write_barrier_kind);
   uint32_t data_offset =
       mirror::Array::DataOffset(DataType::Size(value_type)).Uint32Value();
   Location value_loc = locations->InAt(2);
@@ -6898,16 +6948,17 @@ void InstructionCodeGeneratorARMVIXL::VisitArraySet(HArraySet* instruction) {
           codegen_->StoreToShiftedRegOffset(value_type, value_loc, temp, RegisterFrom(index));
         }
         codegen_->MaybeRecordImplicitNullCheck(instruction);
-        DCHECK(!needs_write_barrier);
+        if (write_barrier_kind == WriteBarrierKind::kEmitBeingReliedOn) {
+          // We need to set a write barrier here even though we are writing null, since this write
+          // barrier is being relied on.
+          DCHECK(needs_write_barrier);
+          vixl32::Register temp1 = RegisterFrom(locations->GetTemp(0));
+          vixl32::Register temp2 = RegisterFrom(locations->GetTemp(1));
+          codegen_->MarkGCCard(temp1, temp2, array);
+        }
         DCHECK(!needs_type_check);
         break;
       }
-
-      DCHECK(needs_write_barrier);
-      Location temp1_loc = locations->GetTemp(0);
-      vixl32::Register temp1 = RegisterFrom(temp1_loc);
-      Location temp2_loc = locations->GetTemp(1);
-      vixl32::Register temp2 = RegisterFrom(temp2_loc);
 
       bool can_value_be_null = instruction->GetValueCanBeNull();
       vixl32::Label do_store;
@@ -6931,6 +6982,9 @@ void InstructionCodeGeneratorARMVIXL::VisitArraySet(HArraySet* instruction) {
         // produce a false positive; it may of course produce a false
         // negative, in which case we would take the ArraySet slow
         // path.
+
+        vixl32::Register temp1 = RegisterFrom(locations->GetTemp(0));
+        vixl32::Register temp2 = RegisterFrom(locations->GetTemp(1));
 
         {
           // Ensure we record the pc position immediately after the `ldr` instruction.
@@ -6969,22 +7023,29 @@ void InstructionCodeGeneratorARMVIXL::VisitArraySet(HArraySet* instruction) {
         }
       }
 
-      if (instruction->GetWriteBarrierKind() != WriteBarrierKind::kDontEmit) {
-        DCHECK_EQ(instruction->GetWriteBarrierKind(), WriteBarrierKind::kEmitNoNullCheck)
-            << " Already null checked so we shouldn't do it again.";
-        codegen_->MarkGCCard(temp1, temp2, array, value, /* emit_null_check= */ false);
-      }
-
       if (can_value_be_null) {
         DCHECK(do_store.IsReferenced());
         __ Bind(&do_store);
       }
 
+      if (needs_write_barrier) {
+        // TODO(solanes): The WriteBarrierKind::kEmitNotBeingReliedOn case should be able to skip
+        // this write barrier when its value is null (without an extra CompareAndBranchIfZero since
+        // we already checked if the value is null for the type check). This will be done as a
+        // follow-up since it is a runtime optimization that needs extra care.
+        vixl32::Register temp1 = RegisterFrom(locations->GetTemp(0));
+        vixl32::Register temp2 = RegisterFrom(locations->GetTemp(1));
+        codegen_->MarkGCCard(temp1, temp2, array);
+      } else if (codegen_->ShouldCheckGCCard(
+                     value_type, instruction->GetValue(), write_barrier_kind)) {
+        vixl32::Register temp1 = RegisterFrom(locations->GetTemp(0));
+        vixl32::Register temp2 = RegisterFrom(locations->GetTemp(1));
+        codegen_->CheckGCCardIsValid(temp1, temp2, array);
+      }
+
       vixl32::Register source = value;
       if (kPoisonHeapReferences) {
-        // Note that in the case where `value` is a null reference,
-        // we do not enter this block, as a null reference does not
-        // need poisoning.
+        vixl32::Register temp1 = RegisterFrom(locations->GetTemp(0));
         DCHECK_EQ(value_type, DataType::Type::kReference);
         __ Mov(temp1, value);
         GetAssembler()->PoisonHeapReference(temp1);
@@ -7200,20 +7261,28 @@ void InstructionCodeGeneratorARMVIXL::VisitBoundsCheck(HBoundsCheck* instruction
   }
 }
 
-void CodeGeneratorARMVIXL::MarkGCCard(vixl32::Register temp,
-                                      vixl32::Register card,
-                                      vixl32::Register object,
-                                      vixl32::Register value,
-                                      bool emit_null_check) {
+void CodeGeneratorARMVIXL::MaybeMarkGCCard(vixl32::Register temp,
+                                           vixl32::Register card,
+                                           vixl32::Register object,
+                                           vixl32::Register value,
+                                           bool emit_null_check) {
   vixl32::Label is_null;
   if (emit_null_check) {
     __ CompareAndBranchIfZero(value, &is_null, /* is_far_target=*/ false);
   }
+  MarkGCCard(temp, card, object);
+  if (emit_null_check) {
+    __ Bind(&is_null);
+  }
+}
+
+void CodeGeneratorARMVIXL::MarkGCCard(vixl32::Register temp,
+                                      vixl32::Register card,
+                                      vixl32::Register object) {
   // Load the address of the card table into `card`.
   GetAssembler()->LoadFromOffset(
       kLoadWord, card, tr, Thread::CardTableOffset<kArmPointerSize>().Int32Value());
-  // Calculate the offset (in the card table) of the card corresponding to
-  // `object`.
+  // Calculate the offset (in the card table) of the card corresponding to `object`.
   __ Lsr(temp, object, Operand::From(gc::accounting::CardTable::kCardShift));
   // Write the `art::gc::accounting::CardTable::kCardDirty` value into the
   // `object`'s card.
@@ -7229,12 +7298,27 @@ void CodeGeneratorARMVIXL::MarkGCCard(vixl32::Register temp,
   // of the card to mark; and 2. to load the `kCardDirty` value) saves a load
   // (no need to explicitly load `kCardDirty` as an immediate value).
   __ Strb(card, MemOperand(card, temp));
-  if (emit_null_check) {
-    __ Bind(&is_null);
-  }
 }
 
-void LocationsBuilderARMVIXL::VisitParallelMove(HParallelMove* instruction ATTRIBUTE_UNUSED) {
+void CodeGeneratorARMVIXL::CheckGCCardIsValid(vixl32::Register temp,
+                                              vixl32::Register card,
+                                              vixl32::Register object) {
+  vixl32::Label done;
+  // Load the address of the card table into `card`.
+  GetAssembler()->LoadFromOffset(
+      kLoadWord, card, tr, Thread::CardTableOffset<kArmPointerSize>().Int32Value());
+  // Calculate the offset (in the card table) of the card corresponding to `object`.
+  __ Lsr(temp, object, Operand::From(gc::accounting::CardTable::kCardShift));
+  // assert (!clean || !self->is_gc_marking)
+  __ Ldrb(temp, MemOperand(card, temp));
+  static_assert(gc::accounting::CardTable::kCardClean == 0);
+  __ CompareAndBranchIfNonZero(temp, &done, /*is_far_target=*/false);
+  __ CompareAndBranchIfZero(mr, &done, /*is_far_target=*/false);
+  __ Bkpt(0);
+  __ Bind(&done);
+}
+
+void LocationsBuilderARMVIXL::VisitParallelMove([[maybe_unused]] HParallelMove* instruction) {
   LOG(FATAL) << "Unreachable";
 }
 
@@ -7591,7 +7675,7 @@ void LocationsBuilderARMVIXL::VisitLoadClass(HLoadClass* cls) {
             load_kind == HLoadClass::LoadKind::kBssEntryPublic ||
                 load_kind == HLoadClass::LoadKind::kBssEntryPackage);
 
-  const bool requires_read_barrier = gUseReadBarrier && !cls->IsInBootImage();
+  const bool requires_read_barrier = !cls->IsInBootImage() && codegen_->EmitReadBarrier();
   LocationSummary::CallKind call_kind = (cls->NeedsEnvironment() || requires_read_barrier)
       ? LocationSummary::kCallOnSlowPath
       : LocationSummary::kNoCall;
@@ -7604,12 +7688,14 @@ void LocationsBuilderARMVIXL::VisitLoadClass(HLoadClass* cls) {
     locations->SetInAt(0, Location::RequiresRegister());
   }
   locations->SetOut(Location::RequiresRegister());
-  if (load_kind == HLoadClass::LoadKind::kBssEntry) {
-    if (!gUseReadBarrier || kUseBakerReadBarrier) {
+  if (load_kind == HLoadClass::LoadKind::kBssEntry ||
+      load_kind == HLoadClass::LoadKind::kBssEntryPublic ||
+      load_kind == HLoadClass::LoadKind::kBssEntryPackage) {
+    if (codegen_->EmitNonBakerReadBarrier()) {
+      // For non-Baker read barrier we have a temp-clobbering call.
+    } else {
       // Rely on the type resolution or initialization and marking to save everything we need.
       locations->SetCustomSlowPathCallerSaves(OneRegInReferenceOutSaveEverythingCallerSaves());
-    } else {
-      // For non-Baker read barrier we have a temp-clobbering call.
     }
   }
 }
@@ -7631,9 +7717,8 @@ void InstructionCodeGeneratorARMVIXL::VisitLoadClass(HLoadClass* cls) NO_THREAD_
   Location out_loc = locations->Out();
   vixl32::Register out = OutputRegister(cls);
 
-  const ReadBarrierOption read_barrier_option = cls->IsInBootImage()
-      ? kWithoutReadBarrier
-      : gCompilerReadBarrierOption;
+  const ReadBarrierOption read_barrier_option =
+      cls->IsInBootImage() ? kWithoutReadBarrier : codegen_->GetCompilerReadBarrierOption();
   bool generate_null_check = false;
   switch (load_kind) {
     case HLoadClass::LoadKind::kReferrersClass: {
@@ -7840,7 +7925,7 @@ HLoadString::LoadKind CodeGeneratorARMVIXL::GetSupportedLoadStringKind(
 }
 
 void LocationsBuilderARMVIXL::VisitLoadString(HLoadString* load) {
-  LocationSummary::CallKind call_kind = CodeGenerator::GetLoadStringCallKind(load);
+  LocationSummary::CallKind call_kind = codegen_->GetLoadStringCallKind(load);
   LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(load, call_kind);
   HLoadString::LoadKind load_kind = load->GetLoadKind();
   if (load_kind == HLoadString::LoadKind::kRuntimeCall) {
@@ -7848,11 +7933,11 @@ void LocationsBuilderARMVIXL::VisitLoadString(HLoadString* load) {
   } else {
     locations->SetOut(Location::RequiresRegister());
     if (load_kind == HLoadString::LoadKind::kBssEntry) {
-      if (!gUseReadBarrier || kUseBakerReadBarrier) {
+      if (codegen_->EmitNonBakerReadBarrier()) {
+        // For non-Baker read barrier we have a temp-clobbering call.
+      } else {
         // Rely on the pResolveString and marking to save everything we need, including temps.
         locations->SetCustomSlowPathCallerSaves(OneRegInReferenceOutSaveEverythingCallerSaves());
-      } else {
-        // For non-Baker read barrier we have a temp-clobbering call.
       }
     }
   }
@@ -7887,7 +7972,7 @@ void InstructionCodeGeneratorARMVIXL::VisitLoadString(HLoadString* load) NO_THRE
       codegen_->EmitMovwMovtPlaceholder(labels, out);
       // All aligned loads are implicitly atomic consume operations on ARM.
       codegen_->GenerateGcRootFieldLoad(
-          load, out_loc, out, /*offset=*/ 0, gCompilerReadBarrierOption);
+          load, out_loc, out, /*offset=*/0, codegen_->GetCompilerReadBarrierOption());
       LoadStringSlowPathARMVIXL* slow_path =
           new (codegen_->GetScopedAllocator()) LoadStringSlowPathARMVIXL(load);
       codegen_->AddSlowPath(slow_path);
@@ -7908,14 +7993,13 @@ void InstructionCodeGeneratorARMVIXL::VisitLoadString(HLoadString* load) NO_THRE
                                                         load->GetString()));
       // /* GcRoot<mirror::String> */ out = *out
       codegen_->GenerateGcRootFieldLoad(
-          load, out_loc, out, /*offset=*/ 0, gCompilerReadBarrierOption);
+          load, out_loc, out, /*offset=*/0, codegen_->GetCompilerReadBarrierOption());
       return;
     }
     default:
       break;
   }
 
-  // TODO: Re-add the compiler code to do string dex cache lookup again.
   DCHECK_EQ(load->GetLoadKind(), HLoadString::LoadKind::kRuntimeCall);
   InvokeRuntimeCallingConventionARMVIXL calling_convention;
   __ Mov(calling_convention.GetRegisterAt(0), load->GetStringIndex().index_);
@@ -7944,7 +8028,7 @@ void LocationsBuilderARMVIXL::VisitClearException(HClearException* clear) {
   new (GetGraph()->GetAllocator()) LocationSummary(clear, LocationSummary::kNoCall);
 }
 
-void InstructionCodeGeneratorARMVIXL::VisitClearException(HClearException* clear ATTRIBUTE_UNUSED) {
+void InstructionCodeGeneratorARMVIXL::VisitClearException([[maybe_unused]] HClearException* clear) {
   UseScratchRegisterScope temps(GetVIXLAssembler());
   vixl32::Register temp = temps.Acquire();
   __ Mov(temp, 0);
@@ -7964,8 +8048,8 @@ void InstructionCodeGeneratorARMVIXL::VisitThrow(HThrow* instruction) {
 }
 
 // Temp is used for read barrier.
-static size_t NumberOfInstanceOfTemps(TypeCheckKind type_check_kind) {
-  if (gUseReadBarrier &&
+static size_t NumberOfInstanceOfTemps(bool emit_read_barrier, TypeCheckKind type_check_kind) {
+  if (emit_read_barrier &&
        (kUseBakerReadBarrier ||
           type_check_kind == TypeCheckKind::kAbstractClassCheck ||
           type_check_kind == TypeCheckKind::kClassHierarchyCheck ||
@@ -7978,11 +8062,11 @@ static size_t NumberOfInstanceOfTemps(TypeCheckKind type_check_kind) {
 // Interface case has 3 temps, one for holding the number of interfaces, one for the current
 // interface pointer, one for loading the current interface.
 // The other checks have one temp for loading the object's class.
-static size_t NumberOfCheckCastTemps(TypeCheckKind type_check_kind) {
+static size_t NumberOfCheckCastTemps(bool emit_read_barrier, TypeCheckKind type_check_kind) {
   if (type_check_kind == TypeCheckKind::kInterfaceCheck) {
     return 3;
   }
-  return 1 + NumberOfInstanceOfTemps(type_check_kind);
+  return 1 + NumberOfInstanceOfTemps(emit_read_barrier, type_check_kind);
 }
 
 void LocationsBuilderARMVIXL::VisitInstanceOf(HInstanceOf* instruction) {
@@ -7994,7 +8078,7 @@ void LocationsBuilderARMVIXL::VisitInstanceOf(HInstanceOf* instruction) {
     case TypeCheckKind::kAbstractClassCheck:
     case TypeCheckKind::kClassHierarchyCheck:
     case TypeCheckKind::kArrayObjectCheck: {
-      bool needs_read_barrier = CodeGenerator::InstanceOfNeedsReadBarrier(instruction);
+      bool needs_read_barrier = codegen_->InstanceOfNeedsReadBarrier(instruction);
       call_kind = needs_read_barrier ? LocationSummary::kCallOnSlowPath : LocationSummary::kNoCall;
       baker_read_barrier_slow_path = kUseBakerReadBarrier && needs_read_barrier;
       break;
@@ -8024,7 +8108,8 @@ void LocationsBuilderARMVIXL::VisitInstanceOf(HInstanceOf* instruction) {
   // The "out" register is used as a temporary, so it overlaps with the inputs.
   // Note that TypeCheckSlowPathARM uses this register too.
   locations->SetOut(Location::RequiresRegister(), Location::kOutputOverlap);
-  locations->AddRegisterTemps(NumberOfInstanceOfTemps(type_check_kind));
+  locations->AddRegisterTemps(
+      NumberOfInstanceOfTemps(codegen_->EmitReadBarrier(), type_check_kind));
 }
 
 void InstructionCodeGeneratorARMVIXL::VisitInstanceOf(HInstanceOf* instruction) {
@@ -8037,7 +8122,7 @@ void InstructionCodeGeneratorARMVIXL::VisitInstanceOf(HInstanceOf* instruction) 
       : InputRegisterAt(instruction, 1);
   Location out_loc = locations->Out();
   vixl32::Register out = OutputRegister(instruction);
-  const size_t num_temps = NumberOfInstanceOfTemps(type_check_kind);
+  const size_t num_temps = NumberOfInstanceOfTemps(codegen_->EmitReadBarrier(), type_check_kind);
   DCHECK_LE(num_temps, 1u);
   Location maybe_temp_loc = (num_temps >= 1) ? locations->GetTemp(0) : Location::NoLocation();
   uint32_t class_offset = mirror::Object::ClassOffset().Int32Value();
@@ -8059,7 +8144,7 @@ void InstructionCodeGeneratorARMVIXL::VisitInstanceOf(HInstanceOf* instruction) 
   switch (type_check_kind) {
     case TypeCheckKind::kExactCheck: {
       ReadBarrierOption read_barrier_option =
-          CodeGenerator::ReadBarrierOptionForInstanceOf(instruction);
+          codegen_->ReadBarrierOptionForInstanceOf(instruction);
       // /* HeapReference<Class> */ out = obj->klass_
       GenerateReferenceLoadTwoRegisters(instruction,
                                         out_loc,
@@ -8094,7 +8179,7 @@ void InstructionCodeGeneratorARMVIXL::VisitInstanceOf(HInstanceOf* instruction) 
 
     case TypeCheckKind::kAbstractClassCheck: {
       ReadBarrierOption read_barrier_option =
-          CodeGenerator::ReadBarrierOptionForInstanceOf(instruction);
+          codegen_->ReadBarrierOptionForInstanceOf(instruction);
       // /* HeapReference<Class> */ out = obj->klass_
       GenerateReferenceLoadTwoRegisters(instruction,
                                         out_loc,
@@ -8122,7 +8207,7 @@ void InstructionCodeGeneratorARMVIXL::VisitInstanceOf(HInstanceOf* instruction) 
 
     case TypeCheckKind::kClassHierarchyCheck: {
       ReadBarrierOption read_barrier_option =
-          CodeGenerator::ReadBarrierOptionForInstanceOf(instruction);
+          codegen_->ReadBarrierOptionForInstanceOf(instruction);
       // /* HeapReference<Class> */ out = obj->klass_
       GenerateReferenceLoadTwoRegisters(instruction,
                                         out_loc,
@@ -8178,7 +8263,7 @@ void InstructionCodeGeneratorARMVIXL::VisitInstanceOf(HInstanceOf* instruction) 
 
     case TypeCheckKind::kArrayObjectCheck: {
       ReadBarrierOption read_barrier_option =
-          CodeGenerator::ReadBarrierOptionForInstanceOf(instruction);
+          codegen_->ReadBarrierOptionForInstanceOf(instruction);
       // /* HeapReference<Class> */ out = obj->klass_
       GenerateReferenceLoadTwoRegisters(instruction,
                                         out_loc,
@@ -8307,7 +8392,7 @@ void InstructionCodeGeneratorARMVIXL::VisitInstanceOf(HInstanceOf* instruction) 
 
 void LocationsBuilderARMVIXL::VisitCheckCast(HCheckCast* instruction) {
   TypeCheckKind type_check_kind = instruction->GetTypeCheckKind();
-  LocationSummary::CallKind call_kind = CodeGenerator::GetCheckCastCallKind(instruction);
+  LocationSummary::CallKind call_kind = codegen_->GetCheckCastCallKind(instruction);
   LocationSummary* locations =
       new (GetGraph()->GetAllocator()) LocationSummary(instruction, call_kind);
   locations->SetInAt(0, Location::RequiresRegister());
@@ -8318,7 +8403,8 @@ void LocationsBuilderARMVIXL::VisitCheckCast(HCheckCast* instruction) {
   } else {
     locations->SetInAt(1, Location::RequiresRegister());
   }
-  locations->AddRegisterTemps(NumberOfCheckCastTemps(type_check_kind));
+  locations->AddRegisterTemps(
+      NumberOfCheckCastTemps(codegen_->EmitReadBarrier(), type_check_kind));
 }
 
 void InstructionCodeGeneratorARMVIXL::VisitCheckCast(HCheckCast* instruction) {
@@ -8331,7 +8417,7 @@ void InstructionCodeGeneratorARMVIXL::VisitCheckCast(HCheckCast* instruction) {
       : InputRegisterAt(instruction, 1);
   Location temp_loc = locations->GetTemp(0);
   vixl32::Register temp = RegisterFrom(temp_loc);
-  const size_t num_temps = NumberOfCheckCastTemps(type_check_kind);
+  const size_t num_temps = NumberOfCheckCastTemps(codegen_->EmitReadBarrier(), type_check_kind);
   DCHECK_LE(num_temps, 3u);
   Location maybe_temp2_loc = (num_temps >= 2) ? locations->GetTemp(1) : Location::NoLocation();
   Location maybe_temp3_loc = (num_temps >= 3) ? locations->GetTemp(2) : Location::NoLocation();
@@ -8344,7 +8430,7 @@ void InstructionCodeGeneratorARMVIXL::VisitCheckCast(HCheckCast* instruction) {
   const uint32_t object_array_data_offset =
       mirror::Array::DataOffset(kHeapReferenceSize).Uint32Value();
 
-  bool is_type_check_slow_path_fatal = CodeGenerator::IsTypeCheckSlowPathFatal(instruction);
+  bool is_type_check_slow_path_fatal = codegen_->IsTypeCheckSlowPathFatal(instruction);
   SlowPathCodeARMVIXL* type_check_slow_path =
       new (codegen_->GetScopedAllocator()) TypeCheckSlowPathARMVIXL(
           instruction, is_type_check_slow_path_fatal);
@@ -8490,12 +8576,11 @@ void InstructionCodeGeneratorARMVIXL::VisitCheckCast(HCheckCast* instruction) {
                                         kWithoutReadBarrier);
 
       // /* HeapReference<Class> */ temp = temp->iftable_
-      GenerateReferenceLoadTwoRegisters(instruction,
-                                        temp_loc,
-                                        temp_loc,
-                                        iftable_offset,
-                                        maybe_temp2_loc,
-                                        kWithoutReadBarrier);
+      GenerateReferenceLoadOneRegister(instruction,
+                                       temp_loc,
+                                       iftable_offset,
+                                       maybe_temp2_loc,
+                                       kWithoutReadBarrier);
       // Iftable is never null.
       __ Ldr(RegisterFrom(maybe_temp2_loc), MemOperand(temp, array_length_offset));
       // Loop through the iftable and check if any class matches.
@@ -8900,7 +8985,7 @@ void InstructionCodeGeneratorARMVIXL::GenerateReferenceLoadOneRegister(
     ReadBarrierOption read_barrier_option) {
   vixl32::Register out_reg = RegisterFrom(out);
   if (read_barrier_option == kWithReadBarrier) {
-    CHECK(gUseReadBarrier);
+    DCHECK(codegen_->EmitReadBarrier());
     DCHECK(maybe_temp.IsRegister()) << maybe_temp;
     if (kUseBakerReadBarrier) {
       // Load with fast path based Baker's read barrier.
@@ -8935,7 +9020,7 @@ void InstructionCodeGeneratorARMVIXL::GenerateReferenceLoadTwoRegisters(
   vixl32::Register out_reg = RegisterFrom(out);
   vixl32::Register obj_reg = RegisterFrom(obj);
   if (read_barrier_option == kWithReadBarrier) {
-    CHECK(gUseReadBarrier);
+    DCHECK(codegen_->EmitReadBarrier());
     if (kUseBakerReadBarrier) {
       DCHECK(maybe_temp.IsRegister()) << maybe_temp;
       // Load with fast path based Baker's read barrier.
@@ -8964,7 +9049,7 @@ void CodeGeneratorARMVIXL::GenerateGcRootFieldLoad(
     ReadBarrierOption read_barrier_option) {
   vixl32::Register root_reg = RegisterFrom(root);
   if (read_barrier_option == kWithReadBarrier) {
-    DCHECK(gUseReadBarrier);
+    DCHECK(EmitReadBarrier());
     if (kUseBakerReadBarrier) {
       // Fast path implementation of art::ReadBarrier::BarrierForRoot when
       // Baker's read barrier are used.
@@ -9025,11 +9110,10 @@ void CodeGeneratorARMVIXL::GenerateGcRootFieldLoad(
   MaybeGenerateMarkingRegisterCheck(/* code= */ 20);
 }
 
-void CodeGeneratorARMVIXL::GenerateIntrinsicCasMoveWithBakerReadBarrier(
+void CodeGeneratorARMVIXL::GenerateIntrinsicMoveWithBakerReadBarrier(
     vixl::aarch32::Register marked_old_value,
     vixl::aarch32::Register old_value) {
-  DCHECK(gUseReadBarrier);
-  DCHECK(kUseBakerReadBarrier);
+  DCHECK(EmitBakerReadBarrier());
 
   // Similar to the Baker RB path in GenerateGcRootFieldLoad(), with a MOV instead of LDR.
   // For low registers, we can reuse the GC root narrow entrypoint, for high registers
@@ -9062,8 +9146,7 @@ void CodeGeneratorARMVIXL::GenerateFieldLoadWithBakerReadBarrier(HInstruction* i
                                                                  vixl32::Register obj,
                                                                  const vixl32::MemOperand& src,
                                                                  bool needs_null_check) {
-  DCHECK(gUseReadBarrier);
-  DCHECK(kUseBakerReadBarrier);
+  DCHECK(EmitBakerReadBarrier());
 
   // Query `art::Thread::Current()->GetIsGcMarking()` (stored in the
   // Marking Register) to decide whether we need to enter the slow
@@ -9155,8 +9238,7 @@ void CodeGeneratorARMVIXL::GenerateArrayLoadWithBakerReadBarrier(Location ref,
                                                                  Location index,
                                                                  Location temp,
                                                                  bool needs_null_check) {
-  DCHECK(gUseReadBarrier);
-  DCHECK(kUseBakerReadBarrier);
+  DCHECK(EmitBakerReadBarrier());
 
   static_assert(
       sizeof(mirror::HeapReference<mirror::Object>) == sizeof(int32_t),
@@ -9221,7 +9303,7 @@ void CodeGeneratorARMVIXL::GenerateArrayLoadWithBakerReadBarrier(Location ref,
 
 void CodeGeneratorARMVIXL::MaybeGenerateMarkingRegisterCheck(int code, Location temp_loc) {
   // The following condition is a compile-time one, so it does not have a run-time cost.
-  if (kIsDebugBuild && gUseReadBarrier && kUseBakerReadBarrier) {
+  if (kIsDebugBuild && EmitBakerReadBarrier()) {
     // The following condition is a run-time one; it is executed after the
     // previous compile-time test, to avoid penalizing non-debug builds.
     if (GetCompilerOptions().EmitRunTimeChecksInDebugMode()) {
@@ -9251,7 +9333,7 @@ void CodeGeneratorARMVIXL::GenerateReadBarrierSlow(HInstruction* instruction,
                                                    Location obj,
                                                    uint32_t offset,
                                                    Location index) {
-  DCHECK(gUseReadBarrier);
+  DCHECK(EmitReadBarrier());
 
   // Insert a slow path based read barrier *after* the reference load.
   //
@@ -9277,7 +9359,7 @@ void CodeGeneratorARMVIXL::MaybeGenerateReadBarrierSlow(HInstruction* instructio
                                                         Location obj,
                                                         uint32_t offset,
                                                         Location index) {
-  if (gUseReadBarrier) {
+  if (EmitReadBarrier()) {
     // Baker's read barriers shall be handled by the fast path
     // (CodeGeneratorARMVIXL::GenerateReferenceLoadWithBakerReadBarrier).
     DCHECK(!kUseBakerReadBarrier);
@@ -9292,7 +9374,7 @@ void CodeGeneratorARMVIXL::MaybeGenerateReadBarrierSlow(HInstruction* instructio
 void CodeGeneratorARMVIXL::GenerateReadBarrierForRootSlow(HInstruction* instruction,
                                                           Location out,
                                                           Location root) {
-  DCHECK(gUseReadBarrier);
+  DCHECK(EmitReadBarrier());
 
   // Insert a slow path based read barrier *after* the GC root load.
   //
@@ -9667,7 +9749,7 @@ void CodeGeneratorARMVIXL::LoadBootImageAddress(vixl32::Register reg,
 
 void CodeGeneratorARMVIXL::LoadTypeForBootImageIntrinsic(vixl::aarch32::Register reg,
                                                          TypeReference target_type) {
-  // Load the class the same way as for HLoadClass::LoadKind::kBootImageLinkTimePcRelative.
+  // Load the type the same way as for HLoadClass::LoadKind::kBootImageLinkTimePcRelative.
   DCHECK(GetCompilerOptions().IsBootImage() || GetCompilerOptions().IsBootImageExtension());
   PcRelativePatchInfo* labels =
       NewBootImageTypePatch(*target_type.dex_file, target_type.TypeIndex());
@@ -9828,7 +9910,7 @@ void CodeGeneratorARMVIXL::EmitThunkCode(const linker::LinkerPatch& patch,
   assembler.FinalizeCode();
   code->resize(assembler.CodeSize());
   MemoryRegion code_region(code->data(), code->size());
-  assembler.FinalizeInstructions(code_region);
+  assembler.CopyInstructions(code_region);
 }
 
 VIXLUInt32Literal* CodeGeneratorARMVIXL::DeduplicateUint32Literal(
@@ -9867,12 +9949,12 @@ void InstructionCodeGeneratorARMVIXL::VisitMultiplyAccumulate(HMultiplyAccumulat
   }
 }
 
-void LocationsBuilderARMVIXL::VisitBoundType(HBoundType* instruction ATTRIBUTE_UNUSED) {
+void LocationsBuilderARMVIXL::VisitBoundType([[maybe_unused]] HBoundType* instruction) {
   // Nothing to do, this should be removed during prepare for register allocator.
   LOG(FATAL) << "Unreachable";
 }
 
-void InstructionCodeGeneratorARMVIXL::VisitBoundType(HBoundType* instruction ATTRIBUTE_UNUSED) {
+void InstructionCodeGeneratorARMVIXL::VisitBoundType([[maybe_unused]] HBoundType* instruction) {
   // Nothing to do, this should be removed during prepare for register allocator.
   LOG(FATAL) << "Unreachable";
 }

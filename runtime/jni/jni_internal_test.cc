@@ -28,7 +28,7 @@
 #include "nativehelper/scoped_local_ref.h"
 #include "scoped_thread_state_change-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 using android::base::StringPrintf;
 
@@ -1555,10 +1555,10 @@ TEST_F(JniInternalTest, NewStringUTF_Validation) {
   // For the following tests, allocate two pages, one R/W and the next inaccessible.
   std::string error_msg;
   MemMap head_map = MemMap::MapAnonymous(
-      "head", 2 * kPageSize, PROT_READ | PROT_WRITE, /*low_4gb=*/ false, &error_msg);
+      "head", 2 * gPageSize, PROT_READ | PROT_WRITE, /*low_4gb=*/ false, &error_msg);
   ASSERT_TRUE(head_map.IsValid()) << error_msg;
   MemMap tail_map = head_map.RemapAtEnd(
-      head_map.Begin() + kPageSize, "tail", PROT_NONE, &error_msg);
+      head_map.Begin() + gPageSize, "tail", PROT_NONE, &error_msg);
   ASSERT_TRUE(tail_map.IsValid()) << error_msg;
   char* utf_src = reinterpret_cast<char*>(head_map.Begin());
 
@@ -1572,28 +1572,28 @@ TEST_F(JniInternalTest, NewStringUTF_Validation) {
   const JNINativeInterface* base_env = down_cast<JNIEnvExt*>(env_)->GetUncheckedFunctions();
 
   // Start with a simple ASCII string consisting of 4095 characters 'x'.
-  memset(utf_src, 'x', kPageSize - 1u);
-  utf_src[kPageSize - 1u] = 0u;
+  memset(utf_src, 'x', gPageSize - 1u);
+  utf_src[gPageSize - 1u] = 0u;
   jstring s = base_env->NewStringUTF(env_, utf_src);
-  ASSERT_EQ(mirror::String::GetFlaggedCount(kPageSize - 1u, /* compressible= */ true),
+  ASSERT_EQ(mirror::String::GetFlaggedCount(gPageSize - 1u, /* compressible= */ true),
             env_->GetIntField(s, count_fid));
   const char* chars = env_->GetStringUTFChars(s, nullptr);
-  for (size_t pos = 0; pos != kPageSize - 1u; ++pos) {
+  for (size_t pos = 0; pos != gPageSize - 1u; ++pos) {
     ASSERT_EQ('x', chars[pos]) << pos;
   }
   env_->ReleaseStringUTFChars(s, chars);
 
   // Replace the last character with invalid character that requires continuation.
   for (char invalid : { '\xc0', '\xe0', '\xf0' }) {
-    utf_src[kPageSize - 2u] = invalid;
+    utf_src[gPageSize - 2u] = invalid;
     s = base_env->NewStringUTF(env_, utf_src);
-    ASSERT_EQ(mirror::String::GetFlaggedCount(kPageSize - 1u, /* compressible= */ true),
+    ASSERT_EQ(mirror::String::GetFlaggedCount(gPageSize - 1u, /* compressible= */ true),
               env_->GetIntField(s, count_fid));
     chars = env_->GetStringUTFChars(s, nullptr);
-    for (size_t pos = 0; pos != kPageSize - 2u; ++pos) {
+    for (size_t pos = 0; pos != gPageSize - 2u; ++pos) {
       ASSERT_EQ('x', chars[pos]) << pos;
     }
-    EXPECT_EQ('?', chars[kPageSize - 2u]);
+    EXPECT_EQ('?', chars[gPageSize - 2u]);
     env_->ReleaseStringUTFChars(s, chars);
   }
 
@@ -1601,14 +1601,14 @@ TEST_F(JniInternalTest, NewStringUTF_Validation) {
   utf_src[0] = '\xc2';
   utf_src[1] = '\x80';
   s = base_env->NewStringUTF(env_, utf_src);
-  ASSERT_EQ(mirror::String::GetFlaggedCount(kPageSize - 2u, /* compressible= */ false),
+  ASSERT_EQ(mirror::String::GetFlaggedCount(gPageSize - 2u, /* compressible= */ false),
             env_->GetIntField(s, count_fid));
   const jchar* jchars = env_->GetStringChars(s, nullptr);
   EXPECT_EQ(jchars[0], 0x80u);
-  for (size_t pos = 1; pos != kPageSize - 3u; ++pos) {
+  for (size_t pos = 1; pos != gPageSize - 3u; ++pos) {
     ASSERT_EQ('x', jchars[pos]) << pos;
   }
-  EXPECT_EQ('?', jchars[kPageSize - 3u]);
+  EXPECT_EQ('?', jchars[gPageSize - 3u]);
   env_->ReleaseStringChars(s, jchars);
 
   // Replace the leading two-byte sequence with a two-byte sequence that decodes as ASCII (0x40).
@@ -1616,14 +1616,14 @@ TEST_F(JniInternalTest, NewStringUTF_Validation) {
   utf_src[1] = '\x80';
   s = base_env->NewStringUTF(env_, utf_src);
   // Note: All invalid characters are replaced by ASCII replacement character.
-  ASSERT_EQ(mirror::String::GetFlaggedCount(kPageSize - 2u, /* compressible= */ true),
+  ASSERT_EQ(mirror::String::GetFlaggedCount(gPageSize - 2u, /* compressible= */ true),
             env_->GetIntField(s, count_fid));
   jchars = env_->GetStringChars(s, nullptr);
   EXPECT_EQ('\x40', jchars[0]);
-  for (size_t pos = 1; pos != kPageSize - 3u; ++pos) {
+  for (size_t pos = 1; pos != gPageSize - 3u; ++pos) {
     ASSERT_EQ('x', jchars[pos]) << pos;
   }
-  EXPECT_EQ('?', jchars[kPageSize - 3u]);
+  EXPECT_EQ('?', jchars[gPageSize - 3u]);
   env_->ReleaseStringChars(s, jchars);
 
   // Replace the leading three bytes with a three-byte sequence that decodes as ASCII (0x40).
@@ -1632,44 +1632,44 @@ TEST_F(JniInternalTest, NewStringUTF_Validation) {
   utf_src[2] = '\x80';
   s = base_env->NewStringUTF(env_, utf_src);
   // Note: All invalid characters are replaced by ASCII replacement character.
-  ASSERT_EQ(mirror::String::GetFlaggedCount(kPageSize - 3u, /* compressible= */ true),
+  ASSERT_EQ(mirror::String::GetFlaggedCount(gPageSize - 3u, /* compressible= */ true),
             env_->GetIntField(s, count_fid));
   jchars = env_->GetStringChars(s, nullptr);
   EXPECT_EQ('\x40', jchars[0]);
-  for (size_t pos = 1; pos != kPageSize - 4u; ++pos) {
+  for (size_t pos = 1; pos != gPageSize - 4u; ++pos) {
     ASSERT_EQ('x', jchars[pos]) << pos;
   }
-  EXPECT_EQ('?', jchars[kPageSize - 4u]);
+  EXPECT_EQ('?', jchars[gPageSize - 4u]);
   env_->ReleaseStringChars(s, jchars);
 
   // Replace the last two characters with a valid two-byte sequence that decodes as 0.
-  utf_src[kPageSize - 3u] = '\xc0';
-  utf_src[kPageSize - 2u] = '\x80';
+  utf_src[gPageSize - 3u] = '\xc0';
+  utf_src[gPageSize - 2u] = '\x80';
   s = base_env->NewStringUTF(env_, utf_src);
-  ASSERT_EQ(mirror::String::GetFlaggedCount(kPageSize - 4u, /* compressible= */ false),
+  ASSERT_EQ(mirror::String::GetFlaggedCount(gPageSize - 4u, /* compressible= */ false),
             env_->GetIntField(s, count_fid));
   jchars = env_->GetStringChars(s, nullptr);
   EXPECT_EQ('\x40', jchars[0]);
-  for (size_t pos = 1; pos != kPageSize - 5u; ++pos) {
+  for (size_t pos = 1; pos != gPageSize - 5u; ++pos) {
     ASSERT_EQ('x', jchars[pos]) << pos;
   }
-  EXPECT_EQ('\0', jchars[kPageSize - 5u]);
+  EXPECT_EQ('\0', jchars[gPageSize - 5u]);
   env_->ReleaseStringChars(s, jchars);
 
   // Replace the last three characters with a three-byte sequence that decodes as 0.
   // This is an incorrect encoding but `NewStringUTF()` is permissive.
-  utf_src[kPageSize - 4u] = '\xe0';
-  utf_src[kPageSize - 3u] = '\x80';
-  utf_src[kPageSize - 2u] = '\x80';
+  utf_src[gPageSize - 4u] = '\xe0';
+  utf_src[gPageSize - 3u] = '\x80';
+  utf_src[gPageSize - 2u] = '\x80';
   s = base_env->NewStringUTF(env_, utf_src);
-  ASSERT_EQ(mirror::String::GetFlaggedCount(kPageSize - 5u, /* compressible= */ false),
+  ASSERT_EQ(mirror::String::GetFlaggedCount(gPageSize - 5u, /* compressible= */ false),
             env_->GetIntField(s, count_fid));
   jchars = env_->GetStringChars(s, nullptr);
   EXPECT_EQ('\x40', jchars[0]);
-  for (size_t pos = 1; pos != kPageSize - 6u; ++pos) {
+  for (size_t pos = 1; pos != gPageSize - 6u; ++pos) {
     ASSERT_EQ('x', jchars[pos]) << pos;
   }
-  EXPECT_EQ('\0', jchars[kPageSize - 6u]);
+  EXPECT_EQ('\0', jchars[gPageSize - 6u]);
   env_->ReleaseStringChars(s, jchars);
 }
 
@@ -2576,42 +2576,80 @@ TEST_F(JniInternalTest, DetachThreadUnlockJNIMonitors) {
 
 // Test the offset computation of IndirectReferenceTable offsets. b/26071368.
 TEST_F(JniInternalTest, IndirectReferenceTableOffsets) {
+  ScopedObjectAccess soa(Thread::Current());
   // The segment_state_ field is private, and we want to avoid friend declaration. So we'll check
-  // by modifying memory.
+  // by modifying LRT state and checking the memory contents directly.
   // The parameters don't really matter here.
   std::string error_msg;
   jni::LocalReferenceTable lrt(/*check_jni=*/ true);
   bool success = lrt.Initialize(/*max_count=*/ 5, &error_msg);
   ASSERT_TRUE(success) << error_msg;
-  jni::LRTSegmentState old_state = lrt.GetSegmentState();
 
-  // Write some new state directly. We invert parts of old_state to ensure a new value.
-  jni::LRTSegmentState new_state;
-  new_state.top_index = old_state.top_index ^ 0x07705005;
-  ASSERT_NE(old_state.top_index, new_state.top_index);
+  // Check initial state.
+  jni::LRTSegmentState* previous_state = reinterpret_cast<jni::LRTSegmentState*>(
+      reinterpret_cast<uint8_t*>(&lrt) +
+      jni::LocalReferenceTable::PreviousStateOffset().SizeValue());
+  jni::LRTSegmentState* segment_state = reinterpret_cast<jni::LRTSegmentState*>(
+      reinterpret_cast<uint8_t*>(&lrt) +
+      jni::LocalReferenceTable::SegmentStateOffset().SizeValue());
+  ASSERT_EQ(jni::kLRTFirstSegment.top_index, previous_state->top_index);
+  ASSERT_EQ(jni::kLRTFirstSegment.top_index, segment_state->top_index);
 
-  uint8_t* base = reinterpret_cast<uint8_t*>(&lrt);
-  int32_t segment_state_offset =
-      jni::LocalReferenceTable::SegmentStateOffset(sizeof(void*)).Int32Value();
-  *reinterpret_cast<jni::LRTSegmentState*>(base + segment_state_offset) = new_state;
+  // Push an empty LRT frame at the bottom.
+  jni::LRTSegmentState cookie0 = lrt.PushFrame();
+  ASSERT_EQ(jni::kLRTFirstSegment.top_index, cookie0.top_index);
+  ASSERT_EQ(jni::kLRTFirstSegment.top_index, previous_state->top_index);
+  ASSERT_EQ(jni::kLRTFirstSegment.top_index, segment_state->top_index);
 
-  // Read and compare.
-  EXPECT_EQ(new_state.top_index, lrt.GetSegmentState().top_index);
+  // Add a bogus reference.
+  IndirectRef ref = lrt.Add(reinterpret_cast32<mirror::Object*>(0xdeadbee0u), &error_msg);
+  ASSERT_TRUE(ref != nullptr) << error_msg;
+  ASSERT_EQ(jni::kLRTFirstSegment.top_index, previous_state->top_index);
+  ASSERT_NE(jni::kLRTFirstSegment.top_index, segment_state->top_index);
+  jni::LRTSegmentState expected_cookie2 = *segment_state;
+
+  // Push the non-empty LRT frame.
+  jni::LRTSegmentState cookie1 = lrt.PushFrame();
+  ASSERT_EQ(jni::kLRTFirstSegment.top_index, cookie1.top_index);
+  ASSERT_EQ(expected_cookie2.top_index, previous_state->top_index);
+  ASSERT_EQ(expected_cookie2.top_index, segment_state->top_index);
+
+  // Push another empty LRT frame.
+  jni::LRTSegmentState cookie2 = lrt.PushFrame();
+  ASSERT_EQ(expected_cookie2.top_index, cookie2.top_index);
+  ASSERT_EQ(expected_cookie2.top_index, previous_state->top_index);
+  ASSERT_EQ(expected_cookie2.top_index, segment_state->top_index);
+
+  // Pop the LRT frames and check state transitions.
+  lrt.PopFrame(cookie2);
+  ASSERT_EQ(expected_cookie2.top_index, previous_state->top_index);
+  ASSERT_EQ(expected_cookie2.top_index, segment_state->top_index);
+  lrt.PopFrame(cookie1);
+  ASSERT_EQ(jni::kLRTFirstSegment.top_index, previous_state->top_index);
+  ASSERT_EQ(expected_cookie2.top_index, segment_state->top_index);
+  lrt.PopFrame(cookie0);
+  ASSERT_EQ(jni::kLRTFirstSegment.top_index, previous_state->top_index);
+  ASSERT_EQ(jni::kLRTFirstSegment.top_index, segment_state->top_index);
 }
 
 // Test the offset computation of JNIEnvExt offsets. b/26071368.
 TEST_F(JniInternalTest, JNIEnvExtOffsets) {
-  EXPECT_EQ(OFFSETOF_MEMBER(JNIEnvExt, local_ref_cookie_),
-            JNIEnvExt::LocalRefCookieOffset(sizeof(void*)).Uint32Value());
+  EXPECT_EQ(OFFSETOF_MEMBER(JNIEnvExt, self_),
+            JNIEnvExt::SelfOffset(kRuntimePointerSize).Uint32Value());
 
-  EXPECT_EQ(OFFSETOF_MEMBER(JNIEnvExt, self_), JNIEnvExt::SelfOffset(sizeof(void*)).Uint32Value());
-
-  // segment_state_ is private in the IndirectReferenceTable. So this test isn't as good as we'd
-  // hope it to be.
+  // `previous_state_` amd `segment_state_` are private in the IndirectReferenceTable.
+  // So this test isn't as good as we'd hope it to be.
+  uint32_t previous_state_now =
+      OFFSETOF_MEMBER(JNIEnvExt, locals_) +
+      jni::LocalReferenceTable::PreviousStateOffset().Uint32Value();
+  uint32_t previous_state_computed =
+      JNIEnvExt::LrtPreviousStateOffset(kRuntimePointerSize).Uint32Value();
+  EXPECT_EQ(previous_state_now, previous_state_computed);
   uint32_t segment_state_now =
       OFFSETOF_MEMBER(JNIEnvExt, locals_) +
-      jni::LocalReferenceTable::SegmentStateOffset(sizeof(void*)).Uint32Value();
-  uint32_t segment_state_computed = JNIEnvExt::SegmentStateOffset(sizeof(void*)).Uint32Value();
+      jni::LocalReferenceTable::SegmentStateOffset().Uint32Value();
+  uint32_t segment_state_computed =
+      JNIEnvExt::LrtSegmentStateOffset(kRuntimePointerSize).Uint32Value();
   EXPECT_EQ(segment_state_now, segment_state_computed);
 }
 

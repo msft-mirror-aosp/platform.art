@@ -108,6 +108,9 @@ interface Itf2 {
 class Itf2Impl implements Itf2 {
 }
 
+class ClassWithDefaultConflict implements IfaceWithSayHi, IfaceWithSayHiAtRuntime {
+}
+
 public class Main implements Itf {
   static String myString = "MyString";
 
@@ -159,7 +162,7 @@ public class Main implements Itf {
 
     if (args.length == 2 && "--second-run".equals(args[1])) {
       DexFile.OptimizationInfo info = VMRuntime.getBaseApkOptimizationInfo();
-      if (!info.isOptimized()) {
+      if (!info.isOptimized() && !isInImageSpace(Main.class)) {
         throw new Error("Expected image to be loaded");
       }
     }
@@ -220,6 +223,7 @@ public class Main implements Itf {
   public static Itf2 itf2 = new Itf2Impl();
   public static ClassWithStatics statics = new ClassWithStatics();
   public static ClassWithStaticType staticType = new ClassWithStaticType();
+  public static ClassWithDefaultConflict defaultConflict = new ClassWithDefaultConflict();
 
   public static void runClassTests() {
     // Test Class.getName, app images expect all strings to have hash codes.
@@ -332,6 +336,7 @@ public class Main implements Itf {
   private static native boolean hasOatFile();
   private static native boolean hasImage();
   private static native String getCompilerFilter(Class<?> cls);
+  private static native boolean isInImageSpace(Class<?> cls);
 
   private static final String TEMP_FILE_NAME_PREFIX = "temp";
   private static final String TEMP_FILE_NAME_SUFFIX = "-file";

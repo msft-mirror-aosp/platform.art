@@ -28,7 +28,7 @@
 #include "x86/instruction_set_features_x86.h"
 #include "x86_64/instruction_set_features_x86_64.h"
 
-namespace art {
+namespace art HIDDEN {
 
 std::unique_ptr<const InstructionSetFeatures> InstructionSetFeatures::FromVariant(
     InstructionSet isa, const std::string& variant, std::string* error_msg) {
@@ -313,7 +313,7 @@ bool InstructionSetFeatures::FindVariantInArray(const char* const variants[], si
 }
 
 std::unique_ptr<const InstructionSetFeatures> InstructionSetFeatures::AddRuntimeDetectedFeatures(
-    const InstructionSetFeatures *features ATTRIBUTE_UNUSED) const {
+    [[maybe_unused]] const InstructionSetFeatures* features) const {
   UNIMPLEMENTED(FATAL) << kRuntimeISA;
   UNREACHABLE();
 }

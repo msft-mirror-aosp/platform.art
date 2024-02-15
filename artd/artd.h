@@ -39,12 +39,18 @@
 #include "android/binder_auto_utils.h"
 #include "base/os.h"
 #include "exec_utils.h"
-#include "oat_file_assistant_context.h"
+#include "oat/oat_file_assistant_context.h"
 #include "tools/cmdline_builder.h"
 #include "tools/system_properties.h"
 
 namespace art {
 namespace artd {
+
+struct Options {
+  // If true, this artd instance is for Pre-reboot Dexopt. It runs in a chroot environment that is
+  // set up by dexopt_chroot_setup.
+  bool is_pre_reboot = false;
+};
 
 class ArtdCancellationSignal : public aidl::com::android::server::art::BnArtdCancellationSignal {
  public:
@@ -69,12 +75,14 @@ class ArtdCancellationSignal : public aidl::com::android::server::art::BnArtdCan
 
 class Artd : public aidl::com::android::server::art::BnArtd {
  public:
-  explicit Artd(std::unique_ptr<art::tools::SystemProperties> props =
+  explicit Artd(Options&& options,
+                std::unique_ptr<art::tools::SystemProperties> props =
                     std::make_unique<art::tools::SystemProperties>(),
                 std::unique_ptr<ExecUtils> exec_utils = std::make_unique<ExecUtils>(),
                 std::function<int(pid_t, int)> kill_func = kill,
                 std::function<int(int, struct stat*)> fstat_func = fstat)
-      : props_(std::move(props)),
+      : options_(std::move(options)),
+        props_(std::move(props)),
         exec_utils_(std::move(exec_utils)),
         kill_(std::move(kill_func)),
         fstat_(std::move(fstat_func)) {}
@@ -99,7 +107,12 @@ class Artd : public aidl::com::android::server::art::BnArtd {
       const aidl::com::android::server::art::ProfilePath& in_src,
       aidl::com::android::server::art::OutputProfile* in_dst,
       const std::string& in_dexFile,
-      bool* _aidl_return) override;
+      aidl::com::android::server::art::CopyAndRewriteProfileResult* _aidl_return) override;
+
+  ndk::ScopedAStatus copyAndRewriteEmbeddedProfile(
+      aidl::com::android::server::art::OutputProfile* in_dst,
+      const std::string& in_dexFile,
+      aidl::com::android::server::art::CopyAndRewriteProfileResult* _aidl_return) override;
 
   ndk::ScopedAStatus commitTmpProfile(
       const aidl::com::android::server::art::ProfilePath::TmpProfilePath& in_profile) override;
@@ -162,10 +175,29 @@ class Artd : public aidl::com::android::server::art::BnArtd {
       const std::vector<aidl::com::android::server::art::ProfilePath>& in_profilesToKeep,
       const std::vector<aidl::com::android::server::art::ArtifactsPath>& in_artifactsToKeep,
       const std::vector<aidl::com::android::server::art::VdexPath>& in_vdexFilesToKeep,
+      const std::vector<aidl::com::android::server::art::RuntimeArtifactsPath>&
+          in_runtimeArtifactsToKeep,
       int64_t* _aidl_return) override;
 
-  ndk::ScopedAStatus isIncrementalFsPath(const std::string& in_dexFile,
-                                         bool* _aidl_return) override;
+  ndk::ScopedAStatus isInDalvikCache(const std::string& in_dexFile, bool* _aidl_return) override;
+
+  ndk::ScopedAStatus deleteRuntimeArtifacts(
+      const aidl::com::android::server::art::RuntimeArtifactsPath& in_runtimeArtifactsPath,
+      int64_t* _aidl_return) override;
+
+  ndk::ScopedAStatus getArtifactsSize(
+      const aidl::com::android::server::art::ArtifactsPath& in_artifactsPath,
+      int64_t* _aidl_return) override;
+
+  ndk::ScopedAStatus getVdexFileSize(const aidl::com::android::server::art::VdexPath& in_vdexPath,
+                                     int64_t* _aidl_return) override;
+
+  ndk::ScopedAStatus getRuntimeArtifactsSize(
+      const aidl::com::android::server::art::RuntimeArtifactsPath& in_runtimeArtifactsPath,
+      int64_t* _aidl_return) override;
+
+  ndk::ScopedAStatus getProfileSize(const aidl::com::android::server::art::ProfilePath& in_profile,
+                                    int64_t* _aidl_return) override;
 
   android::base::Result<void> Start();
 
@@ -216,6 +248,12 @@ class Artd : public aidl::com::android::server::art::BnArtd {
 
   android::base::Result<struct stat> Fstat(const art::File& file) const;
 
+  ndk::ScopedAStatus CopyAndRewriteProfileImpl(
+      File src,
+      aidl::com::android::server::art::OutputProfile* dst_aidl,
+      const std::string& dex_path,
+      aidl::com::android::server::art::CopyAndRewriteProfileResult* aidl_return);
+
   std::mutex cache_mu_;
   std::optional<std::vector<std::string>> cached_boot_image_locations_ GUARDED_BY(cache_mu_);
   std::optional<std::vector<std::string>> cached_boot_class_path_ GUARDED_BY(cache_mu_);
@@ -226,6 +264,7 @@ class Artd : public aidl::com::android::server::art::BnArtd {
   std::mutex ofa_context_mu_;
   std::unique_ptr<OatFileAssistantContext> ofa_context_ GUARDED_BY(ofa_context_mu_);
 
+  const Options options_;
   const std::unique_ptr<art::tools::SystemProperties> props_;
   const std::unique_ptr<ExecUtils> exec_utils_;
   const std::function<int(pid_t, int)> kill_;

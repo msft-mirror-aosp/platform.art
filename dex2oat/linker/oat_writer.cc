@@ -47,6 +47,7 @@
 #include "dex/dex_file_loader.h"
 #include "dex/dex_file_types.h"
 #include "dex/dex_file_verifier.h"
+#include "dex/proto_reference.h"
 #include "dex/standard_dex_file.h"
 #include "dex/type_lookup_table.h"
 #include "dex/verification_results.h"
@@ -66,12 +67,11 @@
 #include "mirror/class_loader.h"
 #include "mirror/dex_cache-inl.h"
 #include "mirror/object-inl.h"
-#include "oat.h"
-#include "oat_quick_method_header.h"
+#include "oat/oat.h"
+#include "oat/oat_quick_method_header.h"
+#include "oat/stack_map.h"
 #include "profile/profile_compilation_info.h"
-#include "quicken_info.h"
 #include "scoped_thread_state_change-inl.h"
-#include "stack_map.h"
 #include "stream/buffered_output_stream.h"
 #include "stream/file_output_stream.h"
 #include "stream/output_stream.h"
@@ -277,8 +277,11 @@ class OatWriter::OatDexFile {
   const uint32_t dex_file_location_size_;
   const char* const dex_file_location_data_;
 
+  DexFile::Magic dex_file_magic_;
+
   // The checksum of the dex file.
   const uint32_t dex_file_location_checksum_;
+  const DexFile::Sha1 dex_file_sha1_;
 
   // Offset of the dex file in the vdex file. Set when writing dex files in
   // SeekToDexFile.
@@ -294,6 +297,7 @@ class OatWriter::OatDexFile {
   uint32_t public_type_bss_mapping_offset_;
   uint32_t package_type_bss_mapping_offset_;
   uint32_t string_bss_mapping_offset_;
+  uint32_t method_type_bss_mapping_offset_;
 
   // Offset of dex sections that will have different runtime madvise states.
   // Set in WriteDexLayoutSections.
@@ -338,7 +342,6 @@ OatWriter::OatWriter(const CompilerOptions& compiler_options,
       vdex_dex_files_offset_(0u),
       vdex_dex_shared_data_offset_(0u),
       vdex_verifier_deps_offset_(0u),
-      vdex_quickening_info_offset_(0u),
       vdex_lookup_tables_offset_(0u),
       oat_checksum_(adler32(0L, Z_NULL, 0)),
       code_size_(0u),
@@ -356,73 +359,9 @@ OatWriter::OatWriter(const CompilerOptions& compiler_options,
       bss_public_type_entries_(),
       bss_package_type_entries_(),
       bss_string_entries_(),
+      bss_method_type_entries_(),
       oat_data_offset_(0u),
       oat_header_(nullptr),
-      size_vdex_header_(0),
-      size_vdex_checksums_(0),
-      size_dex_file_alignment_(0),
-      size_quickening_table_offset_(0),
-      size_executable_offset_alignment_(0),
-      size_oat_header_(0),
-      size_oat_header_key_value_store_(0),
-      size_dex_file_(0),
-      size_verifier_deps_(0),
-      size_verifier_deps_alignment_(0),
-      size_quickening_info_(0),
-      size_quickening_info_alignment_(0),
-      size_vdex_lookup_table_alignment_(0),
-      size_vdex_lookup_table_(0),
-      size_interpreter_to_interpreter_bridge_(0),
-      size_interpreter_to_compiled_code_bridge_(0),
-      size_jni_dlsym_lookup_trampoline_(0),
-      size_jni_dlsym_lookup_critical_trampoline_(0),
-      size_quick_generic_jni_trampoline_(0),
-      size_quick_imt_conflict_trampoline_(0),
-      size_quick_resolution_trampoline_(0),
-      size_quick_to_interpreter_bridge_(0),
-      size_nterp_trampoline_(0),
-      size_trampoline_alignment_(0),
-      size_method_header_(0),
-      size_code_(0),
-      size_code_alignment_(0),
-      size_data_bimg_rel_ro_(0),
-      size_data_bimg_rel_ro_alignment_(0),
-      size_relative_call_thunks_(0),
-      size_misc_thunks_(0),
-      size_vmap_table_(0),
-      size_method_info_(0),
-      size_oat_dex_file_location_size_(0),
-      size_oat_dex_file_location_data_(0),
-      size_oat_dex_file_location_checksum_(0),
-      size_oat_dex_file_offset_(0),
-      size_oat_dex_file_class_offsets_offset_(0),
-      size_oat_dex_file_lookup_table_offset_(0),
-      size_oat_dex_file_dex_layout_sections_offset_(0),
-      size_oat_dex_file_dex_layout_sections_(0),
-      size_oat_dex_file_dex_layout_sections_alignment_(0),
-      size_oat_dex_file_method_bss_mapping_offset_(0),
-      size_oat_dex_file_type_bss_mapping_offset_(0),
-      size_oat_dex_file_public_type_bss_mapping_offset_(0),
-      size_oat_dex_file_package_type_bss_mapping_offset_(0),
-      size_oat_dex_file_string_bss_mapping_offset_(0),
-      size_bcp_bss_info_size_(0),
-      size_bcp_bss_info_method_bss_mapping_offset_(0),
-      size_bcp_bss_info_type_bss_mapping_offset_(0),
-      size_bcp_bss_info_public_type_bss_mapping_offset_(0),
-      size_bcp_bss_info_package_type_bss_mapping_offset_(0),
-      size_bcp_bss_info_string_bss_mapping_offset_(0),
-      size_oat_class_offsets_alignment_(0),
-      size_oat_class_offsets_(0),
-      size_oat_class_type_(0),
-      size_oat_class_status_(0),
-      size_oat_class_num_methods_(0),
-      size_oat_class_method_bitmaps_(0),
-      size_oat_class_method_offsets_(0),
-      size_method_bss_mappings_(0u),
-      size_type_bss_mappings_(0u),
-      size_public_type_bss_mappings_(0u),
-      size_package_type_bss_mappings_(0u),
-      size_string_bss_mappings_(0u),
       relative_patcher_(nullptr),
       profile_compilation_info_(info),
       compact_dex_level_(compact_dex_level) {}
@@ -462,7 +401,7 @@ bool OatWriter::AddDexFileSource(const char* filename, const char* location) {
 bool OatWriter::AddDexFileSource(File&& dex_file_fd, const char* location) {
   DCHECK(write_state_ == WriteState::kAddingDexFileSources);
   std::string error_msg;
-  ArtDexFileLoader loader(dex_file_fd.Release(), location);
+  ArtDexFileLoader loader(&dex_file_fd, location);
   std::vector<std::unique_ptr<const DexFile>> dex_files;
   if (!loader.Open(/*verify=*/false,
                    /*verify_checksum=*/false,
@@ -485,6 +424,7 @@ bool OatWriter::AddDexFileSource(File&& dex_file_fd, const char* location) {
 bool OatWriter::AddVdexDexFilesSource(const VdexFile& vdex_file, const char* location) {
   DCHECK(write_state_ == WriteState::kAddingDexFileSources);
   DCHECK(vdex_file.HasDexSection());
+  auto container = std::make_shared<MemoryDexFileContainer>(vdex_file.Begin(), vdex_file.End());
   const uint8_t* current_dex_data = nullptr;
   size_t i = 0;
   for (; i < vdex_file.GetNumberOfDexFiles(); ++i) {
@@ -500,8 +440,8 @@ bool OatWriter::AddVdexDexFilesSource(const VdexFile& vdex_file, const char* loc
     }
     // We used `zipped_dex_file_locations_` to keep the strings in memory.
     std::string multidex_location = DexFileLoader::GetMultiDexLocation(i, location);
-    const UnalignedDexFileHeader* header = AsUnalignedDexFileHeader(current_dex_data);
-    if (!AddRawDexFileSource({current_dex_data, header->file_size_},
+    if (!AddRawDexFileSource(container,
+                             current_dex_data,
                              multidex_location.c_str(),
                              vdex_file.GetLocationChecksum(i))) {
       return false;
@@ -521,17 +461,21 @@ bool OatWriter::AddVdexDexFilesSource(const VdexFile& vdex_file, const char* loc
 }
 
 // Add dex file source from raw memory.
-bool OatWriter::AddRawDexFileSource(const ArrayRef<const uint8_t>& data,
+bool OatWriter::AddRawDexFileSource(std::shared_ptr<DexFileContainer> container,
+                                    const uint8_t* dex_file_begin,
                                     const char* location,
                                     uint32_t location_checksum) {
   DCHECK(write_state_ == WriteState::kAddingDexFileSources);
   std::string error_msg;
-  ArtDexFileLoader loader(data.data(), data.size(), location);
-  auto dex_file = loader.Open(location_checksum,
-                              nullptr,
-                              /*verify=*/false,
-                              /*verify_checksum=*/false,
-                              &error_msg);
+  ArtDexFileLoader loader(container->Begin(), container->Size(), location);
+  CHECK_GE(dex_file_begin, container->Begin());
+  CHECK_LE(dex_file_begin, container->End());
+  auto dex_file = loader.OpenOne(dex_file_begin - container->Begin(),
+                                 location_checksum,
+                                 nullptr,
+                                 /*verify=*/false,
+                                 /*verify_checksum=*/false,
+                                 &error_msg);
   if (dex_file == nullptr) {
     LOG(ERROR) << "Failed to open dex file '" << location << "': " << error_msg;
     return false;
@@ -680,7 +624,7 @@ void OatWriter::PrepareLayout(MultiOatRelativePatcher* relative_patcher) {
     offset = InitDataBimgRelRoLayout(offset);
   }
   oat_size_ = offset;  // .bss does not count towards oat_size_.
-  bss_start_ = (bss_size_ != 0u) ? RoundUp(oat_size_, kPageSize) : 0u;
+  bss_start_ = (bss_size_ != 0u) ? RoundUp(oat_size_, kElfSegmentAlignment) : 0u;
 
   CHECK_EQ(dex_files_->size(), oat_dex_files_.size());
 
@@ -769,7 +713,7 @@ class OatWriter::InitBssLayoutMethodVisitor : public DexMethodVisitor {
   explicit InitBssLayoutMethodVisitor(OatWriter* writer)
       : DexMethodVisitor(writer, /* offset */ 0u) {}
 
-  bool VisitMethod(size_t class_def_method_index ATTRIBUTE_UNUSED,
+  bool VisitMethod([[maybe_unused]] size_t class_def_method_index,
                    const ClassAccessor::Method& method) override {
     // Look for patches with .bss references and prepare maps with placeholders for their offsets.
     CompiledMethod* compiled_method = writer_->compiler_driver_->GetCompiledMethod(
@@ -809,6 +753,12 @@ class OatWriter::InitBssLayoutMethodVisitor : public DexMethodVisitor {
                           target_string.dex_file->NumStringIds(),
                           &writer_->bss_string_entry_references_);
           writer_->bss_string_entries_.Overwrite(target_string, /* placeholder */ 0u);
+        } else if (patch.GetType() == LinkerPatch::Type::kMethodTypeBssEntry) {
+          ProtoReference target_proto(patch.TargetProtoDexFile(), patch.TargetProtoIndex());
+          AddBssReference(target_proto,
+                          target_proto.dex_file->NumProtoIds(),
+                          &writer_->bss_method_type_entry_references_);
+          writer_->bss_method_type_entries_.Overwrite(target_proto, /* placeholder */ 0u);
         }
       }
     } else {
@@ -863,7 +813,7 @@ class OatWriter::InitOatClassesMethodVisitor : public DexMethodVisitor {
     return true;
   }
 
-  bool VisitMethod(size_t class_def_method_index ATTRIBUTE_UNUSED,
+  bool VisitMethod([[maybe_unused]] size_t class_def_method_index,
                    const ClassAccessor::Method& method) override {
     // Fill in the compiled_methods_ array for methods that have a
     // CompiledMethod. We track the number of non-null entries in
@@ -928,6 +878,7 @@ struct OatWriter::BssMappingInfo {
   uint32_t public_type_bss_mapping_offset = 0u;
   uint32_t package_type_bss_mapping_offset = 0u;
   uint32_t string_bss_mapping_offset = 0u;
+  uint32_t method_type_bss_mapping_offset = 0u;
 
   // Offset of the BSSInfo start from beginning of OatHeader. It is used to validate file position
   // when writing.
@@ -938,7 +889,8 @@ struct OatWriter::BssMappingInfo {
            sizeof(type_bss_mapping_offset) +
            sizeof(public_type_bss_mapping_offset) +
            sizeof(package_type_bss_mapping_offset) +
-           sizeof(string_bss_mapping_offset);
+           sizeof(string_bss_mapping_offset) +
+           sizeof(method_type_bss_mapping_offset);
   }
   bool Write(OatWriter* oat_writer, OutputStream* out) const;
 };
@@ -1276,7 +1228,7 @@ class OatWriter::LayoutReserveOffsetCodeMethodVisitor : public OrderedMethodVisi
       offset_ += code_size;
     }
 
-    // Exclude quickened dex methods (code_size == 0) since they have no native code.
+    // Exclude dex methods without native code.
     if (generate_debug_info_ && code_size != 0) {
       DCHECK(has_debug_info);
       const uint8_t* code_info = compiled_method->GetVmapTable().data();
@@ -1400,8 +1352,8 @@ class OatWriter::InitMapMethodVisitor : public OatDexMethodVisitor {
   }
 
   bool VisitMethod(size_t class_def_method_index,
-                   const ClassAccessor::Method& method ATTRIBUTE_UNUSED)
-      override REQUIRES_SHARED(Locks::mutator_lock_) {
+                   [[maybe_unused]] const ClassAccessor::Method& method) override
+      REQUIRES_SHARED(Locks::mutator_lock_) {
     OatClass* oat_class = &writer_->oat_classes_[oat_class_index_];
     CompiledMethod* compiled_method = oat_class->GetCompiledMethod(class_def_method_index);
 
@@ -1737,6 +1689,16 @@ class OatWriter::WriteCodeMethodVisitor : public OrderedMethodVisitor {
               StringReference ref(patch.TargetStringDexFile(), patch.TargetStringIndex());
               uint32_t target_offset =
                   writer_->bss_start_ + writer_->bss_string_entries_.Get(ref);
+              writer_->relative_patcher_->PatchPcRelativeReference(&patched_code_,
+                                                                   patch,
+                                                                   offset_ + literal_offset,
+                                                                   target_offset);
+              break;
+            }
+            case LinkerPatch::Type::kMethodTypeBssEntry: {
+              ProtoReference ref(patch.TargetProtoDexFile(), patch.TargetProtoIndex());
+              uint32_t target_offset =
+                  writer_->bss_start_ + writer_->bss_method_type_entries_.Get(ref);
               writer_->relative_patcher_->PatchPcRelativeReference(&patched_code_,
                                                                    patch,
                                                                    offset_ + literal_offset,
@@ -2097,7 +2059,8 @@ size_t OatWriter::InitIndexBssMappings(size_t offset) {
       bss_type_entry_references_.empty() &&
       bss_public_type_entry_references_.empty() &&
       bss_package_type_entry_references_.empty() &&
-      bss_string_entry_references_.empty()) {
+      bss_string_entry_references_.empty() &&
+      bss_method_type_entry_references_.empty()) {
     return offset;
   }
   // If there are any classes, the class offsets allocation aligns the offset
@@ -2110,6 +2073,7 @@ size_t OatWriter::InitIndexBssMappings(size_t offset) {
   size_t number_of_public_type_dex_files = 0u;
   size_t number_of_package_type_dex_files = 0u;
   size_t number_of_string_dex_files = 0u;
+  size_t number_of_method_type_dex_files = 0u;
   for (size_t i = 0, size = dex_files_->size(); i != size; ++i) {
     const DexFile* dex_file = (*dex_files_)[i];
     offset = InitIndexBssMappingsHelper(offset,
@@ -2119,11 +2083,13 @@ size_t OatWriter::InitIndexBssMappings(size_t offset) {
                                         number_of_public_type_dex_files,
                                         number_of_package_type_dex_files,
                                         number_of_string_dex_files,
+                                        number_of_method_type_dex_files,
                                         oat_dex_files_[i].method_bss_mapping_offset_,
                                         oat_dex_files_[i].type_bss_mapping_offset_,
                                         oat_dex_files_[i].public_type_bss_mapping_offset_,
                                         oat_dex_files_[i].package_type_bss_mapping_offset_,
-                                        oat_dex_files_[i].string_bss_mapping_offset_);
+                                        oat_dex_files_[i].string_bss_mapping_offset_,
+                                        oat_dex_files_[i].method_type_bss_mapping_offset_);
   }
 
   if (!(compiler_options_.IsBootImage() || compiler_options_.IsBootImageExtension())) {
@@ -2145,11 +2111,13 @@ size_t OatWriter::InitIndexBssMappings(size_t offset) {
                                           number_of_public_type_dex_files,
                                           number_of_package_type_dex_files,
                                           number_of_string_dex_files,
+                                          number_of_method_type_dex_files,
                                           bcp_bss_info_[i].method_bss_mapping_offset,
                                           bcp_bss_info_[i].type_bss_mapping_offset,
                                           bcp_bss_info_[i].public_type_bss_mapping_offset,
                                           bcp_bss_info_[i].package_type_bss_mapping_offset,
-                                          bcp_bss_info_[i].string_bss_mapping_offset);
+                                          bcp_bss_info_[i].string_bss_mapping_offset,
+                                          bcp_bss_info_[i].method_type_bss_mapping_offset);
     }
   }
 
@@ -2160,6 +2128,7 @@ size_t OatWriter::InitIndexBssMappings(size_t offset) {
   CHECK_EQ(number_of_public_type_dex_files, bss_public_type_entry_references_.size());
   CHECK_EQ(number_of_package_type_dex_files, bss_package_type_entry_references_.size());
   CHECK_EQ(number_of_string_dex_files, bss_string_entry_references_.size());
+  CHECK_EQ(number_of_method_type_dex_files, bss_method_type_entry_references_.size());
 
   return offset;
 }
@@ -2171,11 +2140,13 @@ size_t OatWriter::InitIndexBssMappingsHelper(size_t offset,
                                              /*inout*/ size_t& number_of_public_type_dex_files,
                                              /*inout*/ size_t& number_of_package_type_dex_files,
                                              /*inout*/ size_t& number_of_string_dex_files,
+                                             /*inout*/ size_t& number_of_method_type_dex_files,
                                              /*inout*/ uint32_t& method_bss_mapping_offset,
                                              /*inout*/ uint32_t& type_bss_mapping_offset,
                                              /*inout*/ uint32_t& public_type_bss_mapping_offset,
                                              /*inout*/ uint32_t& package_type_bss_mapping_offset,
-                                             /*inout*/ uint32_t& string_bss_mapping_offset) {
+                                             /*inout*/ uint32_t& string_bss_mapping_offset,
+                                             /*inout*/ uint32_t& method_type_bss_mapping_offset) {
   const PointerSize pointer_size = GetInstructionSetPointerSize(oat_header_->GetInstructionSet());
   auto method_it = bss_method_entry_references_.find(dex_file);
   if (method_it != bss_method_entry_references_.end()) {
@@ -2227,6 +2198,21 @@ size_t OatWriter::InitIndexBssMappingsHelper(size_t offset,
           return bss_string_entries_.Get({dex_file, dex::StringIndex(index)});
         });
   }
+
+  auto method_type_it = bss_method_type_entry_references_.find(dex_file);
+  if (method_type_it != bss_method_type_entry_references_.end()) {
+    const BitVector& proto_indexes = method_type_it->second;
+    ++number_of_method_type_dex_files;
+    method_type_bss_mapping_offset = offset;
+    offset += CalculateIndexBssMappingSize(
+        dex_file->NumProtoIds(),
+        sizeof(GcRoot<mirror::MethodType>),
+        proto_indexes,
+        [=](uint32_t index) {
+          return bss_method_type_entries_.Get({dex_file, dex::ProtoIndex(index)});
+        });
+  }
+
   return offset;
 }
 
@@ -2260,13 +2246,11 @@ size_t OatWriter::InitOatCode(size_t offset) {
   // calculate the offsets within OatHeader to executable code
   size_t old_offset = offset;
   // required to be on a new page boundary
-  offset = RoundUp(offset, kPageSize);
+  offset = RoundUp(offset, kElfSegmentAlignment);
   oat_header_->SetExecutableOffset(offset);
   size_executable_offset_alignment_ = offset - old_offset;
   InstructionSet instruction_set = compiler_options_.GetInstructionSet();
-  if (GetCompilerOptions().IsBootImage() && primary_oat_file_ &&
-      // TODO(riscv64): remove this when we have compiler support for RISC-V.
-      instruction_set != InstructionSet::kRiscv64) {
+  if (GetCompilerOptions().IsBootImage() && primary_oat_file_) {
     const bool generate_debug_info = GetCompilerOptions().GenerateAnyDebugInfo();
     size_t adjusted_offset = offset;
 
@@ -2376,7 +2360,7 @@ size_t OatWriter::InitDataBimgRelRoLayout(size_t offset) {
     return offset;
   }
 
-  data_bimg_rel_ro_start_ = RoundUp(offset, kPageSize);
+  data_bimg_rel_ro_start_ = RoundUp(offset, kElfSegmentAlignment);
 
   for (auto& entry : data_bimg_rel_ro_entries_) {
     size_t& entry_offset = entry.second;
@@ -2400,7 +2384,8 @@ void OatWriter::InitBssLayout(InstructionSet instruction_set) {
       bss_type_entries_.empty() &&
       bss_public_type_entries_.empty() &&
       bss_package_type_entries_.empty() &&
-      bss_string_entries_.empty()) {
+      bss_string_entries_.empty() &&
+      bss_method_type_entries_.empty()) {
     // Nothing to put to the .bss section.
     return;
   }
@@ -2440,6 +2425,12 @@ void OatWriter::InitBssLayout(InstructionSet instruction_set) {
     DCHECK_EQ(entry.second, 0u);
     entry.second = bss_size_;
     bss_size_ += sizeof(GcRoot<mirror::String>);
+  }
+  // Prepare offsets for .bss MethodType entries.
+  for (auto& entry : bss_method_type_entries_) {
+    DCHECK_EQ(entry.second, 0u);
+    entry.second = bss_size_;
+    bss_size_ += sizeof(GcRoot<mirror::MethodType>);
   }
 }
 
@@ -2508,12 +2499,6 @@ bool OatWriter::WriteRodata(OutputStream* out) {
 
   write_state_ = WriteState::kWriteText;
   return true;
-}
-
-void OatWriter::WriteQuickeningInfo(/*out*/std::vector<uint8_t>* ATTRIBUTE_UNUSED) {
-  // Nothing to write. Leave `vdex_size_` untouched and unaligned.
-  vdex_quickening_info_offset_ = vdex_size_;
-  size_quickening_info_alignment_ = 0;
 }
 
 void OatWriter::WriteVerifierDeps(verifier::VerifierDeps* verifier_deps,
@@ -2589,7 +2574,7 @@ bool OatWriter::WriteDataBimgRelRo(OutputStream* out) {
   // Record the padding before the .data.bimg.rel.ro section.
   // Do not write anything, this zero-filled part was skipped (Seek()) when starting the section.
   size_t code_end = GetOatHeader().GetExecutableOffset() + code_size_;
-  DCHECK_EQ(RoundUp(code_end, kPageSize), relative_offset);
+  DCHECK_EQ(RoundUp(code_end, kElfSegmentAlignment), relative_offset);
   size_t padding_size = relative_offset - code_end;
   DCHECK_EQ(size_data_bimg_rel_ro_alignment_, 0u);
   size_data_bimg_rel_ro_alignment_ = padding_size;
@@ -2623,7 +2608,6 @@ bool OatWriter::CheckOatSize(OutputStream* out, size_t file_offset, size_t relat
     DO_STAT(size_vdex_header_);
     DO_STAT(size_vdex_checksums_);
     DO_STAT(size_dex_file_alignment_);
-    DO_STAT(size_quickening_table_offset_);
     DO_STAT(size_executable_offset_alignment_);
     DO_STAT(size_oat_header_);
     DO_STAT(size_oat_header_key_value_store_);
@@ -2632,8 +2616,6 @@ bool OatWriter::CheckOatSize(OutputStream* out, size_t file_offset, size_t relat
     DO_STAT(size_verifier_deps_alignment_);
     DO_STAT(size_vdex_lookup_table_);
     DO_STAT(size_vdex_lookup_table_alignment_);
-    DO_STAT(size_quickening_info_);
-    DO_STAT(size_quickening_info_alignment_);
     DO_STAT(size_interpreter_to_interpreter_bridge_);
     DO_STAT(size_interpreter_to_compiled_code_bridge_);
     DO_STAT(size_jni_dlsym_lookup_trampoline_);
@@ -2655,7 +2637,9 @@ bool OatWriter::CheckOatSize(OutputStream* out, size_t file_offset, size_t relat
     DO_STAT(size_method_info_);
     DO_STAT(size_oat_dex_file_location_size_);
     DO_STAT(size_oat_dex_file_location_data_);
+    DO_STAT(size_oat_dex_file_magic_);
     DO_STAT(size_oat_dex_file_location_checksum_);
+    DO_STAT(size_oat_dex_file_sha1_);
     DO_STAT(size_oat_dex_file_offset_);
     DO_STAT(size_oat_dex_file_class_offsets_offset_);
     DO_STAT(size_oat_dex_file_lookup_table_offset_);
@@ -2667,12 +2651,14 @@ bool OatWriter::CheckOatSize(OutputStream* out, size_t file_offset, size_t relat
     DO_STAT(size_oat_dex_file_public_type_bss_mapping_offset_);
     DO_STAT(size_oat_dex_file_package_type_bss_mapping_offset_);
     DO_STAT(size_oat_dex_file_string_bss_mapping_offset_);
+    DO_STAT(size_oat_dex_file_method_type_bss_mapping_offset_);
     DO_STAT(size_bcp_bss_info_size_);
     DO_STAT(size_bcp_bss_info_method_bss_mapping_offset_);
     DO_STAT(size_bcp_bss_info_type_bss_mapping_offset_);
     DO_STAT(size_bcp_bss_info_public_type_bss_mapping_offset_);
     DO_STAT(size_bcp_bss_info_package_type_bss_mapping_offset_);
     DO_STAT(size_bcp_bss_info_string_bss_mapping_offset_);
+    DO_STAT(size_bcp_bss_info_method_type_bss_mapping_offset_);
     DO_STAT(size_oat_class_offsets_alignment_);
     DO_STAT(size_oat_class_offsets_);
     DO_STAT(size_oat_class_type_);
@@ -2685,6 +2671,7 @@ bool OatWriter::CheckOatSize(OutputStream* out, size_t file_offset, size_t relat
     DO_STAT(size_public_type_bss_mappings_);
     DO_STAT(size_package_type_bss_mappings_);
     DO_STAT(size_string_bss_mappings_);
+    DO_STAT(size_method_type_bss_mappings_);
     #undef DO_STAT
 
     VLOG(compiler) << "size_total=" << PrettySize(size_total) << " (" << size_total << "B)";
@@ -2870,7 +2857,8 @@ size_t OatWriter::WriteIndexBssMappingsHelper(OutputStream* out,
                                               uint32_t type_bss_mapping_offset,
                                               uint32_t public_type_bss_mapping_offset,
                                               uint32_t package_type_bss_mapping_offset,
-                                              uint32_t string_bss_mapping_offset) {
+                                              uint32_t string_bss_mapping_offset,
+                                              uint32_t method_type_bss_mapping_offset) {
   const PointerSize pointer_size = GetInstructionSetPointerSize(oat_header_->GetInstructionSet());
   auto method_it = bss_method_entry_references_.find(dex_file);
   if (method_it != bss_method_entry_references_.end()) {
@@ -2964,6 +2952,29 @@ size_t OatWriter::WriteIndexBssMappingsHelper(OutputStream* out,
     DCHECK_EQ(0u, string_bss_mapping_offset);
   }
 
+  auto method_type_it = bss_method_type_entry_references_.find(dex_file);
+  if (method_type_it != bss_method_type_entry_references_.end()) {
+    const BitVector& method_type_indexes = method_type_it->second;
+    DCHECK_EQ(relative_offset, method_type_bss_mapping_offset);
+    DCHECK_OFFSET();
+    size_t method_type_mappings_size =
+        WriteIndexBssMapping(out,
+                             dex_file->NumProtoIds(),
+                             sizeof(GcRoot<mirror::MethodType>),
+                             method_type_indexes,
+                             [=](uint32_t index) {
+                               return bss_method_type_entries_
+                                   .Get({dex_file, dex::ProtoIndex(index)});
+                             });
+    if (method_type_mappings_size == 0u) {
+      return 0u;
+    }
+    size_method_type_bss_mappings_ += method_type_mappings_size;
+    relative_offset += method_type_mappings_size;
+  } else {
+    DCHECK_EQ(0u, method_type_bss_mapping_offset);
+  }
+
   return relative_offset;
 }
 
@@ -2975,7 +2986,8 @@ size_t OatWriter::WriteIndexBssMappings(OutputStream* out,
       bss_type_entry_references_.empty() &&
       bss_public_type_entry_references_.empty() &&
       bss_package_type_entry_references_.empty() &&
-      bss_string_entry_references_.empty()) {
+      bss_string_entry_references_.empty() &&
+      bss_method_type_entry_references_.empty()) {
     return relative_offset;
   }
   // If there are any classes, the class offsets allocation aligns the offset
@@ -2994,7 +3006,8 @@ size_t OatWriter::WriteIndexBssMappings(OutputStream* out,
                                                   oat_dex_file->type_bss_mapping_offset_,
                                                   oat_dex_file->public_type_bss_mapping_offset_,
                                                   oat_dex_file->package_type_bss_mapping_offset_,
-                                                  oat_dex_file->string_bss_mapping_offset_);
+                                                  oat_dex_file->string_bss_mapping_offset_,
+                                                  oat_dex_file->method_type_bss_mapping_offset_);
     if (relative_offset == 0u) {
       return 0u;
     }
@@ -3015,7 +3028,8 @@ size_t OatWriter::WriteIndexBssMappings(OutputStream* out,
                                       bcp_bss_info_[i].type_bss_mapping_offset,
                                       bcp_bss_info_[i].public_type_bss_mapping_offset,
                                       bcp_bss_info_[i].package_type_bss_mapping_offset,
-                                      bcp_bss_info_[i].string_bss_mapping_offset);
+                                      bcp_bss_info_[i].string_bss_mapping_offset,
+                                      bcp_bss_info_[i].method_type_bss_mapping_offset);
       if (relative_offset == 0u) {
         return 0u;
       }
@@ -3072,9 +3086,7 @@ size_t OatWriter::WriteBcpBssInfo(OutputStream* out, size_t file_offset, size_t 
 
 size_t OatWriter::WriteCode(OutputStream* out, size_t file_offset, size_t relative_offset) {
   InstructionSet instruction_set = compiler_options_.GetInstructionSet();
-  if (GetCompilerOptions().IsBootImage() && primary_oat_file_ &&
-      // TODO(riscv64): remove this when we have compiler support for RISC-V.
-      instruction_set != InstructionSet::kRiscv64) {
+  if (GetCompilerOptions().IsBootImage() && primary_oat_file_) {
     #define DO_TRAMPOLINE(field) \
       do { \
         /* Pad with at least four 0xFFs so we can do DCHECKs in OatQuickMethodHeader */ \
@@ -3189,7 +3201,7 @@ bool OatWriter::WriteDexFiles(File* file,
   if (copy_dex_files == CopyOption::kOnlyIfCompressed) {
     extract_dex_files_into_vdex_ = false;
     for (OatDexFile& oat_dex_file : oat_dex_files_) {
-      const DexFileContainer* container = oat_dex_file.GetDexFile()->GetContainer();
+      const DexFileContainer* container = oat_dex_file.GetDexFile()->GetContainer().get();
       if (!(container->IsZip() && container->IsFileMap())) {
         extract_dex_files_into_vdex_ = true;
         break;
@@ -3217,6 +3229,15 @@ bool OatWriter::WriteDexFiles(File* file,
         LOG(ERROR) << "Failed to verify " << dex_file->GetLocation() << ": " << error_msg;
         return false;
       }
+    }
+  }
+
+  // Compact dex reader/writer does not understand dex containers,
+  // which is ok since dex containers replace compat-dex.
+  for (OatDexFile& oat_dex_file : oat_dex_files_) {
+    const DexFile* dex_file = oat_dex_file.GetDexFile();
+    if (dex_file->HasDexContainer()) {
+      compact_dex_level_ = CompactDexLevel::kCompactDexLevelNone;
     }
   }
 
@@ -3289,7 +3310,11 @@ bool OatWriter::WriteDexFiles(File* file,
 
     // Extend the file and include the full page at the end as we need to write
     // additional data there and do not want to mmap that page twice.
-    size_t page_aligned_size = RoundUp(vdex_size_with_dex_files, kPageSize);
+    //
+    // The page size value here is used to figure out the size of the mapping below,
+    // however it doesn't affect the file contents or its size, so should not be
+    // replaced with kElfSegmentAlignment.
+    size_t page_aligned_size = RoundUp(vdex_size_with_dex_files, MemMap::GetPageSize());
     if (!use_existing_vdex) {
       if (file->SetLength(page_aligned_size) != 0) {
         PLOG(ERROR) << "Failed to resize vdex file " << file->GetPath();
@@ -3439,6 +3464,7 @@ bool OatWriter::LayoutDexFile(OatDexFile* oat_dex_file) {
     }
   }
   CHECK_EQ(oat_dex_file->dex_file_location_checksum_, dex_file->GetLocationChecksum());
+  CHECK(oat_dex_file->dex_file_sha1_ == dex_file->GetSha1());
   return true;
 }
 
@@ -3472,6 +3498,7 @@ bool OatWriter::OpenDexFiles(
   DCHECK_EQ(opened_dex_files_map->size(), 1u);
   DCHECK(vdex_begin_ == opened_dex_files_map->front().Begin());
   std::vector<std::unique_ptr<const DexFile>> dex_files;
+  auto dex_container = std::make_shared<MemoryDexFileContainer>(vdex_begin_, vdex_size_);
   for (OatDexFile& oat_dex_file : oat_dex_files_) {
     const uint8_t* raw_dex_file = vdex_begin_ + oat_dex_file.dex_file_offset_;
 
@@ -3492,14 +3519,14 @@ bool OatWriter::OpenDexFiles(
 
     // Now, open the dex file.
     std::string error_msg;
-    ArtDexFileLoader dex_file_loader(
-        raw_dex_file, oat_dex_file.dex_file_size_, oat_dex_file.GetLocation());
+    ArtDexFileLoader dex_file_loader(dex_container, oat_dex_file.GetLocation());
     // All dex files have been already verified in WriteDexFiles before we copied them.
-    dex_files.emplace_back(dex_file_loader.Open(oat_dex_file.dex_file_location_checksum_,
-                                                /*oat_dex_file=*/nullptr,
-                                                /*verify=*/false,
-                                                /*verify_checksum=*/false,
-                                                &error_msg));
+    dex_files.emplace_back(dex_file_loader.OpenOne(oat_dex_file.dex_file_offset_,
+                                                   oat_dex_file.dex_file_location_checksum_,
+                                                   /*oat_dex_file=*/nullptr,
+                                                   /*verify=*/false,
+                                                   /*verify_checksum=*/false,
+                                                   &error_msg));
     if (dex_files.back() == nullptr) {
       LOG(ERROR) << "Failed to open dex file from oat file. File: " << oat_dex_file.GetLocation()
                  << " Error: " << error_msg;
@@ -3666,7 +3693,8 @@ bool OatWriter::FinishVdexFile(File* vdex_file, verifier::VerifierDeps* verifier
   if (extract_dex_files_into_vdex_) {
     DCHECK(vdex_begin != nullptr);
     // Write data to the last already mmapped page of the vdex file.
-    size_t mmapped_vdex_size = RoundUp(old_vdex_size, kPageSize);
+    // The size should match the page_aligned_size in the OatWriter::WriteDexFiles.
+    size_t mmapped_vdex_size = RoundUp(old_vdex_size, MemMap::GetPageSize());
     size_t first_chunk_size = std::min(buffer.size(), mmapped_vdex_size - old_vdex_size);
     memcpy(vdex_begin + old_vdex_size, buffer.data(), first_chunk_size);
 
@@ -3755,7 +3783,11 @@ bool OatWriter::FinishVdexFile(File* vdex_file, verifier::VerifierDeps* verifier
     if (extract_dex_files_into_vdex_) {
       // Note: We passed the ownership of the vdex dex file MemMap to the caller,
       // so we need to use msync() for the range explicitly.
-      if (msync(vdex_begin, RoundUp(old_vdex_size, kPageSize), MS_SYNC) != 0) {
+      //
+      // The page size here is not replaced with kElfSegmentAlignment as the
+      // rounded up size should match the page_aligned_size in OatWriter::WriteDexFiles
+      // which is the size the original (non-extra) mapping created there.
+      if (msync(vdex_begin, RoundUp(old_vdex_size, MemMap::GetPageSize()), MS_SYNC) != 0) {
         PLOG(ERROR) << "Failed to sync vdex file contents" << vdex_file->GetPath();
         return false;
       }
@@ -3773,7 +3805,12 @@ bool OatWriter::FinishVdexFile(File* vdex_file, verifier::VerifierDeps* verifier
 
   // Note: If `extract_dex_files_into_vdex_`, we passed the ownership of the vdex dex file
   // MemMap to the caller, so we need to use msync() for the range explicitly.
-  if (msync(vdex_begin, kPageSize, MS_SYNC) != 0) {
+  //
+  // The page size here should not be replaced with kElfSegmentAlignment as the size
+  // here should match the header size rounded up to the page size. Any higher value
+  // might happen to be larger than the size of the mapping which can in some circumstances
+  // cause msync to fail.
+  if (msync(vdex_begin, MemMap::GetPageSize(), MS_SYNC) != 0) {
     PLOG(ERROR) << "Failed to sync vdex file header " << vdex_file->GetPath();
     return false;
   }
@@ -3816,7 +3853,9 @@ OatWriter::OatDexFile::OatDexFile(std::unique_ptr<const DexFile> dex_file)
       offset_(0),
       dex_file_location_size_(strlen(dex_file_location_->c_str())),
       dex_file_location_data_(dex_file_location_->c_str()),
+      dex_file_magic_(dex_file_->GetHeader().magic_),
       dex_file_location_checksum_(dex_file_->GetLocationChecksum()),
+      dex_file_sha1_(dex_file_->GetSha1()),
       dex_file_offset_(0u),
       lookup_table_offset_(0u),
       class_offsets_offset_(0u),
@@ -3825,22 +3864,18 @@ OatWriter::OatDexFile::OatDexFile(std::unique_ptr<const DexFile> dex_file)
       public_type_bss_mapping_offset_(0u),
       package_type_bss_mapping_offset_(0u),
       string_bss_mapping_offset_(0u),
+      method_type_bss_mapping_offset_(0u),
       dex_sections_layout_offset_(0u),
       class_offsets_() {}
 
 size_t OatWriter::OatDexFile::SizeOf() const {
-  return sizeof(dex_file_location_size_)
-          + dex_file_location_size_
-          + sizeof(dex_file_location_checksum_)
-          + sizeof(dex_file_offset_)
-          + sizeof(class_offsets_offset_)
-          + sizeof(lookup_table_offset_)
-          + sizeof(method_bss_mapping_offset_)
-          + sizeof(type_bss_mapping_offset_)
-          + sizeof(public_type_bss_mapping_offset_)
-          + sizeof(package_type_bss_mapping_offset_)
-          + sizeof(string_bss_mapping_offset_)
-          + sizeof(dex_sections_layout_offset_);
+  return sizeof(dex_file_location_size_) + dex_file_location_size_ + sizeof(dex_file_magic_) +
+         sizeof(dex_file_location_checksum_) + sizeof(dex_file_sha1_) + sizeof(dex_file_offset_) +
+         sizeof(class_offsets_offset_) + sizeof(lookup_table_offset_) +
+         sizeof(method_bss_mapping_offset_) + sizeof(type_bss_mapping_offset_) +
+         sizeof(public_type_bss_mapping_offset_) + sizeof(package_type_bss_mapping_offset_) +
+         sizeof(string_bss_mapping_offset_) + sizeof(method_type_bss_mapping_offset_) +
+         sizeof(dex_sections_layout_offset_);
 }
 
 bool OatWriter::OatDexFile::Write(OatWriter* oat_writer, OutputStream* out) const {
@@ -3859,11 +3894,23 @@ bool OatWriter::OatDexFile::Write(OatWriter* oat_writer, OutputStream* out) cons
   }
   oat_writer->size_oat_dex_file_location_data_ += dex_file_location_size_;
 
+  if (!out->WriteFully(&dex_file_magic_, sizeof(dex_file_magic_))) {
+    PLOG(ERROR) << "Failed to write dex file magic to " << out->GetLocation();
+    return false;
+  }
+  oat_writer->size_oat_dex_file_magic_ += sizeof(dex_file_magic_);
+
   if (!out->WriteFully(&dex_file_location_checksum_, sizeof(dex_file_location_checksum_))) {
     PLOG(ERROR) << "Failed to write dex file location checksum to " << out->GetLocation();
     return false;
   }
   oat_writer->size_oat_dex_file_location_checksum_ += sizeof(dex_file_location_checksum_);
+
+  if (!out->WriteFully(&dex_file_sha1_, sizeof(dex_file_sha1_))) {
+    PLOG(ERROR) << "Failed to write dex file sha1 to " << out->GetLocation();
+    return false;
+  }
+  oat_writer->size_oat_dex_file_sha1_ += sizeof(dex_file_sha1_);
 
   if (!out->WriteFully(&dex_file_offset_, sizeof(dex_file_offset_))) {
     PLOG(ERROR) << "Failed to write dex file offset to " << out->GetLocation();
@@ -3922,6 +3969,13 @@ bool OatWriter::OatDexFile::Write(OatWriter* oat_writer, OutputStream* out) cons
   }
   oat_writer->size_oat_dex_file_string_bss_mapping_offset_ += sizeof(string_bss_mapping_offset_);
 
+  if (!out->WriteFully(&method_type_bss_mapping_offset_, sizeof(method_type_bss_mapping_offset_))) {
+    PLOG(ERROR) << "Failed to write MethodType bss mapping offset to " << out->GetLocation();
+    return false;
+  }
+  oat_writer->size_oat_dex_file_method_type_bss_mapping_offset_ +=
+      sizeof(method_type_bss_mapping_offset_);
+
   return true;
 }
 
@@ -3960,6 +4014,13 @@ bool OatWriter::BssMappingInfo::Write(OatWriter* oat_writer, OutputStream* out) 
     return false;
   }
   oat_writer->size_bcp_bss_info_string_bss_mapping_offset_ += sizeof(string_bss_mapping_offset);
+
+  if (!out->WriteFully(&method_type_bss_mapping_offset, sizeof(method_type_bss_mapping_offset))) {
+    PLOG(ERROR) << "Failed to write method type bss mapping offset to " << out->GetLocation();
+    return false;
+  }
+  oat_writer->size_bcp_bss_info_method_type_bss_mapping_offset_ +=
+      sizeof(method_type_bss_mapping_offset);
 
   return true;
 }

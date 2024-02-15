@@ -22,7 +22,7 @@
 
 #include "base/macros.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class QuickMethodFrameInfo;
 
@@ -31,7 +31,7 @@ class QuickMethodFrameInfo;
 class Context {
  public:
   // Creates a context for the running architecture
-  static Context* Create();
+  EXPORT static Context* Create();
 
   virtual ~Context() {}
 
@@ -90,9 +90,7 @@ class Context {
 
   // Set `new_value` to the physical register containing the dex PC pointer in
   // an nterp frame.
-  virtual void SetNterpDexPC(uintptr_t new_value ATTRIBUTE_UNUSED) {
-    abort();
-  }
+  virtual void SetNterpDexPC([[maybe_unused]] uintptr_t new_value) { abort(); }
 
   // Switches execution of the executing context to this context
   NO_RETURN virtual void DoLongJump() = 0;

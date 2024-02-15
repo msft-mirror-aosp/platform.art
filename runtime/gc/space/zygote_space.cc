@@ -25,7 +25,7 @@
 #include "runtime.h"
 #include "thread-current-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace gc {
 namespace space {
 
@@ -34,9 +34,7 @@ class CountObjectsAllocated {
   explicit CountObjectsAllocated(size_t* objects_allocated)
       : objects_allocated_(objects_allocated) {}
 
-  void operator()(mirror::Object* obj ATTRIBUTE_UNUSED) const {
-    ++*objects_allocated_;
-  }
+  void operator()([[maybe_unused]] mirror::Object* obj) const { ++*objects_allocated_; }
 
  private:
   size_t* const objects_allocated_;

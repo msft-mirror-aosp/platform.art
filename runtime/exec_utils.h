@@ -19,20 +19,23 @@
 
 #include <time.h>
 
+#include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "android-base/unique_fd.h"
+#include "base/macros.h"
 
-namespace art {
+namespace art HIDDEN {
 
 struct ProcessStat {
   // The total wall time, in milliseconds, that the process spent, or 0 if failed to get the value.
-  int wall_time_ms = 0;
+  int64_t wall_time_ms = 0;
   // The total CPU time, in milliseconds, that the process and any waited-for children spent, or 0
   // if failed to get the value.
-  int cpu_time_ms = 0;
+  int64_t cpu_time_ms = 0;
 };
 
 struct ExecCallbacks {
@@ -73,7 +76,7 @@ struct ExecResult {
 // These spawn child processes using the environment as it was set when the single instance
 // of the runtime (Runtime::Current()) was started.  If no instance of the runtime was started, it
 // will use the current environment settings.
-class ExecUtils {
+class EXPORT ExecUtils {
  public:
   virtual ~ExecUtils() = default;
 
@@ -105,7 +108,7 @@ class ExecUtils {
   // Returns the content of `/proc/<pid>/stat`, or an empty string if failed.
   virtual std::string GetProcStat(pid_t pid) const;
 
-  virtual int64_t GetUptimeMs() const;
+  virtual std::optional<int64_t> GetUptimeMs(std::string* error_msg) const;
 
   virtual int64_t GetTicksPerSec() const;
 

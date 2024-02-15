@@ -22,6 +22,7 @@
 #include "base/atomic_pair.h"
 #include "base/bit_utils.h"
 #include "base/locks.h"
+#include "base/macros.h"
 #include "dex/dex_file.h"
 #include "dex/dex_file_types.h"
 #include "gc_root.h"  // Note: must not use -inl here to avoid circular dependency.
@@ -29,7 +30,7 @@
 #include "object.h"
 #include "object_array.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace linker {
 class ImageWriter;
@@ -142,16 +143,16 @@ template <typename T, size_t size> class NativeDexCachePairArray {
 
  private:
   NativeDexCachePair<T> GetNativePair(std::atomic<NativeDexCachePair<T>>* pair_array, size_t idx) {
-    auto* array = reinterpret_cast<std::atomic<AtomicPair<uintptr_t>>*>(pair_array);
+    auto* array = reinterpret_cast<AtomicPair<uintptr_t>*>(pair_array);
     AtomicPair<uintptr_t> value = AtomicPairLoadAcquire(&array[idx]);
-    return NativeDexCachePair<T>(reinterpret_cast<T*>(value.first), value.second);
+    return NativeDexCachePair<T>(reinterpret_cast<T*>(value.val), value.key);
   }
 
   void SetNativePair(std::atomic<NativeDexCachePair<T>>* pair_array,
                      size_t idx,
                      NativeDexCachePair<T> pair) {
-    auto* array = reinterpret_cast<std::atomic<AtomicPair<uintptr_t>>*>(pair_array);
-    AtomicPair<uintptr_t> v(reinterpret_cast<size_t>(pair.object), pair.index);
+    auto* array = reinterpret_cast<AtomicPair<uintptr_t>*>(pair_array);
+    AtomicPair<uintptr_t> v(pair.index, reinterpret_cast<size_t>(pair.object));
     AtomicPairStoreRelease(&array[idx], v);
   }
 
@@ -300,13 +301,12 @@ class MANAGED DexCache final : public Object {
                                      DexCachePair<Object>* pairs_end)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  void Initialize(const DexFile* dex_file, ObjPtr<ClassLoader> class_loader)
-      REQUIRES_SHARED(Locks::mutator_lock_)
-      REQUIRES(Locks::dex_lock_);
+  EXPORT void Initialize(const DexFile* dex_file, ObjPtr<ClassLoader> class_loader)
+      REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(Locks::dex_lock_);
 
   // Zero all array references.
   // WARNING: This does not free the memory since it is in LinearAlloc.
-  void ResetNativeArrays() REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT void ResetNativeArrays() REQUIRES_SHARED(Locks::mutator_lock_);
 
   template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags,
            ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
@@ -368,7 +368,7 @@ class MANAGED DexCache final : public Object {
     SetFieldPtr<false>(OFFSET_OF_OBJECT_MEMBER(DexCache, dex_file_), dex_file);
   }
 
-  void SetLocation(ObjPtr<String> location) REQUIRES_SHARED(Locks::mutator_lock_);
+  EXPORT void SetLocation(ObjPtr<String> location) REQUIRES_SHARED(Locks::mutator_lock_);
 
   void VisitReflectiveTargets(ReflectiveValueVisitor* visitor) REQUIRES(Locks::mutator_lock_);
 

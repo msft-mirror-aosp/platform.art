@@ -17,9 +17,10 @@
 #ifndef ART_RUNTIME_NTERP_HELPERS_H_
 #define ART_RUNTIME_NTERP_HELPERS_H_
 
+#include "base/macros.h"
 #include "quick/quick_method_frame_info.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class ArtMethod;
 
@@ -72,8 +73,13 @@ uint32_t NterpGetVRegReference(ArtMethod** frame, uint16_t vreg)
  * Returns whether the given method can run with nterp. The instruction set can
  * be passed for cross-compilation.
  */
-bool CanMethodUseNterp(ArtMethod* method, InstructionSet isa = kRuntimeISA)
+EXPORT bool CanMethodUseNterp(ArtMethod* method, InstructionSet isa = kRuntimeISA)
     REQUIRES_SHARED(Locks::mutator_lock_);
+
+/**
+ * Returns kAccNterpInvokeFastPathFlag and/or kAccNterpEntryPointFastPathFlag, if appropriate.
+ */
+uint32_t GetNterpFastPathFlags(std::string_view shorty, uint32_t access_flags, InstructionSet isa);
 
 }  // namespace art
 

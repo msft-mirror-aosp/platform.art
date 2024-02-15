@@ -162,21 +162,36 @@ using VIXLUInt32Literal = vixl::aarch32::Literal<uint32_t>;
   /* 1.8 */                                                                \
   V(MathFmaDouble)                                                         \
   V(MathFmaFloat)                                                          \
-  V(UnsafeGetAndAddInt)                                                    \
-  V(UnsafeGetAndAddLong)                                                   \
-  V(UnsafeGetAndSetInt)                                                    \
-  V(UnsafeGetAndSetLong)                                                   \
-  V(UnsafeGetAndSetObject)                                                 \
   V(MethodHandleInvokeExact)                                               \
   V(MethodHandleInvoke)                                                    \
   /* OpenJDK 11 */                                                         \
   V(JdkUnsafeCASLong) /* High register pressure */                         \
-  V(JdkUnsafeGetAndAddInt)                                                 \
-  V(JdkUnsafeGetAndAddLong)                                                \
-  V(JdkUnsafeGetAndSetInt)                                                 \
-  V(JdkUnsafeGetAndSetLong)                                                \
-  V(JdkUnsafeGetAndSetObject)                                              \
   V(JdkUnsafeCompareAndSetLong)
+
+ALWAYS_INLINE inline StoreOperandType GetStoreOperandType(DataType::Type type) {
+  switch (type) {
+    case DataType::Type::kReference:
+      return kStoreWord;
+    case DataType::Type::kBool:
+    case DataType::Type::kUint8:
+    case DataType::Type::kInt8:
+      return kStoreByte;
+    case DataType::Type::kUint16:
+    case DataType::Type::kInt16:
+      return kStoreHalfword;
+    case DataType::Type::kInt32:
+      return kStoreWord;
+    case DataType::Type::kInt64:
+      return kStoreWordPair;
+    case DataType::Type::kFloat32:
+      return kStoreSWord;
+    case DataType::Type::kFloat64:
+      return kStoreDWord;
+    default:
+      LOG(FATAL) << "Unreachable type " << type;
+      UNREACHABLE();
+  }
+}
 
 class JumpTableARMVIXL : public DeletableArenaObject<kArenaAllocSwitchTable> {
  public:
@@ -600,12 +615,26 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
                                            HInstruction* instruction,
                                            SlowPathCode* slow_path);
 
-  // Emit a write barrier.
+  // Emit a write barrier if:
+  // A) emit_null_check is false
+  // B) emit_null_check is true, and value is not null.
+  void MaybeMarkGCCard(vixl::aarch32::Register temp,
+                       vixl::aarch32::Register card,
+                       vixl::aarch32::Register object,
+                       vixl::aarch32::Register value,
+                       bool emit_null_check);
+
+  // Emit a write barrier unconditionally.
   void MarkGCCard(vixl::aarch32::Register temp,
                   vixl::aarch32::Register card,
-                  vixl::aarch32::Register object,
-                  vixl::aarch32::Register value,
-                  bool emit_null_check);
+                  vixl::aarch32::Register object);
+
+  // Crash if the card table is not valid. This check is only emitted for the CC GC. We assert
+  // `(!clean || !self->is_gc_marking)`, since the card table should not be set to clean when the CC
+  // GC is marking for eliminated write barriers.
+  void CheckGCCardIsValid(vixl::aarch32::Register temp,
+                          vixl::aarch32::Register card,
+                          vixl::aarch32::Register object);
 
   void GenerateMemoryBarrier(MemBarrierKind kind);
 
@@ -620,7 +649,7 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
     block_labels_.resize(GetGraph()->GetBlocks().size());
   }
 
-  void Finalize(CodeAllocator* allocator) override;
+  void Finalize() override;
 
   bool NeedsTwoRegisters(DataType::Type type) const override {
     return type == DataType::Type::kFloat64 || type == DataType::Type::kInt64;
@@ -725,9 +754,9 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
                                vixl::aarch32::Register obj,
                                uint32_t offset,
                                ReadBarrierOption read_barrier_option);
-  // Generate MOV for an intrinsic CAS to mark the old value with Baker read barrier.
-  void GenerateIntrinsicCasMoveWithBakerReadBarrier(vixl::aarch32::Register marked_old_value,
-                                                    vixl::aarch32::Register old_value);
+  // Generate MOV for an intrinsic to mark the old value with Baker read barrier.
+  void GenerateIntrinsicMoveWithBakerReadBarrier(vixl::aarch32::Register marked_old_value,
+                                                 vixl::aarch32::Register old_value);
   // Fast path implementation of ReadBarrier::Barrier for a heap
   // reference field load when Baker's read barriers are used.
   // Overload suitable for Unsafe.getObject/-Volatile() intrinsic.
@@ -870,7 +899,7 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
   }
 
   void MaybeGenerateInlineCacheCheck(HInstruction* instruction, vixl32::Register klass);
-  void MaybeIncrementHotness(bool is_frame_entry);
+  void MaybeIncrementHotness(HSuspendCheck* suspend_check, bool is_frame_entry);
 
  private:
   // Encoding of thunk type and data for link-time generated thunks for Baker read barriers.

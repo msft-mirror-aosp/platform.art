@@ -38,6 +38,7 @@
 #include "entrypoints/quick/quick_entrypoints.h"
 #include "instrumentation.h"
 #include "jni/jni_env_ext.h"
+#include "jni/local_reference_table.h"
 #include "runtime.h"
 #include "thread.h"
 #include "utils/arm/managed_register_arm.h"
@@ -50,19 +51,6 @@
 #define __ jni_asm->
 
 namespace art HIDDEN {
-
-constexpr size_t kIRTCookieSize = JniCallingConvention::SavedLocalReferenceCookieSize();
-
-template <PointerSize kPointerSize>
-static void PushLocalReferenceFrame(JNIMacroAssembler<kPointerSize>* jni_asm,
-                                    ManagedRegister jni_env_reg,
-                                    ManagedRegister saved_cookie_reg,
-                                    ManagedRegister temp_reg);
-template <PointerSize kPointerSize>
-static void PopLocalReferenceFrame(JNIMacroAssembler<kPointerSize>* jni_asm,
-                                   ManagedRegister jni_env_reg,
-                                   ManagedRegister saved_cookie_reg,
-                                   ManagedRegister temp_reg);
 
 template <PointerSize kPointerSize>
 static void SetNativeParameter(JNIMacroAssembler<kPointerSize>* jni_asm,
@@ -109,6 +97,7 @@ static JniCompiledMethod ArtJniCompileMethodInternal(const CompilerOptions& comp
   // i.e. if the method was annotated with @CriticalNative
   const bool is_critical_native = (access_flags & kAccCriticalNative) != 0u;
 
+  bool emit_read_barrier = compiler_options.EmitReadBarrier();
   bool is_debuggable = compiler_options.GetDebuggable();
   bool needs_entry_exit_hooks = is_debuggable && compiler_options.IsJitCompiler();
   // We don't support JITing stubs for critical native methods in debuggable runtimes yet.
@@ -154,11 +143,11 @@ static JniCompiledMethod ArtJniCompileMethodInternal(const CompilerOptions& comp
     // -- Don't allow any objects as parameter or return value
     if (UNLIKELY(is_critical_native)) {
       CHECK(is_static)
-          << "@CriticalNative functions cannot be virtual since that would"
+          << "@CriticalNative functions cannot be virtual since that would "
           << "require passing a reference parameter (this), which is illegal "
           << dex_file.PrettyMethod(method_idx, /* with_signature= */ true);
       CHECK(!is_synchronized)
-          << "@CriticalNative functions cannot be synchronized since that would"
+          << "@CriticalNative functions cannot be synchronized since that would "
           << "require passing a (class and/or this) reference parameter, which is illegal "
           << dex_file.PrettyMethod(method_idx, /* with_signature= */ true);
       for (size_t i = 0; i < strlen(shorty); ++i) {
@@ -208,7 +197,7 @@ static JniCompiledMethod ArtJniCompileMethodInternal(const CompilerOptions& comp
   //      Skip this for @CriticalNative because we're not passing a `jclass` to the native method.
   std::unique_ptr<JNIMacroLabel> jclass_read_barrier_slow_path;
   std::unique_ptr<JNIMacroLabel> jclass_read_barrier_return;
-  if (gUseReadBarrier && is_static && LIKELY(!is_critical_native)) {
+  if (emit_read_barrier && is_static && LIKELY(!is_critical_native)) {
     jclass_read_barrier_slow_path = __ CreateLabel();
     jclass_read_barrier_return = __ CreateLabel();
 
@@ -305,22 +294,30 @@ static JniCompiledMethod ArtJniCompileMethodInternal(const CompilerOptions& comp
   // 3. Push local reference frame.
   // Skip this for @CriticalNative methods, they cannot use any references.
   ManagedRegister jni_env_reg = ManagedRegister::NoRegister();
-  ManagedRegister saved_cookie_reg = ManagedRegister::NoRegister();
+  ManagedRegister previous_state_reg = ManagedRegister::NoRegister();
+  ManagedRegister current_state_reg = ManagedRegister::NoRegister();
   ManagedRegister callee_save_temp = ManagedRegister::NoRegister();
   if (LIKELY(!is_critical_native)) {
     // To pop the local reference frame later, we shall need the JNI environment pointer
     // as well as the cookie, so we preserve them across calls in callee-save registers.
     CHECK_GE(callee_save_scratch_regs.size(), 3u);  // At least 3 for each supported architecture.
     jni_env_reg = callee_save_scratch_regs[0];
-    saved_cookie_reg = __ CoreRegisterWithSize(callee_save_scratch_regs[1], kIRTCookieSize);
-    callee_save_temp = __ CoreRegisterWithSize(callee_save_scratch_regs[2], kIRTCookieSize);
+    constexpr size_t kLRTSegmentStateSize = sizeof(jni::LRTSegmentState);
+    previous_state_reg = __ CoreRegisterWithSize(callee_save_scratch_regs[1], kLRTSegmentStateSize);
+    current_state_reg = __ CoreRegisterWithSize(callee_save_scratch_regs[2], kLRTSegmentStateSize);
+    if (callee_save_scratch_regs.size() >= 4) {
+      callee_save_temp = callee_save_scratch_regs[3];
+    }
+    const MemberOffset previous_state_offset = JNIEnvExt::LrtPreviousStateOffset(kPointerSize);
 
     // Load the JNI environment pointer.
     __ LoadRawPtrFromThread(jni_env_reg, Thread::JniEnvOffset<kPointerSize>());
 
-    // Push the local reference frame.
-    PushLocalReferenceFrame<kPointerSize>(
-        jni_asm.get(), jni_env_reg, saved_cookie_reg, callee_save_temp);
+    // Load the local reference frame states.
+    __ LoadLocalReferenceTableStates(jni_env_reg, previous_state_reg, current_state_reg);
+
+    // Store the current state as the previous state (push the LRT frame).
+    __ Store(jni_env_reg, previous_state_offset, current_state_reg, kLRTSegmentStateSize);
   }
 
   // 4. Make the main native call.
@@ -343,6 +340,7 @@ static JniCompiledMethod ArtJniCompileMethodInternal(const CompilerOptions& comp
   refs.clear();
   mr_conv->ResetIterator(FrameOffset(current_frame_size));
   main_jni_conv->ResetIterator(FrameOffset(main_out_arg_size));
+  bool check_method_not_clobbered = false;
   if (UNLIKELY(is_critical_native)) {
     // Move the method pointer to the hidden argument register.
     // TODO: Pass this as the last argument, not first. Change ARM assembler
@@ -353,10 +351,16 @@ static JniCompiledMethod ArtJniCompileMethodInternal(const CompilerOptions& comp
   } else {
     main_jni_conv->Next();    // Skip JNIEnv*.
     FrameOffset method_offset(current_out_arg_size + mr_conv->MethodStackOffset().SizeValue());
-    if (!is_static || main_jni_conv->IsCurrentParamOnStack()) {
+    if (main_jni_conv->IsCurrentParamOnStack()) {
+      // This is for x86 only. The method shall not be clobbered by argument moves
+      // because all arguments are passed on the stack to the native method.
+      check_method_not_clobbered = true;
+      DCHECK(callee_save_temp.IsNoRegister());
+    } else if (!is_static) {
       // The method shall not be available in the `jclass` argument register.
       // Make sure it is available in `callee_save_temp` for the call below.
       // (The old method register can be clobbered by argument moves.)
+      DCHECK(!callee_save_temp.IsNoRegister());
       ManagedRegister new_method_reg = __ CoreRegisterWithSize(callee_save_temp, kRawPointerSize);
       DCHECK(!method_register.IsNoRegister());
       __ Move(new_method_reg, method_register, kRawPointerSize);
@@ -387,8 +391,8 @@ static JniCompiledMethod ArtJniCompileMethodInternal(const CompilerOptions& comp
     DCHECK(main_jni_conv->HasNext());
     static_assert(kObjectReferenceSize == 4u);
     bool is_reference = mr_conv->IsCurrentParamAReference();
-    size_t src_size = (!is_reference && mr_conv->IsCurrentParamALongOrDouble()) ? 8u : 4u;
-    size_t dest_size = is_reference ? kRawPointerSize : src_size;
+    size_t src_size = mr_conv->CurrentParamSize();
+    size_t dest_size = main_jni_conv->CurrentParamSize();
     src_args.push_back(mr_conv->IsCurrentParamInRegister()
         ? ArgumentLocation(mr_conv->CurrentParamRegister(), src_size)
         : ArgumentLocation(mr_conv->CurrentParamStackOffset(), src_size));
@@ -398,6 +402,10 @@ static JniCompiledMethod ArtJniCompileMethodInternal(const CompilerOptions& comp
     refs.push_back(is_reference ? mr_conv->CurrentParamStackOffset() : kInvalidReferenceOffset);
   }
   DCHECK(!main_jni_conv->HasNext());
+  DCHECK_IMPLIES(check_method_not_clobbered,
+                 std::all_of(dest_args.begin(),
+                             dest_args.end(),
+                             [](const ArgumentLocation& loc) { return !loc.IsRegister(); }));
   __ MoveArguments(ArrayRef<ArgumentLocation>(dest_args),
                    ArrayRef<ArgumentLocation>(src_args),
                    ArrayRef<FrameOffset>(refs));
@@ -524,8 +532,10 @@ static JniCompiledMethod ArtJniCompileMethodInternal(const CompilerOptions& comp
 
   // 6. Pop local reference frame.
   if (LIKELY(!is_critical_native)) {
-    PopLocalReferenceFrame<kPointerSize>(
-        jni_asm.get(), jni_env_reg, saved_cookie_reg, callee_save_temp);
+    __ StoreLocalReferenceTableStates(jni_env_reg, previous_state_reg, current_state_reg);
+    // For x86, the `callee_save_temp` is not valid, so let's simply change it to one
+    // of the callee save registers that we don't need anymore for all architectures.
+    callee_save_temp = current_state_reg;
   }
 
   // 7. Return from the JNI stub.
@@ -549,10 +559,10 @@ static JniCompiledMethod ArtJniCompileMethodInternal(const CompilerOptions& comp
       FrameOffset method_offset = mr_conv->MethodStackOffset();
       __ Load(temp, method_offset, kRawPointerSize);
       DCHECK_EQ(ArtMethod::DeclaringClassOffset().SizeValue(), 0u);
-      __ Load(to_lock, temp, MemberOffset(0u), kObjectReferenceSize);
+      __ LoadGcRootWithoutReadBarrier(to_lock, temp, MemberOffset(0u));
     } else {
       // Pass the `this` argument from its spill slot.
-      __ Load(to_lock, mr_conv->CurrentParamStackOffset(), kObjectReferenceSize);
+      __ LoadStackReference(to_lock, mr_conv->CurrentParamStackOffset());
     }
     __ CallFromThread(QUICK_ENTRYPOINT_OFFSET(kPointerSize, pJniUnlockObject));
   }
@@ -601,7 +611,7 @@ static JniCompiledMethod ArtJniCompileMethodInternal(const CompilerOptions& comp
 
   // 8.1. Read barrier slow path for the declaring class in the method for a static call.
   //      Skip this for @CriticalNative because we're not passing a `jclass` to the native method.
-  if (gUseReadBarrier && is_static && !is_critical_native) {
+  if (emit_read_barrier && is_static && !is_critical_native) {
     __ Bind(jclass_read_barrier_slow_path.get());
 
     // Construct slow path for read barrier:
@@ -621,7 +631,7 @@ static JniCompiledMethod ArtJniCompileMethodInternal(const CompilerOptions& comp
           main_jni_conv->CalleeSaveScratchRegisters()[0], kObjectReferenceSize);
       // Load the declaring class reference.
       DCHECK_EQ(ArtMethod::DeclaringClassOffset().SizeValue(), 0u);
-      __ Load(temp, method_register, MemberOffset(0u), kObjectReferenceSize);
+      __ LoadGcRootWithoutReadBarrier(temp, method_register, MemberOffset(0u));
       // Return to main path if the class object is marked.
       __ TestMarkBit(temp, jclass_read_barrier_return.get(), JNIMacroUnaryCondition::kNotZero);
     }
@@ -657,8 +667,7 @@ static JniCompiledMethod ArtJniCompileMethodInternal(const CompilerOptions& comp
         jni_asm->cfi().AdjustCFAOffset(main_out_arg_size);
         __ DecreaseFrameSize(main_out_arg_size);
       }
-      PopLocalReferenceFrame<kPointerSize>(
-          jni_asm.get(), jni_env_reg, saved_cookie_reg, callee_save_temp);
+      __ StoreLocalReferenceTableStates(jni_env_reg, previous_state_reg, current_state_reg);
     }
     DCHECK_EQ(jni_asm->cfi().GetCurrentCFAOffset(), static_cast<int>(current_frame_size));
     __ DeliverPendingException();
@@ -724,7 +733,7 @@ static JniCompiledMethod ArtJniCompileMethodInternal(const CompilerOptions& comp
   size_t cs = __ CodeSize();
   std::vector<uint8_t> managed_code(cs);
   MemoryRegion code(&managed_code[0], managed_code.size());
-  __ FinalizeInstructions(code);
+  __ CopyInstructions(code);
 
   return JniCompiledMethod(instruction_set,
                            std::move(managed_code),
@@ -732,40 +741,6 @@ static JniCompiledMethod ArtJniCompileMethodInternal(const CompilerOptions& comp
                            main_jni_conv->CoreSpillMask(),
                            main_jni_conv->FpSpillMask(),
                            ArrayRef<const uint8_t>(*jni_asm->cfi().data()));
-}
-
-template <PointerSize kPointerSize>
-static void PushLocalReferenceFrame(JNIMacroAssembler<kPointerSize>* jni_asm,
-                                    ManagedRegister jni_env_reg,
-                                    ManagedRegister saved_cookie_reg,
-                                    ManagedRegister temp_reg) {
-  const size_t kRawPointerSize = static_cast<size_t>(kPointerSize);
-  const MemberOffset jni_env_cookie_offset = JNIEnvExt::LocalRefCookieOffset(kRawPointerSize);
-  const MemberOffset jni_env_segment_state_offset = JNIEnvExt::SegmentStateOffset(kRawPointerSize);
-
-  // Load the old cookie that we shall need to restore.
-  __ Load(saved_cookie_reg, jni_env_reg, jni_env_cookie_offset, kIRTCookieSize);
-
-  // Set the cookie in JNI environment to the current segment state.
-  __ Load(temp_reg, jni_env_reg, jni_env_segment_state_offset, kIRTCookieSize);
-  __ Store(jni_env_reg, jni_env_cookie_offset, temp_reg, kIRTCookieSize);
-}
-
-template <PointerSize kPointerSize>
-static void PopLocalReferenceFrame(JNIMacroAssembler<kPointerSize>* jni_asm,
-                                   ManagedRegister jni_env_reg,
-                                   ManagedRegister saved_cookie_reg,
-                                   ManagedRegister temp_reg) {
-  const size_t kRawPointerSize = static_cast<size_t>(kPointerSize);
-  const MemberOffset jni_env_cookie_offset = JNIEnvExt::LocalRefCookieOffset(kRawPointerSize);
-  const MemberOffset jni_env_segment_state_offset = JNIEnvExt::SegmentStateOffset(kRawPointerSize);
-
-  // Set the current segment state to the current cookie in JNI environment.
-  __ Load(temp_reg, jni_env_reg, jni_env_cookie_offset, kIRTCookieSize);
-  __ Store(jni_env_reg, jni_env_segment_state_offset, temp_reg, kIRTCookieSize);
-
-  // Restore the cookie in JNI environment to the saved value.
-  __ Store(jni_env_reg, jni_env_cookie_offset, saved_cookie_reg, kIRTCookieSize);
 }
 
 template <PointerSize kPointerSize>

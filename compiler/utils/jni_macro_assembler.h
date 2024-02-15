@@ -92,7 +92,7 @@ class JNIMacroAssembler : public DeletableArenaObject<kArenaAllocAssembler> {
   virtual size_t CodeSize() const = 0;
 
   // Copy instructions out of assembly buffer into the given region of memory
-  virtual void FinalizeInstructions(const MemoryRegion& region) = 0;
+  virtual void CopyInstructions(const MemoryRegion& region) = 0;
 
   // Emit code that will create an activation on the stack
   virtual void BuildFrame(size_t frame_size,
@@ -129,8 +129,17 @@ class JNIMacroAssembler : public DeletableArenaObject<kArenaAllocAssembler> {
   // Load routines
   virtual void Load(ManagedRegister dest, FrameOffset src, size_t size) = 0;
   virtual void Load(ManagedRegister dest, ManagedRegister base, MemberOffset offs, size_t size) = 0;
-
   virtual void LoadRawPtrFromThread(ManagedRegister dest, ThreadOffset<kPointerSize> offs) = 0;
+
+  // Load reference from a `GcRoot<>`. The default is to load as `jint`. Some architectures
+  // (say, RISC-V) override this to provide a different sign- or zero-extension.
+  virtual void LoadGcRootWithoutReadBarrier(ManagedRegister dest,
+                                            ManagedRegister base,
+                                            MemberOffset offs);
+
+  // Load reference from a `StackReference<>`. The default is to load as `jint`. Some architectures
+  // (say, RISC-V) override this to provide a different sign- or zero-extension.
+  virtual void LoadStackReference(ManagedRegister dest, FrameOffset offs);
 
   // Copying routines
 
@@ -157,6 +166,17 @@ class JNIMacroAssembler : public DeletableArenaObject<kArenaAllocAssembler> {
   // Exploit fast access in managed code to Thread::Current()
   virtual void GetCurrentThread(ManagedRegister dest) = 0;
   virtual void GetCurrentThread(FrameOffset dest_offset) = 0;
+
+  // Manipulating local reference table states.
+  //
+  // These have a default implementation but they can be overridden to use register pair
+  // load/store instructions on architectures that support them (arm, arm64).
+  virtual void LoadLocalReferenceTableStates(ManagedRegister jni_env_reg,
+                                             ManagedRegister previous_state_reg,
+                                             ManagedRegister current_state_reg);
+  virtual void StoreLocalReferenceTableStates(ManagedRegister jni_env_reg,
+                                              ManagedRegister previous_state_reg,
+                                              ManagedRegister current_state_reg);
 
   // Decode JNI transition or local `jobject`. For (weak) global `jobject`, jump to slow path.
   virtual void DecodeJNITransitionOrLocalJObject(ManagedRegister reg,
@@ -266,8 +286,8 @@ class JNIMacroAssemblerFwd : public JNIMacroAssembler<kPointerSize> {
     return asm_.CodeSize();
   }
 
-  void FinalizeInstructions(const MemoryRegion& region) override {
-    asm_.FinalizeInstructions(region);
+  void CopyInstructions(const MemoryRegion& region) override {
+    asm_.CopyInstructions(region);
   }
 
   DebugFrameOpCodeWriterForAssembler& cfi() override {

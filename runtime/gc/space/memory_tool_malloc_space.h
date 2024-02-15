@@ -19,7 +19,7 @@
 
 #include "malloc_space.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace gc {
 namespace space {
 
@@ -48,7 +48,7 @@ class MemoryToolMallocSpace final : public BaseMallocSpaceType {
   size_t FreeList(Thread* self, size_t num_ptrs, mirror::Object** ptrs) override
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  void RegisterRecentFree(mirror::Object* ptr ATTRIBUTE_UNUSED) override {}
+  void RegisterRecentFree([[maybe_unused]] mirror::Object* ptr) override {}
 
   size_t MaxBytesBulkAllocatedFor(size_t num_bytes) override;
 

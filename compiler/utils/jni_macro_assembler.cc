@@ -25,6 +25,9 @@
 #ifdef ART_ENABLE_CODEGEN_arm64
 #include "arm64/jni_macro_assembler_arm64.h"
 #endif
+#ifdef ART_ENABLE_CODEGEN_riscv64
+#include "riscv64/jni_macro_assembler_riscv64.h"
+#endif
 #ifdef ART_ENABLE_CODEGEN_x86
 #include "x86/jni_macro_assembler_x86.h"
 #endif
@@ -34,6 +37,10 @@
 #include "base/casts.h"
 #include "base/globals.h"
 #include "base/memory_region.h"
+#include "gc_root.h"
+#include "jni/jni_env_ext.h"
+#include "jni/local_reference_table.h"
+#include "stack_reference.h"
 
 namespace art HIDDEN {
 
@@ -79,6 +86,10 @@ MacroAsm64UniquePtr JNIMacroAssembler<PointerSize::k64>::Create(
     case InstructionSet::kArm64:
       return MacroAsm64UniquePtr(new (allocator) arm64::Arm64JNIMacroAssembler(allocator));
 #endif
+#ifdef ART_ENABLE_CODEGEN_riscv64
+    case InstructionSet::kRiscv64:
+      return MacroAsm64UniquePtr(new (allocator) riscv64::Riscv64JNIMacroAssembler(allocator));
+#endif
 #ifdef ART_ENABLE_CODEGEN_x86_64
     case InstructionSet::kX86_64:
       return MacroAsm64UniquePtr(new (allocator) x86_64::X86_64JNIMacroAssembler(allocator));
@@ -89,5 +100,83 @@ MacroAsm64UniquePtr JNIMacroAssembler<PointerSize::k64>::Create(
       UNREACHABLE();
   }
 }
+
+template <PointerSize kPointerSize>
+void JNIMacroAssembler<kPointerSize>::LoadGcRootWithoutReadBarrier(ManagedRegister dest,
+                                                                   ManagedRegister base,
+                                                                   MemberOffset offs) {
+  static_assert(sizeof(uint32_t) == sizeof(GcRoot<mirror::Object>));
+  Load(dest, base, offs, sizeof(uint32_t));
+}
+
+template
+void JNIMacroAssembler<PointerSize::k32>::LoadGcRootWithoutReadBarrier(ManagedRegister dest,
+                                                                       ManagedRegister base,
+                                                                       MemberOffset offs);
+template
+void JNIMacroAssembler<PointerSize::k64>::LoadGcRootWithoutReadBarrier(ManagedRegister dest,
+                                                                       ManagedRegister base,
+                                                                       MemberOffset offs);
+
+template <PointerSize kPointerSize>
+void JNIMacroAssembler<kPointerSize>::LoadStackReference(ManagedRegister dest, FrameOffset offs) {
+  static_assert(sizeof(uint32_t) == sizeof(StackReference<mirror::Object>));
+  Load(dest, offs, sizeof(uint32_t));
+}
+
+template
+void JNIMacroAssembler<PointerSize::k32>::LoadStackReference(ManagedRegister dest,
+                                                             FrameOffset offs);
+template
+void JNIMacroAssembler<PointerSize::k64>::LoadStackReference(ManagedRegister dest,
+                                                             FrameOffset offs);
+
+template <PointerSize kPointerSize>
+void JNIMacroAssembler<kPointerSize>::LoadLocalReferenceTableStates(
+    ManagedRegister jni_env_reg,
+    ManagedRegister previous_state_reg,
+    ManagedRegister current_state_reg) {
+  constexpr size_t kLRTSegmentStateSize = sizeof(jni::LRTSegmentState);
+  const MemberOffset previous_state_offset = JNIEnvExt::LrtPreviousStateOffset(kPointerSize);
+  const MemberOffset current_state_offset = JNIEnvExt::LrtSegmentStateOffset(kPointerSize);
+
+  Load(previous_state_reg, jni_env_reg, previous_state_offset, kLRTSegmentStateSize);
+  Load(current_state_reg, jni_env_reg, current_state_offset, kLRTSegmentStateSize);
+}
+
+template
+void JNIMacroAssembler<PointerSize::k32>::LoadLocalReferenceTableStates(
+    ManagedRegister jni_env_reg,
+    ManagedRegister previous_state_reg,
+    ManagedRegister current_state_reg);
+template
+void JNIMacroAssembler<PointerSize::k64>::LoadLocalReferenceTableStates(
+    ManagedRegister jni_env_reg,
+    ManagedRegister previous_state_reg,
+    ManagedRegister current_state_reg);
+
+template <PointerSize kPointerSize>
+void JNIMacroAssembler<kPointerSize>::StoreLocalReferenceTableStates(
+    ManagedRegister jni_env_reg,
+    ManagedRegister previous_state_reg,
+    ManagedRegister current_state_reg) {
+  constexpr size_t kLRTSegmentStateSize = sizeof(jni::LRTSegmentState);
+  const MemberOffset previous_state_offset = JNIEnvExt::LrtPreviousStateOffset(kPointerSize);
+  const MemberOffset segment_state_offset = JNIEnvExt::LrtSegmentStateOffset(kPointerSize);
+
+  Store(jni_env_reg, previous_state_offset, previous_state_reg, kLRTSegmentStateSize);
+  Store(jni_env_reg, segment_state_offset, current_state_reg, kLRTSegmentStateSize);
+}
+
+template
+void JNIMacroAssembler<PointerSize::k32>::StoreLocalReferenceTableStates(
+    ManagedRegister jni_env_reg,
+    ManagedRegister previous_state_reg,
+    ManagedRegister current_state_reg);
+template
+void JNIMacroAssembler<PointerSize::k64>::StoreLocalReferenceTableStates(
+    ManagedRegister jni_env_reg,
+    ManagedRegister previous_state_reg,
+    ManagedRegister current_state_reg);
 
 }  // namespace art

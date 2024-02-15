@@ -119,7 +119,7 @@ class ElfDebugReader {
   }
 
   template <typename VisitSym>
-  void VisitFunctionSymbols(VisitSym visit_sym) {
+  void VisitFunctionSymbols(VisitSym&& visit_sym) {
     const Elf_Shdr* symtab = GetSection(".symtab");
     const Elf_Shdr* strtab = GetSection(".strtab");
     const Elf_Shdr* text = GetSection(".text");
@@ -127,18 +127,20 @@ class ElfDebugReader {
       CHECK_EQ(symtab->sh_entsize, sizeof(Elf_Sym));
       size_t count = symtab->sh_size / sizeof(Elf_Sym);
       for (const Elf_Sym& symbol : Read<Elf_Sym>(symtab->sh_offset, count)) {
-        if (ELF_ST_TYPE(symbol.st_info) == STT_FUNC && &sections_[symbol.st_shndx] == text) {
+        if (ELF_ST_TYPE(symbol.st_info) == STT_FUNC &&
+            symbol.st_shndx < sections_.size() &&  // Ignore ABS section.
+            &sections_[symbol.st_shndx] == text) {
           visit_sym(symbol, Read<char>(strtab->sh_offset + symbol.st_name));
         }
       }
     }
     if (gnu_debugdata_reader_ != nullptr) {
-      gnu_debugdata_reader_->VisitFunctionSymbols(visit_sym);
+      gnu_debugdata_reader_->VisitFunctionSymbols(std::forward<VisitSym>(visit_sym));
     }
   }
 
   template <typename VisitSym>
-  void VisitDynamicSymbols(VisitSym visit_sym) {
+  void VisitDynamicSymbols(VisitSym&& visit_sym) {
     const Elf_Shdr* dynsym = GetSection(".dynsym");
     const Elf_Shdr* dynstr = GetSection(".dynstr");
     if (dynsym != nullptr && dynstr != nullptr) {
@@ -151,7 +153,7 @@ class ElfDebugReader {
   }
 
   template <typename VisitCIE, typename VisitFDE>
-  void VisitDebugFrame(VisitCIE visit_cie, VisitFDE visit_fde) {
+  void VisitDebugFrame(VisitCIE&& visit_cie, VisitFDE&& visit_fde) {
     const Elf_Shdr* debug_frame = GetSection(".debug_frame");
     if (debug_frame != nullptr) {
       for (size_t offset = 0; offset < debug_frame->sh_size;) {
@@ -167,7 +169,8 @@ class ElfDebugReader {
       }
     }
     if (gnu_debugdata_reader_ != nullptr) {
-      gnu_debugdata_reader_->VisitDebugFrame(visit_cie, visit_fde);
+      gnu_debugdata_reader_->VisitDebugFrame(std::forward<VisitCIE>(visit_cie),
+                                             std::forward<VisitFDE>(visit_fde));
     }
   }
 

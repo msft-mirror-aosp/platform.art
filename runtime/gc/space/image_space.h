@@ -20,11 +20,11 @@
 #include "android-base/unique_fd.h"
 #include "base/array_ref.h"
 #include "gc/accounting/space_bitmap.h"
-#include "image.h"
+#include "oat/image.h"
 #include "runtime.h"
 #include "space.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class DexFile;
 enum class InstructionSet;
@@ -133,27 +133,28 @@ class ImageSpace : public MemMapSpace {
   //           extension is not found or broken compile it in memory using
   //           the specified profile file in the BCP component path, each
   //           extension is compiled only against the primary boot image.
-  static bool LoadBootImage(
-      const std::vector<std::string>& boot_class_path,
-      const std::vector<std::string>& boot_class_path_locations,
-      const std::vector<int>& boot_class_path_fds,
-      const std::vector<int>& boot_class_path_image_fds,
-      const std::vector<int>& boot_class_path_vdex_fds,
-      const std::vector<int>& boot_class_path_oat_fds,
-      const std::vector<std::string>& image_locations,
-      const InstructionSet image_isa,
-      bool relocate,
-      bool executable,
-      size_t extra_reservation_size,
-      bool allow_in_memory_compilation,
-      /*out*/std::vector<std::unique_ptr<ImageSpace>>* boot_image_spaces,
-      /*out*/MemMap* extra_reservation) REQUIRES_SHARED(Locks::mutator_lock_);
+  static bool LoadBootImage(const std::vector<std::string>& boot_class_path,
+                            const std::vector<std::string>& boot_class_path_locations,
+                            ArrayRef<File> boot_class_path_files,
+                            ArrayRef<File> boot_class_path_image_files,
+                            ArrayRef<File> boot_class_path_vdex_files,
+                            ArrayRef<File> boot_class_path_oat_files,
+                            const std::vector<std::string>& image_locations,
+                            const InstructionSet image_isa,
+                            bool relocate,
+                            bool executable,
+                            size_t extra_reservation_size,
+                            bool allow_in_memory_compilation,
+                            const std::string& apex_versions,
+                            /*out*/ std::vector<std::unique_ptr<ImageSpace>>* boot_image_spaces,
+                            /*out*/ MemMap* extra_reservation)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Try to open an existing app image space for an oat file,
   // using the boot image spaces from the current Runtime.
-  static std::unique_ptr<ImageSpace> CreateFromAppImage(const char* image,
-                                                        const OatFile* oat_file,
-                                                        std::string* error_msg)
+  EXPORT static std::unique_ptr<ImageSpace> CreateFromAppImage(const char* image,
+                                                               const OatFile* oat_file,
+                                                               std::string* error_msg)
       REQUIRES_SHARED(Locks::mutator_lock_);
   // Try to open an existing app image space for an the oat file and given boot image spaces.
   static std::unique_ptr<ImageSpace> CreateFromAppImage(
@@ -166,7 +167,7 @@ class ImageSpace : public MemMapSpace {
   static bool IsBootClassPathOnDisk(InstructionSet image_isa);
 
   // Give access to the OatFile.
-  const OatFile* GetOatFile() const;
+  EXPORT const OatFile* GetOatFile() const;
 
   // Releases the OatFile from the ImageSpace so it can be transfer to
   // the caller, presumably the OatFileManager.
@@ -237,8 +238,8 @@ class ImageSpace : public MemMapSpace {
   // Returns the checksums for the boot image, extensions and extra boot class path dex files,
   // based on the image spaces and boot class path dex files loaded in memory.
   // The `image_spaces` must correspond to the head of the `boot_class_path`.
-  static std::string GetBootClassPathChecksums(ArrayRef<ImageSpace* const> image_spaces,
-                                               ArrayRef<const DexFile* const> boot_class_path);
+  EXPORT static std::string GetBootClassPathChecksums(
+      ArrayRef<ImageSpace* const> image_spaces, ArrayRef<const DexFile* const> boot_class_path);
 
   // Returns the total number of components (jar files) associated with the image spaces.
   static size_t GetNumberOfComponents(ArrayRef<gc::space::ImageSpace* const> image_spaces);
@@ -254,7 +255,7 @@ class ImageSpace : public MemMapSpace {
       /*out*/std::string* error_msg);
 
   // Expand a single image location to multi-image locations based on the dex locations.
-  static std::vector<std::string> ExpandMultiImageLocations(
+  EXPORT static std::vector<std::string> ExpandMultiImageLocations(
       ArrayRef<const std::string> dex_locations,
       const std::string& image_location,
       bool boot_image_extension = false);
@@ -289,7 +290,7 @@ class ImageSpace : public MemMapSpace {
   static bool ValidateOatFile(const OatFile& oat_file,
                               std::string* error_msg,
                               ArrayRef<const std::string> dex_filenames,
-                              ArrayRef<const int> dex_fds,
+                              ArrayRef<File> dex_files,
                               const std::string& apex_versions);
 
   // Return the end of the image which includes non-heap objects such as ArtMethods and ArtFields.
@@ -341,22 +342,24 @@ class ImageSpace : public MemMapSpace {
       mutable android::base::unique_fd oat_fd;
     };
 
+    // Creates an instance.
+    // `apex_versions` is created from `Runtime::GetApexVersions` and must outlive this instance.
     BootImageLayout(ArrayRef<const std::string> image_locations,
                     ArrayRef<const std::string> boot_class_path,
                     ArrayRef<const std::string> boot_class_path_locations,
-                    ArrayRef<const int> boot_class_path_fds,
-                    ArrayRef<const int> boot_class_path_image_fds,
-                    ArrayRef<const int> boot_class_path_vdex_fds,
-                    ArrayRef<const int> boot_class_path_oat_fds,
-                    const std::string* apex_versions = nullptr)
+                    ArrayRef<File> boot_class_path_files,
+                    ArrayRef<File> boot_class_path_image_files,
+                    ArrayRef<File> boot_class_path_vdex_files,
+                    ArrayRef<File> boot_class_path_oat_files,
+                    const std::string* apex_versions)
         : image_locations_(image_locations),
           boot_class_path_(boot_class_path),
           boot_class_path_locations_(boot_class_path_locations),
-          boot_class_path_fds_(boot_class_path_fds),
-          boot_class_path_image_fds_(boot_class_path_image_fds),
-          boot_class_path_vdex_fds_(boot_class_path_vdex_fds),
-          boot_class_path_oat_fds_(boot_class_path_oat_fds),
-          apex_versions_(GetApexVersions(apex_versions)) {}
+          boot_class_path_files_(boot_class_path_files),
+          boot_class_path_image_files_(boot_class_path_image_files),
+          boot_class_path_vdex_files_(boot_class_path_vdex_files),
+          boot_class_path_oat_files_(boot_class_path_oat_files),
+          apex_versions_(*apex_versions) {}
 
     std::string GetPrimaryImageLocation();
 
@@ -453,24 +456,13 @@ class ImageSpace : public MemMapSpace {
               bool allow_in_memory_compilation,
               /*out*/ std::string* error_msg);
 
-    // This function prefers taking APEX versions from the input instead of from the runtime if
-    // possible. If the input is present, `ValidateFromSystem` can work without an active runtime.
-    static const std::string& GetApexVersions(const std::string* apex_versions) {
-      if (apex_versions == nullptr) {
-        DCHECK(Runtime::Current() != nullptr);
-        return Runtime::Current()->GetApexVersions();
-      } else {
-        return *apex_versions;
-      }
-    }
-
     ArrayRef<const std::string> image_locations_;
     ArrayRef<const std::string> boot_class_path_;
     ArrayRef<const std::string> boot_class_path_locations_;
-    ArrayRef<const int> boot_class_path_fds_;
-    ArrayRef<const int> boot_class_path_image_fds_;
-    ArrayRef<const int> boot_class_path_vdex_fds_;
-    ArrayRef<const int> boot_class_path_oat_fds_;
+    ArrayRef<File> boot_class_path_files_;
+    ArrayRef<File> boot_class_path_image_files_;
+    ArrayRef<File> boot_class_path_vdex_files_;
+    ArrayRef<File> boot_class_path_oat_files_;
 
     std::vector<ImageChunk> chunks_;
     uint32_t base_address_ = 0u;

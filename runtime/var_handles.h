@@ -17,14 +17,28 @@
 #ifndef ART_RUNTIME_VAR_HANDLES_H_
 #define ART_RUNTIME_VAR_HANDLES_H_
 
+#include "base/macros.h"
 #include "mirror/var_handle.h"
 
-namespace art {
+namespace art HIDDEN {
+
+namespace mirror {
+class RawMethodType;
+}  // namespace mirror
 
 bool VarHandleInvokeAccessor(Thread* self,
                              ShadowFrame& shadow_frame,
                              Handle<mirror::VarHandle> var_handle,
                              Handle<mirror::MethodType> callsite_type,
+                             const mirror::VarHandle::AccessMode access_mode,
+                             const InstructionOperands* const operands,
+                             JValue* result)
+    REQUIRES_SHARED(Locks::mutator_lock_);
+
+bool VarHandleInvokeAccessor(Thread* self,
+                             ShadowFrame& shadow_frame,
+                             Handle<mirror::VarHandle> var_handle,
+                             mirror::RawMethodType callsite_type,
                              const mirror::VarHandle::AccessMode access_mode,
                              const InstructionOperands* const operands,
                              JValue* result)

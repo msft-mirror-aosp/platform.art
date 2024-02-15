@@ -23,7 +23,7 @@
 #include "method_verifier.h"
 #include "reg_type_cache-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace verifier {
 
 // Should we dump a warning on failures to verify balanced locking? That would be an indication to
@@ -184,7 +184,7 @@ inline RegisterLine::RegisterLine(size_t num_regs,
       reg_to_lock_depths_(std::less<uint32_t>(),
                           allocator.Adapter(kArenaAllocVerifier)),
       this_initialized_(false) {
-  std::uninitialized_fill_n(line_, num_regs_, 0u);
+  std::uninitialized_fill_n(line_, num_regs_, RegTypeCache::kUndefinedCacheId);
   SetResultTypeToUnknown(reg_types);
 }
 

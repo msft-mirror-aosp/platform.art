@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <functional>
+#include <optional>
 
 #include "art_method-inl.h"
 #include "base/arena_allocator.h"
@@ -35,7 +36,9 @@
 #include "class_root-inl.h"
 #include "code_generator.h"
 #include "common_dominator.h"
+#include "intrinsic_objects.h"
 #include "intrinsics.h"
+#include "intrinsics_list.h"
 #include "mirror/class-inl.h"
 #include "scoped_thread_state_change-inl.h"
 #include "ssa_builder.h"
@@ -254,6 +257,14 @@ GraphAnalysisResult HGraph::BuildDominatorTree() {
   return kAnalysisSuccess;
 }
 
+GraphAnalysisResult HGraph::RecomputeDominatorTree() {
+  DCHECK(!HasIrreducibleLoops()) << "Recomputing loop information in graphs with irreducible loops "
+                                 << "is unsupported, as it could lead to loop header changes";
+  ClearLoopInformation();
+  ClearDominanceInformation();
+  return BuildDominatorTree();
+}
+
 void HGraph::ClearDominanceInformation() {
   for (HBasicBlock* block : GetActiveBlocks()) {
     block->ClearDominanceInformation();
@@ -296,171 +307,6 @@ static bool UpdateDominatorOfSuccessor(HBasicBlock* block, HBasicBlock* successo
     successor->SetDominator(new_dominator);
     return true;
   }
-}
-
-// TODO Consider moving this entirely into LoadStoreAnalysis/Elimination.
-bool HGraph::PathBetween(uint32_t source_idx, uint32_t dest_idx) const {
-  DCHECK_LT(source_idx, blocks_.size()) << "source not present in graph!";
-  DCHECK_LT(dest_idx, blocks_.size()) << "dest not present in graph!";
-  DCHECK(blocks_[source_idx] != nullptr);
-  DCHECK(blocks_[dest_idx] != nullptr);
-  return reachability_graph_.IsBitSet(source_idx, dest_idx);
-}
-
-bool HGraph::PathBetween(const HBasicBlock* source, const HBasicBlock* dest) const {
-  if (source == nullptr || dest == nullptr) {
-    return false;
-  }
-  size_t source_idx = source->GetBlockId();
-  size_t dest_idx = dest->GetBlockId();
-  return PathBetween(source_idx, dest_idx);
-}
-
-// This function/struct calculates the reachability of every node from every
-// other node by iteratively using DFS to find reachability of each individual
-// block.
-//
-// This is in practice faster then the simpler Floyd-Warshall since while that
-// is O(N**3) this is O(N*(E + N)) where N is the number of blocks and E is the
-// number of edges. Since in practice each block only has a few outgoing edges
-// we can confidently say that E ~ B*N where B is a small number (~3). We also
-// memoize the results as we go allowing us to (potentially) avoid walking the
-// entire graph for every node. To make best use of this memoization we
-// calculate the reachability of blocks in PostOrder. This means that
-// (generally) blocks that are dominated by many other blocks and dominate few
-// blocks themselves will be examined first. This makes it more likely we can
-// use our memoized results.
-class ReachabilityAnalysisHelper {
- public:
-  ReachabilityAnalysisHelper(const HGraph* graph,
-                             ArenaBitVectorArray* reachability_graph,
-                             ArenaStack* arena_stack)
-      : graph_(graph),
-        reachability_graph_(reachability_graph),
-        arena_stack_(arena_stack),
-        temporaries_(arena_stack_),
-        block_size_(RoundUp(graph_->GetBlocks().size(), BitVector::kWordBits)),
-        all_visited_nodes_(
-            &temporaries_, graph_->GetBlocks().size(), false, kArenaAllocReachabilityGraph),
-        not_post_order_visited_(
-            &temporaries_, graph_->GetBlocks().size(), false, kArenaAllocReachabilityGraph) {
-    // We can't adjust the size of reachability graph any more without breaking
-    // our allocator invariants so it had better be large enough.
-    CHECK_GE(reachability_graph_->NumRows(), graph_->GetBlocks().size());
-    CHECK_GE(reachability_graph_->NumColumns(), graph_->GetBlocks().size());
-    not_post_order_visited_.SetInitialBits(graph_->GetBlocks().size());
-  }
-
-  void CalculateReachability() {
-    // Calculate what blocks connect using repeated DFS
-    //
-    // Going in PostOrder should generally give memoization a good shot of
-    // hitting.
-    for (const HBasicBlock* blk : graph_->GetPostOrder()) {
-      if (blk == nullptr) {
-        continue;
-      }
-      not_post_order_visited_.ClearBit(blk->GetBlockId());
-      CalculateConnectednessOn(blk);
-      all_visited_nodes_.SetBit(blk->GetBlockId());
-    }
-    // Get all other bits
-    for (auto idx : not_post_order_visited_.Indexes()) {
-      const HBasicBlock* blk = graph_->GetBlocks()[idx];
-      if (blk == nullptr) {
-        continue;
-      }
-      CalculateConnectednessOn(blk);
-      all_visited_nodes_.SetBit(blk->GetBlockId());
-    }
-  }
-
- private:
-  void AddEdge(uint32_t source, const HBasicBlock* dest) {
-    reachability_graph_->SetBit(source, dest->GetBlockId());
-  }
-
-  // Union the reachability of 'idx' into 'update_block_idx'. This is done to
-  // implement memoization. In order to improve performance we do this in 4-byte
-  // blocks. Clang should be able to optimize this to larger blocks if possible.
-  void UnionBlock(size_t update_block_idx, size_t idx) {
-    reachability_graph_->UnionRows(update_block_idx, idx);
-  }
-
-  // Single DFS to get connectedness of a single block
-  void CalculateConnectednessOn(const HBasicBlock* const target_block) {
-    const uint32_t target_idx = target_block->GetBlockId();
-    ScopedArenaAllocator connectedness_temps(arena_stack_);
-    // What nodes we have already discovered and either have processed or are
-    // already on the queue.
-    ArenaBitVector discovered(
-        &connectedness_temps, graph_->GetBlocks().size(), false, kArenaAllocReachabilityGraph);
-    // The work stack. What blocks we still need to process.
-    ScopedArenaVector<const HBasicBlock*> work_stack(
-        connectedness_temps.Adapter(kArenaAllocReachabilityGraph));
-    // Known max size since otherwise we'd have blocks multiple times. Avoids
-    // re-allocation
-    work_stack.reserve(graph_->GetBlocks().size());
-    discovered.SetBit(target_idx);
-    work_stack.push_back(target_block);
-    // Main DFS Loop.
-    while (!work_stack.empty()) {
-      const HBasicBlock* cur = work_stack.back();
-      work_stack.pop_back();
-      // Memoization of previous runs.
-      if (all_visited_nodes_.IsBitSet(cur->GetBlockId())) {
-        DCHECK_NE(target_block, cur);
-        // Already explored from here. Just use that data.
-        UnionBlock(target_idx, cur->GetBlockId());
-        continue;
-      }
-      for (const HBasicBlock* succ : cur->GetSuccessors()) {
-        AddEdge(target_idx, succ);
-        if (!discovered.IsBitSet(succ->GetBlockId())) {
-          work_stack.push_back(succ);
-          discovered.SetBit(succ->GetBlockId());
-        }
-      }
-    }
-  }
-
-  const HGraph* graph_;
-  // The graph's reachability_graph_ on the main allocator.
-  ArenaBitVectorArray* reachability_graph_;
-  ArenaStack* arena_stack_;
-  // An allocator for temporary bit-vectors used by this algorithm. The
-  // 'SetBit,ClearBit' on reachability_graph_ prior to the construction of this
-  // object should be the only allocation on the main allocator so it's safe to
-  // make a sub-allocator here.
-  ScopedArenaAllocator temporaries_;
-  // number of columns
-  const size_t block_size_;
-  // Where we've already completely calculated connectedness.
-  ArenaBitVector all_visited_nodes_;
-  // What we never visited and need to do later
-  ArenaBitVector not_post_order_visited_;
-
-  DISALLOW_COPY_AND_ASSIGN(ReachabilityAnalysisHelper);
-};
-
-void HGraph::ComputeReachabilityInformation() {
-  DCHECK_EQ(reachability_graph_.GetRawData().NumSetBits(), 0u);
-  DCHECK(reachability_graph_.IsExpandable());
-  // Reserve all the bits we'll need. This is the only allocation on the
-  // standard allocator we do here, enabling us to create a new ScopedArena for
-  // use with temporaries.
-  //
-  // reachability_graph_ acts as |N| x |N| graph for PathBetween. Array is
-  // padded so each row starts on an BitVector::kWordBits-bit alignment for
-  // simplicity and performance, allowing us to union blocks together without
-  // going bit-by-bit.
-  reachability_graph_.Resize(blocks_.size(), blocks_.size(), /*clear=*/false);
-  ReachabilityAnalysisHelper helper(this, &reachability_graph_, GetArenaStack());
-  helper.CalculateReachability();
-}
-
-void HGraph::ClearReachabilityInformation() {
-  reachability_graph_.Clear();
 }
 
 void HGraph::ComputeDominanceInformation() {
@@ -1488,11 +1334,11 @@ bool HInstructionList::FoundBefore(const HInstruction* instruction1,
                                    const HInstruction* instruction2) const {
   DCHECK_EQ(instruction1->GetBlock(), instruction2->GetBlock());
   for (HInstructionIterator it(*this); !it.Done(); it.Advance()) {
-    if (it.Current() == instruction1) {
-      return true;
-    }
     if (it.Current() == instruction2) {
       return false;
+    }
+    if (it.Current() == instruction1) {
+      return true;
     }
   }
   LOG(FATAL) << "Did not find an order between two instructions of the same block.";
@@ -1565,14 +1411,54 @@ void HInstruction::ReplaceWith(HInstruction* other) {
 void HInstruction::ReplaceUsesDominatedBy(HInstruction* dominator,
                                           HInstruction* replacement,
                                           bool strictly_dominated) {
+  HBasicBlock* dominator_block = dominator->GetBlock();
+  std::optional<ArenaBitVector> visited_blocks;
+
+  // Lazily compute the dominated blocks to faster calculation of domination afterwards.
+  auto maybe_generate_visited_blocks = [&visited_blocks, this, dominator_block]() {
+    if (visited_blocks.has_value()) {
+      return;
+    }
+    HGraph* graph = GetBlock()->GetGraph();
+    visited_blocks.emplace(graph->GetAllocator(),
+                           graph->GetBlocks().size(),
+                           /* expandable= */ false,
+                           kArenaAllocMisc);
+    visited_blocks->ClearAllBits();
+    ScopedArenaAllocator allocator(graph->GetArenaStack());
+    ScopedArenaQueue<const HBasicBlock*> worklist(allocator.Adapter(kArenaAllocMisc));
+    worklist.push(dominator_block);
+
+    while (!worklist.empty()) {
+      const HBasicBlock* current = worklist.front();
+      worklist.pop();
+      visited_blocks->SetBit(current->GetBlockId());
+      for (HBasicBlock* dominated : current->GetDominatedBlocks()) {
+        if (visited_blocks->IsBitSet(dominated->GetBlockId())) {
+          continue;
+        }
+        worklist.push(dominated);
+      }
+    }
+  };
+
   const HUseList<HInstruction*>& uses = GetUses();
   for (auto it = uses.begin(), end = uses.end(); it != end; /* ++it below */) {
     HInstruction* user = it->GetUser();
+    HBasicBlock* block = user->GetBlock();
     size_t index = it->GetIndex();
     // Increment `it` now because `*it` may disappear thanks to user->ReplaceInput().
     ++it;
-    const bool dominated =
-        strictly_dominated ? dominator->StrictlyDominates(user) : dominator->Dominates(user);
+    bool dominated = false;
+    if (dominator_block == block) {
+      // Trickier case, call the other methods.
+      dominated =
+          strictly_dominated ? dominator->StrictlyDominates(user) : dominator->Dominates(user);
+    } else {
+      // Block domination.
+      maybe_generate_visited_blocks();
+      dominated = visited_blocks->IsBitSet(block->GetBlockId());
+    }
 
     if (dominated) {
       user->ReplaceInput(replacement, index);
@@ -1580,9 +1466,9 @@ void HInstruction::ReplaceUsesDominatedBy(HInstruction* dominator,
       // If the input flows from a block dominated by `dominator`, we can replace it.
       // We do not perform this for catch phis as we don't have control flow support
       // for their inputs.
-      const ArenaVector<HBasicBlock*>& predecessors = user->GetBlock()->GetPredecessors();
-      HBasicBlock* predecessor = predecessors[index];
-      if (dominator->GetBlock()->Dominates(predecessor)) {
+      HBasicBlock* predecessor = block->GetPredecessors()[index];
+      maybe_generate_visited_blocks();
+      if (visited_blocks->IsBitSet(predecessor->GetBlockId())) {
         user->ReplaceInput(replacement, index);
       }
     }
@@ -1807,18 +1693,30 @@ void HGraphVisitor::VisitReversePostOrder() {
 }
 
 void HGraphVisitor::VisitBasicBlock(HBasicBlock* block) {
+  VisitPhis(block);
+  VisitNonPhiInstructions(block);
+}
+
+void HGraphVisitor::VisitPhis(HBasicBlock* block) {
   for (HInstructionIterator it(block->GetPhis()); !it.Done(); it.Advance()) {
-    it.Current()->Accept(this);
+    DCHECK(it.Current()->IsPhi());
+    VisitPhi(it.Current()->AsPhi());
   }
+}
+
+void HGraphVisitor::VisitNonPhiInstructions(HBasicBlock* block) {
   for (HInstructionIterator it(block->GetInstructions()); !it.Done(); it.Advance()) {
+    DCHECK(!it.Current()->IsPhi());
     it.Current()->Accept(this);
   }
 }
 
-HConstant* HTypeConversion::TryStaticEvaluation() const {
-  HGraph* graph = GetBlock()->GetGraph();
-  if (GetInput()->IsIntConstant()) {
-    int32_t value = GetInput()->AsIntConstant()->GetValue();
+HConstant* HTypeConversion::TryStaticEvaluation() const { return TryStaticEvaluation(GetInput()); }
+
+HConstant* HTypeConversion::TryStaticEvaluation(HInstruction* input) const {
+  HGraph* graph = input->GetBlock()->GetGraph();
+  if (input->IsIntConstant()) {
+    int32_t value = input->AsIntConstant()->GetValue();
     switch (GetResultType()) {
       case DataType::Type::kInt8:
         return graph->GetIntConstant(static_cast<int8_t>(value), GetDexPc());
@@ -1837,8 +1735,8 @@ HConstant* HTypeConversion::TryStaticEvaluation() const {
       default:
         return nullptr;
     }
-  } else if (GetInput()->IsLongConstant()) {
-    int64_t value = GetInput()->AsLongConstant()->GetValue();
+  } else if (input->IsLongConstant()) {
+    int64_t value = input->AsLongConstant()->GetValue();
     switch (GetResultType()) {
       case DataType::Type::kInt8:
         return graph->GetIntConstant(static_cast<int8_t>(value), GetDexPc());
@@ -1857,8 +1755,8 @@ HConstant* HTypeConversion::TryStaticEvaluation() const {
       default:
         return nullptr;
     }
-  } else if (GetInput()->IsFloatConstant()) {
-    float value = GetInput()->AsFloatConstant()->GetValue();
+  } else if (input->IsFloatConstant()) {
+    float value = input->AsFloatConstant()->GetValue();
     switch (GetResultType()) {
       case DataType::Type::kInt32:
         if (std::isnan(value))
@@ -1881,8 +1779,8 @@ HConstant* HTypeConversion::TryStaticEvaluation() const {
       default:
         return nullptr;
     }
-  } else if (GetInput()->IsDoubleConstant()) {
-    double value = GetInput()->AsDoubleConstant()->GetValue();
+  } else if (input->IsDoubleConstant()) {
+    double value = input->AsDoubleConstant()->GetValue();
     switch (GetResultType()) {
       case DataType::Type::kInt32:
         if (std::isnan(value))
@@ -1909,41 +1807,47 @@ HConstant* HTypeConversion::TryStaticEvaluation() const {
   return nullptr;
 }
 
-HConstant* HUnaryOperation::TryStaticEvaluation() const {
-  if (GetInput()->IsIntConstant()) {
-    return Evaluate(GetInput()->AsIntConstant());
-  } else if (GetInput()->IsLongConstant()) {
-    return Evaluate(GetInput()->AsLongConstant());
+HConstant* HUnaryOperation::TryStaticEvaluation() const { return TryStaticEvaluation(GetInput()); }
+
+HConstant* HUnaryOperation::TryStaticEvaluation(HInstruction* input) const {
+  if (input->IsIntConstant()) {
+    return Evaluate(input->AsIntConstant());
+  } else if (input->IsLongConstant()) {
+    return Evaluate(input->AsLongConstant());
   } else if (kEnableFloatingPointStaticEvaluation) {
-    if (GetInput()->IsFloatConstant()) {
-      return Evaluate(GetInput()->AsFloatConstant());
-    } else if (GetInput()->IsDoubleConstant()) {
-      return Evaluate(GetInput()->AsDoubleConstant());
+    if (input->IsFloatConstant()) {
+      return Evaluate(input->AsFloatConstant());
+    } else if (input->IsDoubleConstant()) {
+      return Evaluate(input->AsDoubleConstant());
     }
   }
   return nullptr;
 }
 
 HConstant* HBinaryOperation::TryStaticEvaluation() const {
-  if (GetLeft()->IsIntConstant() && GetRight()->IsIntConstant()) {
-    return Evaluate(GetLeft()->AsIntConstant(), GetRight()->AsIntConstant());
-  } else if (GetLeft()->IsLongConstant()) {
-    if (GetRight()->IsIntConstant()) {
+  return TryStaticEvaluation(GetLeft(), GetRight());
+}
+
+HConstant* HBinaryOperation::TryStaticEvaluation(HInstruction* left, HInstruction* right) const {
+  if (left->IsIntConstant() && right->IsIntConstant()) {
+    return Evaluate(left->AsIntConstant(), right->AsIntConstant());
+  } else if (left->IsLongConstant()) {
+    if (right->IsIntConstant()) {
       // The binop(long, int) case is only valid for shifts and rotations.
       DCHECK(IsShl() || IsShr() || IsUShr() || IsRor()) << DebugName();
-      return Evaluate(GetLeft()->AsLongConstant(), GetRight()->AsIntConstant());
-    } else if (GetRight()->IsLongConstant()) {
-      return Evaluate(GetLeft()->AsLongConstant(), GetRight()->AsLongConstant());
+      return Evaluate(left->AsLongConstant(), right->AsIntConstant());
+    } else if (right->IsLongConstant()) {
+      return Evaluate(left->AsLongConstant(), right->AsLongConstant());
     }
-  } else if (GetLeft()->IsNullConstant() && GetRight()->IsNullConstant()) {
+  } else if (left->IsNullConstant() && right->IsNullConstant()) {
     // The binop(null, null) case is only valid for equal and not-equal conditions.
     DCHECK(IsEqual() || IsNotEqual()) << DebugName();
-    return Evaluate(GetLeft()->AsNullConstant(), GetRight()->AsNullConstant());
+    return Evaluate(left->AsNullConstant(), right->AsNullConstant());
   } else if (kEnableFloatingPointStaticEvaluation) {
-    if (GetLeft()->IsFloatConstant() && GetRight()->IsFloatConstant()) {
-      return Evaluate(GetLeft()->AsFloatConstant(), GetRight()->AsFloatConstant());
-    } else if (GetLeft()->IsDoubleConstant() && GetRight()->IsDoubleConstant()) {
-      return Evaluate(GetLeft()->AsDoubleConstant(), GetRight()->AsDoubleConstant());
+    if (left->IsFloatConstant() && right->IsFloatConstant()) {
+      return Evaluate(left->AsFloatConstant(), right->AsFloatConstant());
+    } else if (left->IsDoubleConstant() && right->IsDoubleConstant()) {
+      return Evaluate(left->AsDoubleConstant(), right->AsDoubleConstant());
     }
   }
   return nullptr;
@@ -2797,8 +2701,11 @@ HInstruction* HGraph::InlineInto(HGraph* outer_graph, HInvoke* invoke) {
   if (HasMonitorOperations()) {
     outer_graph->SetHasMonitorOperations(true);
   }
-  if (HasSIMD()) {
-    outer_graph->SetHasSIMD(true);
+  if (HasTraditionalSIMD()) {
+    outer_graph->SetHasTraditionalSIMD(true);
+  }
+  if (HasPredicatedSIMD()) {
+    outer_graph->SetHasPredicatedSIMD(true);
   }
   if (HasAlwaysThrowingInvokes()) {
     outer_graph->SetHasAlwaysThrowingInvokes(true);
@@ -2989,12 +2896,7 @@ HInstruction* HGraph::InlineInto(HGraph* outer_graph, HInvoke* invoke) {
       }
     }
     if (rerun_loop_analysis) {
-      DCHECK(!outer_graph->HasIrreducibleLoops())
-          << "Recomputing loop information in graphs with irreducible loops "
-          << "is unsupported, as it could lead to loop header changes";
-      outer_graph->ClearLoopInformation();
-      outer_graph->ClearDominanceInformation();
-      outer_graph->BuildDominatorTree();
+      outer_graph->RecomputeDominatorTree();
     } else if (rerun_dominance) {
       outer_graph->ClearDominanceInformation();
       outer_graph->ComputeDominanceInformation();
@@ -3026,9 +2928,9 @@ HInstruction* HGraph::InlineInto(HGraph* outer_graph, HInvoke* invoke) {
       replacement = outer_graph->GetDoubleConstant(
           current->AsDoubleConstant()->GetValue(), current->GetDexPc());
     } else if (current->IsParameterValue()) {
-      if (kIsDebugBuild
-          && invoke->IsInvokeStaticOrDirect()
-          && invoke->AsInvokeStaticOrDirect()->IsStaticWithExplicitClinitCheck()) {
+      if (kIsDebugBuild &&
+          invoke->IsInvokeStaticOrDirect() &&
+          invoke->AsInvokeStaticOrDirect()->IsStaticWithExplicitClinitCheck()) {
         // Ensure we do not use the last input of `invoke`, as it
         // contains a clinit check which is not an actual argument.
         size_t last_input_index = invoke->InputCount() - 1;
@@ -3125,6 +3027,8 @@ void HGraph::TransformLoopHeaderForBCE(HBasicBlock* header) {
       new_pre_header, old_pre_header, /* replace_if_back_edge= */ false);
 }
 
+// Creates a new two-basic-block loop and inserts it between original loop header and
+// original loop exit; also adjusts dominators, post order and new LoopInformation.
 HBasicBlock* HGraph::TransformLoopForVectorization(HBasicBlock* header,
                                                    HBasicBlock* body,
                                                    HBasicBlock* exit) {
@@ -3346,6 +3250,21 @@ std::ostream& operator<<(std::ostream& os, HInvokeStaticOrDirect::ClinitCheckReq
   }
 }
 
+bool HInvokeStaticOrDirect::CanBeNull() const {
+  if (GetType() != DataType::Type::kReference || IsStringInit()) {
+    return false;
+  }
+  switch (GetIntrinsic()) {
+#define DEFINE_BOXED_CASE(name, unused1, unused2, unused3, unused4) \
+    case Intrinsics::k##name##ValueOf: \
+      return false;
+    BOXED_TYPES(DEFINE_BOXED_CASE)
+#undef DEFINE_BOXED_CASE
+    default:
+      return true;
+  }
+}
+
 bool HInvokeVirtual::CanDoImplicitNullCheckOn(HInstruction* obj) const {
   if (obj != InputAt(0)) {
     return false;
@@ -3518,9 +3437,7 @@ std::ostream& operator<<(std::ostream& os, TypeCheckKind rhs) {
   static_assert( \
     static_cast<uint32_t>(Intrinsics::k ## Name) <= (kAccIntrinsicBits >> CTZ(kAccIntrinsicBits)), \
     "Instrinsics enumeration space overflow.");
-#include "intrinsics_list.h"
-  INTRINSICS_LIST(CHECK_INTRINSICS_ENUM_VALUES)
-#undef INTRINSICS_LIST
+  ART_INTRINSICS_LIST(CHECK_INTRINSICS_ENUM_VALUES)
 #undef CHECK_INTRINSICS_ENUM_VALUES
 
 // Function that returns whether an intrinsic needs an environment or not.
@@ -3531,9 +3448,7 @@ static inline IntrinsicNeedsEnvironment NeedsEnvironmentIntrinsic(Intrinsics i) 
 #define OPTIMIZING_INTRINSICS(Name, InvokeType, NeedsEnv, SideEffects, Exceptions, ...) \
     case Intrinsics::k ## Name: \
       return NeedsEnv;
-#include "intrinsics_list.h"
-      INTRINSICS_LIST(OPTIMIZING_INTRINSICS)
-#undef INTRINSICS_LIST
+      ART_INTRINSICS_LIST(OPTIMIZING_INTRINSICS)
 #undef OPTIMIZING_INTRINSICS
   }
   return kNeedsEnvironment;
@@ -3547,9 +3462,7 @@ static inline IntrinsicSideEffects GetSideEffectsIntrinsic(Intrinsics i) {
 #define OPTIMIZING_INTRINSICS(Name, InvokeType, NeedsEnv, SideEffects, Exceptions, ...) \
     case Intrinsics::k ## Name: \
       return SideEffects;
-#include "intrinsics_list.h"
-      INTRINSICS_LIST(OPTIMIZING_INTRINSICS)
-#undef INTRINSICS_LIST
+      ART_INTRINSICS_LIST(OPTIMIZING_INTRINSICS)
 #undef OPTIMIZING_INTRINSICS
   }
   return kAllSideEffects;
@@ -3563,9 +3476,7 @@ static inline IntrinsicExceptions GetExceptionsIntrinsic(Intrinsics i) {
 #define OPTIMIZING_INTRINSICS(Name, InvokeType, NeedsEnv, SideEffects, Exceptions, ...) \
     case Intrinsics::k ## Name: \
       return Exceptions;
-#include "intrinsics_list.h"
-      INTRINSICS_LIST(OPTIMIZING_INTRINSICS)
-#undef INTRINSICS_LIST
+      ART_INTRINSICS_LIST(OPTIMIZING_INTRINSICS)
 #undef OPTIMIZING_INTRINSICS
   }
   return kCanThrow;

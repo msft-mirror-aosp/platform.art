@@ -29,6 +29,7 @@
 #include "base/systrace.h"
 #include "dex/dex_file_types.h"
 #include "dex/dex_instruction.h"
+#include "dex/dex_instruction-inl.h"
 #include "entrypoints/entrypoint_utils.h"
 #include "entrypoints/quick/quick_entrypoints_enum.h"
 #include "entrypoints/runtime_asm_entrypoints.h"
@@ -40,11 +41,11 @@
 #include "mirror/class_loader.h"
 #include "mirror/throwable.h"
 #include "nterp_helpers.h"
-#include "oat_quick_method_header.h"
+#include "oat/oat_quick_method_header.h"
+#include "oat/stack_map.h"
 #include "stack.h"
-#include "stack_map.h"
 
-namespace art {
+namespace art HIDDEN {
 
 static constexpr bool kDebugExceptionDelivery = false;
 static constexpr size_t kInvalidFrameDepth = 0xffffffff;
@@ -385,6 +386,7 @@ class DeoptimizeStackVisitor final : public StackVisitor {
       : StackVisitor(self, context, StackVisitor::StackWalkKind::kIncludeInlinedFrames),
         exception_handler_(exception_handler),
         prev_shadow_frame_(nullptr),
+        bottom_shadow_frame_(nullptr),
         stacked_shadow_frame_pushed_(false),
         single_frame_deopt_(single_frame),
         single_frame_done_(false),
@@ -399,6 +401,14 @@ class DeoptimizeStackVisitor final : public StackVisitor {
 
   const OatQuickMethodHeader* GetSingleFrameDeoptQuickMethodHeader() const {
     return single_frame_deopt_quick_method_header_;
+  }
+
+  ShadowFrame* GetBottomShadowFrame() const {
+    return bottom_shadow_frame_;
+  }
+
+  const std::vector<uint32_t>& GetDexPcs() const {
+    return dex_pcs_;
   }
 
   void FinishStackWalk() REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -503,16 +513,20 @@ class DeoptimizeStackVisitor final : public StackVisitor {
         // Will be popped after the long jump after DeoptimizeStack(),
         // right before interpreter::EnterInterpreterFromDeoptimize().
         stacked_shadow_frame_pushed_ = true;
+        bottom_shadow_frame_ = new_frame;
         GetThread()->PushStackedShadowFrame(
             new_frame, StackedShadowFrameType::kDeoptimizationShadowFrame);
       }
       prev_shadow_frame_ = new_frame;
 
-      if (single_frame_deopt_ && !IsInInlinedFrame()) {
-        // Single-frame deopt ends at the first non-inlined frame and needs to store that method.
-        single_frame_done_ = true;
-        single_frame_deopt_method_ = method;
-        single_frame_deopt_quick_method_header_ = GetCurrentOatQuickMethodHeader();
+      if (single_frame_deopt_) {
+        dex_pcs_.push_back(GetDexPc());
+        if (!IsInInlinedFrame()) {
+          // Single-frame deopt ends at the first non-inlined frame and needs to store that method.
+          single_frame_done_ = true;
+          single_frame_deopt_method_ = method;
+          single_frame_deopt_quick_method_header_ = GetCurrentOatQuickMethodHeader();
+        }
       }
       callee_method_ = method;
       return true;
@@ -641,6 +655,7 @@ class DeoptimizeStackVisitor final : public StackVisitor {
 
   QuickExceptionHandler* const exception_handler_;
   ShadowFrame* prev_shadow_frame_;
+  ShadowFrame* bottom_shadow_frame_;
   bool stacked_shadow_frame_pushed_;
   const bool single_frame_deopt_;
   bool single_frame_done_;
@@ -651,6 +666,7 @@ class DeoptimizeStackVisitor final : public StackVisitor {
   // a deopt after running method exit callbacks if the callback throws or requests events that
   // need a deopt.
   bool skip_method_exit_callbacks_;
+  std::vector<uint32_t> dex_pcs_;
 
   DISALLOW_COPY_AND_ASSIGN(DeoptimizeStackVisitor);
 };
@@ -707,12 +723,56 @@ void QuickExceptionHandler::DeoptimizeSingleFrame(DeoptimizationKind kind) {
   // When deoptimizing for debug support the optimized code is still valid and
   // can be reused when debugging support (like breakpoints) are no longer
   // needed fot this method.
-  if (Runtime::Current()->UseJitCompilation() && (kind != DeoptimizationKind::kDebugging)) {
-    Runtime::Current()->GetJit()->GetCodeCache()->InvalidateCompiledCodeFor(
+  Runtime* runtime = Runtime::Current();
+  if (runtime->UseJitCompilation() && (kind != DeoptimizationKind::kDebugging)) {
+    runtime->GetJit()->GetCodeCache()->InvalidateCompiledCodeFor(
         deopt_method, visitor.GetSingleFrameDeoptQuickMethodHeader());
   } else {
-    Runtime::Current()->GetInstrumentation()->InitializeMethodsCode(
+    runtime->GetInstrumentation()->InitializeMethodsCode(
         deopt_method, /*aot_code=*/ nullptr);
+  }
+
+  // If the deoptimization is due to an inline cache, update it with the type
+  // that made us deoptimize. This avoids pathological cases of never seeing
+  // that type while executing baseline generated code.
+  if (kind == DeoptimizationKind::kJitInlineCache || kind == DeoptimizationKind::kJitSameTarget) {
+    DCHECK(runtime->UseJitCompilation());
+    ShadowFrame* shadow_frame = visitor.GetBottomShadowFrame();
+    uint32_t dex_pc = shadow_frame->GetDexPC();
+    CodeItemDataAccessor accessor(shadow_frame->GetMethod()->DexInstructionData());
+    const uint16_t* const insns = accessor.Insns();
+    const Instruction* inst = Instruction::At(insns + dex_pc);
+    switch (inst->Opcode()) {
+      case Instruction::INVOKE_INTERFACE:
+      case Instruction::INVOKE_VIRTUAL:
+      case Instruction::INVOKE_INTERFACE_RANGE:
+      case Instruction::INVOKE_VIRTUAL_RANGE: {
+        uint32_t encoded_dex_pc = InlineCache::EncodeDexPc(
+            visitor.GetSingleFrameDeoptMethod(),
+            visitor.GetDexPcs(),
+            runtime->GetJit()->GetJitCompiler()->GetInlineMaxCodeUnits());
+        if (encoded_dex_pc != static_cast<uint32_t>(-1)) {
+          // The inline cache comes from the top-level method.
+          runtime->GetJit()->GetCodeCache()->MaybeUpdateInlineCache(
+              visitor.GetSingleFrameDeoptMethod(),
+              encoded_dex_pc,
+              shadow_frame->GetVRegReference(inst->VRegC())->GetClass(),
+              self_);
+        } else {
+          // If the top-level inline cache did not exist, update the one for the
+          // bottom method, we know it's the one that was used for compilation.
+          runtime->GetJit()->GetCodeCache()->MaybeUpdateInlineCache(
+              shadow_frame->GetMethod(),
+              dex_pc,
+              shadow_frame->GetVRegReference(inst->VRegC())->GetClass(),
+              self_);
+        }
+        break;
+      }
+      default: {
+        LOG(FATAL) << "Unexpected instruction for inline cache: " << inst->Name();
+      }
+    }
   }
 
   PrepareForLongJumpToInvokeStubOrInterpreterBridge();

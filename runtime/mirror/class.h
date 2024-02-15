@@ -30,7 +30,7 @@
 #include "object_array.h"
 #include "read_barrier_option.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace dex {
 struct ClassDef;
@@ -82,7 +82,7 @@ using StringDexCachePair = DexCachePair<String>;
 using StringDexCacheType = std::atomic<StringDexCachePair>;
 
 // C++ mirror of java.lang.Class
-class MANAGED Class final : public Object {
+class EXPORT MANAGED Class final : public Object {
  public:
   MIRROR_CLASS("Ljava/lang/Class;");
 
@@ -208,6 +208,11 @@ class MANAGED Class final : public Object {
   bool IsVisiblyInitialized() REQUIRES_SHARED(Locks::mutator_lock_) {
     // Note: Avoiding the synchronization barrier for the visibly initialized check.
     ClassStatus status = GetStatus<kVerifyFlags, /*kWithSynchronizationBarrier=*/ false>();
+
+    // We need to prevent the compiler from reordering loads that depend
+    // on the class being visibly initialized before the status load above.
+    asm volatile ("" : : : "memory");
+
     return status == ClassStatus::kVisiblyInitialized;
   }
 
@@ -575,7 +580,7 @@ class MANAGED Class final : public Object {
   // The size of java.lang.Class.class.
   static uint32_t ClassClassSize(PointerSize pointer_size) {
     // The number of vtable entries in java.lang.Class.
-    uint32_t vtable_entries = Object::kVTableLength + 81;
+    uint32_t vtable_entries = Object::kVTableLength + 83;
     return ComputeClassSize(true, vtable_entries, 0, 0, 4, 1, 0, pointer_size);
   }
 

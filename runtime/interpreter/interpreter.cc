@@ -35,7 +35,7 @@
 #include "thread-inl.h"
 #include "unstarted_runtime.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace interpreter {
 
 ALWAYS_INLINE static ObjPtr<mirror::Object> ObjArg(uint32_t arg)
@@ -272,7 +272,10 @@ static inline JValue Execute(
     ArtMethod *method = shadow_frame.GetMethod();
 
     // If we can continue in JIT and have JITed code available execute JITed code.
-    if (!stay_in_interpreter && !self->IsForceInterpreter() && !shadow_frame.GetForcePopFrame()) {
+    if (!stay_in_interpreter &&
+        !self->IsForceInterpreter() &&
+        !shadow_frame.GetForcePopFrame() &&
+        !shadow_frame.GetNotifyDexPcMoveEvents()) {
       jit::Jit* jit = Runtime::Current()->GetJit();
       if (jit != nullptr) {
         jit->MethodEntered(self, shadow_frame.GetMethod());
@@ -377,7 +380,7 @@ void EnterInterpreterFromInvoke(Thread* self,
     return;
   } else {
     DCHECK(method->IsNative()) << method->PrettyMethod();
-    num_regs = num_ins = ArtMethod::NumArgRegisters(method->GetShorty());
+    num_regs = num_ins = ArtMethod::NumArgRegisters(method->GetShortyView());
     if (!method->IsStatic()) {
       num_regs++;
       num_ins++;

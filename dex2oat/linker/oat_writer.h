@@ -32,6 +32,7 @@
 #include "dex/compact_dex_level.h"
 #include "dex/method_reference.h"
 #include "dex/string_reference.h"
+#include "dex/proto_reference.h"
 #include "dex/type_reference.h"
 #include "linker/relative_patcher.h"  // For RelativePatcherTargetProvider.
 #include "mirror/class.h"
@@ -93,7 +94,7 @@ enum class CopyOption {
 // ...
 // MethodBssMapping
 //
-// VmapTable         one variable sized VmapTable blob (CodeInfo or QuickeningInfo).
+// VmapTable         one variable sized VmapTable blob (CodeInfo).
 // VmapTable         VmapTables are deduplicated.
 // ...
 // VmapTable
@@ -147,7 +148,8 @@ class OatWriter {
       const char* location);
   // Add dex file source from raw memory.
   bool AddRawDexFileSource(
-      const ArrayRef<const uint8_t>& data,
+      std::shared_ptr<DexFileContainer> container,
+      const uint8_t* dex_file_begin,
       const char* location,
       uint32_t location_checksum);
   // Add dex file source(s) from a vdex file.
@@ -286,7 +288,6 @@ class OatWriter {
   bool OpenDexFiles(File* file,
                     /*inout*/ std::vector<MemMap>* opened_dex_files_map,
                     /*out*/ std::vector<std::unique_ptr<const DexFile>>* opened_dex_files);
-  void WriteQuickeningInfo(/*out*/std::vector<uint8_t>* buffer);
   void WriteTypeLookupTables(/*out*/std::vector<uint8_t>* buffer);
   void WriteVerifierDeps(verifier::VerifierDeps* verifier_deps,
                          /*out*/std::vector<uint8_t>* buffer);
@@ -321,7 +322,8 @@ class OatWriter {
                                      uint32_t type_bss_mapping_offset,
                                      uint32_t public_type_bss_mapping_offset,
                                      uint32_t package_type_bss_mapping_offset,
-                                     uint32_t string_bss_mapping_offset);
+                                     uint32_t string_bss_mapping_offset,
+                                     uint32_t method_type_bss_mapping_offset);
   size_t InitIndexBssMappingsHelper(size_t offset,
                                     const DexFile* dex_file,
                                     /*inout*/ size_t& number_of_method_dex_files,
@@ -329,11 +331,13 @@ class OatWriter {
                                     /*inout*/ size_t& number_of_public_type_dex_files,
                                     /*inout*/ size_t& number_of_package_type_dex_files,
                                     /*inout*/ size_t& number_of_string_dex_files,
+                                    /*inout*/ size_t& number_of_method_type_dex_files,
                                     /*inout*/ uint32_t& method_bss_mapping_offset,
                                     /*inout*/ uint32_t& type_bss_mapping_offset,
                                     /*inout*/ uint32_t& public_type_bss_mapping_offset,
                                     /*inout*/ uint32_t& package_type_bss_mapping_offset,
-                                    /*inout*/ uint32_t& string_bss_mapping_offset);
+                                    /*inout*/ uint32_t& string_bss_mapping_offset,
+                                    /*inout*/ uint32_t& method_type_bss_mapping_offset);
 
   bool RecordOatDataOffset(OutputStream* out);
   void InitializeTypeLookupTables(
@@ -397,9 +401,6 @@ class OatWriter {
   // Offset of section holding VerifierDeps inside Vdex.
   size_t vdex_verifier_deps_offset_;
 
-  // Offset of section holding quickening info inside Vdex.
-  size_t vdex_quickening_info_offset_;
-
   // Offset of type lookup tables inside Vdex.
   size_t vdex_lookup_tables_offset_;
 
@@ -452,6 +453,9 @@ class OatWriter {
   // Map for recording references to GcRoot<mirror::String> entries in .bss.
   SafeMap<const DexFile*, BitVector> bss_string_entry_references_;
 
+  // Map for recording references to GcRoot<mirror::MethodType> entries in .bss.
+  SafeMap<const DexFile*, BitVector> bss_method_type_entry_references_;
+
   // Map for allocating ArtMethod entries in .bss. Indexed by MethodReference for the target
   // method in the dex file with the "method reference value comparator" for deduplication.
   // The value is the target offset for patching, starting at `bss_start_ + bss_methods_offset_`.
@@ -477,6 +481,11 @@ class OatWriter {
   // is the target offset for patching, starting at `bss_start_ + bss_roots_offset_`.
   SafeMap<StringReference, size_t, StringReferenceValueComparator> bss_string_entries_;
 
+  // Map for allocating MethodType entries in .bss. Indexed by ProtoReference for the source
+  // proto in the dex file with the "proto value comparator" for deduplication. The value
+  // is the target offset for patching, starting at `bss_start_ + bss_roots_offset_`.
+  SafeMap<ProtoReference, size_t, ProtoReferenceValueComparator> bss_method_type_entries_;
+
   // Offset of the oat data from the start of the mmapped region of the elf file.
   size_t oat_data_offset_;
 
@@ -497,71 +506,73 @@ class OatWriter {
   std::unique_ptr<const std::vector<uint8_t>> nterp_trampoline_;
 
   // output stats
-  uint32_t size_vdex_header_;
-  uint32_t size_vdex_checksums_;
-  uint32_t size_dex_file_alignment_;
-  uint32_t size_quickening_table_offset_;
-  uint32_t size_executable_offset_alignment_;
-  uint32_t size_oat_header_;
-  uint32_t size_oat_header_key_value_store_;
-  uint32_t size_dex_file_;
-  uint32_t size_verifier_deps_;
-  uint32_t size_verifier_deps_alignment_;
-  uint32_t size_quickening_info_;
-  uint32_t size_quickening_info_alignment_;
-  uint32_t size_vdex_lookup_table_alignment_;
-  uint32_t size_vdex_lookup_table_;
-  uint32_t size_interpreter_to_interpreter_bridge_;
-  uint32_t size_interpreter_to_compiled_code_bridge_;
-  uint32_t size_jni_dlsym_lookup_trampoline_;
-  uint32_t size_jni_dlsym_lookup_critical_trampoline_;
-  uint32_t size_quick_generic_jni_trampoline_;
-  uint32_t size_quick_imt_conflict_trampoline_;
-  uint32_t size_quick_resolution_trampoline_;
-  uint32_t size_quick_to_interpreter_bridge_;
-  uint32_t size_nterp_trampoline_;
-  uint32_t size_trampoline_alignment_;
-  uint32_t size_method_header_;
-  uint32_t size_code_;
-  uint32_t size_code_alignment_;
-  uint32_t size_data_bimg_rel_ro_;
-  uint32_t size_data_bimg_rel_ro_alignment_;
-  uint32_t size_relative_call_thunks_;
-  uint32_t size_misc_thunks_;
-  uint32_t size_vmap_table_;
-  uint32_t size_method_info_;
-  uint32_t size_oat_dex_file_location_size_;
-  uint32_t size_oat_dex_file_location_data_;
-  uint32_t size_oat_dex_file_location_checksum_;
-  uint32_t size_oat_dex_file_offset_;
-  uint32_t size_oat_dex_file_class_offsets_offset_;
-  uint32_t size_oat_dex_file_lookup_table_offset_;
-  uint32_t size_oat_dex_file_dex_layout_sections_offset_;
-  uint32_t size_oat_dex_file_dex_layout_sections_;
-  uint32_t size_oat_dex_file_dex_layout_sections_alignment_;
-  uint32_t size_oat_dex_file_method_bss_mapping_offset_;
-  uint32_t size_oat_dex_file_type_bss_mapping_offset_;
-  uint32_t size_oat_dex_file_public_type_bss_mapping_offset_;
-  uint32_t size_oat_dex_file_package_type_bss_mapping_offset_;
-  uint32_t size_oat_dex_file_string_bss_mapping_offset_;
-  uint32_t size_bcp_bss_info_size_;
-  uint32_t size_bcp_bss_info_method_bss_mapping_offset_;
-  uint32_t size_bcp_bss_info_type_bss_mapping_offset_;
-  uint32_t size_bcp_bss_info_public_type_bss_mapping_offset_;
-  uint32_t size_bcp_bss_info_package_type_bss_mapping_offset_;
-  uint32_t size_bcp_bss_info_string_bss_mapping_offset_;
-  uint32_t size_oat_class_offsets_alignment_;
-  uint32_t size_oat_class_offsets_;
-  uint32_t size_oat_class_type_;
-  uint32_t size_oat_class_status_;
-  uint32_t size_oat_class_num_methods_;
-  uint32_t size_oat_class_method_bitmaps_;
-  uint32_t size_oat_class_method_offsets_;
-  uint32_t size_method_bss_mappings_;
-  uint32_t size_type_bss_mappings_;
-  uint32_t size_public_type_bss_mappings_;
-  uint32_t size_package_type_bss_mappings_;
-  uint32_t size_string_bss_mappings_;
+  uint32_t size_vdex_header_ = 0;
+  uint32_t size_vdex_checksums_ = 0;
+  uint32_t size_dex_file_alignment_ = 0;
+  uint32_t size_executable_offset_alignment_ = 0;
+  uint32_t size_oat_header_ = 0;
+  uint32_t size_oat_header_key_value_store_ = 0;
+  uint32_t size_dex_file_ = 0;
+  uint32_t size_verifier_deps_ = 0;
+  uint32_t size_verifier_deps_alignment_ = 0;
+  uint32_t size_vdex_lookup_table_alignment_ = 0;
+  uint32_t size_vdex_lookup_table_ = 0;
+  uint32_t size_interpreter_to_interpreter_bridge_ = 0;
+  uint32_t size_interpreter_to_compiled_code_bridge_ = 0;
+  uint32_t size_jni_dlsym_lookup_trampoline_ = 0;
+  uint32_t size_jni_dlsym_lookup_critical_trampoline_ = 0;
+  uint32_t size_quick_generic_jni_trampoline_ = 0;
+  uint32_t size_quick_imt_conflict_trampoline_ = 0;
+  uint32_t size_quick_resolution_trampoline_ = 0;
+  uint32_t size_quick_to_interpreter_bridge_ = 0;
+  uint32_t size_nterp_trampoline_ = 0;
+  uint32_t size_trampoline_alignment_ = 0;
+  uint32_t size_method_header_ = 0;
+  uint32_t size_code_ = 0;
+  uint32_t size_code_alignment_ = 0;
+  uint32_t size_data_bimg_rel_ro_ = 0;
+  uint32_t size_data_bimg_rel_ro_alignment_ = 0;
+  uint32_t size_relative_call_thunks_ = 0;
+  uint32_t size_misc_thunks_ = 0;
+  uint32_t size_vmap_table_ = 0;
+  uint32_t size_method_info_ = 0;
+  uint32_t size_oat_dex_file_location_size_ = 0;
+  uint32_t size_oat_dex_file_location_data_ = 0;
+  uint32_t size_oat_dex_file_magic_ = 0;
+  uint32_t size_oat_dex_file_location_checksum_ = 0;
+  uint32_t size_oat_dex_file_sha1_ = 0;
+  uint32_t size_oat_dex_file_offset_ = 0;
+  uint32_t size_oat_dex_file_class_offsets_offset_ = 0;
+  uint32_t size_oat_dex_file_lookup_table_offset_ = 0;
+  uint32_t size_oat_dex_file_dex_layout_sections_offset_ = 0;
+  uint32_t size_oat_dex_file_dex_layout_sections_ = 0;
+  uint32_t size_oat_dex_file_dex_layout_sections_alignment_ = 0;
+  uint32_t size_oat_dex_file_method_bss_mapping_offset_ = 0;
+  uint32_t size_oat_dex_file_type_bss_mapping_offset_ = 0;
+  uint32_t size_oat_dex_file_public_type_bss_mapping_offset_ = 0;
+  uint32_t size_oat_dex_file_package_type_bss_mapping_offset_ = 0;
+  uint32_t size_oat_dex_file_string_bss_mapping_offset_ = 0;
+  uint32_t size_oat_dex_file_method_type_bss_mapping_offset_ = 0;
+  uint32_t size_bcp_bss_info_size_ = 0;
+  uint32_t size_bcp_bss_info_method_bss_mapping_offset_ = 0;
+  uint32_t size_bcp_bss_info_type_bss_mapping_offset_ = 0;
+  uint32_t size_bcp_bss_info_public_type_bss_mapping_offset_ = 0;
+  uint32_t size_bcp_bss_info_package_type_bss_mapping_offset_ = 0;
+  uint32_t size_bcp_bss_info_string_bss_mapping_offset_ = 0;
+  uint32_t size_bcp_bss_info_method_type_bss_mapping_offset_ = 0;
+  uint32_t size_oat_class_offsets_alignment_ = 0;
+  uint32_t size_oat_class_offsets_ = 0;
+  uint32_t size_oat_class_type_ = 0;
+  uint32_t size_oat_class_status_ = 0;
+  uint32_t size_oat_class_num_methods_ = 0;
+  uint32_t size_oat_class_method_bitmaps_ = 0;
+  uint32_t size_oat_class_method_offsets_ = 0;
+  uint32_t size_method_bss_mappings_ = 0;
+  uint32_t size_type_bss_mappings_ = 0;
+  uint32_t size_public_type_bss_mappings_ = 0;
+  uint32_t size_package_type_bss_mappings_ = 0;
+  uint32_t size_string_bss_mappings_ = 0;
+  uint32_t size_method_type_bss_mappings_ = 0;
 
   // The helper for processing relative patches is external so that we can patch across oat files.
   MultiOatRelativePatcher* relative_patcher_;

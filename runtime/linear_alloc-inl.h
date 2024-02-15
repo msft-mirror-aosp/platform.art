@@ -22,7 +22,7 @@
 #include "base/gc_visited_arena_pool.h"
 #include "thread-current-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 inline void LinearAlloc::SetFirstObject(void* begin, size_t bytes) const {
   DCHECK(track_allocations_);
@@ -38,6 +38,18 @@ inline void LinearAlloc::SetFirstObject(void* begin, size_t bytes) const {
   }
   DCHECK(begin >= arena->Begin() && end <= arena->End());
   down_cast<TrackedArena*>(arena)->SetFirstObject(static_cast<uint8_t*>(begin), end);
+}
+
+inline void LinearAlloc::ConvertToNoGcRoots(void* ptr, LinearAllocKind orig_kind) {
+  if (track_allocations_ && ptr != nullptr) {
+    TrackingHeader* header = static_cast<TrackingHeader*>(ptr);
+    header--;
+    DCHECK_EQ(header->GetKind(), orig_kind);
+    DCHECK_GT(header->GetSize(), 0u);
+    // 16-byte allocations are not supported yet.
+    DCHECK(!header->Is16Aligned());
+    header->SetKind(LinearAllocKind::kNoGCRoots);
+  }
 }
 
 inline void LinearAlloc::SetupForPostZygoteFork(Thread* self) {

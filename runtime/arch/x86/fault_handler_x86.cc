@@ -24,8 +24,7 @@
 #include "base/hex_dump.h"
 #include "base/logging.h"  // For VLOG.
 #include "base/macros.h"
-#include "base/safe_copy.h"
-#include "oat_quick_method_header.h"
+#include "oat/oat_quick_method_header.h"
 #include "runtime_globals.h"
 #include "thread-current-inl.h"
 
@@ -70,7 +69,7 @@
 // X86 (and X86_64) specific fault handler functions.
 //
 
-namespace art {
+namespace art HIDDEN {
 
 extern "C" void art_quick_throw_null_pointer_exception_from_signal();
 extern "C" void art_quick_throw_stack_overflow();
@@ -259,7 +258,7 @@ static uint32_t GetInstructionSize(const uint8_t* pc, size_t bytes) {
 #undef FETCH_OR_SKIP_BYTE
 }
 
-uintptr_t FaultManager::GetFaultPc(siginfo_t* siginfo ATTRIBUTE_UNUSED, void* context) {
+uintptr_t FaultManager::GetFaultPc([[maybe_unused]] siginfo_t* siginfo, void* context) {
   ucontext_t* uc = reinterpret_cast<ucontext_t*>(context);
   if (uc->CTX_ESP == 0) {
     VLOG(signals) << "Missing SP";

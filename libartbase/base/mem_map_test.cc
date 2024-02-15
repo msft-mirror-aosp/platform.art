@@ -64,7 +64,7 @@ class MemMapTest : public CommonArtTest {
   static void RemapAtEndTest(bool low_4gb) {
     std::string error_msg;
     // Cast the page size to size_t.
-    const size_t page_size = static_cast<size_t>(kPageSize);
+    const size_t page_size = MemMap::GetPageSize();
     // Map a two-page memory region.
     MemMap m0 = MemMap::MapAnonymous("MemMapTest_RemapAtEndTest_map0",
                                      2 * page_size,
@@ -134,8 +134,13 @@ class MemMapTest : public CommonArtTest {
 #if defined(__LP64__) && !defined(__x86_64__)
 
 #ifdef __BIONIC__
-extern uintptr_t CreateStartPos(uint64_t input);
+extern uintptr_t CreateStartPos(uint64_t input, uint64_t page_size);
 #endif
+
+TEST_F(MemMapTest, PageSize) {
+  const size_t page_size = MemMap::GetPageSize();
+  EXPECT_EQ(page_size, GetPageSizeSlow());
+}
 
 TEST_F(MemMapTest, Start) {
   CommonInit();
@@ -143,16 +148,17 @@ TEST_F(MemMapTest, Start) {
   EXPECT_LE(64 * KB, start);
   EXPECT_LT(start, static_cast<uintptr_t>(ART_BASE_ADDRESS));
 #ifdef __BIONIC__
+  const size_t page_size = MemMap::GetPageSize();
   // Test a couple of values. Make sure they are different.
   uintptr_t last = 0;
   for (size_t i = 0; i < 100; ++i) {
-    uintptr_t random_start = CreateStartPos(i * kPageSize);
+    uintptr_t random_start = CreateStartPos(i * page_size, page_size);
     EXPECT_NE(last, random_start);
     last = random_start;
   }
 
   // Even on max, should be below ART_BASE_ADDRESS.
-  EXPECT_LT(CreateStartPos(~0), static_cast<uintptr_t>(ART_BASE_ADDRESS));
+  EXPECT_LT(CreateStartPos(~0, page_size), static_cast<uintptr_t>(ART_BASE_ADDRESS));
 #endif
   // End of test.
 }
@@ -161,15 +167,16 @@ TEST_F(MemMapTest, Start) {
 // We need mremap to be able to test ReplaceMapping at all
 #if HAVE_MREMAP_SYSCALL
 TEST_F(MemMapTest, ReplaceMapping_SameSize) {
+  const size_t page_size = MemMap::GetPageSize();
   std::string error_msg;
   MemMap dest = MemMap::MapAnonymous("MapAnonymousEmpty-atomic-replace-dest",
-                                     kPageSize,
+                                     page_size,
                                      PROT_READ,
                                      /*low_4gb=*/ false,
                                      &error_msg);
   ASSERT_TRUE(dest.IsValid());
   MemMap source = MemMap::MapAnonymous("MapAnonymous-atomic-replace-source",
-                                       kPageSize,
+                                       page_size,
                                        PROT_WRITE | PROT_READ,
                                        /*low_4gb=*/ false,
                                        &error_msg);
@@ -179,7 +186,7 @@ TEST_F(MemMapTest, ReplaceMapping_SameSize) {
   ASSERT_TRUE(IsAddressMapped(source_addr));
   ASSERT_TRUE(IsAddressMapped(dest_addr));
 
-  std::vector<uint8_t> data = RandomData(kPageSize);
+  std::vector<uint8_t> data = RandomData(page_size);
   memcpy(source.Begin(), data.data(), data.size());
 
   ASSERT_TRUE(dest.ReplaceWith(&source, &error_msg)) << error_msg;
@@ -188,15 +195,16 @@ TEST_F(MemMapTest, ReplaceMapping_SameSize) {
   ASSERT_TRUE(IsAddressMapped(dest_addr));
   ASSERT_FALSE(source.IsValid());
 
-  ASSERT_EQ(dest.Size(), static_cast<size_t>(kPageSize));
+  ASSERT_EQ(dest.Size(), static_cast<size_t>(page_size));
 
   ASSERT_EQ(memcmp(dest.Begin(), data.data(), dest.Size()), 0);
 }
 
 TEST_F(MemMapTest, ReplaceMapping_MakeLarger) {
+  const size_t page_size = MemMap::GetPageSize();
   std::string error_msg;
   MemMap dest = MemMap::MapAnonymous("MapAnonymousEmpty-atomic-replace-dest",
-                                     5 * kPageSize,  // Need to make it larger
+                                     5 * page_size,  // Need to make it larger
                                                      // initially so we know
                                                      // there won't be mappings
                                                      // in the way when we move
@@ -206,7 +214,7 @@ TEST_F(MemMapTest, ReplaceMapping_MakeLarger) {
                                      &error_msg);
   ASSERT_TRUE(dest.IsValid());
   MemMap source = MemMap::MapAnonymous("MapAnonymous-atomic-replace-source",
-                                       3 * kPageSize,
+                                       3 * page_size,
                                        PROT_WRITE | PROT_READ,
                                        /*low_4gb=*/ false,
                                        &error_msg);
@@ -216,37 +224,38 @@ TEST_F(MemMapTest, ReplaceMapping_MakeLarger) {
   ASSERT_TRUE(IsAddressMapped(source_addr));
 
   // Fill the source with random data.
-  std::vector<uint8_t> data = RandomData(3 * kPageSize);
+  std::vector<uint8_t> data = RandomData(3 * page_size);
   memcpy(source.Begin(), data.data(), data.size());
 
   // Make the dest smaller so that we know we'll have space.
-  dest.SetSize(kPageSize);
+  dest.SetSize(page_size);
 
   ASSERT_TRUE(IsAddressMapped(dest_addr));
-  ASSERT_FALSE(IsAddressMapped(dest_addr + 2 * kPageSize));
-  ASSERT_EQ(dest.Size(), static_cast<size_t>(kPageSize));
+  ASSERT_FALSE(IsAddressMapped(dest_addr + 2 * page_size));
+  ASSERT_EQ(dest.Size(), static_cast<size_t>(page_size));
 
   ASSERT_TRUE(dest.ReplaceWith(&source, &error_msg)) << error_msg;
 
   ASSERT_FALSE(IsAddressMapped(source_addr));
-  ASSERT_EQ(dest.Size(), static_cast<size_t>(3 * kPageSize));
+  ASSERT_EQ(dest.Size(), static_cast<size_t>(3 * page_size));
   ASSERT_TRUE(IsAddressMapped(dest_addr));
-  ASSERT_TRUE(IsAddressMapped(dest_addr + 2 * kPageSize));
+  ASSERT_TRUE(IsAddressMapped(dest_addr + 2 * page_size));
   ASSERT_FALSE(source.IsValid());
 
   ASSERT_EQ(memcmp(dest.Begin(), data.data(), dest.Size()), 0);
 }
 
 TEST_F(MemMapTest, ReplaceMapping_MakeSmaller) {
+  const size_t page_size = MemMap::GetPageSize();
   std::string error_msg;
   MemMap dest = MemMap::MapAnonymous("MapAnonymousEmpty-atomic-replace-dest",
-                                     3 * kPageSize,
+                                     3 * page_size,
                                      PROT_READ,
                                      /*low_4gb=*/ false,
                                      &error_msg);
   ASSERT_TRUE(dest.IsValid());
   MemMap source = MemMap::MapAnonymous("MapAnonymous-atomic-replace-source",
-                                       kPageSize,
+                                       page_size,
                                        PROT_WRITE | PROT_READ,
                                        /*low_4gb=*/ false,
                                        &error_msg);
@@ -255,59 +264,60 @@ TEST_F(MemMapTest, ReplaceMapping_MakeSmaller) {
   uint8_t* dest_addr = dest.Begin();
   ASSERT_TRUE(IsAddressMapped(source_addr));
   ASSERT_TRUE(IsAddressMapped(dest_addr));
-  ASSERT_TRUE(IsAddressMapped(dest_addr + 2 * kPageSize));
-  ASSERT_EQ(dest.Size(), static_cast<size_t>(3 * kPageSize));
+  ASSERT_TRUE(IsAddressMapped(dest_addr + 2 * page_size));
+  ASSERT_EQ(dest.Size(), static_cast<size_t>(3 * page_size));
 
-  std::vector<uint8_t> data = RandomData(kPageSize);
-  memcpy(source.Begin(), data.data(), kPageSize);
+  std::vector<uint8_t> data = RandomData(page_size);
+  memcpy(source.Begin(), data.data(), page_size);
 
   ASSERT_TRUE(dest.ReplaceWith(&source, &error_msg)) << error_msg;
 
   ASSERT_FALSE(IsAddressMapped(source_addr));
-  ASSERT_EQ(dest.Size(), static_cast<size_t>(kPageSize));
+  ASSERT_EQ(dest.Size(), static_cast<size_t>(page_size));
   ASSERT_TRUE(IsAddressMapped(dest_addr));
-  ASSERT_FALSE(IsAddressMapped(dest_addr + 2 * kPageSize));
+  ASSERT_FALSE(IsAddressMapped(dest_addr + 2 * page_size));
   ASSERT_FALSE(source.IsValid());
 
   ASSERT_EQ(memcmp(dest.Begin(), data.data(), dest.Size()), 0);
 }
 
 TEST_F(MemMapTest, ReplaceMapping_FailureOverlap) {
+  const size_t page_size = MemMap::GetPageSize();
   std::string error_msg;
   MemMap dest =
       MemMap::MapAnonymous(
           "MapAnonymousEmpty-atomic-replace-dest",
-          3 * kPageSize,  // Need to make it larger initially so we know there won't be mappings in
+          3 * page_size,  // Need to make it larger initially so we know there won't be mappings in
                           // the way when we move source.
           PROT_READ | PROT_WRITE,
           /*low_4gb=*/ false,
           &error_msg);
   ASSERT_TRUE(dest.IsValid());
   // Resize down to 1 page so we can remap the rest.
-  dest.SetSize(kPageSize);
+  dest.SetSize(page_size);
   // Create source from the last 2 pages
   MemMap source = MemMap::MapAnonymous("MapAnonymous-atomic-replace-source",
-                                       dest.Begin() + kPageSize,
-                                       2 * kPageSize,
+                                       dest.Begin() + page_size,
+                                       2 * page_size,
                                        PROT_WRITE | PROT_READ,
                                        /*low_4gb=*/ false,
                                        /*reuse=*/ false,
                                        /*reservation=*/ nullptr,
                                        &error_msg);
   ASSERT_TRUE(source.IsValid());
-  ASSERT_EQ(dest.Begin() + kPageSize, source.Begin());
+  ASSERT_EQ(dest.Begin() + page_size, source.Begin());
   uint8_t* source_addr = source.Begin();
   uint8_t* dest_addr = dest.Begin();
   ASSERT_TRUE(IsAddressMapped(source_addr));
 
   // Fill the source and dest with random data.
-  std::vector<uint8_t> data = RandomData(2 * kPageSize);
+  std::vector<uint8_t> data = RandomData(2 * page_size);
   memcpy(source.Begin(), data.data(), data.size());
-  std::vector<uint8_t> dest_data = RandomData(kPageSize);
+  std::vector<uint8_t> dest_data = RandomData(page_size);
   memcpy(dest.Begin(), dest_data.data(), dest_data.size());
 
   ASSERT_TRUE(IsAddressMapped(dest_addr));
-  ASSERT_EQ(dest.Size(), static_cast<size_t>(kPageSize));
+  ASSERT_EQ(dest.Size(), static_cast<size_t>(page_size));
 
   ASSERT_FALSE(dest.ReplaceWith(&source, &error_msg)) << error_msg;
 
@@ -323,6 +333,7 @@ TEST_F(MemMapTest, ReplaceMapping_FailureOverlap) {
 
 TEST_F(MemMapTest, MapAnonymousEmpty) {
   CommonInit();
+  const size_t page_size = MemMap::GetPageSize();
   std::string error_msg;
   MemMap map = MemMap::MapAnonymous("MapAnonymousEmpty",
                                     /*byte_count=*/ 0,
@@ -334,7 +345,7 @@ TEST_F(MemMapTest, MapAnonymousEmpty) {
 
   error_msg.clear();
   map = MemMap::MapAnonymous("MapAnonymousNonEmpty",
-                             kPageSize,
+                             page_size,
                              PROT_READ | PROT_WRITE,
                              /*low_4gb=*/ false,
                              &error_msg);
@@ -344,9 +355,10 @@ TEST_F(MemMapTest, MapAnonymousEmpty) {
 
 TEST_F(MemMapTest, MapAnonymousFailNullError) {
   CommonInit();
+  const size_t page_size = MemMap::GetPageSize();
   // Test that we don't crash with a null error_str when mapping at an invalid location.
   MemMap map = MemMap::MapAnonymous("MapAnonymousInvalid",
-                                    reinterpret_cast<uint8_t*>(kPageSize),
+                                    reinterpret_cast<uint8_t*>(static_cast<size_t>(page_size)),
                                     0x20000,
                                     PROT_READ | PROT_WRITE,
                                     /*low_4gb=*/ false,
@@ -359,6 +371,7 @@ TEST_F(MemMapTest, MapAnonymousFailNullError) {
 #ifdef __LP64__
 TEST_F(MemMapTest, MapAnonymousEmpty32bit) {
   CommonInit();
+  const size_t page_size = MemMap::GetPageSize();
   std::string error_msg;
   MemMap map = MemMap::MapAnonymous("MapAnonymousEmpty",
                                     /*byte_count=*/ 0,
@@ -370,7 +383,7 @@ TEST_F(MemMapTest, MapAnonymousEmpty32bit) {
 
   error_msg.clear();
   map = MemMap::MapAnonymous("MapAnonymousNonEmpty",
-                             kPageSize,
+                             page_size,
                              PROT_READ | PROT_WRITE,
                              /*low_4gb=*/ true,
                              &error_msg);
@@ -382,10 +395,10 @@ TEST_F(MemMapTest, MapFile32Bit) {
   CommonInit();
   std::string error_msg;
   ScratchFile scratch_file;
-  constexpr size_t kMapSize = kPageSize;
-  std::unique_ptr<uint8_t[]> data(new uint8_t[kMapSize]());
-  ASSERT_TRUE(scratch_file.GetFile()->WriteFully(&data[0], kMapSize));
-  MemMap map = MemMap::MapFile(/*byte_count=*/kMapSize,
+  const size_t map_size = MemMap::GetPageSize();
+  std::unique_ptr<uint8_t[]> data(new uint8_t[map_size]());
+  ASSERT_TRUE(scratch_file.GetFile()->WriteFully(&data[0], map_size));
+  MemMap map = MemMap::MapFile(/*byte_count=*/map_size,
                                PROT_READ,
                                MAP_PRIVATE,
                                scratch_file.GetFd(),
@@ -395,7 +408,7 @@ TEST_F(MemMapTest, MapFile32Bit) {
                                &error_msg);
   ASSERT_TRUE(map.IsValid()) << error_msg;
   ASSERT_TRUE(error_msg.empty());
-  ASSERT_EQ(map.Size(), kMapSize);
+  ASSERT_EQ(map.Size(), map_size);
   ASSERT_LT(reinterpret_cast<uintptr_t>(map.BaseBegin()), 1ULL << 32);
 }
 #endif
@@ -408,13 +421,14 @@ TEST_F(MemMapTest, MapAnonymousExactAddr) {
   TEST_DISABLED_FOR_MEMORY_TOOL();
 
   CommonInit();
+  const size_t page_size = MemMap::GetPageSize();
   std::string error_msg;
   // Find a valid address.
-  uint8_t* valid_address = GetValidMapAddress(kPageSize, /*low_4gb=*/false);
+  uint8_t* valid_address = GetValidMapAddress(page_size, /*low_4gb=*/false);
   // Map at an address that should work, which should succeed.
   MemMap map0 = MemMap::MapAnonymous("MapAnonymous0",
                                      valid_address,
-                                     kPageSize,
+                                     page_size,
                                      PROT_READ | PROT_WRITE,
                                      /*low_4gb=*/ false,
                                      /*reuse=*/ false,
@@ -425,7 +439,7 @@ TEST_F(MemMapTest, MapAnonymousExactAddr) {
   ASSERT_TRUE(map0.BaseBegin() == valid_address);
   // Map at an unspecified address, which should succeed.
   MemMap map1 = MemMap::MapAnonymous("MapAnonymous1",
-                                     kPageSize,
+                                     page_size,
                                      PROT_READ | PROT_WRITE,
                                      /*low_4gb=*/ false,
                                      &error_msg);
@@ -435,7 +449,7 @@ TEST_F(MemMapTest, MapAnonymousExactAddr) {
   // Attempt to map at the same address, which should fail.
   MemMap map2 = MemMap::MapAnonymous("MapAnonymous2",
                                      reinterpret_cast<uint8_t*>(map1.BaseBegin()),
-                                     kPageSize,
+                                     page_size,
                                      PROT_READ | PROT_WRITE,
                                      /*low_4gb=*/ false,
                                      /*reuse=*/ false,
@@ -457,19 +471,20 @@ TEST_F(MemMapTest, RemapAtEnd32bit) {
 
 TEST_F(MemMapTest, RemapFileViewAtEnd) {
   CommonInit();
+  const size_t page_size = MemMap::GetPageSize();
   std::string error_msg;
   ScratchFile scratch_file;
 
   // Create a scratch file 3 pages large.
-  constexpr size_t kMapSize = 3 * kPageSize;
-  std::unique_ptr<uint8_t[]> data(new uint8_t[kMapSize]());
-  memset(data.get(), 1, kPageSize);
-  memset(&data[0], 0x55, kPageSize);
-  memset(&data[kPageSize], 0x5a, kPageSize);
-  memset(&data[2 * kPageSize], 0xaa, kPageSize);
-  ASSERT_TRUE(scratch_file.GetFile()->WriteFully(&data[0], kMapSize));
+  const size_t map_size = 3 * page_size;
+  std::unique_ptr<uint8_t[]> data(new uint8_t[map_size]());
+  memset(data.get(), 1, page_size);
+  memset(&data[0], 0x55, page_size);
+  memset(&data[page_size], 0x5a, page_size);
+  memset(&data[2 * page_size], 0xaa, page_size);
+  ASSERT_TRUE(scratch_file.GetFile()->WriteFully(&data[0], map_size));
 
-  MemMap map = MemMap::MapFile(/*byte_count=*/kMapSize,
+  MemMap map = MemMap::MapFile(/*byte_count=*/map_size,
                                PROT_READ,
                                MAP_PRIVATE,
                                scratch_file.GetFd(),
@@ -479,13 +494,13 @@ TEST_F(MemMapTest, RemapFileViewAtEnd) {
                                &error_msg);
   ASSERT_TRUE(map.IsValid()) << error_msg;
   ASSERT_TRUE(error_msg.empty());
-  ASSERT_EQ(map.Size(), kMapSize);
+  ASSERT_EQ(map.Size(), map_size);
   ASSERT_LT(reinterpret_cast<uintptr_t>(map.BaseBegin()), 1ULL << 32);
   ASSERT_EQ(data[0], *map.Begin());
-  ASSERT_EQ(data[kPageSize], *(map.Begin() + kPageSize));
-  ASSERT_EQ(data[2 * kPageSize], *(map.Begin() + 2 * kPageSize));
+  ASSERT_EQ(data[page_size], *(map.Begin() + page_size));
+  ASSERT_EQ(data[2 * page_size], *(map.Begin() + 2 * page_size));
 
-  for (size_t offset = 2 * kPageSize; offset > 0; offset -= kPageSize) {
+  for (size_t offset = 2 * page_size; offset > 0; offset -= page_size) {
     MemMap tail = map.RemapAtEnd(map.Begin() + offset,
                                  "bad_offset_map",
                                  PROT_READ,
@@ -496,7 +511,7 @@ TEST_F(MemMapTest, RemapFileViewAtEnd) {
     ASSERT_TRUE(tail.IsValid()) << error_msg;
     ASSERT_TRUE(error_msg.empty());
     ASSERT_EQ(offset, map.Size());
-    ASSERT_EQ(static_cast<size_t>(kPageSize), tail.Size());
+    ASSERT_EQ(static_cast<size_t>(page_size), tail.Size());
     ASSERT_EQ(tail.Begin(), map.Begin() + map.Size());
     ASSERT_EQ(data[offset], *tail.Begin());
   }
@@ -534,12 +549,13 @@ TEST_F(MemMapTest, MapAnonymousExactAddr32bitHighAddr) {
 
 TEST_F(MemMapTest, MapAnonymousOverflow) {
   CommonInit();
+  const size_t page_size = MemMap::GetPageSize();
   std::string error_msg;
   uintptr_t ptr = 0;
-  ptr -= kPageSize;  // Now it's close to the top.
+  ptr -= page_size;  // Now it's close to the top.
   MemMap map = MemMap::MapAnonymous("MapAnonymousOverflow",
                                     reinterpret_cast<uint8_t*>(ptr),
-                                    2 * kPageSize,  // brings it over the top.
+                                    2 * page_size,  // brings it over the top.
                                     PROT_READ | PROT_WRITE,
                                     /*low_4gb=*/ false,
                                     /*reuse=*/ false,
@@ -552,11 +568,12 @@ TEST_F(MemMapTest, MapAnonymousOverflow) {
 #ifdef __LP64__
 TEST_F(MemMapTest, MapAnonymousLow4GBExpectedTooHigh) {
   CommonInit();
+  const size_t page_size = MemMap::GetPageSize();
   std::string error_msg;
   MemMap map =
       MemMap::MapAnonymous("MapAnonymousLow4GBExpectedTooHigh",
                            reinterpret_cast<uint8_t*>(UINT64_C(0x100000000)),
-                           kPageSize,
+                           page_size,
                            PROT_READ | PROT_WRITE,
                            /*low_4gb=*/ true,
                            /*reuse=*/ false,
@@ -606,11 +623,12 @@ TEST_F(MemMapTest, MapAnonymousReuse) {
 
 TEST_F(MemMapTest, CheckNoGaps) {
   CommonInit();
+  const size_t page_size = MemMap::GetPageSize();
   std::string error_msg;
   constexpr size_t kNumPages = 3;
   // Map a 3-page mem map.
   MemMap reservation = MemMap::MapAnonymous("MapAnonymous0",
-                                            kPageSize * kNumPages,
+                                            page_size * kNumPages,
                                             PROT_READ | PROT_WRITE,
                                             /*low_4gb=*/ false,
                                             &error_msg);
@@ -621,7 +639,7 @@ TEST_F(MemMapTest, CheckNoGaps) {
 
   // Map at the same address, taking from the `map` reservation.
   MemMap map0 = MemMap::MapAnonymous("MapAnonymous0",
-                                     kPageSize,
+                                     page_size,
                                      PROT_READ | PROT_WRITE,
                                      /*low_4gb=*/ false,
                                      &reservation,
@@ -630,23 +648,23 @@ TEST_F(MemMapTest, CheckNoGaps) {
   ASSERT_TRUE(error_msg.empty());
   ASSERT_EQ(map_base, map0.Begin());
   MemMap map1 = MemMap::MapAnonymous("MapAnonymous1",
-                                     kPageSize,
+                                     page_size,
                                      PROT_READ | PROT_WRITE,
                                      /*low_4gb=*/ false,
                                      &reservation,
                                      &error_msg);
   ASSERT_TRUE(map1.IsValid()) << error_msg;
   ASSERT_TRUE(error_msg.empty());
-  ASSERT_EQ(map_base + kPageSize, map1.Begin());
+  ASSERT_EQ(map_base + page_size, map1.Begin());
   MemMap map2 = MemMap::MapAnonymous("MapAnonymous2",
-                                     kPageSize,
+                                     page_size,
                                      PROT_READ | PROT_WRITE,
                                      /*low_4gb=*/ false,
                                      &reservation,
                                      &error_msg);
   ASSERT_TRUE(map2.IsValid()) << error_msg;
   ASSERT_TRUE(error_msg.empty());
-  ASSERT_EQ(map_base + 2 * kPageSize, map2.Begin());
+  ASSERT_EQ(map_base + 2 * page_size, map2.Begin());
   ASSERT_FALSE(reservation.IsValid());  // The entire reservation was used.
 
   // One-map cases.
@@ -668,9 +686,8 @@ TEST_F(MemMapTest, CheckNoGaps) {
 
 TEST_F(MemMapTest, AlignBy) {
   CommonInit();
+  const size_t page_size = MemMap::GetPageSize();
   std::string error_msg;
-  // Cast the page size to size_t.
-  const size_t page_size = static_cast<size_t>(kPageSize);
   // Map a region.
   MemMap m0 = MemMap::MapAnonymous("MemMapTest_AlignByTest_map0",
                                    14 * page_size,
@@ -771,14 +788,15 @@ TEST_F(MemMapTest, AlignBy) {
 
 TEST_F(MemMapTest, Reservation) {
   CommonInit();
+  const size_t page_size = MemMap::GetPageSize();
   std::string error_msg;
   ScratchFile scratch_file;
-  constexpr size_t kMapSize = 5 * kPageSize;
-  std::unique_ptr<uint8_t[]> data(new uint8_t[kMapSize]());
-  ASSERT_TRUE(scratch_file.GetFile()->WriteFully(&data[0], kMapSize));
+  const size_t map_size = 5 * page_size;
+  std::unique_ptr<uint8_t[]> data(new uint8_t[map_size]());
+  ASSERT_TRUE(scratch_file.GetFile()->WriteFully(&data[0], map_size));
 
   MemMap reservation = MemMap::MapAnonymous("Test reservation",
-                                            kMapSize,
+                                            map_size,
                                             PROT_NONE,
                                             /*low_4gb=*/ false,
                                             &error_msg);
@@ -786,11 +804,11 @@ TEST_F(MemMapTest, Reservation) {
   ASSERT_TRUE(error_msg.empty());
 
   // Map first part of the reservation.
-  constexpr size_t kChunk1Size = kPageSize - 1u;
-  static_assert(kChunk1Size < kMapSize, "We want to split the reservation.");
+  const size_t chunk1_size = page_size - 1u;
+  ASSERT_LT(chunk1_size, map_size) << "We want to split the reservation.";
   uint8_t* addr1 = reservation.Begin();
   MemMap map1 = MemMap::MapFileAtAddress(addr1,
-                                         /*byte_count=*/ kChunk1Size,
+                                         /*byte_count=*/ chunk1_size,
                                          PROT_READ,
                                          MAP_PRIVATE,
                                          scratch_file.GetFd(),
@@ -802,7 +820,7 @@ TEST_F(MemMapTest, Reservation) {
                                          &error_msg);
   ASSERT_TRUE(map1.IsValid()) << error_msg;
   ASSERT_TRUE(error_msg.empty());
-  ASSERT_EQ(map1.Size(), kChunk1Size);
+  ASSERT_EQ(map1.Size(), chunk1_size);
   ASSERT_EQ(addr1, map1.Begin());
   ASSERT_TRUE(reservation.IsValid());
   // Entire pages are taken from the `reservation`.
@@ -810,12 +828,12 @@ TEST_F(MemMapTest, Reservation) {
   ASSERT_EQ(map1.BaseEnd(), reservation.Begin());
 
   // Map second part as an anonymous mapping.
-  constexpr size_t kChunk2Size = 2 * kPageSize;
-  DCHECK_LT(kChunk2Size, reservation.Size());  // We want to split the reservation.
+  const size_t chunk2_size = 2 * page_size;
+  DCHECK_LT(chunk2_size, reservation.Size());  // We want to split the reservation.
   uint8_t* addr2 = reservation.Begin();
   MemMap map2 = MemMap::MapAnonymous("MiddleReservation",
                                      addr2,
-                                     /*byte_count=*/ kChunk2Size,
+                                     /*byte_count=*/ chunk2_size,
                                      PROT_READ,
                                      /*low_4gb=*/ false,
                                      /*reuse=*/ false,
@@ -823,16 +841,16 @@ TEST_F(MemMapTest, Reservation) {
                                      &error_msg);
   ASSERT_TRUE(map2.IsValid()) << error_msg;
   ASSERT_TRUE(error_msg.empty());
-  ASSERT_EQ(map2.Size(), kChunk2Size);
+  ASSERT_EQ(map2.Size(), chunk2_size);
   ASSERT_EQ(addr2, map2.Begin());
-  ASSERT_EQ(map2.End(), map2.BaseEnd());  // kChunk2Size is page aligned.
+  ASSERT_EQ(map2.End(), map2.BaseEnd());  // chunk2_size is page aligned.
   ASSERT_EQ(map2.BaseEnd(), reservation.Begin());
 
   // Map the rest of the reservation except the last byte.
-  const size_t kChunk3Size = reservation.Size() - 1u;
+  const size_t chunk3_size = reservation.Size() - 1u;
   uint8_t* addr3 = reservation.Begin();
   MemMap map3 = MemMap::MapFileAtAddress(addr3,
-                                         /*byte_count=*/ kChunk3Size,
+                                         /*byte_count=*/ chunk3_size,
                                          PROT_READ,
                                          MAP_PRIVATE,
                                          scratch_file.GetFd(),
@@ -844,30 +862,30 @@ TEST_F(MemMapTest, Reservation) {
                                          &error_msg);
   ASSERT_TRUE(map3.IsValid()) << error_msg;
   ASSERT_TRUE(error_msg.empty());
-  ASSERT_EQ(map3.Size(), kChunk3Size);
+  ASSERT_EQ(map3.Size(), chunk3_size);
   ASSERT_EQ(addr3, map3.Begin());
   // Entire pages are taken from the `reservation`, so it's now exhausted.
   ASSERT_FALSE(reservation.IsValid());
 
   // Now split the MiddleReservation.
-  constexpr size_t kChunk2ASize = kPageSize - 1u;
-  DCHECK_LT(kChunk2ASize, map2.Size());  // We want to split the reservation.
-  MemMap map2a = map2.TakeReservedMemory(kChunk2ASize);
+  const size_t chunk2a_size = page_size - 1u;
+  DCHECK_LT(chunk2a_size, map2.Size());  // We want to split the reservation.
+  MemMap map2a = map2.TakeReservedMemory(chunk2a_size);
   ASSERT_TRUE(map2a.IsValid()) << error_msg;
   ASSERT_TRUE(error_msg.empty());
-  ASSERT_EQ(map2a.Size(), kChunk2ASize);
+  ASSERT_EQ(map2a.Size(), chunk2a_size);
   ASSERT_EQ(addr2, map2a.Begin());
   ASSERT_TRUE(map2.IsValid());
   ASSERT_LT(map2a.End(), map2a.BaseEnd());
   ASSERT_EQ(map2a.BaseEnd(), map2.Begin());
 
   // And take the rest of the middle reservation.
-  const size_t kChunk2BSize = map2.Size() - 1u;
+  const size_t chunk2b_size = map2.Size() - 1u;
   uint8_t* addr2b = map2.Begin();
-  MemMap map2b = map2.TakeReservedMemory(kChunk2BSize);
+  MemMap map2b = map2.TakeReservedMemory(chunk2b_size);
   ASSERT_TRUE(map2b.IsValid()) << error_msg;
   ASSERT_TRUE(error_msg.empty());
-  ASSERT_EQ(map2b.Size(), kChunk2ASize);
+  ASSERT_EQ(map2b.Size(), chunk2a_size);
   ASSERT_EQ(addr2b, map2b.Begin());
   ASSERT_FALSE(map2.IsValid());
 }

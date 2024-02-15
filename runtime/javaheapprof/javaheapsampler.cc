@@ -23,7 +23,7 @@
 #endif
 #include "runtime.h"
 
-namespace art {
+namespace art HIDDEN {
 
 size_t HeapSampler::NextGeoDistRandSample() {
   // Make sure that rng_ and geo_dist are thread safe by acquiring a lock to access.
@@ -129,10 +129,6 @@ void HeapSampler::AdjustSampleOffset(size_t adjustment) {
   *bytes_until_sample = next_bytes_until_sample;
   VLOG(heap) << "JHP:AdjustSampleOffset: adjustment = " << adjustment
              << " next_bytes_until_sample = " << next_bytes_until_sample;
-}
-
-bool HeapSampler::IsEnabled() {
-  return enabled_.load(std::memory_order_acquire);
 }
 
 int HeapSampler::GetSamplingInterval() {

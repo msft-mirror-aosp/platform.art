@@ -21,6 +21,7 @@
 #include <list>
 
 #include "base/histogram.h"
+#include "base/macros.h"
 #include "base/metrics/metrics.h"
 #include "base/mutex.h"
 #include "base/timing_logger.h"
@@ -32,7 +33,7 @@
 #include "object_byte_pair.h"
 #include "object_callbacks.h"
 
-namespace art {
+namespace art HIDDEN {
 
 namespace mirror {
 class Class;
@@ -76,7 +77,6 @@ class GarbageCollector : public RootVisitor, public IsMarkedVisitor, public Mark
   const CumulativeLogger& GetCumulativeTimings() const {
     return cumulative_timings_;
   }
-  void ResetCumulativeStatistics() REQUIRES(!pause_histogram_lock_);
   // Swap the live and mark bitmaps of spaces that are active for the collector. For partial GC,
   // this is the allocation space, for full GC then we swap the zygote bitmaps too.
   void SwapBitmaps()
@@ -142,6 +142,8 @@ class GarbageCollector : public RootVisitor, public IsMarkedVisitor, public Mark
   bool IsTransactionActive() const {
     return is_transaction_active_;
   }
+
+  bool ShouldEagerlyReleaseMemoryToOS() const;
 
  protected:
   // Run all of the GC phases.

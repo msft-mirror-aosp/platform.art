@@ -39,7 +39,7 @@
 #include "offsets.h"
 #include "read_barrier_option.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class CodeItemDataAccessor;
 class CodeItemDebugInfoAccessor;
@@ -84,7 +84,7 @@ template <char Shorty> struct HandleShortyTraits;
 template <> struct HandleShortyTraits<'L'>;
 }  // namespace detail
 
-class ArtMethod final {
+class EXPORT ArtMethod final {
  public:
   // Should the class state be checked on sensitive operations?
   DECLARE_RUNTIME_DEBUG_FLAG(kCheckDeclaringClassState);
@@ -584,8 +584,17 @@ class ArtMethod final {
     AddAccessFlags(kAccNterpEntryPointFastPathFlag);
   }
 
+  void ClearNterpEntryPointFastPathFlag() REQUIRES_SHARED(Locks::mutator_lock_) {
+    DCHECK(!IsNative());
+    ClearAccessFlags(kAccNterpEntryPointFastPathFlag);
+  }
+
   void SetNterpInvokeFastPathFlag() REQUIRES_SHARED(Locks::mutator_lock_) {
     AddAccessFlags(kAccNterpInvokeFastPathFlag);
+  }
+
+  void ClearNterpInvokeFastPathFlag() REQUIRES_SHARED(Locks::mutator_lock_) {
+    ClearAccessFlags(kAccNterpInvokeFastPathFlag);
   }
 
   // Returns whether the method is a string constructor. The method must not
@@ -631,7 +640,7 @@ class ArtMethod final {
   }
 
   // Number of 32bit registers that would be required to hold all the arguments
-  static size_t NumArgRegisters(const char* shorty);
+  static size_t NumArgRegisters(std::string_view shorty);
 
   ALWAYS_INLINE uint32_t GetDexMethodIndex() const {
     return dex_method_index_;
@@ -865,6 +874,7 @@ class ArtMethod final {
     uint32_t access_flags = GetAccessFlags();
     return !IsNative(access_flags) &&
            !IsAbstract(access_flags) &&
+           !IsDefaultConflicting(access_flags) &&
            !IsRuntimeMethod() &&
            !IsProxyMethod();
   }
@@ -901,6 +911,8 @@ class ArtMethod final {
   ALWAYS_INLINE const char* GetShorty() REQUIRES_SHARED(Locks::mutator_lock_);
 
   const char* GetShorty(uint32_t* out_length) REQUIRES_SHARED(Locks::mutator_lock_);
+
+  std::string_view GetShortyView() REQUIRES_SHARED(Locks::mutator_lock_);
 
   const Signature GetSignature() REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -1104,6 +1116,7 @@ class ArtMethod final {
     //   - conflict method: ImtConflictTable,
     //   - abstract/interface method: the single-implementation if any,
     //   - proxy method: the original interface method or constructor,
+    //   - default conflict method: null
     //   - other methods: during AOT the code item offset, at runtime a pointer
     //                    to the code item.
     void* data_;

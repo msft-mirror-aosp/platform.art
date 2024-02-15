@@ -22,7 +22,7 @@
 
 #include "base/flags.h"
 #include "base/stl_util.h"
-#include "oat_file_manager.h"
+#include "oat/oat_file_manager.h"
 #include "runtime.h"
 #include "runtime_options.h"
 #include "statsd.h"
@@ -31,7 +31,7 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic error "-Wconversion"
 
-namespace art {
+namespace art HIDDEN {
 namespace metrics {
 
 std::unique_ptr<MetricsReporter> MetricsReporter::Create(
@@ -293,12 +293,12 @@ ReportingConfig ReportingConfig::FromFlags(bool is_system_server) {
 
   return {
       .dump_to_logcat = gFlags.MetricsWriteToLogcat(),
-      .dump_to_file = gFlags.MetricsWriteToFile.GetValueOptional(),
       .dump_to_statsd = gFlags.MetricsWriteToStatsd(),
+      .dump_to_file = gFlags.MetricsWriteToFile.GetValueOptional(),
       .metrics_format = gFlags.MetricsFormat(),
       .period_spec = period_spec,
-      .reporting_num_mods = reporting_num_mods,
       .reporting_mods = reporting_mods,
+      .reporting_num_mods = reporting_num_mods,
   };
 }
 

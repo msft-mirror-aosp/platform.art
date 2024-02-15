@@ -21,7 +21,7 @@
 #include "arch/instruction_set.h"
 #include "base/common_art_test.h"
 
-namespace art {
+namespace art HIDDEN {
 
 class ParsedOptionsTest : public CommonArtTest {
  public:
@@ -165,9 +165,10 @@ TEST_F(ParsedOptionsTest, ParsedOptionsInstructionSet) {
     EXPECT_EQ(kRuntimeISA, isa);
   }
 
-  const char* isa_strings[] = { "arm", "arm64", "x86", "x86_64" };
+  const char* isa_strings[] = { "arm", "arm64", "riscv64", "x86", "x86_64" };
   InstructionSet ISAs[] = { InstructionSet::kArm,
                             InstructionSet::kArm64,
+                            InstructionSet::kRiscv64,
                             InstructionSet::kX86,
                             InstructionSet::kX86_64 };
   static_assert(arraysize(isa_strings) == arraysize(ISAs), "Need same amount.");

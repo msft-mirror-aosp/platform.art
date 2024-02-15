@@ -24,7 +24,7 @@
 
 #include <set>
 
-namespace art {
+namespace art HIDDEN {
 namespace gc {
 namespace space {
 class ContinuousSpace;
@@ -43,6 +43,7 @@ class ImmuneSpaces {
  public:
   ImmuneSpaces() {}
   void Reset();
+  bool IsEmpty() const { return spaces_.empty(); }
 
   // Add a continuous space to the immune spaces set.
   void AddSpace(space::ContinuousSpace* space) REQUIRES(Locks::heap_bitmap_lock_);

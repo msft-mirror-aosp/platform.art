@@ -20,6 +20,8 @@ import static android.os.ParcelFileDescriptor.AutoCloseInputStream;
 
 import static com.android.server.art.ArtManagerLocal.SnapshotProfileException;
 import static com.android.server.art.PrimaryDexUtils.PrimaryDexInfo;
+import static com.android.server.art.ReasonMapping.BatchDexoptReason;
+import static com.android.server.art.model.ArtFlags.BatchDexoptPass;
 import static com.android.server.art.model.ArtFlags.DexoptFlags;
 import static com.android.server.art.model.ArtFlags.PriorityClassApi;
 import static com.android.server.art.model.DexoptResult.DexContainerFileDexoptResult;
@@ -66,11 +68,14 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
@@ -195,6 +200,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
         boolean forAllPackages = false;
         boolean legacyClearProfile = false;
         boolean verbose = false;
+        boolean forceMergeProfile = false;
 
         String opt;
         while ((opt = getNextOption()) != null) {
@@ -259,6 +265,9 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
                 case "-v":
                     verbose = true;
                     break;
+                case "--force-merge-profile":
+                    forceMergeProfile = true;
+                    break;
                 default:
                     pw.println("Error: Unknown option: " + opt);
                     return 1;
@@ -289,6 +298,10 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
         }
         if (force) {
             paramsBuilder.setFlags(ArtFlags.FLAG_FORCE, ArtFlags.FLAG_FORCE);
+        }
+        if (forceMergeProfile) {
+            paramsBuilder.setFlags(
+                    ArtFlags.FLAG_FORCE_MERGE_PROFILE, ArtFlags.FLAG_FORCE_MERGE_PROFILE);
         }
         if (splitArg != null) {
             if (scopeFlags != 0) {
@@ -382,8 +395,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
             BackgroundDexoptJob.Result result = Utils.getFuture(future);
             if (result instanceof BackgroundDexoptJob.CompletedResult) {
                 var completedResult = (BackgroundDexoptJob.CompletedResult) result;
-                if (completedResult.dexoptResult().getFinalStatus()
-                        == DexoptResult.DEXOPT_CANCELLED) {
+                if (completedResult.isCancelled()) {
                     pw.println("Job cancelled. See logs for details");
                 } else {
                     pw.println("Job finished. See logs for details");
@@ -545,9 +557,6 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
         AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
         try (var tracing = new Utils.Tracing("dump profiles")) {
             for (PrimaryDexInfo dexInfo : PrimaryDexUtils.getDexInfo(pkg)) {
-                if (!dexInfo.hasCode()) {
-                    continue;
-                }
                 String profileName = PrimaryDexUtils.getProfileName(dexInfo.splitName());
                 // The path is intentionally inconsistent with the one for "snapshot-profile". This
                 // is to match the behavior of the legacy PM shell command.
@@ -584,20 +593,41 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
                     ReasonMapping.BATCH_DEXOPT_REASONS);
             return 1;
         }
-        DexoptResult result;
+
+        final String finalReason = reason;
+
+        // Create callbacks to print the progress.
+        Map<Integer, Consumer<OperationProgress>> progressCallbacks = new HashMap<>();
+        for (@BatchDexoptPass int pass : ArtFlags.BATCH_DEXOPT_PASSES) {
+            progressCallbacks.put(pass, progress -> {
+                pw.println(String.format(Locale.US, "%s: %d%%",
+                        getProgressMessageForBatchDexoptPass(pass, finalReason),
+                        progress.getPercentage()));
+                pw.flush();
+            });
+        }
+
         ExecutorService progressCallbackExecutor = Executors.newSingleThreadExecutor();
         try (var signal = new WithCancellationSignal(pw, true /* verbose */)) {
-            result = mArtManagerLocal.dexoptPackages(
-                    snapshot, reason, signal.get(), progressCallbackExecutor, progress -> {
-                        pw.println(String.format("Dexopting apps: %d%%", progress.getPercentage()));
-                        pw.flush();
-                    });
+            Map<Integer, DexoptResult> results = mArtManagerLocal.dexoptPackages(snapshot,
+                    finalReason, signal.get(), progressCallbackExecutor, progressCallbacks);
+
             Utils.executeAndWait(progressCallbackExecutor, () -> {
-                printDexoptResult(pw, result, true /* verbose */, true /* multiPackage */);
+                for (@BatchDexoptPass int pass : ArtFlags.BATCH_DEXOPT_PASSES) {
+                    if (results.containsKey(pass)) {
+                        pw.println("Result of "
+                                + getProgressMessageForBatchDexoptPass(pass, finalReason)
+                                          .toLowerCase(Locale.US)
+                                + ":");
+                        printDexoptResult(
+                                pw, results.get(pass), true /* verbose */, true /* multiPackage */);
+                    }
+                }
             });
         } finally {
             progressCallbackExecutor.shutdown();
         }
+
         return 0;
     }
 
@@ -642,6 +672,8 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
         pw.println("       For secondary dex files, it also clears all dexopt artifacts.");
         pw.println("       When this flag is set, all the other flags are ignored.");
         pw.println("    -v Verbose mode. This mode prints detailed results.");
+        pw.println("    --force-merge-profile Force merge profiles even if the difference between");
+        pw.println("       before and after the merge is not significant.");
         pw.println("  Scope options:");
         pw.println("    --primary-dex Dexopt primary dex files only (all APKs that are installed");
         pw.println("      as part of the package, including the base APK and all other split");
@@ -783,20 +815,17 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
 
         PackageState pkgState = Utils.getPackageStateOrThrow(snapshot, packageName);
         AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
-        List<PrimaryDexInfo> dexInfoList = PrimaryDexUtils.getDexInfo(pkg);
-
-        for (PrimaryDexInfo dexInfo : dexInfoList) {
-            if (splitArg.equals(dexInfo.splitName())) {
-                return splitArg;
-            }
+        PrimaryDexInfo dexInfo =
+                PrimaryDexUtils.findDexInfo(pkg, info -> splitArg.equals(info.splitName()));
+        if (dexInfo != null) {
+            return splitArg;
         }
-
-        for (PrimaryDexInfo dexInfo : dexInfoList) {
-            if (splitArg.equals(new File(dexInfo.dexPath()).getName())) {
-                pw.println("Warning: Specifying a split using a filename is deprecated. Please "
-                        + "use a split name (or an empty string for the base APK) instead");
-                return dexInfo.splitName();
-            }
+        dexInfo = PrimaryDexUtils.findDexInfo(
+                pkg, info -> splitArg.equals(new File(info.dexPath()).getName()));
+        if (dexInfo != null) {
+            pw.println("Warning: Specifying a split using a filename is deprecated. Please "
+                    + "use a split name (or an empty string for the base APK) instead");
+            return dexInfo.splitName();
         }
 
         throw new IllegalArgumentException(String.format("Split '%s' not found", splitArg));
@@ -807,14 +836,11 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
             @NonNull String packageName, @NonNull String fullPath) {
         PackageState pkgState = Utils.getPackageStateOrThrow(snapshot, packageName);
         AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
-        List<PrimaryDexInfo> dexInfoList = PrimaryDexUtils.getDexInfo(pkg);
-
-        for (PrimaryDexInfo dexInfo : dexInfoList) {
-            if (fullPath.equals(dexInfo.dexPath())) {
-                return dexInfo.splitName();
-            }
+        PrimaryDexInfo dexInfo =
+                PrimaryDexUtils.findDexInfo(pkg, info -> fullPath.equals(info.dexPath()));
+        if (dexInfo != null) {
+            return dexInfo.splitName();
         }
-
         throw new IllegalArgumentException(String.format("Code path '%s' not found", fullPath));
     }
 
@@ -904,6 +930,21 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
             Utils.deleteIfExistsSafe(outputPath);
             throw new RuntimeException(e);
         }
+    }
+
+    @NonNull
+    private String getProgressMessageForBatchDexoptPass(
+            @BatchDexoptPass int pass, @NonNull @BatchDexoptReason String reason) {
+        switch (pass) {
+            case ArtFlags.PASS_DOWNGRADE:
+                return "Downgrading apps";
+            case ArtFlags.PASS_MAIN:
+                return reason.equals(ReasonMapping.REASON_BG_DEXOPT) ? "Dexopting apps (main pass)"
+                                                                     : "Dexopting apps";
+            case ArtFlags.PASS_SUPPLEMENTARY:
+                return "Dexopting apps (supplementary pass)";
+        }
+        throw new IllegalArgumentException("Unknown batch dexopt pass " + pass);
     }
 
     private static class WithCancellationSignal implements AutoCloseable {

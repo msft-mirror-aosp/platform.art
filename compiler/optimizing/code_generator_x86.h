@@ -89,19 +89,8 @@ static constexpr size_t kRuntimeParameterFpuRegistersLength =
   V(StringBuilderLength)                    \
   V(StringBuilderToString)                  \
   /* 1.8 */                                 \
-  V(UnsafeGetAndAddInt)                     \
-  V(UnsafeGetAndAddLong)                    \
-  V(UnsafeGetAndSetInt)                     \
-  V(UnsafeGetAndSetLong)                    \
-  V(UnsafeGetAndSetObject)                  \
   V(MethodHandleInvokeExact)                \
-  V(MethodHandleInvoke)                     \
-  /* OpenJDK 11 */                          \
-  V(JdkUnsafeGetAndAddInt)                  \
-  V(JdkUnsafeGetAndAddLong)                 \
-  V(JdkUnsafeGetAndSetInt)                  \
-  V(JdkUnsafeGetAndSetLong)                 \
-  V(JdkUnsafeGetAndSetObject)
+  V(MethodHandleInvoke)
 
 class InvokeRuntimeCallingConvention : public CallingConvention<Register, XmmRegister> {
  public:
@@ -196,7 +185,7 @@ class FieldAccessCallingConventionX86 : public FieldAccessCallingConvention {
             ? Location::RegisterLocation(EDX)
             : Location::RegisterLocation(ECX));
   }
-  Location GetFpuLocation(DataType::Type type ATTRIBUTE_UNUSED) const override {
+  Location GetFpuLocation([[maybe_unused]] DataType::Type type) const override {
     return Location::FpuRegisterLocation(XMM0);
   }
 
@@ -578,9 +567,19 @@ class CodeGeneratorX86 : public CodeGenerator {
                        uint64_t index_in_table) const;
   void EmitJitRootPatches(uint8_t* code, const uint8_t* roots_data) override;
 
-  // Emit a write barrier.
-  void MarkGCCard(
+  // Emit a write barrier if:
+  // A) emit_null_check is false
+  // B) emit_null_check is true, and value is not null.
+  void MaybeMarkGCCard(
       Register temp, Register card, Register object, Register value, bool emit_null_check);
+
+  // Emit a write barrier unconditionally.
+  void MarkGCCard(Register temp, Register card, Register object);
+
+  // Crash if the card table is not valid. This check is only emitted for the CC GC. We assert
+  // `(!clean || !self->is_gc_marking)`, since the card table should not be set to clean when the CC
+  // GC is marking for eliminated write barriers.
+  void CheckGCCardIsValid(Register temp, Register card, Register object);
 
   void GenerateMemoryBarrier(MemBarrierKind kind);
 
@@ -635,7 +634,7 @@ class CodeGeneratorX86 : public CodeGenerator {
 
   Address LiteralCaseTable(HX86PackedSwitch* switch_instr, Register reg, Register value);
 
-  void Finalize(CodeAllocator* allocator) override;
+  void Finalize() override;
 
   // Fast path implementation of ReadBarrier::Barrier for a heap
   // reference field load when Baker's read barriers are used.
@@ -739,7 +738,7 @@ class CodeGeneratorX86 : public CodeGenerator {
   void GenerateExplicitNullCheck(HNullCheck* instruction) override;
 
   void MaybeGenerateInlineCacheCheck(HInstruction* instruction, Register klass);
-  void MaybeIncrementHotness(bool is_frame_entry);
+  void MaybeIncrementHotness(HSuspendCheck* suspend_check, bool is_frame_entry);
 
   // When we don't know the proper offset for the value, we use kPlaceholder32BitOffset.
   // The correct value will be inserted when processing Assembler fixups.

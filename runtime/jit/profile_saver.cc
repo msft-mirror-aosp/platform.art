@@ -39,11 +39,11 @@
 #include "gc/gc_cause.h"
 #include "jit/jit.h"
 #include "jit/profiling_info.h"
-#include "oat_file_manager.h"
+#include "oat/oat_file_manager.h"
 #include "profile/profile_compilation_info.h"
 #include "scoped_thread_state_change-inl.h"
 
-namespace art {
+namespace art HIDDEN {
 
 using Hotness = ProfileCompilationInfo::MethodHotness;
 
@@ -542,6 +542,9 @@ void ProfileSaver::GetClassesAndMethodsHelper::CollectInternal(
     dex::TypeIndex type_index = k->GetDexTypeIndex();
     uint32_t copied_methods_start = klass->GetCopiedMethodsStartOffset();
     LengthPrefixedArray<ArtMethod>* methods = klass->GetMethodsPtr();
+    if (methods != nullptr) {
+      CHECK_LE(copied_methods_start, methods->size()) << k->PrettyClass();
+    }
 
     DexFileRecords* dex_file_records;
     auto it = dex_file_records_map_.find(&dex_file);
@@ -593,11 +596,13 @@ void ProfileSaver::GetClassesAndMethodsHelper::CollectClasses(Thread* self) {
         continue;
       }
       const size_t methods_size = methods->size();
+      CHECK_LE(class_record.copied_methods_start, methods_size)
+          << dex_file->PrettyType(class_record.type_index);
       for (size_t index = class_record.copied_methods_start; index != methods_size; ++index) {
         // Note: Using `ArtMethod` array with implicit `kRuntimePointerSize`.
         ArtMethod& method = methods->At(index);
-        DCHECK(method.IsCopied());
-        DCHECK(!method.IsNative());
+        CHECK(method.IsCopied()) << dex_file->PrettyType(class_record.type_index);
+        CHECK(!method.IsNative()) << dex_file->PrettyType(class_record.type_index);
         if (method.IsInvokable()) {
           const DexFile* method_dex_file = method.GetDexFile();
           DexFileRecords* method_dex_file_records = dex_file_records;
@@ -863,7 +868,8 @@ bool ProfileSaver::ProcessProfilingInfo(
     std::vector<ProfileMethodInfo> profile_methods;
     {
       ScopedObjectAccess soa(Thread::Current());
-      jit_code_cache_->GetProfiledMethods(locations, profile_methods);
+      jit_code_cache_->GetProfiledMethods(
+          locations, profile_methods, options_.GetInlineCacheThreshold());
       total_number_of_code_cache_queries_++;
     }
     {

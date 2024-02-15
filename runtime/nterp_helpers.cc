@@ -14,15 +14,16 @@
  * limitations under the License.
  */
 
+#include "arch/instruction_set.h"
 #include "art_method-inl.h"
 #include "dex/code_item_accessors.h"
 #include "entrypoints/quick/callee_save_frame.h"
 #include "interpreter/mterp/nterp.h"
 #include "nterp_helpers.h"
-#include "oat_quick_method_header.h"
+#include "oat/oat_quick_method_header.h"
 #include "quick/quick_method_frame_info.h"
 
-namespace art {
+namespace art HIDDEN {
 
 /**
  * An nterp frame follows the optimizing compiler's ABI conventions, with
@@ -232,6 +233,9 @@ bool CanMethodUseNterp(ArtMethod* method, InstructionSet isa) {
       // run them with nterp.
       method->IsProxyMethod()) {
     return false;
+  }
+  if (isa == InstructionSet::kRiscv64 && method->GetDexFile()->IsCompactDexFile()) {
+    return false;  // Riscv64 nterp does not support compact dex yet.
   }
   // There is no need to add the alignment padding size for comparison with aligned limit.
   size_t frame_size_without_padding = NterpGetFrameSizeWithoutPadding(method, isa);

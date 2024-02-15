@@ -24,8 +24,8 @@
 #include "jni/jni_internal.h"
 #include "mirror/class-inl.h"
 #include "nth_caller_visitor.h"
-#include "oat_file.h"
-#include "oat_quick_method_header.h"
+#include "oat/oat_file.h"
+#include "oat/oat_quick_method_header.h"
 #include "runtime.h"
 #include "scoped_thread_state_change-inl.h"
 #include "stack.h"
@@ -38,8 +38,8 @@ static bool asserts_enabled = true;
 // public static native void disableStackFrameAsserts();
 // Note: to globally disable asserts in unsupported configurations.
 
-extern "C" JNIEXPORT void JNICALL Java_Main_disableStackFrameAsserts(JNIEnv* env ATTRIBUTE_UNUSED,
-                                                                     jclass cls ATTRIBUTE_UNUSED) {
+extern "C" JNIEXPORT void JNICALL Java_Main_disableStackFrameAsserts([[maybe_unused]] JNIEnv* env,
+                                                                     [[maybe_unused]] jclass cls) {
   asserts_enabled = false;
 }
 
@@ -98,7 +98,7 @@ static bool IsMethodInterpreted(Thread* self,
 
 // TODO Remove 'require_deoptimizable' option once we have deoptimization through runtime frames.
 extern "C" JNIEXPORT jboolean JNICALL Java_Main_isInterpretedFunction(
-    JNIEnv* env, jclass klass ATTRIBUTE_UNUSED, jobject method, jboolean require_deoptimizable) {
+    JNIEnv* env, [[maybe_unused]] jclass klass, jobject method, jboolean require_deoptimizable) {
   // Return false if this seems to not be an ART runtime.
   if (Runtime::Current() == nullptr) {
     return JNI_FALSE;
@@ -185,7 +185,7 @@ extern "C" JNIEXPORT void JNICALL Java_Main_assertCallerIsManaged(JNIEnv* env, j
 }
 
 extern "C" JNIEXPORT jobject JNICALL Java_Main_getThisOfCaller(
-    JNIEnv* env, jclass cls ATTRIBUTE_UNUSED) {
+    JNIEnv* env, [[maybe_unused]] jclass cls) {
   ScopedObjectAccess soa(env);
   std::unique_ptr<art::Context> context(art::Context::Create());
   jobject result = nullptr;

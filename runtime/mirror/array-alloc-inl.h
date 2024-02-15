@@ -30,7 +30,7 @@
 #include "obj_ptr-inl.h"
 #include "runtime.h"
 
-namespace art {
+namespace art HIDDEN {
 namespace mirror {
 
 static inline size_t ComputeArraySize(int32_t component_count, size_t component_size_shift) {
@@ -67,7 +67,7 @@ class SetLengthVisitor {
   explicit SetLengthVisitor(int32_t length) : length_(length) {
   }
 
-  void operator()(ObjPtr<Object> obj, size_t usable_size ATTRIBUTE_UNUSED) const
+  void operator()(ObjPtr<Object> obj, [[maybe_unused]] size_t usable_size) const
       REQUIRES_SHARED(Locks::mutator_lock_) {
     // Avoid AsArray as object is not yet in live bitmap or allocation stack.
     ObjPtr<Array> array = ObjPtr<Array>::DownCast(obj);
