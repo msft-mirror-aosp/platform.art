@@ -52,33 +52,39 @@ class AssemblerRISCV64Test : public AssemblerTest<Riscv64Assembler,
 
   InstructionSet GetIsa() override { return InstructionSet::kRiscv64; }
 
-  // Clang's assembler takes advantage of certain extensions for emitting constants with `li`
-  // but our assembler does not. For now, we use a simple `-march` to avoid the divergence.
-  // TODO(riscv64): Implement these more efficient patterns in assembler.
-  void SetUseSimpleMarch(bool value) {
-    use_simple_march_ = value;
-  }
+  class ScopedMarchOverride {
+   public:
+    ScopedMarchOverride(AssemblerRISCV64Test* test, const std::string& march)
+        : test_(test), old_override_(test->march_override_) {
+      test->march_override_ = march;
+    }
+
+    ~ScopedMarchOverride() {
+      test_->march_override_ = old_override_;
+    }
+
+   private:
+    AssemblerRISCV64Test* const test_;
+    std::optional<std::string> const old_override_;
+  };
+
+  class ScopedCSuppression {
+   public:
+    explicit ScopedCSuppression(AssemblerRISCV64Test* test)
+        : smo_(test, "-march=rv64imafdv_zba_zbb") {}
+
+   private:
+    ScopedMarchOverride smo_;
+  };
 
   std::vector<std::string> GetAssemblerCommand() override {
     std::vector<std::string> result = Base::GetAssemblerCommand();
-    if (use_simple_march_) {
+    if (march_override_.has_value()) {
       auto it = std::find_if(result.begin(),
                              result.end(),
                              [](const std::string& s) { return StartsWith(s, "-march="); });
       CHECK(it != result.end());
-      *it = "-march=rv64imafdv";
-    }
-    return result;
-  }
-
-  std::vector<std::string> GetDisassemblerCommand() override {
-    std::vector<std::string> result = Base::GetDisassemblerCommand();
-    if (use_simple_march_) {
-      auto it = std::find_if(result.begin(),
-                             result.end(),
-                             [](const std::string& s) { return StartsWith(s, "--mattr="); });
-      CHECK(it != result.end());
-      *it = "--mattr=+F,+D,+A,+V";
+      *it = march_override_.value();
     }
     return result;
   }
@@ -167,6 +173,20 @@ class AssemblerRISCV64Test : public AssemblerTest<Riscv64Assembler,
     return ArrayRef<const XRegister>(kXRegisters);
   }
 
+  ArrayRef<const XRegister> GetRegistersShort() {
+    static constexpr XRegister kXRegistersShort[] = {
+        S0,
+        S1,
+        A0,
+        A1,
+        A2,
+        A3,
+        A4,
+        A5,
+    };
+    return ArrayRef<const XRegister>(kXRegistersShort);
+  }
+
   ArrayRef<const FRegister> GetFPRegisters() override {
     static constexpr FRegister kFRegisters[] = {
         FT0,
@@ -211,6 +231,20 @@ class AssemblerRISCV64Test : public AssemblerTest<Riscv64Assembler,
         V16, V17, V18, V19, V20, V21, V22, V23, V24, V25, V26, V27, V28, V29, V30, V31
     };
     return ArrayRef<const VRegister>(kVRegisters);
+  }
+
+  ArrayRef<const FRegister> GetFPRegistersShort() {
+    static constexpr FRegister kFRegistersShort[] = {
+        FS0,
+        FS1,
+        FA0,
+        FA1,
+        FA2,
+        FA3,
+        FA4,
+        FA5,
+    };
+    return ArrayRef<const FRegister>(kFRegistersShort);
   }
 
   std::string GetSecondaryRegisterName(const XRegister& reg) override {
@@ -952,6 +986,186 @@ class AssemblerRISCV64Test : public AssemblerTest<Riscv64Assembler,
       }
     }
     return str;
+  }
+
+  template <typename Reg, typename Imm>
+  std::string RepeatCTemplateRegImm(void (Riscv64Assembler::*f)(Reg, Imm),
+                                    ArrayRef<const Reg> registers,
+                                    std::string (Base::*GetName)(const Reg&),
+                                    int imm_bits,
+                                    int shift,
+                                    bool no_zero_imm,
+                                    const std::string& fmt) {
+    auto imms = CreateImmediateValuesBits(abs(imm_bits), /*as_uint=*/imm_bits > 0, shift);
+
+    CHECK(f != nullptr);
+    std::string str;
+    for (Reg reg : registers) {
+      for (int64_t imm_raw : imms) {
+        if (no_zero_imm && imm_raw == 0) {
+          continue;
+        }
+
+        Imm imm = CreateImmediate(imm_raw);
+        (GetAssembler()->*f)(reg, imm);
+
+        std::string base = fmt;
+        ReplaceReg(REG_TOKEN, (this->*GetName)(reg), &base);
+        ReplaceImm(imm, /*bias=*/0, /*multiplier=*/1, &base);
+        str += base;
+        str += "\n";
+      }
+    }
+    return str;
+  }
+
+  template <typename Imm>
+  std::string RepeatCRImm(void (Riscv64Assembler::*f)(XRegister, Imm),
+                          bool is_short,
+                          bool no_zero_reg,
+                          bool no_zero_imm,
+                          int imm_bits,
+                          int shift,
+                          const std::string& fmt) {
+    auto regs = is_short ? GetRegistersShort() : GetRegisters();
+    if (no_zero_reg) {
+      CHECK(!is_short);
+      CHECK_EQ(regs[0], Zero);
+      regs = regs.SubArray(1);
+    }
+    return RepeatCTemplateRegImm(
+        f, regs, &AssemblerRISCV64Test::GetRegisterName, imm_bits, shift, no_zero_imm, fmt);
+  }
+
+  template <typename Imm>
+  std::string RepeatCFImm(void (Riscv64Assembler::*f)(FRegister, Imm),
+                          int imm_bits,
+                          int shift,
+                          const std::string& fmt) {
+    auto regs = GetFPRegisters();
+    return RepeatCTemplateRegImm(
+        f, regs, &AssemblerRISCV64Test::GetFPRegName, imm_bits, shift, /*no_zero_imm=*/false, fmt);
+  }
+
+  template <typename Reg1>
+  std::string RepeatTemplatedShortRegistersImm(void (Riscv64Assembler::*f)(Reg1,
+                                                                           XRegister,
+                                                                           int32_t),
+                                               ArrayRef<const Reg1> reg1_registers,
+                                               std::string (Base::*GetName1)(const Reg1&),
+                                               int imm_bits,
+                                               int shift,
+                                               bool no_zero_imm,
+                                               const std::string& fmt) {
+    CHECK(f != nullptr);
+    auto imms = CreateImmediateValuesBits(abs(imm_bits), imm_bits > 0, shift);
+    std::string str;
+    for (Reg1 reg1 : reg1_registers) {
+      for (XRegister reg2 : GetRegistersShort()) {
+        for (int64_t imm_raw : imms) {
+          if (no_zero_imm && imm_raw == 0) {
+            continue;
+          }
+
+          int32_t imm = CreateImmediate(imm_raw);
+          (GetAssembler()->*f)(reg1, reg2, imm);
+
+          std::string base = fmt;
+          ReplaceReg(REG1_TOKEN, (this->*GetName1)(reg1), &base);
+          ReplaceReg(REG2_TOKEN, GetRegisterName(reg2), &base);
+          ReplaceImm(imm, /*bias=*/0, /*multiplier=*/1, &base);
+          str += base;
+          str += "\n";
+        }
+      }
+    }
+    return str;
+  }
+
+  std::string RepeatCRRImm(void (Riscv64Assembler::*f)(XRegister, XRegister, int32_t),
+                           int imm_bits,
+                           int shift,
+                           const std::string& fmt) {
+    return RepeatTemplatedShortRegistersImm(f,
+                                            GetRegistersShort(),
+                                            &AssemblerRISCV64Test::GetRegisterName,
+                                            imm_bits,
+                                            shift,
+                                            /*no_zero_imm=*/false,
+                                            fmt);
+  }
+
+  std::string RepeatCFRImm(void (Riscv64Assembler::*f)(FRegister, XRegister, int32_t),
+                           int imm_bits,
+                           int shift,
+                           const std::string& fmt) {
+    return RepeatTemplatedShortRegistersImm(f,
+                                            GetFPRegistersShort(),
+                                            &AssemblerRISCV64Test::GetFPRegName,
+                                            imm_bits,
+                                            shift,
+                                            /*no_zero_imm=*/false,
+                                            fmt);
+  }
+
+  std::string RepeatCRRShort(void (Riscv64Assembler::*f)(XRegister, XRegister),
+                             const std::string& fmt) {
+    return RepeatTemplatedRegisters(f,
+                                    GetRegistersShort(),
+                                    GetRegistersShort(),
+                                    &AssemblerRISCV64Test::GetRegisterName,
+                                    &AssemblerRISCV64Test::GetRegisterName,
+                                    fmt);
+  }
+
+  std::string RepeatCRRNonZero(void (Riscv64Assembler::*f)(XRegister, XRegister),
+                               const std::string& fmt) {
+    auto regs = GetRegisters();
+    CHECK_EQ(regs[0], Zero);
+    auto regs_no_zero = regs.SubArray(1);
+    return RepeatTemplatedRegisters(f,
+                                    regs_no_zero,
+                                    regs_no_zero,
+                                    &AssemblerRISCV64Test::GetRegisterName,
+                                    &AssemblerRISCV64Test::GetRegisterName,
+                                    fmt);
+  }
+
+  std::string RepeatCRShort(void (Riscv64Assembler::*f)(XRegister), const std::string& fmt) {
+    return RepeatTemplatedRegister(
+        f, GetRegistersShort(), &AssemblerRISCV64Test::GetRegisterName, fmt);
+  }
+
+  template <typename Imm>
+  std::string RepeatImm(void (Riscv64Assembler::*f)(Imm),
+                        bool no_zero_imm,
+                        int imm_bits,
+                        int shift,
+                        const std::string& fmt) {
+    auto imms = CreateImmediateValuesBits(abs(imm_bits), imm_bits > 0, shift);
+    std::string str;
+    for (int64_t imm_raw : imms) {
+      if (no_zero_imm && imm_raw == 0) {
+        continue;
+      }
+
+      Imm imm = CreateImmediate(imm_raw);
+      (GetAssembler()->*f)(imm);
+
+      std::string base = fmt;
+      ReplaceImm(imm, /*bias=*/0, /*multiplier=*/1, &base);
+      str += base;
+      str += "\n";
+    }
+
+    return str;
+  }
+
+  std::string RepeatRNoZero(void (Riscv64Assembler::*f)(XRegister), const std::string& fmt) {
+    auto regs = GetRegisters();
+    CHECK_EQ(regs[0], Zero);
+    return RepeatTemplatedRegister(
+        f, regs.SubArray(1), &AssemblerRISCV64Test::GetRegisterName, fmt);
   }
 
   template <typename Reg1, typename Reg2>
@@ -1973,12 +2187,13 @@ class AssemblerRISCV64Test : public AssemblerTest<Riscv64Assembler,
   std::map<XRegister, std::string, RISCV64CpuRegisterCompare> secondary_register_names_;
 
   std::unique_ptr<const Riscv64InstructionSetFeatures> instruction_set_features_;
-  bool use_simple_march_ = false;
+  std::optional<std::string> march_override_;
 };
 
 TEST_F(AssemblerRISCV64Test, Toolchain) { EXPECT_TRUE(CheckTools()); }
 
 TEST_F(AssemblerRISCV64Test, Lui) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRIb(&Riscv64Assembler::Lui, 20, "lui {reg}, {imm}"), "Lui");
 }
 
@@ -1987,21 +2202,25 @@ TEST_F(AssemblerRISCV64Test, Auipc) {
 }
 
 TEST_F(AssemblerRISCV64Test, Jal) {
+  ScopedCSuppression scs(this);
   // TODO(riscv64): Change "-19, 2" to "-20, 1" for "C" Standard Extension.
   DriverStr(RepeatRIbS(&Riscv64Assembler::Jal, -19, 2, "jal {reg}, {imm}\n"), "Jal");
 }
 
 TEST_F(AssemblerRISCV64Test, Jalr) {
+  ScopedCSuppression scs(this);
   // TODO(riscv64): Change "-11, 2" to "-12, 1" for "C" Standard Extension.
   DriverStr(RepeatRRIb(&Riscv64Assembler::Jalr, -12, "jalr {reg1}, {reg2}, {imm}\n"), "Jalr");
 }
 
 TEST_F(AssemblerRISCV64Test, Beq) {
+  ScopedCSuppression scs(this);
   // TODO(riscv64): Change "-11, 2" to "-12, 1" for "C" Standard Extension.
   DriverStr(RepeatRRIbS(&Riscv64Assembler::Beq, -11, 2, "beq {reg1}, {reg2}, {imm}\n"), "Beq");
 }
 
 TEST_F(AssemblerRISCV64Test, Bne) {
+  ScopedCSuppression scs(this);
   // TODO(riscv64): Change "-11, 2" to "-12, 1" for "C" Standard Extension.
   DriverStr(RepeatRRIbS(&Riscv64Assembler::Bne, -11, 2, "bne {reg1}, {reg2}, {imm}\n"), "Bne");
 }
@@ -2027,50 +2246,62 @@ TEST_F(AssemblerRISCV64Test, Bgeu) {
 }
 
 TEST_F(AssemblerRISCV64Test, Lb) {
+  // Note: There is no 16-bit instruction for `Lb()`.
   DriverStr(RepeatRRIb(&Riscv64Assembler::Lb, -12, "lb {reg1}, {imm}({reg2})"), "Lb");
 }
 
 TEST_F(AssemblerRISCV64Test, Lh) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRIb(&Riscv64Assembler::Lh, -12, "lh {reg1}, {imm}({reg2})"), "Lh");
 }
 
 TEST_F(AssemblerRISCV64Test, Lw) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRIb(&Riscv64Assembler::Lw, -12, "lw {reg1}, {imm}({reg2})"), "Lw");
 }
 
 TEST_F(AssemblerRISCV64Test, Ld) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRIb(&Riscv64Assembler::Ld, -12, "ld {reg1}, {imm}({reg2})"), "Ld");
 }
 
 TEST_F(AssemblerRISCV64Test, Lbu) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRIb(&Riscv64Assembler::Lbu, -12, "lbu {reg1}, {imm}({reg2})"), "Lbu");
 }
 
 TEST_F(AssemblerRISCV64Test, Lhu) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRIb(&Riscv64Assembler::Lhu, -12, "lhu {reg1}, {imm}({reg2})"), "Lhu");
 }
 
 TEST_F(AssemblerRISCV64Test, Lwu) {
+  // Note: There is no 16-bit instruction for `Lwu()`.
   DriverStr(RepeatRRIb(&Riscv64Assembler::Lwu, -12, "lwu {reg1}, {imm}({reg2})"), "Lwu");
 }
 
 TEST_F(AssemblerRISCV64Test, Sb) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRIb(&Riscv64Assembler::Sb, -12, "sb {reg1}, {imm}({reg2})"), "Sb");
 }
 
 TEST_F(AssemblerRISCV64Test, Sh) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRIb(&Riscv64Assembler::Sh, -12, "sh {reg1}, {imm}({reg2})"), "Sh");
 }
 
 TEST_F(AssemblerRISCV64Test, Sw) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRIb(&Riscv64Assembler::Sw, -12, "sw {reg1}, {imm}({reg2})"), "Sw");
 }
 
 TEST_F(AssemblerRISCV64Test, Sd) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRIb(&Riscv64Assembler::Sd, -12, "sd {reg1}, {imm}({reg2})"), "Sd");
 }
 
 TEST_F(AssemblerRISCV64Test, Addi) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRIb(&Riscv64Assembler::Addi, -12, "addi {reg1}, {reg2}, {imm}"), "Addi");
 }
 
@@ -2091,26 +2322,32 @@ TEST_F(AssemblerRISCV64Test, Ori) {
 }
 
 TEST_F(AssemblerRISCV64Test, Andi) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRIb(&Riscv64Assembler::Andi, -12, "andi {reg1}, {reg2}, {imm}"), "Andi");
 }
 
 TEST_F(AssemblerRISCV64Test, Slli) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRIb(&Riscv64Assembler::Slli, 6, "slli {reg1}, {reg2}, {imm}"), "Slli");
 }
 
 TEST_F(AssemblerRISCV64Test, Srli) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRIb(&Riscv64Assembler::Srli, 6, "srli {reg1}, {reg2}, {imm}"), "Srli");
 }
 
 TEST_F(AssemblerRISCV64Test, Srai) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRIb(&Riscv64Assembler::Srai, 6, "srai {reg1}, {reg2}, {imm}"), "Srai");
 }
 
 TEST_F(AssemblerRISCV64Test, Add) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRR(&Riscv64Assembler::Add, "add {reg1}, {reg2}, {reg3}"), "Add");
 }
 
 TEST_F(AssemblerRISCV64Test, Sub) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRR(&Riscv64Assembler::Sub, "sub {reg1}, {reg2}, {reg3}"), "Sub");
 }
 
@@ -2123,14 +2360,17 @@ TEST_F(AssemblerRISCV64Test, Sltu) {
 }
 
 TEST_F(AssemblerRISCV64Test, Xor) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRR(&Riscv64Assembler::Xor, "xor {reg1}, {reg2}, {reg3}"), "Xor");
 }
 
 TEST_F(AssemblerRISCV64Test, Or) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRR(&Riscv64Assembler::Or, "or {reg1}, {reg2}, {reg3}"), "Or");
 }
 
 TEST_F(AssemblerRISCV64Test, And) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRR(&Riscv64Assembler::And, "and {reg1}, {reg2}, {reg3}"), "And");
 }
 
@@ -2147,6 +2387,7 @@ TEST_F(AssemblerRISCV64Test, Sra) {
 }
 
 TEST_F(AssemblerRISCV64Test, Addiw) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRIb(&Riscv64Assembler::Addiw, -12, "addiw {reg1}, {reg2}, {imm}"), "Addiw");
 }
 
@@ -2166,10 +2407,12 @@ TEST_F(AssemblerRISCV64Test, Sraiw) {
 }
 
 TEST_F(AssemblerRISCV64Test, Addw) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRR(&Riscv64Assembler::Addw, "addw {reg1}, {reg2}, {reg3}"), "Addw");
 }
 
 TEST_F(AssemblerRISCV64Test, Subw) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRR(&Riscv64Assembler::Subw, "subw {reg1}, {reg2}, {reg3}"), "Subw");
 }
 
@@ -2191,6 +2434,7 @@ TEST_F(AssemblerRISCV64Test, Ecall) {
 }
 
 TEST_F(AssemblerRISCV64Test, Ebreak) {
+  ScopedCSuppression scs(this);
   __ Ebreak();
   DriverStr("ebreak\n", "Ebreak");
 }
@@ -2241,6 +2485,7 @@ TEST_F(AssemblerRISCV64Test, FenceI) {
 }
 
 TEST_F(AssemblerRISCV64Test, Mul) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRRR(&Riscv64Assembler::Mul, "mul {reg1}, {reg2}, {reg3}"), "Mul");
 }
 
@@ -2433,18 +2678,22 @@ TEST_F(AssemblerRISCV64Test, Csrrci) {
 }
 
 TEST_F(AssemblerRISCV64Test, FLw) {
+  // Note: 16-bit variants of `flw` are not available on riscv64.
   DriverStr(RepeatFRIb(&Riscv64Assembler::FLw, -12, "flw {reg1}, {imm}({reg2})"), "FLw");
 }
 
 TEST_F(AssemblerRISCV64Test, FLd) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatFRIb(&Riscv64Assembler::FLd, -12, "fld {reg1}, {imm}({reg2})"), "FLw");
 }
 
 TEST_F(AssemblerRISCV64Test, FSw) {
+  // Note: 16-bit variants of `fsw` are not available on riscv64.
   DriverStr(RepeatFRIb(&Riscv64Assembler::FSw, 2, "fsw {reg1}, {imm}({reg2})"), "FSw");
 }
 
 TEST_F(AssemblerRISCV64Test, FSd) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatFRIb(&Riscv64Assembler::FSd, 2, "fsd {reg1}, {imm}({reg2})"), "FSd");
 }
 
@@ -2874,7 +3123,384 @@ TEST_F(AssemblerRISCV64Test, FClassD) {
   DriverStr(RepeatrF(&Riscv64Assembler::FClassD, "fclass.d {reg1}, {reg2}"), "FClassD");
 }
 
+TEST_F(AssemblerRISCV64Test, CLwsp) {
+  DriverStr(RepeatCRImm(&Riscv64Assembler::CLwsp,
+                        /*is_short=*/false,
+                        /*no_zero_reg=*/true,
+                        /*no_zero_imm=*/false,
+                        /*imm_bits=*/6,
+                        /*shift=*/2,
+                        "c.lwsp {reg}, {imm}(sp)"),
+            "CLwsp");
+}
+
+TEST_F(AssemblerRISCV64Test, CLdsp) {
+  DriverStr(RepeatCRImm(&Riscv64Assembler::CLdsp,
+                        /*is_short=*/false,
+                        /*no_zero_reg=*/true,
+                        /*no_zero_imm=*/false,
+                        /*imm_bits=*/6,
+                        /*shift=*/3,
+                        "c.ldsp {reg}, {imm}(sp)"),
+            "CLdsp");
+}
+
+TEST_F(AssemblerRISCV64Test, CFLdsp) {
+  DriverStr(RepeatCFImm(
+                &Riscv64Assembler::CFLdsp, /*imm_bits=*/6, /*shift=*/3, "c.fldsp {reg}, {imm}(sp)"),
+            "CFLdsp");
+}
+
+TEST_F(AssemblerRISCV64Test, CSwsp) {
+  DriverStr(RepeatCRImm(&Riscv64Assembler::CSwsp,
+                        /*is_short=*/false,
+                        /*no_zero_reg=*/false,
+                        /*no_zero_imm=*/false,
+                        /*imm_bits=*/6,
+                        /*shift=*/2,
+                        "c.swsp {reg}, {imm}(sp)"),
+            "CLwsp");
+}
+
+TEST_F(AssemblerRISCV64Test, CSdsp) {
+  DriverStr(RepeatCRImm(&Riscv64Assembler::CSdsp,
+                        /*is_short=*/false,
+                        /*no_zero_reg=*/false,
+                        /*no_zero_imm=*/false,
+                        /*imm_bits=*/6,
+                        /*shift=*/3,
+                        "c.sdsp {reg}, {imm}(sp)"),
+            "CLdsp");
+}
+
+TEST_F(AssemblerRISCV64Test, CFSdsp) {
+  DriverStr(RepeatCFImm(
+                &Riscv64Assembler::CFSdsp, /*imm_bits=*/6, /*shift=*/3, "c.fsdsp {reg}, {imm}(sp)"),
+            "CFLdsp");
+}
+
+TEST_F(AssemblerRISCV64Test, CLw) {
+  DriverStr(RepeatCRRImm(
+                &Riscv64Assembler::CLw, /*imm_bits=*/5, /*shift=*/2, "c.lw {reg1}, {imm}({reg2})"),
+            "CLw");
+}
+
+TEST_F(AssemblerRISCV64Test, CLd) {
+  DriverStr(RepeatCRRImm(
+                &Riscv64Assembler::CLd, /*imm_bits=*/5, /*shift=*/3, "c.ld {reg1}, {imm}({reg2})"),
+            "CLd");
+}
+
+TEST_F(AssemblerRISCV64Test, CFLd) {
+  DriverStr(RepeatCFRImm(&Riscv64Assembler::CFLd,
+                         /*imm_bits=*/5,
+                         /*shift=*/3,
+                         "c.fld {reg1}, {imm}({reg2})"),
+            "CFLd");
+}
+
+TEST_F(AssemblerRISCV64Test, CSw) {
+  DriverStr(RepeatCRRImm(
+                &Riscv64Assembler::CSw, /*imm_bits=*/5, /*shift=*/2, "c.sw {reg1}, {imm}({reg2})"),
+            "CSw");
+}
+
+TEST_F(AssemblerRISCV64Test, CSd) {
+  DriverStr(RepeatCRRImm(
+                &Riscv64Assembler::CSd, /*imm_bits=*/5, /*shift=*/3, "c.sd {reg1}, {imm}({reg2})"),
+            "CSd");
+}
+
+TEST_F(AssemblerRISCV64Test, CFSd) {
+  DriverStr(RepeatCFRImm(&Riscv64Assembler::CFSd,
+                         /*imm_bits=*/5,
+                         /*shift=*/3,
+                         "c.fsd {reg1}, {imm}({reg2})"),
+            "CFSd");
+}
+
+TEST_F(AssemblerRISCV64Test, CLi) {
+  DriverStr(RepeatCRImm(&Riscv64Assembler::CLi,
+                        /*is_short=*/false,
+                        /*no_zero_reg=*/true,
+                        /*no_zero_imm=*/false,
+                        /*imm_bits=*/-6,
+                        /*shift=*/0,
+                        "c.li {reg}, {imm}"),
+            "CLi");
+}
+
+TEST_F(AssemblerRISCV64Test, CLui) {
+  std::string str;
+  auto imms = CreateImmediateValuesBits(/*imm_bits=*/5, /*as_uint=*/true);
+  for (uint32_t v = 0xfffe0; v <= 0xfffff; ++v) {
+    imms.push_back(v);
+  }
+
+  for (XRegister reg : GetRegisters()) {
+    for (int64_t imm_raw : imms) {
+      if (imm_raw == 0) {
+        continue;
+      }
+
+      if (reg == Zero || reg == SP) {
+        continue;
+      }
+
+      uint32_t imm = CreateImmediate(imm_raw);
+      GetAssembler()->CLui(reg, imm);
+
+      std::string base = "c.lui {reg}, {imm}";
+      ReplaceReg(REG_TOKEN, GetRegisterName(reg), &base);
+      ReplaceImm(imm, /*bias=*/0, /*multiplier=*/1, &base);
+      str += base;
+      str += "\n";
+    }
+  }
+
+  DriverStr(str, "CLui");
+}
+
+TEST_F(AssemblerRISCV64Test, CAddi) {
+  DriverStr(RepeatCRImm(&Riscv64Assembler::CAddi,
+                        /*is_short=*/false,
+                        /*no_zero_reg=*/true,
+                        /*no_zero_imm=*/true,
+                        /*imm_bits=*/-6,
+                        /*shift=*/0,
+                        "c.addi {reg}, {imm}"),
+            "CAddi");
+}
+
+TEST_F(AssemblerRISCV64Test, CAddiw) {
+  DriverStr(RepeatCRImm(&Riscv64Assembler::CAddiw,
+                        /*is_short=*/false,
+                        /*no_zero_reg=*/true,
+                        /*no_zero_imm=*/false,
+                        /*imm_bits=*/-6,
+                        /*shift=*/0,
+                        "c.addiw {reg}, {imm}"),
+            "CAddiw");
+}
+
+TEST_F(AssemblerRISCV64Test, CAddi16Sp) {
+  DriverStr(RepeatImm(&Riscv64Assembler::CAddi16Sp,
+                      /*no_zero_imm=*/true,
+                      /*imm_bits=*/-6,
+                      /*shift=*/4,
+                      "c.addi16sp sp, {imm}"),
+            "CAddi16Sp");
+}
+
+TEST_F(AssemblerRISCV64Test, CAddi4Spn) {
+  DriverStr(RepeatCRImm(&Riscv64Assembler::CAddi4Spn,
+                        /*is_short=*/true,
+                        /*no_zero_reg=*/false,
+                        /*no_zero_imm=*/true,
+                        /*imm_bits=*/8,
+                        /*shift=*/2,
+                        "c.addi4spn {reg}, sp, {imm}"),
+            "CAddi4Spn");
+}
+
+TEST_F(AssemblerRISCV64Test, CSlli) {
+  DriverStr(RepeatCRImm(&Riscv64Assembler::CSlli,
+                        /*is_short=*/false,
+                        /*no_zero_reg=*/true,
+                        /*no_zero_imm=*/true,
+                        /*imm_bits=*/6,
+                        /*shift=*/0,
+                        "c.slli {reg}, {imm}"),
+            "CSlli");
+}
+
+TEST_F(AssemblerRISCV64Test, CSRli) {
+  DriverStr(RepeatCRImm(&Riscv64Assembler::CSrli,
+                        /*is_short=*/true,
+                        /*no_zero_reg=*/false,
+                        /*no_zero_imm=*/true,
+                        /*imm_bits=*/6,
+                        /*shift=*/0,
+                        "c.srli {reg}, {imm}"),
+            "CSRli");
+}
+
+TEST_F(AssemblerRISCV64Test, CSRai) {
+  DriverStr(RepeatCRImm(&Riscv64Assembler::CSrai,
+                        /*is_short=*/true,
+                        /*no_zero_reg=*/false,
+                        /*no_zero_imm=*/true,
+                        /*imm_bits=*/6,
+                        /*shift=*/0,
+                        "c.srai {reg}, {imm}"),
+            "CSRai");
+}
+
+TEST_F(AssemblerRISCV64Test, CAndi) {
+  DriverStr(RepeatCRImm(&Riscv64Assembler::CAndi,
+                        /*is_short=*/true,
+                        /*no_zero_reg=*/false,
+                        /*no_zero_imm=*/false,
+                        /*imm_bits=*/-6,
+                        /*shift=*/0,
+                        "c.andi {reg}, {imm}"),
+            "CAndi");
+}
+
+TEST_F(AssemblerRISCV64Test, CMv) {
+  DriverStr(RepeatCRRNonZero(&Riscv64Assembler::CMv, "c.mv {reg1}, {reg2}"), "CMv");
+}
+
+TEST_F(AssemblerRISCV64Test, CAdd) {
+  DriverStr(RepeatCRRNonZero(&Riscv64Assembler::CAdd, "c.add {reg1}, {reg2}"), "CAdd");
+}
+
+TEST_F(AssemblerRISCV64Test, CAnd) {
+  DriverStr(RepeatCRRShort(&Riscv64Assembler::CAnd, "c.and {reg1}, {reg2}"), "CAnd");
+}
+
+TEST_F(AssemblerRISCV64Test, COr) {
+  DriverStr(RepeatCRRShort(&Riscv64Assembler::COr, "c.or {reg1}, {reg2}"), "COr");
+}
+
+TEST_F(AssemblerRISCV64Test, CXor) {
+  DriverStr(RepeatCRRShort(&Riscv64Assembler::CXor, "c.xor {reg1}, {reg2}"), "CXor");
+}
+
+TEST_F(AssemblerRISCV64Test, CSub) {
+  DriverStr(RepeatCRRShort(&Riscv64Assembler::CSub, "c.sub {reg1}, {reg2}"), "CSub");
+}
+
+TEST_F(AssemblerRISCV64Test, CAddw) {
+  DriverStr(RepeatCRRShort(&Riscv64Assembler::CAddw, "c.addw {reg1}, {reg2}"), "CAddw");
+}
+
+TEST_F(AssemblerRISCV64Test, CSubw) {
+  DriverStr(RepeatCRRShort(&Riscv64Assembler::CSubw, "c.subw {reg1}, {reg2}"), "CSubw");
+}
+
+TEST_F(AssemblerRISCV64Test, CLbu) {
+  DriverStr(RepeatCRRImm(&Riscv64Assembler::CLbu,
+                         /*imm_bits=*/2,
+                         /*shift=*/0,
+                         "c.lbu {reg1}, {imm}({reg2})"),
+            "CLbu");
+}
+
+TEST_F(AssemblerRISCV64Test, CLhu) {
+  DriverStr(RepeatCRRImm(&Riscv64Assembler::CLhu,
+                         /*imm_bits=*/1,
+                         /*shift=*/1,
+                         "c.lhu {reg1}, {imm}({reg2})"),
+            "CLhu");
+}
+
+TEST_F(AssemblerRISCV64Test, CLh) {
+  DriverStr(RepeatCRRImm(&Riscv64Assembler::CLh,
+                         /*imm_bits=*/1,
+                         /*shift=*/1,
+                         "c.lh {reg1}, {imm}({reg2})"),
+            "CLh");
+}
+
+TEST_F(AssemblerRISCV64Test, CSb) {
+  DriverStr(RepeatCRRImm(&Riscv64Assembler::CSb,
+                         /*imm_bits=*/2,
+                         /*shift=*/0,
+                         "c.sb {reg1}, {imm}({reg2})"),
+            "CSb");
+}
+
+TEST_F(AssemblerRISCV64Test, CSh) {
+  DriverStr(RepeatCRRImm(&Riscv64Assembler::CSh,
+                         /*imm_bits=*/1,
+                         /*shift=*/1,
+                         "c.sh {reg1}, {imm}({reg2})"),
+            "CSh");
+}
+
+TEST_F(AssemblerRISCV64Test, CZext_b) {
+  DriverStr(RepeatCRShort(&Riscv64Assembler::CZext_b, "c.zext.b {reg}"), "CZext_b");
+}
+
+TEST_F(AssemblerRISCV64Test, CSext_b) {
+  DriverStr(RepeatCRShort(&Riscv64Assembler::CSext_b, "c.sext.b {reg}"), "CSext_b");
+}
+
+TEST_F(AssemblerRISCV64Test, CZext_h) {
+  DriverStr(RepeatCRShort(&Riscv64Assembler::CZext_h, "c.zext.h {reg}"), "CZext_h");
+}
+
+TEST_F(AssemblerRISCV64Test, CSext_h) {
+  DriverStr(RepeatCRShort(&Riscv64Assembler::CSext_h, "c.sext.h {reg}"), "CSext_h");
+}
+
+TEST_F(AssemblerRISCV64Test, CZext_w) {
+  DriverStr(RepeatCRShort(&Riscv64Assembler::CZext_w, "c.zext.w {reg}"), "CZext_w");
+}
+
+TEST_F(AssemblerRISCV64Test, CNot) {
+  DriverStr(RepeatCRShort(&Riscv64Assembler::CNot, "c.not {reg}"), "CNot");
+}
+
+TEST_F(AssemblerRISCV64Test, CMul) {
+  DriverStr(RepeatCRRShort(&Riscv64Assembler::CMul, "c.mul {reg1}, {reg2}"), "CMul");
+}
+
+TEST_F(AssemblerRISCV64Test, CJ) {
+  DriverStr(
+      RepeatImm(
+          &Riscv64Assembler::CJ, /*no_zero_imm=*/false, /*imm_bits=*/-11, /*shift=*/1, "c.j {imm}"),
+      "CJ");
+}
+
+TEST_F(AssemblerRISCV64Test, CJr) {
+  DriverStr(RepeatRNoZero(&Riscv64Assembler::CJr, "c.jr {reg}"), "CJr");
+}
+
+TEST_F(AssemblerRISCV64Test, CJalr) {
+  DriverStr(RepeatRNoZero(&Riscv64Assembler::CJalr, "c.jalr {reg}"), "CJalr");
+}
+
+TEST_F(AssemblerRISCV64Test, CBeqz) {
+  DriverStr(RepeatCRImm(&Riscv64Assembler::CBeqz,
+                        /*is_short=*/true,
+                        /*no_zero_reg=*/false,
+                        /*no_zero_imm=*/false,
+                        /*imm_bits=*/-8,
+                        /*shift=*/1,
+                        "c.beqz {reg}, {imm}"),
+            "CBeqz");
+}
+
+TEST_F(AssemblerRISCV64Test, CBnez) {
+  DriverStr(RepeatCRImm(&Riscv64Assembler::CBnez,
+                        /*is_short=*/true,
+                        /*no_zero_reg=*/false,
+                        /*no_zero_imm=*/false,
+                        /*imm_bits=*/-8,
+                        /*shift=*/1,
+                        "c.bnez {reg}, {imm}"),
+            "CBnez");
+}
+
+TEST_F(AssemblerRISCV64Test, CEbreak) {
+  __ CEbreak();
+  DriverStr("c.ebreak", "CEbreak");
+}
+
+TEST_F(AssemblerRISCV64Test, CNop) {
+  __ CNop();
+  DriverStr("c.nop", "CNop");
+}
+
+TEST_F(AssemblerRISCV64Test, CUnimp) {
+  __ CUnimp();
+  DriverStr("c.unimp", "CUnimp");
+}
+
 TEST_F(AssemblerRISCV64Test, AddUw) {
+  ScopedCSuppression scs(this);  // Avoid `c.zext.w`.
   DriverStr(RepeatRRR(&Riscv64Assembler::AddUw, "add.uw {reg1}, {reg2}, {reg3}"), "AddUw");
 }
 
@@ -2992,14 +3618,17 @@ TEST_F(AssemblerRISCV64Test, Rev8) {
 }
 
 TEST_F(AssemblerRISCV64Test, ZbbSextB) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRR(&Riscv64Assembler::ZbbSextB, "sext.b {reg1}, {reg2}"), "ZbbSextB");
 }
 
 TEST_F(AssemblerRISCV64Test, ZbbSextH) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRR(&Riscv64Assembler::ZbbSextH, "sext.h {reg1}, {reg2}"), "ZbbSextH");
 }
 
 TEST_F(AssemblerRISCV64Test, ZbbZextH) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRR(&Riscv64Assembler::ZbbZextH, "zext.h {reg1}, {reg2}"), "ZbbZextH");
 }
 
@@ -7215,22 +7844,25 @@ TEST_F(AssemblerRISCV64Test, VId_v) {
 
 // Pseudo instructions.
 TEST_F(AssemblerRISCV64Test, Nop) {
+  ScopedCSuppression scs(this);
   __ Nop();
   DriverStr("addi zero,zero,0", "Nop");
 }
 
 TEST_F(AssemblerRISCV64Test, Li) {
-  SetUseSimpleMarch(true);
+  ScopedMarchOverride smo(this, "-march=rv64imafd");
   TestLoadConst64("Li",
                   /*can_use_tmp=*/ false,
                   [&](XRegister rd, int64_t value) { __ Li(rd, value); });
 }
 
 TEST_F(AssemblerRISCV64Test, Mv) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRR(&Riscv64Assembler::Mv, "addi {reg1}, {reg2}, 0"), "Mv");
 }
 
 TEST_F(AssemblerRISCV64Test, Not) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRR(&Riscv64Assembler::Not, "xori {reg1}, {reg2}, -1"), "Not");
 }
 
@@ -7243,6 +7875,7 @@ TEST_F(AssemblerRISCV64Test, NegW) {
 }
 
 TEST_F(AssemblerRISCV64Test, SextB) {
+  ScopedCSuppression scs(this);
   // Note: SEXT.B from the Zbb extension is not supported.
   DriverStr(RepeatRR(&Riscv64Assembler::SextB,
                      "slli {reg1}, {reg2}, 56\n"
@@ -7251,6 +7884,7 @@ TEST_F(AssemblerRISCV64Test, SextB) {
 }
 
 TEST_F(AssemblerRISCV64Test, SextH) {
+  ScopedCSuppression scs(this);
   // Note: SEXT.H from the Zbb extension is not supported.
   DriverStr(RepeatRR(&Riscv64Assembler::SextH,
                      "slli {reg1}, {reg2}, 48\n"
@@ -7259,14 +7893,17 @@ TEST_F(AssemblerRISCV64Test, SextH) {
 }
 
 TEST_F(AssemblerRISCV64Test, SextW) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRR(&Riscv64Assembler::SextW, "addiw {reg1}, {reg2}, 0\n"), "SextW");
 }
 
 TEST_F(AssemblerRISCV64Test, ZextB) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRR(&Riscv64Assembler::ZextB, "andi {reg1}, {reg2}, 255"), "ZextB");
 }
 
 TEST_F(AssemblerRISCV64Test, ZextH) {
+  ScopedCSuppression scs(this);
   // Note: ZEXT.H from the Zbb extension is not supported.
   DriverStr(RepeatRR(&Riscv64Assembler::ZextH,
                      "slli {reg1}, {reg2}, 48\n"
@@ -7275,6 +7912,7 @@ TEST_F(AssemblerRISCV64Test, ZextH) {
 }
 
 TEST_F(AssemblerRISCV64Test, ZextW) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRR(&Riscv64Assembler::ZextW,
                      "slli {reg1}, {reg2}, 32\n"
                      "srli {reg1}, {reg1}, 32"),
@@ -7322,11 +7960,13 @@ TEST_F(AssemblerRISCV64Test, FNegD) {
 }
 
 TEST_F(AssemblerRISCV64Test, Beqz) {
+  ScopedCSuppression scs(this);
   // TODO(riscv64): Change "-11, 2" to "-12, 1" for "C" Standard Extension.
   DriverStr(RepeatRIbS(&Riscv64Assembler::Beqz, -11, 2, "beq {reg}, zero, {imm}\n"), "Beqz");
 }
 
 TEST_F(AssemblerRISCV64Test, Bnez) {
+  ScopedCSuppression scs(this);
   // TODO(riscv64): Change "-11, 2" to "-12, 1" for "C" Standard Extension.
   DriverStr(RepeatRIbS(&Riscv64Assembler::Bnez, -11, 2, "bne {reg}, zero, {imm}\n"), "Bnez");
 }
@@ -7372,6 +8012,7 @@ TEST_F(AssemblerRISCV64Test, Bleu) {
 }
 
 TEST_F(AssemblerRISCV64Test, J) {
+  ScopedCSuppression scs(this);
   // TODO(riscv64): Change "-19, 2" to "-20, 1" for "C" Standard Extension.
   DriverStr(RepeatIbS<int32_t>(&Riscv64Assembler::J, -19, 2, "j {imm}\n"), "J");
 }
@@ -7382,18 +8023,22 @@ TEST_F(AssemblerRISCV64Test, JalRA) {
 }
 
 TEST_F(AssemblerRISCV64Test, Jr) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatR(&Riscv64Assembler::Jr, "jr {reg}\n"), "Jr");
 }
 
 TEST_F(AssemblerRISCV64Test, JalrRA) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatR(&Riscv64Assembler::Jalr, "jalr {reg}\n"), "JalrRA");
 }
 
 TEST_F(AssemblerRISCV64Test, Jalr0) {
+  ScopedCSuppression scs(this);
   DriverStr(RepeatRR(&Riscv64Assembler::Jalr, "jalr {reg1}, {reg2}\n"), "Jalr0");
 }
 
 TEST_F(AssemblerRISCV64Test, Ret) {
+  ScopedCSuppression scs(this);
   __ Ret();
   DriverStr("ret\n", "Ret");
 }
@@ -7446,6 +8091,7 @@ TEST_F(AssemblerRISCV64Test, Csrci) {
 }
 
 TEST_F(AssemblerRISCV64Test, LoadConst32) {
+  ScopedCSuppression scs(this);
   // `LoadConst32()` emits the same code sequences as `Li()` for 32-bit values.
   ScratchRegisterScope srs(GetAssembler());
   srs.ExcludeXRegister(TMP);
@@ -7454,13 +8100,14 @@ TEST_F(AssemblerRISCV64Test, LoadConst32) {
 }
 
 TEST_F(AssemblerRISCV64Test, LoadConst64) {
-  SetUseSimpleMarch(true);
+  ScopedMarchOverride smo(this, "-march=rv64imafd");
   TestLoadConst64("LoadConst64",
                   /*can_use_tmp=*/ true,
                   [&](XRegister rd, int64_t value) { __ LoadConst64(rd, value); });
 }
 
 TEST_F(AssemblerRISCV64Test, AddConst32) {
+  ScopedCSuppression scs(this);
   auto emit_op = [&](XRegister rd, XRegister rs1, int64_t value) {
     __ AddConst32(rd, rs1, dchecked_integral_cast<int32_t>(value));
   };
@@ -7468,7 +8115,7 @@ TEST_F(AssemblerRISCV64Test, AddConst32) {
 }
 
 TEST_F(AssemblerRISCV64Test, AddConst64) {
-  SetUseSimpleMarch(true);
+  ScopedMarchOverride smo(this, "-march=rv64imafd");
   auto emit_op = [&](XRegister rd, XRegister rs1, int64_t value) {
     __ AddConst64(rd, rs1, value);
   };
@@ -7476,38 +8123,47 @@ TEST_F(AssemblerRISCV64Test, AddConst64) {
 }
 
 TEST_F(AssemblerRISCV64Test, BcondForward3KiB) {
+  ScopedCSuppression scs(this);
   TestBcondForward("BcondForward3KiB", 3 * KB, "1", GetPrintBcond());
 }
 
 TEST_F(AssemblerRISCV64Test, BcondForward3KiBBare) {
+  ScopedCSuppression scs(this);
   TestBcondForward("BcondForward3KiB", 3 * KB, "1", GetPrintBcond(), /*is_bare=*/ true);
 }
 
 TEST_F(AssemblerRISCV64Test, BcondBackward3KiB) {
+  ScopedCSuppression scs(this);
   TestBcondBackward("BcondBackward3KiB", 3 * KB, "1", GetPrintBcond());
 }
 
 TEST_F(AssemblerRISCV64Test, BcondBackward3KiBBare) {
+  ScopedCSuppression scs(this);
   TestBcondBackward("BcondBackward3KiB", 3 * KB, "1", GetPrintBcond(), /*is_bare=*/ true);
 }
 
 TEST_F(AssemblerRISCV64Test, BcondForward5KiB) {
+  ScopedCSuppression scs(this);
   TestBcondForward("BcondForward5KiB", 5 * KB, "1", GetPrintBcondOppositeAndJ("2"));
 }
 
 TEST_F(AssemblerRISCV64Test, BcondBackward5KiB) {
+  ScopedCSuppression scs(this);
   TestBcondBackward("BcondBackward5KiB", 5 * KB, "1", GetPrintBcondOppositeAndJ("2"));
 }
 
 TEST_F(AssemblerRISCV64Test, BcondForward2MiB) {
+  ScopedCSuppression scs(this);
   TestBcondForward("BcondForward2MiB", 2 * MB, "1", GetPrintBcondOppositeAndTail("2", "3"));
 }
 
 TEST_F(AssemblerRISCV64Test, BcondBackward2MiB) {
+  ScopedCSuppression scs(this);
   TestBcondBackward("BcondBackward2MiB", 2 * MB, "1", GetPrintBcondOppositeAndTail("2", "3"));
 }
 
 TEST_F(AssemblerRISCV64Test, BeqA0A1MaxOffset13Forward) {
+  ScopedCSuppression scs(this);
   TestBeqA0A1Forward("BeqA0A1MaxOffset13Forward",
                      MaxOffset13ForwardDistance() - /*BEQ*/ 4u,
                      "1",
@@ -7515,6 +8171,7 @@ TEST_F(AssemblerRISCV64Test, BeqA0A1MaxOffset13Forward) {
 }
 
 TEST_F(AssemblerRISCV64Test, BeqA0A1MaxOffset13ForwardBare) {
+  ScopedCSuppression scs(this);
   TestBeqA0A1Forward("BeqA0A1MaxOffset13ForwardBare",
                      MaxOffset13ForwardDistance() - /*BEQ*/ 4u,
                      "1",
@@ -7523,6 +8180,7 @@ TEST_F(AssemblerRISCV64Test, BeqA0A1MaxOffset13ForwardBare) {
 }
 
 TEST_F(AssemblerRISCV64Test, BeqA0A1MaxOffset13Backward) {
+  ScopedCSuppression scs(this);
   TestBeqA0A1Backward("BeqA0A1MaxOffset13Forward",
                       MaxOffset13BackwardDistance(),
                       "1",
@@ -7530,6 +8188,7 @@ TEST_F(AssemblerRISCV64Test, BeqA0A1MaxOffset13Backward) {
 }
 
 TEST_F(AssemblerRISCV64Test, BeqA0A1MaxOffset13BackwardBare) {
+  ScopedCSuppression scs(this);
   TestBeqA0A1Backward("BeqA0A1MaxOffset13ForwardBare",
                       MaxOffset13BackwardDistance(),
                       "1",
@@ -7538,6 +8197,7 @@ TEST_F(AssemblerRISCV64Test, BeqA0A1MaxOffset13BackwardBare) {
 }
 
 TEST_F(AssemblerRISCV64Test, BeqA0A1OverMaxOffset13Forward) {
+  ScopedCSuppression scs(this);
   TestBeqA0A1Forward("BeqA0A1OverMaxOffset13Forward",
                      MaxOffset13ForwardDistance() - /*BEQ*/ 4u + /*Exceed max*/ 4u,
                      "1",
@@ -7545,6 +8205,7 @@ TEST_F(AssemblerRISCV64Test, BeqA0A1OverMaxOffset13Forward) {
 }
 
 TEST_F(AssemblerRISCV64Test, BeqA0A1OverMaxOffset13Backward) {
+  ScopedCSuppression scs(this);
   TestBeqA0A1Backward("BeqA0A1OverMaxOffset13Forward",
                       MaxOffset13BackwardDistance() + /*Exceed max*/ 4u,
                       "1",
@@ -7552,6 +8213,7 @@ TEST_F(AssemblerRISCV64Test, BeqA0A1OverMaxOffset13Backward) {
 }
 
 TEST_F(AssemblerRISCV64Test, BeqA0A1MaxOffset21Forward) {
+  ScopedCSuppression scs(this);
   TestBeqA0A1Forward("BeqA0A1MaxOffset21Forward",
                      MaxOffset21ForwardDistance() - /*J*/ 4u,
                      "1",
@@ -7559,6 +8221,7 @@ TEST_F(AssemblerRISCV64Test, BeqA0A1MaxOffset21Forward) {
 }
 
 TEST_F(AssemblerRISCV64Test, BeqA0A1MaxOffset21Backward) {
+  ScopedCSuppression scs(this);
   TestBeqA0A1Backward("BeqA0A1MaxOffset21Backward",
                       MaxOffset21BackwardDistance() - /*BNE*/ 4u,
                       "1",
@@ -7566,6 +8229,7 @@ TEST_F(AssemblerRISCV64Test, BeqA0A1MaxOffset21Backward) {
 }
 
 TEST_F(AssemblerRISCV64Test, BeqA0A1OverMaxOffset21Forward) {
+  ScopedCSuppression scs(this);
   TestBeqA0A1Forward("BeqA0A1OverMaxOffset21Forward",
                      MaxOffset21ForwardDistance() - /*J*/ 4u + /*Exceed max*/ 4u,
                      "1",
@@ -7573,6 +8237,7 @@ TEST_F(AssemblerRISCV64Test, BeqA0A1OverMaxOffset21Forward) {
 }
 
 TEST_F(AssemblerRISCV64Test, BeqA0A1OverMaxOffset21Backward) {
+  ScopedCSuppression scs(this);
   TestBeqA0A1Backward("BeqA0A1OverMaxOffset21Backward",
                       MaxOffset21BackwardDistance() - /*BNE*/ 4u + /*Exceed max*/ 4u,
                       "1",
@@ -7580,15 +8245,18 @@ TEST_F(AssemblerRISCV64Test, BeqA0A1OverMaxOffset21Backward) {
 }
 
 TEST_F(AssemblerRISCV64Test, BeqA0A1AlmostCascade) {
+  ScopedCSuppression scs(this);
   TestBeqA0A1MaybeCascade("BeqA0A1AlmostCascade", /*cascade=*/ false, GetPrintBcond());
 }
 
 TEST_F(AssemblerRISCV64Test, BeqA0A1Cascade) {
+  ScopedCSuppression scs(this);
   TestBeqA0A1MaybeCascade(
       "BeqA0A1AlmostCascade", /*cascade=*/ true, GetPrintBcondOppositeAndJ("1"));
 }
 
 TEST_F(AssemblerRISCV64Test, BcondElimination) {
+  ScopedCSuppression scs(this);
   Riscv64Label label;
   __ Bind(&label);
   __ Nop();
@@ -7603,6 +8271,7 @@ TEST_F(AssemblerRISCV64Test, BcondElimination) {
 }
 
 TEST_F(AssemblerRISCV64Test, BcondUnconditional) {
+  ScopedCSuppression scs(this);
   Riscv64Label label;
   __ Bind(&label);
   __ Nop();
@@ -7621,54 +8290,67 @@ TEST_F(AssemblerRISCV64Test, BcondUnconditional) {
 }
 
 TEST_F(AssemblerRISCV64Test, JalRdForward3KiB) {
+  ScopedCSuppression scs(this);
   TestJalRdForward("JalRdForward3KiB", 3 * KB, "1", GetPrintJalRd());
 }
 
 TEST_F(AssemblerRISCV64Test, JalRdForward3KiBBare) {
+  ScopedCSuppression scs(this);
   TestJalRdForward("JalRdForward3KiB", 3 * KB, "1", GetPrintJalRd(), /*is_bare=*/ true);
 }
 
 TEST_F(AssemblerRISCV64Test, JalRdBackward3KiB) {
+  ScopedCSuppression scs(this);
   TestJalRdBackward("JalRdBackward3KiB", 3 * KB, "1", GetPrintJalRd());
 }
 
 TEST_F(AssemblerRISCV64Test, JalRdBackward3KiBBare) {
+  ScopedCSuppression scs(this);
   TestJalRdBackward("JalRdBackward3KiB", 3 * KB, "1", GetPrintJalRd(), /*is_bare=*/ true);
 }
 
 TEST_F(AssemblerRISCV64Test, JalRdForward2MiB) {
+  ScopedCSuppression scs(this);
   TestJalRdForward("JalRdForward2MiB", 2 * MB, "1", GetPrintCallRd("2"));
 }
 
 TEST_F(AssemblerRISCV64Test, JalRdBackward2MiB) {
+  ScopedCSuppression scs(this);
   TestJalRdBackward("JalRdBackward2MiB", 2 * MB, "1", GetPrintCallRd("2"));
 }
 
 TEST_F(AssemblerRISCV64Test, JForward3KiB) {
+  ScopedCSuppression scs(this);
   TestBuncondForward("JForward3KiB", 3 * KB, "1", GetEmitJ(), GetPrintJ());
 }
 
 TEST_F(AssemblerRISCV64Test, JForward3KiBBare) {
+  ScopedCSuppression scs(this);
   TestBuncondForward("JForward3KiB", 3 * KB, "1", GetEmitJ(/*is_bare=*/ true), GetPrintJ());
 }
 
 TEST_F(AssemblerRISCV64Test, JBackward3KiB) {
+  ScopedCSuppression scs(this);
   TestBuncondBackward("JBackward3KiB", 3 * KB, "1", GetEmitJ(), GetPrintJ());
 }
 
 TEST_F(AssemblerRISCV64Test, JBackward3KiBBare) {
+  ScopedCSuppression scs(this);
   TestBuncondBackward("JBackward3KiB", 3 * KB, "1", GetEmitJ(/*is_bare=*/ true), GetPrintJ());
 }
 
 TEST_F(AssemblerRISCV64Test, JForward2MiB) {
+  ScopedCSuppression scs(this);
   TestBuncondForward("JForward2MiB", 2 * MB, "1", GetEmitJ(), GetPrintTail("2"));
 }
 
 TEST_F(AssemblerRISCV64Test, JBackward2MiB) {
+  ScopedCSuppression scs(this);
   TestBuncondBackward("JBackward2MiB", 2 * MB, "1", GetEmitJ(), GetPrintTail("2"));
 }
 
 TEST_F(AssemblerRISCV64Test, JMaxOffset21Forward) {
+  ScopedCSuppression scs(this);
   TestBuncondForward("JMaxOffset21Forward",
                      MaxOffset21ForwardDistance() - /*J*/ 4u,
                      "1",
@@ -7677,6 +8359,7 @@ TEST_F(AssemblerRISCV64Test, JMaxOffset21Forward) {
 }
 
 TEST_F(AssemblerRISCV64Test, JMaxOffset21ForwardBare) {
+  ScopedCSuppression scs(this);
   TestBuncondForward("JMaxOffset21Forward",
                      MaxOffset21ForwardDistance() - /*J*/ 4u,
                      "1",
@@ -7685,6 +8368,7 @@ TEST_F(AssemblerRISCV64Test, JMaxOffset21ForwardBare) {
 }
 
 TEST_F(AssemblerRISCV64Test, JMaxOffset21Backward) {
+  ScopedCSuppression scs(this);
   TestBuncondBackward("JMaxOffset21Backward",
                       MaxOffset21BackwardDistance(),
                       "1",
@@ -7693,6 +8377,7 @@ TEST_F(AssemblerRISCV64Test, JMaxOffset21Backward) {
 }
 
 TEST_F(AssemblerRISCV64Test, JMaxOffset21BackwardBare) {
+  ScopedCSuppression scs(this);
   TestBuncondBackward("JMaxOffset21Backward",
                       MaxOffset21BackwardDistance(),
                       "1",
@@ -7701,6 +8386,7 @@ TEST_F(AssemblerRISCV64Test, JMaxOffset21BackwardBare) {
 }
 
 TEST_F(AssemblerRISCV64Test, JOverMaxOffset21Forward) {
+  ScopedCSuppression scs(this);
   TestBuncondForward("JOverMaxOffset21Forward",
                      MaxOffset21ForwardDistance() - /*J*/ 4u + /*Exceed max*/ 4u,
                      "1",
@@ -7709,6 +8395,7 @@ TEST_F(AssemblerRISCV64Test, JOverMaxOffset21Forward) {
 }
 
 TEST_F(AssemblerRISCV64Test, JOverMaxOffset21Backward) {
+  ScopedCSuppression scs(this);
   TestBuncondBackward("JMaxOffset21Backward",
                       MaxOffset21BackwardDistance() + /*Exceed max*/ 4u,
                       "1",
@@ -7717,22 +8404,27 @@ TEST_F(AssemblerRISCV64Test, JOverMaxOffset21Backward) {
 }
 
 TEST_F(AssemblerRISCV64Test, CallForward3KiB) {
+  ScopedCSuppression scs(this);
   TestBuncondForward("CallForward3KiB", 3 * KB, "1", GetEmitJal(), GetPrintJal());
 }
 
 TEST_F(AssemblerRISCV64Test, CallBackward3KiB) {
+  ScopedCSuppression scs(this);
   TestBuncondBackward("CallBackward3KiB", 3 * KB, "1", GetEmitJal(), GetPrintJal());
 }
 
 TEST_F(AssemblerRISCV64Test, CallForward2MiB) {
+  ScopedCSuppression scs(this);
   TestBuncondForward("CallForward2MiB", 2 * MB, "1", GetEmitJal(), GetPrintCall("2"));
 }
 
 TEST_F(AssemblerRISCV64Test, CallBackward2MiB) {
+  ScopedCSuppression scs(this);
   TestBuncondBackward("CallBackward2MiB", 2 * MB, "1", GetEmitJal(), GetPrintCall("2"));
 }
 
 TEST_F(AssemblerRISCV64Test, CallMaxOffset21Forward) {
+  ScopedCSuppression scs(this);
   TestBuncondForward("CallMaxOffset21Forward",
                      MaxOffset21ForwardDistance() - /*J*/ 4u,
                      "1",
@@ -7741,6 +8433,7 @@ TEST_F(AssemblerRISCV64Test, CallMaxOffset21Forward) {
 }
 
 TEST_F(AssemblerRISCV64Test, CallMaxOffset21Backward) {
+  ScopedCSuppression scs(this);
   TestBuncondBackward("CallMaxOffset21Backward",
                       MaxOffset21BackwardDistance(),
                       "1",
@@ -7749,6 +8442,7 @@ TEST_F(AssemblerRISCV64Test, CallMaxOffset21Backward) {
 }
 
 TEST_F(AssemblerRISCV64Test, CallOverMaxOffset21Forward) {
+  ScopedCSuppression scs(this);
   TestBuncondForward("CallOverMaxOffset21Forward",
                      MaxOffset21ForwardDistance() - /*J*/ 4u + /*Exceed max*/ 4u,
                      "1",
@@ -7757,6 +8451,7 @@ TEST_F(AssemblerRISCV64Test, CallOverMaxOffset21Forward) {
 }
 
 TEST_F(AssemblerRISCV64Test, CallOverMaxOffset21Backward) {
+  ScopedCSuppression scs(this);
   TestBuncondBackward("CallMaxOffset21Backward",
                       MaxOffset21BackwardDistance() + /*Exceed max*/ 4u,
                       "1",
@@ -7765,66 +8460,82 @@ TEST_F(AssemblerRISCV64Test, CallOverMaxOffset21Backward) {
 }
 
 TEST_F(AssemblerRISCV64Test, Loadb) {
+  ScopedCSuppression scs(this);  // Suppress 16-bit instructions for address formation.
   TestLoadStoreArbitraryOffset("Loadb", "lb", &Riscv64Assembler::Loadb, /*is_store=*/ false);
 }
 
 TEST_F(AssemblerRISCV64Test, Loadh) {
+  ScopedCSuppression scs(this);
   TestLoadStoreArbitraryOffset("Loadh", "lh", &Riscv64Assembler::Loadh, /*is_store=*/ false);
 }
 
 TEST_F(AssemblerRISCV64Test, Loadw) {
+  ScopedCSuppression scs(this);
   TestLoadStoreArbitraryOffset("Loadw", "lw", &Riscv64Assembler::Loadw, /*is_store=*/ false);
 }
 
 TEST_F(AssemblerRISCV64Test, Loadd) {
+  ScopedCSuppression scs(this);
   TestLoadStoreArbitraryOffset("Loadd", "ld", &Riscv64Assembler::Loadd, /*is_store=*/ false);
 }
 
 TEST_F(AssemblerRISCV64Test, Loadbu) {
+  ScopedCSuppression scs(this);
   TestLoadStoreArbitraryOffset("Loadbu", "lbu", &Riscv64Assembler::Loadbu, /*is_store=*/ false);
 }
 
 TEST_F(AssemblerRISCV64Test, Loadhu) {
+  ScopedCSuppression scs(this);
   TestLoadStoreArbitraryOffset("Loadhu", "lhu", &Riscv64Assembler::Loadhu, /*is_store=*/ false);
 }
 
 TEST_F(AssemblerRISCV64Test, Loadwu) {
+  ScopedCSuppression scs(this);  // Suppress 16-bit instructions for address formation.
   TestLoadStoreArbitraryOffset("Loadwu", "lwu", &Riscv64Assembler::Loadwu, /*is_store=*/ false);
 }
 
 TEST_F(AssemblerRISCV64Test, Storeb) {
+  ScopedCSuppression scs(this);
   TestLoadStoreArbitraryOffset("Storeb", "sb", &Riscv64Assembler::Storeb, /*is_store=*/ true);
 }
 
 TEST_F(AssemblerRISCV64Test, Storeh) {
+  ScopedCSuppression scs(this);
   TestLoadStoreArbitraryOffset("Storeh", "sh", &Riscv64Assembler::Storeh, /*is_store=*/ true);
 }
 
 TEST_F(AssemblerRISCV64Test, Storew) {
+  ScopedCSuppression scs(this);
   TestLoadStoreArbitraryOffset("Storew", "sw", &Riscv64Assembler::Storew, /*is_store=*/ true);
 }
 
 TEST_F(AssemblerRISCV64Test, Stored) {
+  ScopedCSuppression scs(this);
   TestLoadStoreArbitraryOffset("Stored", "sd", &Riscv64Assembler::Stored, /*is_store=*/ true);
 }
 
 TEST_F(AssemblerRISCV64Test, FLoadw) {
+  ScopedCSuppression scs(this);  // Suppress 16-bit instructions for address formation.
   TestFPLoadStoreArbitraryOffset("FLoadw", "flw", &Riscv64Assembler::FLoadw);
 }
 
 TEST_F(AssemblerRISCV64Test, FLoadd) {
+  ScopedCSuppression scs(this);
   TestFPLoadStoreArbitraryOffset("FLoadd", "fld", &Riscv64Assembler::FLoadd);
 }
 
 TEST_F(AssemblerRISCV64Test, FStorew) {
+  ScopedCSuppression scs(this);  // Suppress 16-bit instructions for address formation.
   TestFPLoadStoreArbitraryOffset("FStorew", "fsw", &Riscv64Assembler::FStorew);
 }
 
 TEST_F(AssemblerRISCV64Test, FStored) {
+  ScopedCSuppression scs(this);
   TestFPLoadStoreArbitraryOffset("FStored", "fsd", &Riscv64Assembler::FStored);
 }
 
 TEST_F(AssemblerRISCV64Test, Unimp) {
+  ScopedCSuppression scs(this);
   __ Unimp();
   DriverStr("unimp\n", "Unimp");
 }
@@ -7854,14 +8565,17 @@ TEST_F(AssemblerRISCV64Test, LoadLabelAddress) {
 }
 
 TEST_F(AssemblerRISCV64Test, LoadLiteralWithPaddingForLong) {
+  ScopedCSuppression scs(this);
   TestLoadLiteral("LoadLiteralWithPaddingForLong", /*with_padding_for_long=*/ true);
 }
 
 TEST_F(AssemblerRISCV64Test, LoadLiteralWithoutPaddingForLong) {
+  ScopedCSuppression scs(this);
   TestLoadLiteral("LoadLiteralWithoutPaddingForLong", /*with_padding_for_long=*/ false);
 }
 
 TEST_F(AssemblerRISCV64Test, JumpTable) {
+  ScopedCSuppression scs(this);
   std::string expected;
   expected += EmitNops(sizeof(uint32_t));
   Riscv64Label targets[4];
