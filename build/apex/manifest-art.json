@@ -1,9 +1,10 @@
 {
+  // LINT.IfChange
   "name": "com.android.art",
 
   // Placeholder module version to be replaced during build.
   // Do not change!
-  "version": 350003000,
+  "version": 350004000,
 
   "provideNativeLibs": [
     "libjdwp.so"
@@ -11,4 +12,5 @@
   "requireNativeLibs": [
     "libicu_jni.so"
   ]
+  // LINT.ThenChange(manifest-art-debug.json)
 }
