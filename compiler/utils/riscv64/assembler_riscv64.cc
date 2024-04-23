@@ -86,20 +86,58 @@ void Riscv64Assembler::Auipc(XRegister rd, uint32_t imm20) {
 // Jump instructions (RV32I), opcode = 0x67, 0x6f
 
 void Riscv64Assembler::Jal(XRegister rd, int32_t offset) {
+  if (IsExtensionEnabled(Riscv64Extension::kZca)) {
+    if (rd == Zero && IsInt<12>(offset)) {
+      CJ(offset);
+      return;
+    }
+    // Note: `c.jal` is RV32-only.
+  }
+
   EmitJ(offset, rd, 0x6F);
 }
 
 void Riscv64Assembler::Jalr(XRegister rd, XRegister rs1, int32_t offset) {
+  if (IsExtensionEnabled(Riscv64Extension::kZca)) {
+    if (rd == RA && rs1 != Zero && offset == 0) {
+      CJalr(rs1);
+      return;
+    } else if (rd == Zero && rs1 != Zero && offset == 0) {
+      CJr(rs1);
+      return;
+    }
+  }
+
   EmitI(offset, rs1, 0x0, rd, 0x67);
 }
 
 // Branch instructions, opcode = 0x63 (subfunc from 0x0 ~ 0x7), 0x67, 0x6f
 
 void Riscv64Assembler::Beq(XRegister rs1, XRegister rs2, int32_t offset) {
+  if (IsExtensionEnabled(Riscv64Extension::kZca)) {
+    if (rs2 == Zero && IsShortReg(rs1) && IsInt<9>(offset)) {
+      CBeqz(rs1, offset);
+      return;
+    } else if (rs1 == Zero && IsShortReg(rs2) && IsInt<9>(offset)) {
+      CBeqz(rs2, offset);
+      return;
+    }
+  }
+
   EmitB(offset, rs2, rs1, 0x0, 0x63);
 }
 
 void Riscv64Assembler::Bne(XRegister rs1, XRegister rs2, int32_t offset) {
+  if (IsExtensionEnabled(Riscv64Extension::kZca)) {
+    if (rs2 == Zero && IsShortReg(rs1) && IsInt<9>(offset)) {
+      CBnez(rs1, offset);
+      return;
+    } else if (rs1 == Zero && IsShortReg(rs2) && IsInt<9>(offset)) {
+      CBnez(rs2, offset);
+      return;
+    }
+  }
+
   EmitB(offset, rs2, rs1, 0x1, 0x63);
 }
 
@@ -6642,7 +6680,8 @@ Riscv64Assembler::Branch::Branch(uint32_t location, uint32_t target, XRegister r
       lhs_reg_(rd),
       rhs_reg_(Zero),
       freg_(kNoFRegister),
-      condition_(kUncond) {
+      condition_(kUncond),
+      next_branch_id_(0u) {
   InitializeType(
       (rd != Zero ? (is_bare ? kBareCall : kCall) : (is_bare ? kBareUncondBranch : kUncondBranch)));
 }
@@ -6659,7 +6698,8 @@ Riscv64Assembler::Branch::Branch(uint32_t location,
       lhs_reg_(lhs_reg),
       rhs_reg_(rhs_reg),
       freg_(kNoFRegister),
-      condition_(condition) {
+      condition_(condition),
+      next_branch_id_(0u) {
   DCHECK_NE(condition, kUncond);
   DCHECK(!IsNop(condition, lhs_reg, rhs_reg));
   DCHECK(!IsUncond(condition, lhs_reg, rhs_reg));
@@ -6676,7 +6716,8 @@ Riscv64Assembler::Branch::Branch(uint32_t location,
       lhs_reg_(rd),
       rhs_reg_(Zero),
       freg_(kNoFRegister),
-      condition_(kUncond) {
+      condition_(kUncond),
+      next_branch_id_(0u) {
   CHECK_NE(rd , Zero);
   InitializeType(label_or_literal_type);
 }
@@ -6691,7 +6732,8 @@ Riscv64Assembler::Branch::Branch(uint32_t location,
       lhs_reg_(Zero),
       rhs_reg_(Zero),
       freg_(rd),
-      condition_(kUncond) {
+      condition_(kUncond),
+      next_branch_id_(0u) {
   InitializeType(literal_type);
 }
 
@@ -6751,6 +6793,8 @@ uint32_t Riscv64Assembler::Branch::GetEndLocation() const { return GetLocation()
 uint32_t Riscv64Assembler::Branch::GetOldEndLocation() const {
   return GetOldLocation() + GetOldLength();
 }
+
+uint32_t Riscv64Assembler::Branch::NextBranchId() const { return next_branch_id_; }
 
 bool Riscv64Assembler::Branch::IsBare() const {
   switch (type_) {
@@ -6866,6 +6910,10 @@ int32_t Riscv64Assembler::Branch::GetOffset() const {
   return offset;
 }
 
+void Riscv64Assembler::Branch::LinkToList(uint32_t next_branch_id) {
+  next_branch_id_ = next_branch_id;
+}
+
 void Riscv64Assembler::EmitBcond(BranchCondition cond,
                                  XRegister rs,
                                  XRegister rt,
@@ -6899,9 +6947,9 @@ void Riscv64Assembler::EmitBranch(Riscv64Assembler::Branch* branch) {
   BranchCondition condition = branch->GetCondition();
   XRegister lhs = branch->GetLeftRegister();
   XRegister rhs = branch->GetRightRegister();
+  ScopedNoCInstructions no_compression(this);
 
   auto emit_auipc_and_next = [&](XRegister reg, auto next) {
-    ScopedNoCInstructions no_compression(this);
     CHECK_EQ(overwrite_location_, branch->GetOffsetLocation());
     auto [imm20, short_offset] = SplitOffset(offset);
     Auipc(reg, imm20);
@@ -6985,16 +7033,16 @@ void Riscv64Assembler::EmitBranches() {
 }
 
 void Riscv64Assembler::FinalizeLabeledBranch(Riscv64Label* label) {
-  DCHECK_ALIGNED(branches_.back().GetLength(), sizeof(uint32_t));
-  uint32_t length = branches_.back().GetLength() / sizeof(uint32_t);
+  Branch& this_branch = branches_.back();
+  DCHECK_ALIGNED(this_branch.GetLength(), sizeof(uint32_t));
+  uint32_t length = this_branch.GetLength() / sizeof(uint32_t);
   ScopedNoCInstructions no_compression(this);
 
   if (!label->IsBound()) {
     // Branch forward (to a following label), distance is unknown.
     // The first branch forward will contain 0, serving as the terminator of
     // the list of forward-reaching branches.
-    Emit32(label->position_);
-    length--;
+    this_branch.LinkToList(label->position_);
     // Now make the label object point to this branch
     // (this forms a linked list of branches preceding this label).
     uint32_t branch_id = branches_.size() - 1;
@@ -7059,14 +7107,8 @@ void Riscv64Assembler::Bind(Riscv64Label* label) {
     uint32_t branch_id = label->Position();
     Branch* branch = GetBranch(branch_id);
     branch->Resolve(bound_pc);
-
-    uint32_t branch_location = branch->GetLocation();
-    // Extract the location of the previous branch in the list (walking the list backwards;
-    // the previous branch ID was stored in the space reserved for this branch).
-    uint32_t prev = buffer_.Load<uint32_t>(branch_location);
-
-    // On to the previous branch in the list...
-    label->position_ = prev;
+    // On to the next branch in the list...
+    label->position_ = branch->NextBranchId();
   }
 
   // Now make the label object contain its own location (relative to the end of the preceding

@@ -43,14 +43,6 @@ art_module_sdk {
     name: "art-module-sdk",
     host_supported: true,
 
-    // Enable if ART_MODULE_BUILD_FROM_SOURCE is true
-    enabled: false,
-    soong_config_variables: {
-        source_build: {
-            enabled: true,
-        },
-    },
-
     prebuilt_visibility: prebuilt_visibility,
 
     traits: {
@@ -78,11 +70,13 @@ art_module_sdk {
 
             native_shared_libs: [
                 "libandroidio",
-                "libdexfile",
                 "libnativebridge",
                 "libnativehelper",
                 "libnativeloader",
                 "libsigchain",
+                // The host variant of libdexfile is not present in >=V snapshots
+                // via the workaround in https://r.android.com/3011798.
+                "libdexfile",
             ],
 
             native_static_libs: [
@@ -150,14 +144,6 @@ art_module_exports {
     name: "art-module-host-exports",
     host_supported: true,
 
-    // Enable if ART_MODULE_BUILD_FROM_SOURCE is true
-    enabled: false,
-    soong_config_variables: {
-        source_build: {
-            enabled: true,
-        },
-    },
-
     prebuilt_visibility: prebuilt_visibility,
 
     target: {
@@ -181,8 +167,9 @@ art_module_exports {
             ],
             native_libs: [
                 // libdexfile dependencies for host tests.
-                // TODO(b/178691801): Support transitive internal library
-                // dependencies in module_export snapshots and clean this up.
+                // These two libraries will be present in <=U snapshots.
+                // These two libraries will be dropped in >=V snapshots
+                // via the workaround in https://r.android.com/3011798.
                 "libartpalette",
                 "libartbase",
             ],
@@ -203,14 +190,6 @@ art_module_exports {
 // Exported tests and supporting libraries
 art_module_exports {
     name: "art-module-test-exports",
-
-    // Enable if ART_MODULE_BUILD_FROM_SOURCE is true
-    enabled: false,
-    soong_config_variables: {
-        source_build: {
-            enabled: true,
-        },
-    },
 
     prebuilt_visibility: prebuilt_visibility,
 

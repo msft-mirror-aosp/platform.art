@@ -449,7 +449,7 @@ inline bool ArtMethod::NameEquals(ObjPtr<mirror::String> name) {
   const dex::MethodId& method_id = dex_file->GetMethodId(GetDexMethodIndex());
   const dex::StringIndex name_idx = method_id.name_idx_;
   uint32_t utf16_length;
-  const char* utf8_name = dex_file->StringDataAndUtf16LengthByIdx(name_idx, &utf16_length);
+  const char* utf8_name = dex_file->GetStringDataAndUtf16Length(name_idx, &utf16_length);
   return dchecked_integral_cast<uint32_t>(name->GetLength()) == utf16_length &&
          name->Equals(utf8_name);
 }
@@ -464,11 +464,6 @@ inline const dex::CodeItem* ArtMethod::GetCodeItem() {
       ? GetDexFile()->GetCodeItem(reinterpret_cast32<uint32_t>(GetDataPtrSize(pointer_size)))
       : reinterpret_cast<const dex::CodeItem*>(
           reinterpret_cast<uintptr_t>(GetDataPtrSize(pointer_size)) & ~1);
-}
-
-inline bool ArtMethod::IsResolvedTypeIdx(dex::TypeIndex type_idx) {
-  DCHECK(!IsProxyMethod());
-  return LookupResolvedClassFromTypeIndex(type_idx) != nullptr;
 }
 
 inline int32_t ArtMethod::GetLineNumFromDexPC(uint32_t dex_pc) {

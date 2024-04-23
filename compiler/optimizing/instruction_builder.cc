@@ -60,7 +60,7 @@ class SamePackageCompare {
       const DexFile* dex_file = dex_compilation_unit_.GetDexFile();
       uint32_t referrers_method_idx = dex_compilation_unit_.GetDexMethodIndex();
       referrers_descriptor_ =
-          dex_file->StringByTypeIdx(dex_file->GetMethodId(referrers_method_idx).class_idx_);
+          dex_file->GetMethodDeclaringClassDescriptor(dex_file->GetMethodId(referrers_method_idx));
       referrers_package_length_ = PackageLength(referrers_descriptor_);
     }
     std::string temp;
@@ -1513,12 +1513,12 @@ void HInstructionBuilder::BuildConstructorFenceForAllocation(HInstruction* alloc
       MethodCompilationStat::kConstructorFenceGeneratedNew);
 }
 
-static bool IsInBootImage(ObjPtr<mirror::Class> cls, const CompilerOptions& compiler_options)
+static bool IsInImage(ObjPtr<mirror::Class> cls, const CompilerOptions& compiler_options)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   if (Runtime::Current()->GetHeap()->ObjectIsInBootImageSpace(cls)) {
     return true;
   }
-  if (compiler_options.IsBootImage() || compiler_options.IsBootImageExtension()) {
+  if (compiler_options.IsGeneratingImage()) {
     std::string temp;
     const char* descriptor = cls->GetDescriptor(&temp);
     return compiler_options.IsImageClass(descriptor);
@@ -1634,8 +1634,8 @@ static bool HasTrivialInitialization(ObjPtr<mirror::Class> cls,
 
   // Check the superclass chain.
   for (ObjPtr<mirror::Class> klass = cls; klass != nullptr; klass = klass->GetSuperClass()) {
-    if (klass->IsInitialized() && IsInBootImage(klass, compiler_options)) {
-      break;  // `klass` and its superclasses are already initialized in the boot image.
+    if (klass->IsInitialized() && IsInImage(klass, compiler_options)) {
+      break;  // `klass` and its superclasses are already initialized in the boot or app image.
     }
     if (!HasTrivialClinit(klass, pointer_size)) {
       return false;
@@ -1650,8 +1650,8 @@ static bool HasTrivialInitialization(ObjPtr<mirror::Class> cls,
     if (!iface->HasDefaultMethods()) {
       continue;  // Initializing `cls` does not initialize this interface.
     }
-    if (iface->IsInitialized() && IsInBootImage(iface, compiler_options)) {
-      continue;  // This interface is already initialized in the boot image.
+    if (iface->IsInitialized() && IsInImage(iface, compiler_options)) {
+      continue;  // This interface is already initialized in the boot or app image.
     }
     if (!HasTrivialClinit(iface, pointer_size)) {
       return false;
@@ -1669,9 +1669,8 @@ bool HInstructionBuilder::IsInitialized(ObjPtr<mirror::Class> cls) const {
   if (cls->IsInitialized()) {
     const CompilerOptions& compiler_options = code_generator_->GetCompilerOptions();
     if (compiler_options.IsAotCompiler()) {
-      // Assume loaded only if klass is in the boot image. App classes cannot be assumed
-      // loaded because we don't even know what class loader will be used to load them.
-      if (IsInBootImage(cls, compiler_options)) {
+      // Assume loaded only if klass is in the boot or app image.
+      if (IsInImage(cls, compiler_options)) {
         return true;
       }
     } else {
@@ -2439,7 +2438,7 @@ HNewArray* HInstructionBuilder::BuildFilledNewArray(uint32_t dex_pc,
   HInstruction* length = graph_->GetIntConstant(number_of_operands, dex_pc);
 
   HNewArray* new_array = BuildNewArray(dex_pc, type_index, length);
-  const char* descriptor = dex_file_->StringByTypeIdx(type_index);
+  const char* descriptor = dex_file_->GetTypeDescriptor(type_index);
   DCHECK_EQ(descriptor[0], '[') << descriptor;
   char primitive = descriptor[1];
   DCHECK(primitive == 'I'
@@ -2657,14 +2656,11 @@ bool HInstructionBuilder::LoadClassNeedsAccessCheck(dex::TypeIndex type_index,
         return true;
       }
     } else {
-      uint32_t outer_utf16_length;
-      const char* outer_descriptor =
-          outer_dex_file->StringByTypeIdx(outer_class_def.class_idx_, &outer_utf16_length);
-      uint32_t target_utf16_length;
-      const char* target_descriptor =
-          inner_dex_file->StringByTypeIdx(type_index, &target_utf16_length);
-      if (outer_utf16_length != target_utf16_length ||
-          strcmp(outer_descriptor, target_descriptor) != 0) {
+      const std::string_view outer_descriptor =
+          outer_dex_file->GetTypeDescriptorView(outer_class_def.class_idx_);
+      const std::string_view target_descriptor =
+          inner_dex_file->GetTypeDescriptorView(type_index);
+      if (outer_descriptor != target_descriptor) {
         return true;
       }
     }

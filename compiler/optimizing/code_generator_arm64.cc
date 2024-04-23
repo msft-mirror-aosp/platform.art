@@ -4359,9 +4359,6 @@ void InstructionCodeGeneratorARM64::VisitInstanceOf(HInstanceOf* instruction) {
           instruction, /* is_fatal= */ false);
       codegen_->AddSlowPath(slow_path);
       __ B(slow_path->GetEntryLabel());
-      if (zero.IsLinked()) {
-        __ B(&done);
-      }
       break;
     }
 
@@ -5226,10 +5223,10 @@ void CodeGeneratorARM64::EmitLdrOffsetPlaceholder(vixl::aarch64::Label* fixup_la
 void CodeGeneratorARM64::LoadBootImageRelRoEntry(vixl::aarch64::Register reg,
                                                  uint32_t boot_image_offset) {
   DCHECK(reg.IsW());
-  // Add ADRP with its PC-relative .data.bimg.rel.ro patch.
+  // Add ADRP with its PC-relative boot image .data.img.rel.ro patch.
   vixl::aarch64::Label* adrp_label = NewBootImageRelRoPatch(boot_image_offset);
   EmitAdrpPlaceholder(adrp_label, reg.X());
-  // Add LDR with its PC-relative .data.bimg.rel.ro patch.
+  // Add LDR with its PC-relative boot image .data.img.rel.ro patch.
   vixl::aarch64::Label* ldr_label = NewBootImageRelRoPatch(boot_image_offset, adrp_label);
   EmitLdrOffsetPlaceholder(ldr_label, reg.W(), reg.X());
 }
@@ -5346,7 +5343,7 @@ void CodeGeneratorARM64::EmitLinkerPatches(ArenaVector<linker::LinkerPatch>* lin
     EmitPcRelativeLinkerPatches<NoDexFileAdapter<linker::LinkerPatch::IntrinsicReferencePatch>>(
         boot_image_other_patches_, linker_patches);
   } else {
-    EmitPcRelativeLinkerPatches<NoDexFileAdapter<linker::LinkerPatch::DataBimgRelRoPatch>>(
+    EmitPcRelativeLinkerPatches<NoDexFileAdapter<linker::LinkerPatch::BootImageRelRoPatch>>(
         boot_image_other_patches_, linker_patches);
   }
   EmitPcRelativeLinkerPatches<linker::LinkerPatch::MethodBssEntryPatch>(
@@ -5489,7 +5486,7 @@ void LocationsBuilderARM64::VisitLoadClass(HLoadClass* cls) {
             load_kind == HLoadClass::LoadKind::kBssEntryPublic ||
                 load_kind == HLoadClass::LoadKind::kBssEntryPackage);
 
-  const bool requires_read_barrier = !cls->IsInBootImage() && codegen_->EmitReadBarrier();
+  const bool requires_read_barrier = !cls->IsInImage() && codegen_->EmitReadBarrier();
   LocationSummary::CallKind call_kind = (cls->NeedsEnvironment() || requires_read_barrier)
       ? LocationSummary::kCallOnSlowPath
       : LocationSummary::kNoCall;
@@ -5531,7 +5528,7 @@ void InstructionCodeGeneratorARM64::VisitLoadClass(HLoadClass* cls) NO_THREAD_SA
   Register out = OutputRegister(cls);
 
   const ReadBarrierOption read_barrier_option =
-      cls->IsInBootImage() ? kWithoutReadBarrier : codegen_->GetCompilerReadBarrierOption();
+      cls->IsInImage() ? kWithoutReadBarrier : codegen_->GetCompilerReadBarrierOption();
   bool generate_null_check = false;
   switch (load_kind) {
     case HLoadClass::LoadKind::kReferrersClass: {

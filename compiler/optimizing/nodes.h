@@ -1665,7 +1665,11 @@ class HLoopInformationOutwardIterator : public ValueObject {
 
 #define FOR_EACH_CONCRETE_INSTRUCTION_ARM64(M)
 
+#if defined(ART_ENABLE_CODEGEN_riscv64)
+#define FOR_EACH_CONCRETE_INSTRUCTION_RISCV64(M) M(Riscv64ShiftAdd, Instruction)
+#else
 #define FOR_EACH_CONCRETE_INSTRUCTION_RISCV64(M)
+#endif
 
 #ifndef ART_ENABLE_CODEGEN_x86
 #define FOR_EACH_CONCRETE_INSTRUCTION_X86(M)
@@ -1692,6 +1696,7 @@ class HLoopInformationOutwardIterator : public ValueObject {
   FOR_EACH_CONCRETE_INSTRUCTION_SHARED(M)                               \
   FOR_EACH_CONCRETE_INSTRUCTION_ARM(M)                                  \
   FOR_EACH_CONCRETE_INSTRUCTION_ARM64(M)                                \
+  FOR_EACH_CONCRETE_INSTRUCTION_RISCV64(M)                              \
   FOR_EACH_CONCRETE_INSTRUCTION_X86(M)                                  \
   FOR_EACH_CONCRETE_INSTRUCTION_X86_64(M)                               \
   FOR_EACH_CONCRETE_INSTRUCTION_X86_COMMON(M)
@@ -4698,7 +4703,7 @@ enum class MethodLoadKind {
   // Used for boot image methods referenced by boot image code.
   kBootImageLinkTimePcRelative,
 
-  // Load from an entry in the .data.bimg.rel.ro using a PC-relative load.
+  // Load from a boot image entry in the .data.img.rel.ro using a PC-relative load.
   // Used for app->boot calls with relocatable image.
   kBootImageRelRo,
 
@@ -6734,7 +6739,7 @@ class HLoadClass final : public HInstruction {
     // Used for boot image classes referenced by boot image code.
     kBootImageLinkTimePcRelative,
 
-    // Load from an entry in the .data.bimg.rel.ro using a PC-relative load.
+    // Load from a boot image entry in the .data.img.rel.ro using a PC-relative load.
     // Used for boot image classes referenced by apps in AOT-compiled code.
     kBootImageRelRo,
 
@@ -6793,7 +6798,7 @@ class HLoadClass final : public HInstruction {
     SetPackedField<LoadKindField>(
         is_referrers_class ? LoadKind::kReferrersClass : LoadKind::kRuntimeCall);
     SetPackedFlag<kFlagNeedsAccessCheck>(needs_access_check);
-    SetPackedFlag<kFlagIsInBootImage>(false);
+    SetPackedFlag<kFlagIsInImage>(false);
     SetPackedFlag<kFlagGenerateClInitCheck>(false);
     SetPackedFlag<kFlagValidLoadedClassRTI>(false);
   }
@@ -6846,8 +6851,8 @@ class HLoadClass final : public HInstruction {
   bool CanThrow() const override {
     return NeedsAccessCheck() ||
            MustGenerateClinitCheck() ||
-           // If the class is in the boot image, the lookup in the runtime call cannot throw.
-           ((GetLoadKind() == LoadKind::kRuntimeCall || NeedsBss()) && !IsInBootImage());
+           // If the class is in the boot or app image, the lookup in the runtime call cannot throw.
+           ((GetLoadKind() == LoadKind::kRuntimeCall || NeedsBss()) && !IsInImage());
   }
 
   ReferenceTypeInfo GetLoadedClassRTI() {
@@ -6874,7 +6879,7 @@ class HLoadClass final : public HInstruction {
 
   bool IsReferrersClass() const { return GetLoadKind() == LoadKind::kReferrersClass; }
   bool NeedsAccessCheck() const { return GetPackedFlag<kFlagNeedsAccessCheck>(); }
-  bool IsInBootImage() const { return GetPackedFlag<kFlagIsInBootImage>(); }
+  bool IsInImage() const { return GetPackedFlag<kFlagIsInImage>(); }
   bool MustGenerateClinitCheck() const { return GetPackedFlag<kFlagGenerateClInitCheck>(); }
 
   bool MustResolveTypeOnSlowPath() const {
@@ -6889,8 +6894,8 @@ class HLoadClass final : public HInstruction {
     return must_resolve_type_on_slow_path;
   }
 
-  void MarkInBootImage() {
-    SetPackedFlag<kFlagIsInBootImage>(true);
+  void MarkInImage() {
+    SetPackedFlag<kFlagIsInImage>(true);
   }
 
   void AddSpecialInput(HInstruction* special_input);
@@ -6912,10 +6917,11 @@ class HLoadClass final : public HInstruction {
 
  private:
   static constexpr size_t kFlagNeedsAccessCheck    = kNumberOfGenericPackedBits;
-  static constexpr size_t kFlagIsInBootImage       = kFlagNeedsAccessCheck + 1;
+  // Whether the type is in an image (boot image or app image).
+  static constexpr size_t kFlagIsInImage           = kFlagNeedsAccessCheck + 1;
   // Whether this instruction must generate the initialization check.
   // Used for code generation.
-  static constexpr size_t kFlagGenerateClInitCheck = kFlagIsInBootImage + 1;
+  static constexpr size_t kFlagGenerateClInitCheck = kFlagIsInImage + 1;
   static constexpr size_t kFieldLoadKind           = kFlagGenerateClInitCheck + 1;
   static constexpr size_t kFieldLoadKindSize =
       MinimumBitsToStore(static_cast<size_t>(LoadKind::kLast));
@@ -6989,7 +6995,7 @@ class HLoadString final : public HInstruction {
     // Used for boot image strings referenced by boot image code.
     kBootImageLinkTimePcRelative,
 
-    // Load from an entry in the .data.bimg.rel.ro using a PC-relative load.
+    // Load from a boot image entry in the .data.img.rel.ro using a PC-relative load.
     // Used for boot image strings referenced by apps in AOT-compiled code.
     kBootImageRelRo,
 
@@ -8419,6 +8425,9 @@ class HIntermediateAddress final : public HExpression<2> {
 #endif
 #if defined(ART_ENABLE_CODEGEN_x86) || defined(ART_ENABLE_CODEGEN_x86_64)
 #include "nodes_x86.h"
+#endif
+#if defined(ART_ENABLE_CODEGEN_riscv64)
+#include "nodes_riscv64.h"
 #endif
 
 namespace art HIDDEN {

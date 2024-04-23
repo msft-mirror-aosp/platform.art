@@ -467,10 +467,10 @@ class CodeGenerator : public DeletableArenaObject<kArenaAllocCodeGenerator> {
            instance_of->GetTypeCheckKind() == TypeCheckKind::kClassHierarchyCheck ||
            instance_of->GetTypeCheckKind() == TypeCheckKind::kArrayObjectCheck)
         << instance_of->GetTypeCheckKind();
-    // If the target class is in the boot image, it's non-moveable and it doesn't matter
+    // If the target class is in the boot or app image, it's non-moveable and it doesn't matter
     // if we compare it with a from-space or to-space reference, the result is the same.
     // It's OK to traverse a class hierarchy jumping between from-space and to-space.
-    return EmitReadBarrier() && !instance_of->GetTargetClass()->IsInBootImage();
+    return EmitReadBarrier() && !instance_of->GetTargetClass()->IsInImage();
   }
 
   ReadBarrierOption ReadBarrierOptionForInstanceOf(HInstanceOf* instance_of) {
@@ -485,7 +485,7 @@ class CodeGenerator : public DeletableArenaObject<kArenaAllocCodeGenerator> {
       case TypeCheckKind::kArrayObjectCheck:
       case TypeCheckKind::kInterfaceCheck: {
         bool needs_read_barrier =
-            EmitReadBarrier() && !check_cast->GetTargetClass()->IsInBootImage();
+            EmitReadBarrier() && !check_cast->GetTargetClass()->IsInImage();
         // We do not emit read barriers for HCheckCast, so we can get false negatives
         // and the slow path shall re-check and simply return if the cast is actually OK.
         return !needs_read_barrier;
@@ -735,15 +735,15 @@ class CodeGenerator : public DeletableArenaObject<kArenaAllocCodeGenerator> {
  protected:
   // Patch info used for recording locations of required linker patches and their targets,
   // i.e. target method, string, type or code identified by their dex file and index,
-  // or .data.bimg.rel.ro entries identified by the boot image offset.
+  // or boot image .data.img.rel.ro entries identified by the boot image offset.
   template <typename LabelType>
   struct PatchInfo {
     PatchInfo(const DexFile* dex_file, uint32_t off_or_idx)
         : target_dex_file(dex_file), offset_or_index(off_or_idx), label() { }
 
-    // Target dex file or null for .data.bmig.rel.ro patches.
+    // Target dex file or null for boot image .data.img.rel.ro patches.
     const DexFile* target_dex_file;
-    // Either the boot image offset (to write to .data.bmig.rel.ro) or string/type/method index.
+    // Either the boot image offset (to write to .data.img.rel.ro) or string/type/method index.
     uint32_t offset_or_index;
     // Label for the instruction to patch.
     LabelType label;

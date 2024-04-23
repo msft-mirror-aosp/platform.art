@@ -831,6 +831,11 @@ class ProfMan final {
     CodeItemInstructionAccessor accessor(
         *dex_file, dex_file->GetCodeItem(dex_file->FindCodeItemOffset(*class_def, dex_method_idx)));
     for (const auto& [pc, ic_data] : *inline_caches) {
+      if (pc >= accessor.InsnsSizeInCodeUnits()) {
+        // Inlined inline caches are not supported in AOT, so discard any pc beyond the
+        // code item size. See also `HInliner::GetInlineCacheAOT`.
+        continue;
+      }
       const Instruction& inst = accessor.InstructionAt(pc);
       const dex::MethodId& target = dex_file->GetMethodId(inst.VRegB());
       if (ic_data.classes.empty() && !ic_data.is_megamorphic && !ic_data.is_missing_types) {
@@ -1322,6 +1327,10 @@ class ProfMan final {
     const dex::ClassDef* def = dex->FindClassDef(class_ref.TypeIndex());
     if (def == nullptr || method_index >= dex->NumMethodIds()) {
       // Class not in dex-file.
+      return std::nullopt;
+    }
+    if (dex->GetClassData(*def) == nullptr) {
+      // Class has no fields or methods.
       return std::nullopt;
     }
     if (LIKELY(dex->GetCodeItemOffset(*def, method_index).has_value())) {

@@ -926,8 +926,6 @@ class EXPORT ArtMethod final {
 
   const dex::CodeItem* GetCodeItem() REQUIRES_SHARED(Locks::mutator_lock_);
 
-  bool IsResolvedTypeIdx(dex::TypeIndex type_idx) REQUIRES_SHARED(Locks::mutator_lock_);
-
   int32_t GetLineNumFromDexPC(uint32_t dex_pc) REQUIRES_SHARED(Locks::mutator_lock_);
 
   const dex::ProtoId& GetPrototype() REQUIRES_SHARED(Locks::mutator_lock_);
@@ -1017,9 +1015,6 @@ class EXPORT ArtMethod final {
   // Get compiled code for the method, return null if no code exists.
   const void* GetOatMethodQuickCode(PointerSize pointer_size)
       REQUIRES_SHARED(Locks::mutator_lock_);
-
-  // Returns whether the method has any compiled code, JIT or AOT.
-  bool HasAnyCompiledCode() REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Returns a human-readable signature for 'm'. Something like "a.b.C.m" or
   // "a.b.C.m(II)V" (depending on the value of 'with_signature').
