@@ -23,7 +23,7 @@
 
 #include "arch/context.h"
 #include "art_method-inl.h"
-#include "base/enums.h"
+#include "base/pointer_size.h"
 #include "base/stl_util.h"
 #include "class_linker-inl.h"
 #include "class_root-inl.h"
@@ -302,7 +302,7 @@ uint32_t ArtMethod::FindDexMethodIndexInOtherDexFile(const DexFile& other_dexfil
   if (dexfile == &other_dexfile) {
     return dex_method_idx;
   }
-  const char* mid_declaring_class_descriptor = dexfile->StringByTypeIdx(mid.class_idx_);
+  const char* mid_declaring_class_descriptor = dexfile->GetTypeDescriptor(mid.class_idx_);
   const dex::TypeId* other_type_id = other_dexfile.FindTypeId(mid_declaring_class_descriptor);
   if (other_type_id != nullptr) {
     const dex::MethodId* other_mid = other_dexfile.FindMethodId(
@@ -715,22 +715,6 @@ const void* ArtMethod::GetOatMethodQuickCode(PointerSize pointer_size) {
     return oat_method.GetQuickCode();
   }
   return nullptr;
-}
-
-bool ArtMethod::HasAnyCompiledCode() {
-  if (IsNative() || !IsInvokable() || IsProxyMethod()) {
-    return false;
-  }
-
-  // Check whether the JIT has compiled it.
-  Runtime* runtime = Runtime::Current();
-  jit::Jit* jit = runtime->GetJit();
-  if (jit != nullptr && jit->GetCodeCache()->ContainsMethod(this)) {
-    return true;
-  }
-
-  // Check whether we have AOT code.
-  return GetOatMethodQuickCode(runtime->GetClassLinker()->GetImagePointerSize()) != nullptr;
 }
 
 void ArtMethod::SetIntrinsic(uint32_t intrinsic) {

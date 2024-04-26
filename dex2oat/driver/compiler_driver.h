@@ -222,7 +222,9 @@ class CompilerDriver {
   }
 
  private:
-  void LoadImageClasses(TimingLogger* timings, /*inout*/ HashSet<std::string>* image_classes)
+  void LoadImageClasses(TimingLogger* timings,
+                        jobject class_loader,
+                        /*inout*/ HashSet<std::string>* image_classes)
       REQUIRES(!Locks::mutator_lock_);
 
   // Attempt to resolve all type, methods, fields, and strings
@@ -234,7 +236,6 @@ class CompilerDriver {
       REQUIRES(!Locks::mutator_lock_);
   void ResolveDexFile(jobject class_loader,
                       const DexFile& dex_file,
-                      const std::vector<const DexFile*>& dex_files,
                       ThreadPool* thread_pool,
                       size_t thread_count,
                       TimingLogger* timings)
@@ -252,7 +253,6 @@ class CompilerDriver {
 
   void VerifyDexFile(jobject class_loader,
                      const DexFile& dex_file,
-                     const std::vector<const DexFile*>& dex_files,
                      ThreadPool* thread_pool,
                      size_t thread_count,
                      TimingLogger* timings)
@@ -263,7 +263,6 @@ class CompilerDriver {
                    TimingLogger* timings);
   void SetVerifiedDexFile(jobject class_loader,
                           const DexFile& dex_file,
-                          const std::vector<const DexFile*>& dex_files,
                           ThreadPool* thread_pool,
                           size_t thread_count,
                           TimingLogger* timings)
@@ -275,7 +274,6 @@ class CompilerDriver {
       REQUIRES(!Locks::mutator_lock_);
   void InitializeClasses(jobject class_loader,
                          const DexFile& dex_file,
-                         const std::vector<const DexFile*>& dex_files,
                          TimingLogger* timings)
       REQUIRES(!Locks::mutator_lock_);
 

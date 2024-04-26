@@ -67,8 +67,6 @@ LOCAL_LICENSE_CONDITIONS := notice
 LOCAL_NOTICE_FILE := $(LOCAL_PATH)/NOTICE
 LOCAL_IS_HOST_MODULE := true
 
-ifeq (true,$(my_art_module_source_build))
-
 LOCAL_REQUIRED_MODULES := \
     ahat \
     dexdump \
@@ -85,33 +83,12 @@ LOCAL_REQUIRED_MODULES += \
 
 endif
 
-else
-
-# The developer tools available as prebuilts.
-LOCAL_REQUIRED_MODULES := \
-    dexdump \
-    oatdump \
-
-endif # ifeq (true,$(my_art_module_source_build))
-
 include $(BUILD_PHONY_PACKAGE)
 endif # HOST_OS != darwin
-
-
-########################################################################
-# Everything below is only available in ART source builds
-# (ART_MODULE_BUILD_FROM_SOURCE=true).
-########################################################################
-
-# TODO(b/172480617): Clean up the platform dependencies on everything above and
-# remove this condition.
-ifeq (true,$(my_art_module_source_build))
-
 
 ########################################################################
 # product rules
 
-include $(art_path)/oatdump/Android.mk
 include $(art_path)/tools/ahat/Android.mk
 include $(art_path)/tools/dexfuzz/Android.mk
 
@@ -833,5 +810,3 @@ public_sdk_stubs: $(STUB_ZIP_FILES)
 
 MIN_SDK_VERSION :=
 SDK_VERSIONS :=
-
-endif # ifeq (true,$(my_art_module_source_build))
