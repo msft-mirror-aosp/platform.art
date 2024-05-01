@@ -17,6 +17,7 @@
 #include "artd.h"
 
 #include <fcntl.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -25,6 +26,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -35,7 +37,6 @@
 #include <string>
 #include <thread>
 #include <type_traits>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -62,9 +63,12 @@
 #include "path_utils.h"
 #include "profman/profman_result.h"
 #include "testing.h"
+#include "tools/binder_utils.h"
 #include "tools/system_properties.h"
 #include "tools/tools.h"
 #include "ziparchive/zip_writer.h"
+
+extern char** environ;
 
 namespace art {
 namespace artd {
@@ -108,20 +112,24 @@ using ::testing::DoAll;
 using ::testing::ElementsAre;
 using ::testing::Field;
 using ::testing::HasSubstr;
+using ::testing::InSequence;
 using ::testing::IsEmpty;
 using ::testing::Matcher;
 using ::testing::MockFunction;
+using ::testing::NiceMock;
 using ::testing::Not;
 using ::testing::Property;
 using ::testing::ResultOf;
 using ::testing::Return;
 using ::testing::SetArgPointee;
+using ::testing::StrEq;
 using ::testing::UnorderedElementsAreArray;
 using ::testing::WithArg;
 
 using PrimaryCurProfilePath = ProfilePath::PrimaryCurProfilePath;
 using PrimaryRefProfilePath = ProfilePath::PrimaryRefProfilePath;
 using TmpProfilePath = ProfilePath::TmpProfilePath;
+using WritableProfilePath = ProfilePath::WritableProfilePath;
 
 using std::literals::operator""s;  // NOLINT
 
@@ -385,7 +393,8 @@ class ArtdTest : public CommonArtTest {
     compiler_filter_ = "speed";
     tmp_profile_path_ =
         TmpProfilePath{.finalPath = PrimaryRefProfilePath{.packageName = "com.android.foo",
-                                                          .profileName = "primary"},
+                                                          .profileName = "primary",
+                                                          .isPreReboot = false},
                        .id = "12345"};
     profile_path_ = tmp_profile_path_;
     vdex_path_ = artifacts_path_;
@@ -440,7 +449,7 @@ class ArtdTest : public CommonArtTest {
       std::pair<std::conditional_t<kExpectOk, CopyAndRewriteProfileResult, ndk::ScopedAStatus>,
                 OutputProfile>>;
 
-  // Runs `copyAndRewriteProfile` with `tmp_profile_path_` and `dex_file_`.
+  // Runs `copyAndRewriteProfile` with `profile_path_` and `dex_file_`.
   template <bool kExpectOk = true>
   RunCopyAndRewriteProfileResult<kExpectOk> RunCopyAndRewriteProfile() {
     OutputProfile dst{.profilePath = tmp_profile_path_,
@@ -450,7 +459,7 @@ class ArtdTest : public CommonArtTest {
 
     CopyAndRewriteProfileResult result;
     ndk::ScopedAStatus status =
-        artd_->copyAndRewriteProfile(tmp_profile_path_, &dst, dex_file_, &result);
+        artd_->copyAndRewriteProfile(profile_path_.value(), &dst, dex_file_, &result);
     if constexpr (kExpectOk) {
       if (!status.isOk()) {
         return Error() << status.getMessage();
@@ -561,10 +570,10 @@ class ArtdTest : public CommonArtTest {
     }
 
     // Files to be replaced.
-    std::string oat_path = OR_FATAL(BuildOatPath(artifacts_path_));
-    CreateFile(oat_path, "old_oat");
-    CreateFile(OatPathToVdexPath(oat_path), "old_vdex");
-    CreateFile(OatPathToArtPath(oat_path), "old_art");
+    RawArtifactsPath artifacts_path = OR_FATAL(BuildArtifactsPath(artifacts_path_));
+    CreateFile(artifacts_path.oat_path, "old_oat");
+    CreateFile(artifacts_path.vdex_path, "old_vdex");
+    CreateFile(artifacts_path.art_path, "old_art");
   }
 };
 
@@ -1382,7 +1391,7 @@ TEST_F(ArtdTest, isProfileUsableFailed) {
 }
 
 TEST_F(ArtdTest, copyAndRewriteProfileSuccess) {
-  std::string src_file = OR_FATAL(BuildTmpProfilePath(tmp_profile_path_));
+  std::string src_file = OR_FATAL(BuildProfileOrDmPath(profile_path_.value()));
   CreateFile(src_file, "valid_profile");
 
   CreateFile(dex_file_);
@@ -1414,7 +1423,7 @@ TEST_F(ArtdTest, copyAndRewriteProfileSuccess) {
 
 // The input is a plain profile file in the wrong format.
 TEST_F(ArtdTest, copyAndRewriteProfileBadProfileWrongFormat) {
-  std::string src_file = OR_FATAL(BuildTmpProfilePath(tmp_profile_path_));
+  std::string src_file = OR_FATAL(BuildProfileOrDmPath(profile_path_.value()));
   CreateFile(src_file, "wrong_format");
 
   CreateFile(dex_file_);
@@ -1433,7 +1442,7 @@ TEST_F(ArtdTest, copyAndRewriteProfileBadProfileWrongFormat) {
 
 // The input is a plain profile file that doesn't match the APK.
 TEST_F(ArtdTest, copyAndRewriteProfileBadProfileNoMatch) {
-  std::string src_file = OR_FATAL(BuildTmpProfilePath(tmp_profile_path_));
+  std::string src_file = OR_FATAL(BuildProfileOrDmPath(profile_path_.value()));
   CreateFile(src_file, "no_match");
 
   CreateFile(dex_file_);
@@ -1451,7 +1460,7 @@ TEST_F(ArtdTest, copyAndRewriteProfileBadProfileNoMatch) {
 
 // The input is a plain profile file that is empty.
 TEST_F(ArtdTest, copyAndRewriteProfileNoProfileEmpty) {
-  std::string src_file = OR_FATAL(BuildTmpProfilePath(tmp_profile_path_));
+  std::string src_file = OR_FATAL(BuildProfileOrDmPath(profile_path_.value()));
   CreateFile(src_file, "");
 
   CreateFile(dex_file_);
@@ -1479,7 +1488,7 @@ TEST_F(ArtdTest, copyAndRewriteProfileNoProfileNoFile) {
 
 // The input is a dm file with a profile entry in the wrong format.
 TEST_F(ArtdTest, copyAndRewriteProfileNoProfileDmWrongFormat) {
-  std::string src_file = OR_FATAL(BuildTmpProfilePath(tmp_profile_path_));
+  std::string src_file = OR_FATAL(BuildProfileOrDmPath(profile_path_.value()));
   CreateZipWithSingleEntry(src_file, "primary.prof", "wrong_format");
 
   CreateFile(dex_file_);
@@ -1498,7 +1507,7 @@ TEST_F(ArtdTest, copyAndRewriteProfileNoProfileDmWrongFormat) {
 
 // The input is a dm file with a profile entry that doesn't match the APK.
 TEST_F(ArtdTest, copyAndRewriteProfileNoProfileDmNoMatch) {
-  std::string src_file = OR_FATAL(BuildTmpProfilePath(tmp_profile_path_));
+  std::string src_file = OR_FATAL(BuildProfileOrDmPath(profile_path_.value()));
   CreateZipWithSingleEntry(src_file, "primary.prof", "no_match");
 
   CreateFile(dex_file_);
@@ -1516,7 +1525,7 @@ TEST_F(ArtdTest, copyAndRewriteProfileNoProfileDmNoMatch) {
 
 // The input is a dm file with a profile entry that is empty.
 TEST_F(ArtdTest, copyAndRewriteProfileNoProfileDmEmpty) {
-  std::string src_file = OR_FATAL(BuildTmpProfilePath(tmp_profile_path_));
+  std::string src_file = OR_FATAL(BuildProfileOrDmPath(profile_path_.value()));
   CreateZipWithSingleEntry(src_file, "primary.prof");
 
   CreateFile(dex_file_);
@@ -1533,7 +1542,7 @@ TEST_F(ArtdTest, copyAndRewriteProfileNoProfileDmEmpty) {
 
 // The input is a dm file without a profile entry.
 TEST_F(ArtdTest, copyAndRewriteProfileNoProfileDmNoEntry) {
-  std::string src_file = OR_FATAL(BuildTmpProfilePath(tmp_profile_path_));
+  std::string src_file = OR_FATAL(BuildProfileOrDmPath(profile_path_.value()));
   CreateZipWithSingleEntry(src_file, "primary.vdex");
 
   CreateFile(dex_file_);
@@ -1549,7 +1558,7 @@ TEST_F(ArtdTest, copyAndRewriteProfileNoProfileDmNoEntry) {
 }
 
 TEST_F(ArtdTest, copyAndRewriteProfileException) {
-  std::string src_file = OR_FATAL(BuildTmpProfilePath(tmp_profile_path_));
+  std::string src_file = OR_FATAL(BuildProfileOrDmPath(profile_path_.value()));
   CreateFile(src_file, "valid_profile");
 
   CreateFile(dex_file_);
@@ -1773,13 +1782,15 @@ TEST_F(ArtdGetVisibilityTest, getProfileVisibilityPermissionDenied) {
 }
 
 TEST_F(ArtdGetVisibilityTest, getArtifactsVisibilityOtherReadable) {
-  TestGetVisibilityOtherReadable(
-      &Artd::getArtifactsVisibility, artifacts_path_, OR_FATAL(BuildOatPath(artifacts_path_)));
+  TestGetVisibilityOtherReadable(&Artd::getArtifactsVisibility,
+                                 artifacts_path_,
+                                 OR_FATAL(BuildArtifactsPath(artifacts_path_)).oat_path);
 }
 
 TEST_F(ArtdGetVisibilityTest, getArtifactsVisibilityNotOtherReadable) {
-  TestGetVisibilityNotOtherReadable(
-      &Artd::getArtifactsVisibility, artifacts_path_, OR_FATAL(BuildOatPath(artifacts_path_)));
+  TestGetVisibilityNotOtherReadable(&Artd::getArtifactsVisibility,
+                                    artifacts_path_,
+                                    OR_FATAL(BuildArtifactsPath(artifacts_path_)).oat_path);
 }
 
 TEST_F(ArtdGetVisibilityTest, getArtifactsVisibilityNotFound) {
@@ -1787,8 +1798,9 @@ TEST_F(ArtdGetVisibilityTest, getArtifactsVisibilityNotFound) {
 }
 
 TEST_F(ArtdGetVisibilityTest, getArtifactsVisibilityPermissionDenied) {
-  TestGetVisibilityPermissionDenied(
-      &Artd::getArtifactsVisibility, artifacts_path_, OR_FATAL(BuildOatPath(artifacts_path_)));
+  TestGetVisibilityPermissionDenied(&Artd::getArtifactsVisibility,
+                                    artifacts_path_,
+                                    OR_FATAL(BuildArtifactsPath(artifacts_path_)).oat_path);
 }
 
 TEST_F(ArtdGetVisibilityTest, getDexFileVisibilityOtherReadable) {
@@ -1830,8 +1842,7 @@ TEST_F(ArtdGetVisibilityTest, getDmFileVisibilityPermissionDenied) {
 }
 
 TEST_F(ArtdTest, mergeProfiles) {
-  const TmpProfilePath& reference_profile_path = tmp_profile_path_;
-  std::string reference_profile_file = OR_FATAL(BuildTmpProfilePath(reference_profile_path));
+  std::string reference_profile_file = OR_FATAL(BuildProfileOrDmPath(profile_path_.value()));
   CreateFile(reference_profile_file, "abc");
 
   // Doesn't exist.
@@ -1844,7 +1855,7 @@ TEST_F(ArtdTest, mergeProfiles) {
   std::string profile_1_file = OR_FATAL(BuildPrimaryCurProfilePath(profile_1_path));
   CreateFile(profile_1_file, "def");
 
-  OutputProfile output_profile{.profilePath = reference_profile_path,
+  OutputProfile output_profile{.profilePath = tmp_profile_path_,
                                .fsPermission = FsPermission{.uid = -1, .gid = -1}};
   output_profile.profilePath.id = "";
   output_profile.profilePath.tmpPath = "";
@@ -1877,7 +1888,7 @@ TEST_F(ArtdTest, mergeProfiles) {
   bool result;
   EXPECT_TRUE(artd_
                   ->mergeProfiles({profile_0_path, profile_1_path},
-                                  reference_profile_path,
+                                  profile_path_,
                                   &output_profile,
                                   {dex_file_1, dex_file_2},
                                   /*in_options=*/{},
@@ -1932,10 +1943,6 @@ TEST_F(ArtdTest, mergeProfilesEmptyReferenceProfile) {
 }
 
 TEST_F(ArtdTest, mergeProfilesProfilesDontExist) {
-  const TmpProfilePath& reference_profile_path = tmp_profile_path_;
-  std::string reference_profile_file = OR_FATAL(BuildTmpProfilePath(reference_profile_path));
-  CreateFile(reference_profile_file, "abc");
-
   // Doesn't exist.
   PrimaryCurProfilePath profile_0_path{
       .userId = 0, .packageName = "com.android.foo", .profileName = "primary"};
@@ -1946,7 +1953,7 @@ TEST_F(ArtdTest, mergeProfilesProfilesDontExist) {
       .userId = 1, .packageName = "com.android.foo", .profileName = "primary"};
   std::string profile_1_file = OR_FATAL(BuildPrimaryCurProfilePath(profile_1_path));
 
-  OutputProfile output_profile{.profilePath = reference_profile_path,
+  OutputProfile output_profile{.profilePath = tmp_profile_path_,
                                .fsPermission = FsPermission{.uid = -1, .gid = -1}};
   output_profile.profilePath.id = "";
   output_profile.profilePath.tmpPath = "";
@@ -1958,7 +1965,7 @@ TEST_F(ArtdTest, mergeProfilesProfilesDontExist) {
   bool result;
   EXPECT_TRUE(artd_
                   ->mergeProfiles({profile_0_path},
-                                  std::nullopt,
+                                  /*in_referenceProfile=*/std::nullopt,
                                   &output_profile,
                                   {dex_file_},
                                   /*in_options=*/{},
@@ -2437,6 +2444,323 @@ TEST_F(ArtdTest, getProfileSize) {
                       &aidl_return)
                   .isOk());
   EXPECT_EQ(aidl_return, 1);
+}
+
+class ArtdPreRebootTest : public ArtdTest {
+ protected:
+  void SetUp() override {
+    ArtdTest::SetUp();
+
+    pre_reboot_tmp_dir_ = scratch_path_ + "/artd_tmp";
+    std::filesystem::create_directories(pre_reboot_tmp_dir_);
+    init_environ_rc_path_ = scratch_path_ + "/init.environ.rc";
+
+    auto mock_props = std::make_unique<NiceMock<MockSystemProperties>>();
+    mock_props_ = mock_props.get();
+    ON_CALL(*mock_props_, GetProperty).WillByDefault(Return(""));
+    auto mock_exec_utils = std::make_unique<MockExecUtils>();
+    mock_exec_utils_ = mock_exec_utils.get();
+    artd_ = ndk::SharedRefBase::make<Artd>(Options{.is_pre_reboot = true},
+                                           std::move(mock_props),
+                                           std::move(mock_exec_utils),
+                                           mock_kill_.AsStdFunction(),
+                                           mock_fstat_.AsStdFunction(),
+                                           mock_mount_.AsStdFunction(),
+                                           mock_restorecon_.AsStdFunction(),
+                                           pre_reboot_tmp_dir_,
+                                           init_environ_rc_path_);
+
+    ON_CALL(mock_restorecon_, Call).WillByDefault(Return(Result<void>()));
+
+    constexpr const char* kInitEnvironRcTmpl = R"(
+      on early-init
+          export ANDROID_ART_ROOT {}
+          export ANDROID_DATA {}
+    )";
+    ASSERT_TRUE(WriteStringToFile(ART_FORMAT(kInitEnvironRcTmpl, art_root_, android_data_),
+                                  init_environ_rc_path_));
+
+    tmp_profile_path_.finalPath.get<WritableProfilePath::forPrimary>().isPreReboot = true;
+    output_artifacts_.artifactsPath.isPreReboot = true;
+  }
+
+  std::string pre_reboot_tmp_dir_;
+  std::string init_environ_rc_path_;
+  MockFunction<int(const char*, const char*, const char*, uint32_t, const void*)> mock_mount_;
+  MockFunction<Result<void>(const std::string&,
+                            const std::optional<OutputArtifacts::PermissionSettings::SeContext>&,
+                            bool)>
+      mock_restorecon_;
+};
+
+TEST_F(ArtdPreRebootTest, preRebootInit) {
+  // Color the env vars to make sure that the expected values are not from the parent process but
+  // from "/init.environ.rc".
+  ASSERT_EQ(setenv("ANDROID_ART_ROOT", "old_value", /*replace=*/1), 0);
+  ASSERT_EQ(setenv("ANDROID_DATA", "old_value", /*replace=*/1), 0);
+  ASSERT_EQ(setenv("BOOTCLASSPATH", "old_value", /*replace=*/1), 0);
+
+  // Add an env var that doesn't get overridden, to check that it gets removed.
+  ASSERT_EQ(setenv("FOO", "old_value", /*replace=*/1), 0);
+
+  InSequence seq;
+
+  EXPECT_CALL(*mock_exec_utils_,
+              DoExecAndReturnCode(
+                  AllOf(WhenSplitBy("--",
+                                    AllOf(Contains(art_root_ + "/bin/art_exec"),
+                                          Contains("--drop-capabilities")),
+                                    Contains("/apex/com.android.sdkext/bin/derive_classpath")),
+                        HasKeepFdsFor("/proc/self/fd/")),
+                  _,
+                  _))
+      .WillOnce(DoAll(WithArg<0>(WriteToFdFlag("/proc/self/fd/", "export BOOTCLASSPATH /foo:/bar")),
+                      Return(0)));
+
+  EXPECT_CALL(mock_mount_,
+              Call(StrEq(pre_reboot_tmp_dir_ + "/art_apex_data"),
+                   StrEq("/data/misc/apexdata/com.android.art"),
+                   /*fs_type=*/nullptr,
+                   MS_BIND | MS_PRIVATE,
+                   /*data=*/nullptr))
+      .WillOnce(Return(0));
+
+  EXPECT_CALL(mock_mount_,
+              Call(StrEq(pre_reboot_tmp_dir_ + "/odrefresh"),
+                   StrEq("/data/misc/odrefresh"),
+                   /*fs_type=*/nullptr,
+                   MS_BIND | MS_PRIVATE,
+                   /*data=*/nullptr))
+      .WillOnce(Return(0));
+
+  EXPECT_CALL(*mock_exec_utils_,
+              DoExecAndReturnCode(WhenSplitBy("--",
+                                              AllOf(Contains(art_root_ + "/bin/art_exec"),
+                                                    Contains("--drop-capabilities")),
+                                              AllOf(Contains(art_root_ + "/bin/odrefresh"),
+                                                    Contains("--only-boot-images"),
+                                                    Contains("--compile"))),
+                                  _,
+                                  _))
+      .WillOnce(Return(0));
+
+  ASSERT_STATUS_OK(artd_->preRebootInit());
+
+  auto env_var_count = []() {
+    int count = 0;
+    for (char** it = environ; *it != nullptr; it++) {
+      count++;
+    }
+    return count;
+  };
+
+  EXPECT_EQ(getenv("ANDROID_ART_ROOT"), art_root_);
+  EXPECT_EQ(getenv("ANDROID_DATA"), android_data_);
+  EXPECT_STREQ(getenv("BOOTCLASSPATH"), "/foo:/bar");
+  EXPECT_EQ(env_var_count(), 3);
+  EXPECT_TRUE(std::filesystem::exists(pre_reboot_tmp_dir_ + "/preparation_done"));
+
+  // Color the env vars again to simulate that artd died and restarted.
+  ASSERT_EQ(setenv("ANDROID_ART_ROOT", "old_value", /*replace=*/1), 0);
+  ASSERT_EQ(setenv("ANDROID_DATA", "old_value", /*replace=*/1), 0);
+  ASSERT_EQ(setenv("BOOTCLASSPATH", "old_value", /*replace=*/1), 0);
+
+  // Calling again will not involve `mount`, `derive_classpath`, or `odrefresh` but only restore env
+  // vars.
+  EXPECT_TRUE(artd_->preRebootInit().isOk());
+  EXPECT_EQ(getenv("ANDROID_ART_ROOT"), art_root_);
+  EXPECT_EQ(getenv("ANDROID_DATA"), android_data_);
+  EXPECT_STREQ(getenv("BOOTCLASSPATH"), "/foo:/bar");
+  EXPECT_EQ(env_var_count(), 3);
+}
+
+TEST_F(ArtdPreRebootTest, preRebootInitFailed) {
+  EXPECT_CALL(*mock_exec_utils_,
+              DoExecAndReturnCode(Contains("/apex/com.android.sdkext/bin/derive_classpath"), _, _))
+      .WillOnce(DoAll(WithArg<0>(WriteToFdFlag("/proc/self/fd/", "export BOOTCLASSPATH /foo:/bar")),
+                      Return(0)));
+
+  EXPECT_CALL(mock_mount_, Call).Times(2).WillRepeatedly(Return(0));
+
+  EXPECT_CALL(*mock_exec_utils_, DoExecAndReturnCode(Contains(art_root_ + "/bin/odrefresh"), _, _))
+      .WillOnce(Return(1));
+
+  ndk::ScopedAStatus status = artd_->preRebootInit();
+  EXPECT_FALSE(status.isOk());
+  EXPECT_EQ(status.getExceptionCode(), EX_SERVICE_SPECIFIC);
+  EXPECT_STREQ(status.getMessage(), "odrefresh returned an unexpected code: 1");
+}
+
+TEST_F(ArtdPreRebootTest, preRebootInitNoRetry) {
+  // Simulate that a previous attempt failed halfway.
+  ASSERT_TRUE(WriteStringToFile("", pre_reboot_tmp_dir_ + "/classpath.txt"));
+
+  ndk::ScopedAStatus status = artd_->preRebootInit();
+  EXPECT_FALSE(status.isOk());
+  EXPECT_EQ(status.getExceptionCode(), EX_ILLEGAL_STATE);
+  EXPECT_STREQ(status.getMessage(),
+               "preRebootInit must not be concurrently called or retried after failure");
+}
+
+TEST_F(ArtdPreRebootTest, dexopt) {
+  std::string profile_file = OR_FATAL(BuildProfileOrDmPath(profile_path_.value()));
+
+  dexopt_options_.generateAppImage = true;
+
+  EXPECT_CALL(
+      *mock_exec_utils_,
+      DoExecAndReturnCode(
+          WhenSplitBy("--", _, Contains(Flag("--profile-file-fd=", FdOf(profile_file)))), _, _))
+      .WillOnce(DoAll(WithArg<0>(WriteToFdFlag("--oat-fd=", "oat")),
+                      WithArg<0>(WriteToFdFlag("--output-vdex-fd=", "vdex")),
+                      WithArg<0>(WriteToFdFlag("--app-image-fd=", "art")),
+                      Return(0)));
+  RunDexopt();
+
+  CheckContent(scratch_path_ + "/a/oat/arm64/b.odex.staged", "oat");
+  CheckContent(scratch_path_ + "/a/oat/arm64/b.vdex.staged", "vdex");
+  CheckContent(scratch_path_ + "/a/oat/arm64/b.art.staged", "art");
+}
+
+TEST_F(ArtdPreRebootTest, dexoptPreRebootProfile) {
+  profile_path_->get<ProfilePath::tmpProfilePath>()
+      .finalPath.get<WritableProfilePath::forPrimary>()
+      .isPreReboot = true;
+  std::string profile_file = OR_FATAL(BuildProfileOrDmPath(profile_path_.value()));
+
+  dexopt_options_.generateAppImage = true;
+
+  EXPECT_CALL(
+      *mock_exec_utils_,
+      DoExecAndReturnCode(
+          WhenSplitBy("--", _, Contains(Flag("--profile-file-fd=", FdOf(profile_file)))), _, _))
+      .WillOnce(DoAll(WithArg<0>(WriteToFdFlag("--oat-fd=", "oat")),
+                      WithArg<0>(WriteToFdFlag("--output-vdex-fd=", "vdex")),
+                      WithArg<0>(WriteToFdFlag("--app-image-fd=", "art")),
+                      Return(0)));
+  RunDexopt();
+
+  CheckContent(scratch_path_ + "/a/oat/arm64/b.odex.staged", "oat");
+  CheckContent(scratch_path_ + "/a/oat/arm64/b.vdex.staged", "vdex");
+  CheckContent(scratch_path_ + "/a/oat/arm64/b.art.staged", "art");
+}
+
+TEST_F(ArtdPreRebootTest, copyAndRewriteProfile) {
+  std::string src_file = OR_FATAL(BuildProfileOrDmPath(profile_path_.value()));
+  CreateFile(src_file, "valid_profile");
+
+  CreateFile(dex_file_);
+
+  EXPECT_CALL(*mock_exec_utils_, DoExecAndReturnCode)
+      .WillOnce(DoAll(WithArg<0>(WriteToFdFlag("--reference-profile-file-fd=", "def")),
+                      Return(ProfmanResult::kCopyAndUpdateSuccess)));
+
+  auto [result, dst] = OR_FAIL(RunCopyAndRewriteProfile());
+
+  EXPECT_EQ(result.status, CopyAndRewriteProfileResult::Status::SUCCESS);
+  EXPECT_THAT(dst.profilePath.tmpPath, ContainsRegex(R"re(/primary\.prof\.staged\.\w+\.tmp$)re"));
+  CheckContent(dst.profilePath.tmpPath, "def");
+}
+
+TEST_F(ArtdPreRebootTest, copyAndRewriteEmbeddedProfile) {
+  CreateZipWithSingleEntry(dex_file_, "assets/art-profile/baseline.prof", "valid_profile");
+
+  EXPECT_CALL(*mock_exec_utils_, DoExecAndReturnCode)
+      .WillOnce(DoAll(WithArg<0>(WriteToFdFlag("--reference-profile-file-fd=", "def")),
+                      Return(ProfmanResult::kCopyAndUpdateSuccess)));
+
+  auto [result, dst] = OR_FAIL(RunCopyAndRewriteEmbeddedProfile());
+
+  EXPECT_EQ(result.status, CopyAndRewriteProfileResult::Status::SUCCESS);
+  EXPECT_THAT(dst.profilePath.tmpPath, ContainsRegex(R"re(/primary\.prof\.staged\.\w+\.tmp$)re"));
+  CheckContent(dst.profilePath.tmpPath, "def");
+}
+
+TEST_F(ArtdPreRebootTest, mergeProfiles) {
+  std::string reference_profile_file = OR_FATAL(BuildProfileOrDmPath(profile_path_.value()));
+  CreateFile(reference_profile_file, "abc");
+
+  PrimaryCurProfilePath profile_1_path{
+      .userId = 1, .packageName = "com.android.foo", .profileName = "primary"};
+  std::string profile_1_file = OR_FATAL(BuildPrimaryCurProfilePath(profile_1_path));
+  CreateFile(profile_1_file, "def");
+
+  OutputProfile output_profile{.profilePath = tmp_profile_path_,
+                               .fsPermission = FsPermission{.uid = -1, .gid = -1}};
+  output_profile.profilePath.id = "";
+  output_profile.profilePath.tmpPath = "";
+
+  std::string dex_file_1 = scratch_path_ + "/a/b.apk";
+  CreateFile(dex_file_1);
+
+  EXPECT_CALL(
+      *mock_exec_utils_,
+      DoExecAndReturnCode(
+          WhenSplitBy("--",
+                      _,
+                      AllOf(Contains(Flag("--reference-profile-file-fd=", FdHasContent("abc"))),
+                            Contains(Flag("--profile-file-fd=", FdHasContent("def"))))),
+          _,
+          _))
+      .WillOnce(DoAll(WithArg<0>(ClearAndWriteToFdFlag("--reference-profile-file-fd=", "merged")),
+                      Return(ProfmanResult::kCompile)));
+
+  bool result;
+  ASSERT_STATUS_OK(artd_->mergeProfiles({profile_1_path},
+                                        profile_path_,
+                                        &output_profile,
+                                        {dex_file_1},
+                                        /*in_options=*/{},
+                                        &result));
+  EXPECT_TRUE(result);
+  EXPECT_THAT(output_profile.profilePath.tmpPath,
+              ContainsRegex(R"re(/primary\.prof\.staged\.\w+\.tmp$)re"));
+  CheckContent(output_profile.profilePath.tmpPath, "merged");
+}
+
+TEST_F(ArtdPreRebootTest, mergeProfilesPreRebootReference) {
+  profile_path_->get<ProfilePath::tmpProfilePath>()
+      .finalPath.get<WritableProfilePath::forPrimary>()
+      .isPreReboot = true;
+  std::string reference_profile_file = OR_FATAL(BuildProfileOrDmPath(profile_path_.value()));
+  CreateFile(reference_profile_file, "abc");
+
+  PrimaryCurProfilePath profile_1_path{
+      .userId = 1, .packageName = "com.android.foo", .profileName = "primary"};
+  std::string profile_1_file = OR_FATAL(BuildPrimaryCurProfilePath(profile_1_path));
+  CreateFile(profile_1_file, "def");
+
+  OutputProfile output_profile{.profilePath = tmp_profile_path_,
+                               .fsPermission = FsPermission{.uid = -1, .gid = -1}};
+  output_profile.profilePath.id = "";
+  output_profile.profilePath.tmpPath = "";
+
+  std::string dex_file_1 = scratch_path_ + "/a/b.apk";
+  CreateFile(dex_file_1);
+
+  EXPECT_CALL(
+      *mock_exec_utils_,
+      DoExecAndReturnCode(
+          WhenSplitBy("--",
+                      _,
+                      AllOf(Contains(Flag("--reference-profile-file-fd=", FdHasContent("abc"))),
+                            Contains(Flag("--profile-file-fd=", FdHasContent("def"))))),
+          _,
+          _))
+      .WillOnce(DoAll(WithArg<0>(ClearAndWriteToFdFlag("--reference-profile-file-fd=", "merged")),
+                      Return(ProfmanResult::kCompile)));
+
+  bool result;
+  ASSERT_STATUS_OK(artd_->mergeProfiles({profile_1_path},
+                                        profile_path_,
+                                        &output_profile,
+                                        {dex_file_1},
+                                        /*in_options=*/{},
+                                        &result));
+  EXPECT_TRUE(result);
+  EXPECT_THAT(output_profile.profilePath.tmpPath,
+              ContainsRegex(R"re(/primary\.prof\.staged\.\w+\.tmp$)re"));
+  CheckContent(output_profile.profilePath.tmpPath, "merged");
 }
 
 }  // namespace

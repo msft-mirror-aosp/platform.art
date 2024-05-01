@@ -70,17 +70,11 @@ public class ArtFileManager {
         mInjector = injector;
     }
 
-    /**
-     * @param excludeObsoleteDexesAndLoaders If true, excludes secondary dex files and loaders based
-     *         on file visibility. See details in {@link
-     *         DexUseManagerLocal#getCheckedSecondaryDexInfo}.
-     */
     @NonNull
-    public List<Pair<DetailedDexInfo, Abi>> getDexAndAbis(@NonNull PackageState pkgState,
-            @NonNull AndroidPackage pkg, boolean forPrimaryDex, boolean forSecondaryDex,
-            boolean excludeObsoleteDexesAndLoaders) {
+    public List<Pair<DetailedDexInfo, Abi>> getDexAndAbis(
+            @NonNull PackageState pkgState, @NonNull AndroidPackage pkg, @NonNull Options options) {
         List<Pair<DetailedDexInfo, Abi>> dexAndAbis = new ArrayList<>();
-        if (forPrimaryDex) {
+        if (options.forPrimaryDex()) {
             for (DetailedPrimaryDexInfo dexInfo :
                     PrimaryDexUtils.getDetailedDexInfo(pkgState, pkg)) {
                 for (Abi abi : Utils.getAllAbis(pkgState)) {
@@ -88,11 +82,8 @@ public class ArtFileManager {
                 }
             }
         }
-        if (forSecondaryDex) {
-            List<? extends SecondaryDexInfo> dexInfos = excludeObsoleteDexesAndLoaders
-                    ? mInjector.getDexUseManager().getCheckedSecondaryDexInfo(
-                            pkgState.getPackageName(), true /* excludeObsoleteDexesAndLoaders */)
-                    : mInjector.getDexUseManager().getSecondaryDexInfo(pkgState.getPackageName());
+        if (options.forSecondaryDex()) {
+            List<? extends SecondaryDexInfo> dexInfos = getSecondaryDexInfo(pkgState, options);
             for (SecondaryDexInfo dexInfo : dexInfos) {
                 if (!mInjector.isSystemOrRootOrShell()
                         && !mInjector.getCallingUserHandle().equals(dexInfo.userHandle())) {
@@ -111,27 +102,30 @@ public class ArtFileManager {
      * whether they are usable.
      */
     @NonNull
-    public WritableArtifactLists getWritableArtifacts(
-            @NonNull PackageState pkgState, @NonNull AndroidPackage pkg) throws RemoteException {
+    public WritableArtifactLists getWritableArtifacts(@NonNull PackageState pkgState,
+            @NonNull AndroidPackage pkg, @NonNull Options options) throws RemoteException {
         List<ArtifactsPath> artifacts = new ArrayList<>();
         List<RuntimeArtifactsPath> runtimeArtifacts = new ArrayList<>();
 
-        boolean isInDalvikCache = Utils.isInDalvikCache(pkgState, mInjector.getArtd());
-        for (PrimaryDexInfo dexInfo : PrimaryDexUtils.getDexInfo(pkg)) {
-            for (Abi abi : Utils.getAllAbis(pkgState)) {
-                artifacts.add(AidlUtils.buildArtifactsPath(
-                        dexInfo.dexPath(), abi.isa(), isInDalvikCache));
-                // Runtime images are only generated for primary dex files.
-                runtimeArtifacts.add(AidlUtils.buildRuntimeArtifactsPath(
-                        pkgState.getPackageName(), dexInfo.dexPath(), abi.isa()));
+        if (options.forPrimaryDex()) {
+            boolean isInDalvikCache = Utils.isInDalvikCache(pkgState, mInjector.getArtd());
+            for (PrimaryDexInfo dexInfo : PrimaryDexUtils.getDexInfo(pkg)) {
+                for (Abi abi : Utils.getAllAbis(pkgState)) {
+                    artifacts.add(AidlUtils.buildArtifactsPathAsInput(
+                            dexInfo.dexPath(), abi.isa(), isInDalvikCache));
+                    // Runtime images are only generated for primary dex files.
+                    runtimeArtifacts.add(AidlUtils.buildRuntimeArtifactsPath(
+                            pkgState.getPackageName(), dexInfo.dexPath(), abi.isa()));
+                }
             }
         }
 
-        for (SecondaryDexInfo dexInfo :
-                mInjector.getDexUseManager().getSecondaryDexInfo(pkgState.getPackageName())) {
-            for (Abi abi : Utils.getAllAbisForNames(dexInfo.abiNames(), pkgState)) {
-                artifacts.add(AidlUtils.buildArtifactsPath(
-                        dexInfo.dexPath(), abi.isa(), false /* isInDalvikCache */));
+        if (options.forSecondaryDex()) {
+            for (SecondaryDexInfo dexInfo : getSecondaryDexInfo(pkgState, options)) {
+                for (Abi abi : Utils.getAllAbisForNames(dexInfo.abiNames(), pkgState)) {
+                    artifacts.add(AidlUtils.buildArtifactsPathAsInput(
+                            dexInfo.dexPath(), abi.isa(), false /* isInDalvikCache */));
+                }
             }
         }
 
@@ -146,9 +140,12 @@ public class ArtFileManager {
         List<VdexPath> vdexFiles = new ArrayList<>();
         List<RuntimeArtifactsPath> runtimeArtifacts = new ArrayList<>();
 
-        for (Pair<DetailedDexInfo, Abi> pair :
-                getDexAndAbis(pkgState, pkg, true /* forPrimaryDex */, true /* forSecondaryDex */,
-                        true /* excludeObsoleteDexesAndLoaders */)) {
+        var options = ArtFileManager.Options.builder()
+                              .setForPrimaryDex(true)
+                              .setForSecondaryDex(true)
+                              .setExcludeForObsoleteDexesAndLoaders(true)
+                              .build();
+        for (Pair<DetailedDexInfo, Abi> pair : getDexAndAbis(pkgState, pkg, options)) {
             DetailedDexInfo dexInfo = pair.first;
             Abi abi = pair.second;
             try {
@@ -156,8 +153,9 @@ public class ArtFileManager {
                         dexInfo.dexPath(), abi.isa(), dexInfo.classLoaderContext());
                 if (result.artifactsLocation == ArtifactsLocation.DALVIK_CACHE
                         || result.artifactsLocation == ArtifactsLocation.NEXT_TO_DEX) {
-                    ArtifactsPath thisArtifacts = AidlUtils.buildArtifactsPath(dexInfo.dexPath(),
-                            abi.isa(), result.artifactsLocation == ArtifactsLocation.DALVIK_CACHE);
+                    ArtifactsPath thisArtifacts =
+                            AidlUtils.buildArtifactsPathAsInput(dexInfo.dexPath(), abi.isa(),
+                                    result.artifactsLocation == ArtifactsLocation.DALVIK_CACHE);
                     if (result.compilationReason.equals(ArtConstants.REASON_VDEX)) {
                         // Only the VDEX file is usable.
                         vdexFiles.add(VdexPath.artifactsPath(thisArtifacts));
@@ -185,41 +183,46 @@ public class ArtFileManager {
         return UsableArtifactLists.create(artifacts, vdexFiles, runtimeArtifacts);
     }
 
-    /**
-     * @param excludeForObsoleteDexesAndLoaders If true, excludes profiles for secondary dex files
-     *         and loaders based on file visibility. See details in {@link
-     *         DexUseManagerLocal#getCheckedSecondaryDexInfo}.
-     */
     @NonNull
-    public ProfileLists getProfiles(@NonNull PackageState pkgState, @NonNull AndroidPackage pkg,
-            boolean alsoForSecondaryDex, boolean excludeForObsoleteDexesAndLoaders) {
+    public ProfileLists getProfiles(
+            @NonNull PackageState pkgState, @NonNull AndroidPackage pkg, @NonNull Options options) {
         List<ProfilePath> refProfiles = new ArrayList<>();
         List<ProfilePath> curProfiles = new ArrayList<>();
 
-        for (PrimaryDexInfo dexInfo : PrimaryDexUtils.getDexInfo(pkg)) {
-            refProfiles.add(PrimaryDexUtils.buildRefProfilePath(pkgState, dexInfo));
-            curProfiles.addAll(mInjector.isSystemOrRootOrShell()
-                            ? PrimaryDexUtils.getCurProfiles(
-                                    mInjector.getUserManager(), pkgState, dexInfo)
-                            : PrimaryDexUtils.getCurProfiles(
-                                    List.of(mInjector.getCallingUserHandle()), pkgState, dexInfo));
+        if (options.forPrimaryDex()) {
+            for (PrimaryDexInfo dexInfo : PrimaryDexUtils.getDexInfo(pkg)) {
+                refProfiles.add(PrimaryDexUtils.buildRefProfilePathAsInput(pkgState, dexInfo));
+                curProfiles.addAll(mInjector.isSystemOrRootOrShell()
+                                ? PrimaryDexUtils.getCurProfiles(
+                                          mInjector.getUserManager(), pkgState, dexInfo)
+                                : PrimaryDexUtils.getCurProfiles(
+                                          List.of(mInjector.getCallingUserHandle()), pkgState,
+                                          dexInfo));
+            }
         }
-        if (alsoForSecondaryDex) {
-            List<? extends SecondaryDexInfo> dexInfos = excludeForObsoleteDexesAndLoaders
-                    ? mInjector.getDexUseManager().getCheckedSecondaryDexInfo(
-                            pkgState.getPackageName(), true /* excludeForObsoleteDexesAndLoaders */)
-                    : mInjector.getDexUseManager().getSecondaryDexInfo(pkgState.getPackageName());
+        if (options.forSecondaryDex()) {
+            List<? extends SecondaryDexInfo> dexInfos = getSecondaryDexInfo(pkgState, options);
             for (SecondaryDexInfo dexInfo : dexInfos) {
                 if (!mInjector.isSystemOrRootOrShell()
                         && !mInjector.getCallingUserHandle().equals(dexInfo.userHandle())) {
                     continue;
                 }
-                refProfiles.add(AidlUtils.buildProfilePathForSecondaryRef(dexInfo.dexPath()));
+                refProfiles.add(
+                        AidlUtils.buildProfilePathForSecondaryRefAsInput(dexInfo.dexPath()));
                 curProfiles.add(AidlUtils.buildProfilePathForSecondaryCur(dexInfo.dexPath()));
             }
         }
 
         return ProfileLists.create(refProfiles, curProfiles);
+    }
+
+    @NonNull
+    private List<? extends SecondaryDexInfo> getSecondaryDexInfo(
+            @NonNull PackageState pkgState, @NonNull Options options) {
+        return options.excludeForObsoleteDexesAndLoaders()
+                ? mInjector.getDexUseManager().getCheckedSecondaryDexInfo(
+                          pkgState.getPackageName(), true /* excludeObsoleteDexesAndLoaders */)
+                : mInjector.getDexUseManager().getSecondaryDexInfo(pkgState.getPackageName());
     }
 
     @Immutable
@@ -292,6 +295,33 @@ public class ArtFileManager {
             profiles.addAll(refProfiles());
             profiles.addAll(curProfiles());
             return profiles;
+        }
+    }
+
+    @Immutable
+    @AutoValue
+    public abstract static class Options {
+        // Whether to return files for primary dex files.
+        public abstract boolean forPrimaryDex();
+        // Whether to return files for secondary dex files.
+        public abstract boolean forSecondaryDex();
+        // If true, excludes files for secondary dex files and loaders based on file visibility. See
+        // details in {@link DexUseManagerLocal#getCheckedSecondaryDexInfo}.
+        public abstract boolean excludeForObsoleteDexesAndLoaders();
+
+        public static @NonNull Builder builder() {
+            return new AutoValue_ArtFileManager_Options.Builder()
+                    .setForPrimaryDex(false)
+                    .setForSecondaryDex(false)
+                    .setExcludeForObsoleteDexesAndLoaders(false);
+        }
+
+        @AutoValue.Builder
+        public abstract static class Builder {
+            public abstract @NonNull Builder setForPrimaryDex(boolean value);
+            public abstract @NonNull Builder setForSecondaryDex(boolean value);
+            public abstract @NonNull Builder setExcludeForObsoleteDexesAndLoaders(boolean value);
+            public abstract @NonNull Options build();
         }
     }
 

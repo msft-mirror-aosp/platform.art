@@ -169,7 +169,7 @@ public final class ArtManagerLocal {
     public int handleShellCommand(@NonNull Binder target, @NonNull ParcelFileDescriptor in,
             @NonNull ParcelFileDescriptor out, @NonNull ParcelFileDescriptor err,
             @NonNull String[] args) {
-        return new ArtShellCommand(this, mInjector.getPackageManagerLocal())
+        return new ArtShellCommand(this, mInjector.getPackageManagerLocal(), mInjector.getContext())
                 .exec(target, in.getFileDescriptor(), out.getFileDescriptor(),
                         err.getFileDescriptor(), args);
     }
@@ -200,7 +200,11 @@ public final class ArtManagerLocal {
         try (var pin = mInjector.createArtdPin()) {
             long freedBytes = 0;
             WritableArtifactLists list =
-                    mInjector.getArtFileManager().getWritableArtifacts(pkgState, pkg);
+                    mInjector.getArtFileManager().getWritableArtifacts(pkgState, pkg,
+                            ArtFileManager.Options.builder()
+                                    .setForPrimaryDex(true)
+                                    .setForSecondaryDex(true)
+                                    .build());
             for (ArtifactsPath artifacts : list.artifacts()) {
                 freedBytes += mInjector.getArtd().deleteArtifacts(artifacts);
             }
@@ -247,10 +251,12 @@ public final class ArtManagerLocal {
 
         PackageState pkgState = Utils.getPackageStateOrThrow(snapshot, packageName);
         AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
-        List<Pair<DetailedDexInfo, Abi>> dexAndAbis = mInjector.getArtFileManager().getDexAndAbis(
-                pkgState, pkg, (flags & ArtFlags.FLAG_FOR_PRIMARY_DEX) != 0,
-                (flags & ArtFlags.FLAG_FOR_SECONDARY_DEX) != 0,
-                false /* excludeObsoleteDexesAndLoaders */);
+        List<Pair<DetailedDexInfo, Abi>> dexAndAbis =
+                mInjector.getArtFileManager().getDexAndAbis(pkgState, pkg,
+                        ArtFileManager.Options.builder()
+                                .setForPrimaryDex((flags & ArtFlags.FLAG_FOR_PRIMARY_DEX) != 0)
+                                .setForSecondaryDex((flags & ArtFlags.FLAG_FOR_SECONDARY_DEX) != 0)
+                                .build());
 
         try (var pin = mInjector.createArtdPin()) {
             List<DexContainerFileDexoptStatus> statuses = new ArrayList<>();
@@ -308,7 +314,10 @@ public final class ArtManagerLocal {
             // secondary dex files. If there are unknown secondary dex files, their profiles will be
             // deleted by `cleanup`.
             ProfileLists list = mInjector.getArtFileManager().getProfiles(pkgState, pkg,
-                    true /* alsoForSecondaryDex */, false /* excludeForObsoleteDexesAndLoaders */);
+                    ArtFileManager.Options.builder()
+                            .setForPrimaryDex(true)
+                            .setForSecondaryDex(true)
+                            .build());
             for (ProfilePath profile : list.allProfiles()) {
                 mInjector.getArtd().deleteProfile(profile);
             }
@@ -734,12 +743,14 @@ public final class ArtManagerLocal {
 
             List<ProfilePath> profiles = new ArrayList<>();
 
+            // Doesn't support Pre-reboot.
             InitProfileResult result = Utils.getOrInitReferenceProfile(mInjector.getArtd(),
-                    dexInfo.dexPath(), PrimaryDexUtils.buildRefProfilePath(pkgState, dexInfo),
+                    dexInfo.dexPath(),
+                    PrimaryDexUtils.buildRefProfilePathAsInput(pkgState, dexInfo),
                     PrimaryDexUtils.getExternalProfiles(dexInfo),
                     dmInfo.config().getEnableEmbeddedProfile(),
                     PrimaryDexUtils.buildOutputProfile(pkgState, dexInfo, Process.SYSTEM_UID,
-                            Process.SYSTEM_UID, false /* isPublic */));
+                            Process.SYSTEM_UID, false /* isPublic */, false /* isPreReboot */));
             if (!result.externalProfileErrors().isEmpty()) {
                 Log.e(TAG,
                         "Error occurred when initializing from external profiles: "
@@ -755,8 +766,10 @@ public final class ArtManagerLocal {
             profiles.addAll(
                     PrimaryDexUtils.getCurProfiles(mInjector.getUserManager(), pkgState, dexInfo));
 
-            OutputProfile output = PrimaryDexUtils.buildOutputProfile(pkgState, dexInfo,
-                    Process.SYSTEM_UID, Process.SYSTEM_UID, false /* isPublic */);
+            // Doesn't support Pre-reboot.
+            OutputProfile output =
+                    PrimaryDexUtils.buildOutputProfile(pkgState, dexInfo, Process.SYSTEM_UID,
+                            Process.SYSTEM_UID, false /* isPublic */, false /* isPreReboot */);
 
             try {
                 return mergeProfilesAndGetFd(profiles, output, List.of(dexInfo.dexPath()), options);
@@ -796,7 +809,7 @@ public final class ArtManagerLocal {
         List<ProfilePath> profiles = new ArrayList<>();
 
         // System server profiles.
-        profiles.add(AidlUtils.buildProfilePathForPrimaryRef(
+        profiles.add(AidlUtils.buildProfilePathForPrimaryRefAsInput(
                 Utils.PLATFORM_PACKAGE_NAME, PrimaryDexUtils.PROFILE_PRIMARY));
         for (UserHandle handle :
                 mInjector.getUserManager().getUserHandles(true /* excludeDying */)) {
@@ -811,15 +824,15 @@ public final class ArtManagerLocal {
             if (Utils.canDexoptPackage(appPkgState, null /* appHibernationManager */)) {
                 AndroidPackage appPkg = Utils.getPackageOrThrow(appPkgState);
                 ProfileLists list = mInjector.getArtFileManager().getProfiles(appPkgState, appPkg,
-                        false /* alsoForSecondaryDex */,
-                        true /* excludeForObsoleteDexesAndLoaders */);
+                        ArtFileManager.Options.builder().setForPrimaryDex(true).build());
                 profiles.addAll(list.allProfiles());
             }
         });
 
+        // Doesn't support Pre-reboot.
         OutputProfile output = AidlUtils.buildOutputProfileForPrimary(Utils.PLATFORM_PACKAGE_NAME,
                 PrimaryDexUtils.PROFILE_PRIMARY, Process.SYSTEM_UID, Process.SYSTEM_UID,
-                false /* isPublic */);
+                false /* isPublic */, false /* isPreReboot */);
 
         List<String> dexPaths = Arrays.stream(CLASSPATHS_FOR_BOOT_IMAGE_PROFILE)
                                         .map(envVar -> Constants.getenv(envVar))
@@ -943,7 +956,11 @@ public final class ArtManagerLocal {
             }
 
             ProfileLists profileLists = mInjector.getArtFileManager().getProfiles(pkgState, pkg,
-                    true /* alsoForSecondaryDex */, true /* excludeForObsoleteDexesAndLoaders */);
+                    ArtFileManager.Options.builder()
+                            .setForPrimaryDex(true)
+                            .setForSecondaryDex(true)
+                            .setExcludeForObsoleteDexesAndLoaders(true)
+                            .build());
             for (ProfilePath profile : profileLists.refProfiles()) {
                 refProfilesSize += artd.getProfileSize(profile);
             }
@@ -1016,8 +1033,11 @@ public final class ArtManagerLocal {
                 }
                 AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
                 ProfileLists profileLists = mInjector.getArtFileManager().getProfiles(pkgState, pkg,
-                        true /* alsoForSecondaryDex */,
-                        true /* excludeForObsoleteDexesAndLoaders */);
+                        ArtFileManager.Options.builder()
+                                .setForPrimaryDex(true)
+                                .setForSecondaryDex(true)
+                                .setExcludeForObsoleteDexesAndLoaders(true)
+                                .build());
                 profilesToKeep.addAll(profileLists.allProfiles());
                 if (!Utils.shouldSkipDexoptDueToHibernation(
                             pkgState, mInjector.getAppHibernationManager())) {
