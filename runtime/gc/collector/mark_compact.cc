@@ -128,7 +128,7 @@ static constexpr uint64_t kUffdFeaturesRequired =
     kUffdFeaturesForMinorFault | kUffdFeaturesForSigbus;
 
 bool KernelSupportsUffd() {
-#ifdef __linux__
+#if 0
   if (gHaveMremapDontunmap) {
     int fd = syscall(__NR_userfaultfd, O_CLOEXEC | UFFD_USER_MODE_ONLY);
     // On non-android devices we may not have the kernel patches that restrict
