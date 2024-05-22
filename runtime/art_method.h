@@ -766,11 +766,7 @@ class EXPORT ArtMethod final {
   }
   ALWAYS_INLINE void SetEntryPointFromQuickCompiledCodePtrSize(
       const void* entry_point_from_quick_compiled_code, PointerSize pointer_size)
-      REQUIRES_SHARED(Locks::mutator_lock_) {
-    SetNativePointer(EntryPointFromQuickCompiledCodeOffset(pointer_size),
-                     entry_point_from_quick_compiled_code,
-                     pointer_size);
-  }
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   static constexpr MemberOffset DataOffset(PointerSize pointer_size) {
     return MemberOffset(PtrSizedFieldsOffset(pointer_size) + OFFSETOF_MEMBER(
@@ -907,6 +903,7 @@ class EXPORT ArtMethod final {
   const DexFile* GetDexFile() REQUIRES_SHARED(Locks::mutator_lock_);
 
   const char* GetDeclaringClassDescriptor() REQUIRES_SHARED(Locks::mutator_lock_);
+  std::string_view GetDeclaringClassDescriptorView() REQUIRES_SHARED(Locks::mutator_lock_);
 
   ALWAYS_INLINE const char* GetShorty() REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -941,6 +938,7 @@ class EXPORT ArtMethod final {
   ALWAYS_INLINE size_t GetNumberOfParameters() REQUIRES_SHARED(Locks::mutator_lock_);
 
   const char* GetReturnTypeDescriptor() REQUIRES_SHARED(Locks::mutator_lock_);
+  std::string_view GetReturnTypeDescriptorView() REQUIRES_SHARED(Locks::mutator_lock_);
 
   ALWAYS_INLINE Primitive::Type GetReturnTypePrimitive() REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -1189,6 +1187,8 @@ class EXPORT ArtMethod final {
 
   // Used by GetName and GetNameView to share common code.
   const char* GetRuntimeMethodName() REQUIRES_SHARED(Locks::mutator_lock_);
+
+  friend class RuntimeImageHelper;  // For SetNativePointer.
 
   DISALLOW_COPY_AND_ASSIGN(ArtMethod);  // Need to use CopyFrom to deal with 32 vs 64 bits.
 };

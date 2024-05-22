@@ -32,15 +32,16 @@
 #include <crt_externs.h>  // for _NSGetEnviron
 #endif
 
+#include <android-base/properties.h>
+#include <android-base/strings.h>
+#include <string.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
-#include <string.h>
 #include <thread>
 #include <unordered_set>
 #include <vector>
-
-#include "android-base/strings.h"
 
 #include "arch/arm/registers_arm.h"
 #include "arch/arm64/registers_arm64.h"
@@ -75,8 +76,8 @@
 #include "debugger.h"
 #include "dex/art_dex_file_loader.h"
 #include "dex/dex_file_loader.h"
-#include "entrypoints/runtime_asm_entrypoints.h"
 #include "entrypoints/entrypoint_utils-inl.h"
+#include "entrypoints/runtime_asm_entrypoints.h"
 #include "experimental_flags.h"
 #include "fault_handler.h"
 #include "gc/accounting/card_table-inl.h"
@@ -116,8 +117,8 @@
 #include "mirror/throwable.h"
 #include "mirror/var_handle.h"
 #include "monitor.h"
-#include "native/dalvik_system_DexFile.h"
 #include "native/dalvik_system_BaseDexClassLoader.h"
+#include "native/dalvik_system_DexFile.h"
 #include "native/dalvik_system_VMDebug.h"
 #include "native/dalvik_system_VMRuntime.h"
 #include "native/dalvik_system_VMStack.h"
@@ -143,12 +144,12 @@
 #include "native/java_lang_reflect_Parameter.h"
 #include "native/java_lang_reflect_Proxy.h"
 #include "native/java_util_concurrent_atomic_AtomicLong.h"
+#include "native/jdk_internal_misc_Unsafe.h"
 #include "native/libcore_io_Memory.h"
 #include "native/libcore_util_CharsetUtils.h"
 #include "native/org_apache_harmony_dalvik_ddmc_DdmServer.h"
 #include "native/org_apache_harmony_dalvik_ddmc_DdmVmInternal.h"
 #include "native/sun_misc_Unsafe.h"
-#include "native/jdk_internal_misc_Unsafe.h"
 #include "native_bridge_art_interface.h"
 #include "native_stack_dump.h"
 #include "nativehelper/scoped_local_ref.h"
@@ -177,7 +178,6 @@
 #include "thread_list.h"
 #include "ti/agent.h"
 #include "trace.h"
-#include "transaction.h"
 #include "vdex_file.h"
 #include "verifier/class_verifier.h"
 #include "well_known_classes-inl.h"
@@ -286,7 +286,7 @@ Runtime::Runtime()
       system_thread_group_(nullptr),
       system_class_loader_(nullptr),
       dump_gc_performance_on_shutdown_(false),
-      preinitialization_transactions_(),
+      active_transaction_(false),
       verify_(verifier::VerifyMode::kNone),
       target_sdk_version_(static_cast<uint32_t>(SdkVersion::kUnset)),
       compat_framework_(),
@@ -766,14 +766,14 @@ static void WaitUntilSingleThreaded() {
 #if defined(__linux__)
   // Read num_threads field from /proc/self/stat, avoiding higher-level IO libraries that may
   // break atomicity of the read.
-  static constexpr size_t kNumTries = 1000;
+  static constexpr size_t kNumTries = 1500;
   static constexpr size_t kNumThreadsIndex = 20;
   static constexpr size_t BUF_SIZE = 500;
   static constexpr size_t BUF_PRINT_SIZE = 150;  // Only log this much on failure to limit length.
   static_assert(BUF_SIZE > BUF_PRINT_SIZE);
   char buf[BUF_SIZE];
   size_t bytes_read = 0;
-
+  uint64_t millis = 0;
   for (size_t tries = 0; tries < kNumTries; ++tries) {
     bytes_read = GetOsThreadStat(getpid(), buf, BUF_SIZE);
     CHECK_NE(bytes_read, 0u);
@@ -794,6 +794,9 @@ static void WaitUntilSingleThreaded() {
     if (buf[pos] == '1') {
       return;  //  num_threads == 1; success.
     }
+    if (millis == 0) {
+      millis = MilliTime();
+    }
     usleep(1000);
   }
   buf[std::min(BUF_PRINT_SIZE, bytes_read)] = '\0';  // Truncate buf before printing.
@@ -804,7 +807,7 @@ static void WaitUntilSingleThreaded() {
   CHECK_NE(bytes_read, 0u);
   LOG(ERROR) << "After re-read: bytes_read = " << bytes_read << " stat contents = \"" << buf
              << "...\"";
-  LOG(FATAL) << "Failed to reach single-threaded state";
+  LOG(FATAL) << "Failed to reach single-threaded state: wait_time = " << MilliTime() - millis;
 #else  // Not Linux; shouldn't matter, but this has a high probability of working slowly.
   usleep(20'000);
 #endif
@@ -1509,6 +1512,14 @@ static std::vector<File> FileFdsToFileObjects(std::vector<int>&& fds) {
   return files;
 }
 
+inline static uint64_t GetThreadSuspendTimeout(const RuntimeArgumentMap* runtime_options) {
+  auto suspend_timeout_opt = runtime_options->GetOptional(RuntimeArgumentMap::ThreadSuspendTimeout);
+  return suspend_timeout_opt.has_value() ?
+             suspend_timeout_opt.value().GetNanoseconds() :
+             ThreadList::kDefaultThreadSuspendTimeout *
+                 android::base::GetIntProperty("ro.hw_timeout_multiplier", 1);
+}
+
 bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
   // (b/30160149): protect subprocesses from modifications to LD_LIBRARY_PATH, etc.
   // Take a snapshot of the environment at the time the runtime was created, for use by Exec, etc.
@@ -1654,7 +1665,7 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
 
   monitor_list_ = new MonitorList;
   monitor_pool_ = MonitorPool::Create();
-  thread_list_ = new ThreadList(runtime_options.GetOrDefault(Opt::ThreadSuspendTimeout));
+  thread_list_ = new ThreadList(GetThreadSuspendTimeout(&runtime_options));
   intern_table_ = new InternTable;
 
   monitor_timeout_enable_ = runtime_options.GetOrDefault(Opt::MonitorTimeoutEnable);
@@ -2649,12 +2660,6 @@ void Runtime::VisitConcurrentRoots(RootVisitor* visitor, VisitRootFlags flags) {
   }
 }
 
-void Runtime::VisitTransactionRoots(RootVisitor* visitor) {
-  for (Transaction& transaction : preinitialization_transactions_) {
-    transaction.VisitRoots(visitor);
-  }
-}
-
 void Runtime::VisitNonThreadRoots(RootVisitor* visitor) {
   java_vm_->VisitRoots(visitor);
   sentinel_.VisitRootIfNonNull(visitor, RootInfo(kRootVMInternal));
@@ -2666,7 +2671,7 @@ void Runtime::VisitNonThreadRoots(RootVisitor* visitor) {
       .VisitRootIfNonNull(visitor, RootInfo(kRootVMInternal));
   pre_allocated_NoClassDefFoundError_.VisitRootIfNonNull(visitor, RootInfo(kRootVMInternal));
   VisitImageRoots(visitor);
-  VisitTransactionRoots(visitor);
+  class_linker_->VisitTransactionRoots(visitor);
 }
 
 void Runtime::VisitNonConcurrentRoots(RootVisitor* visitor, VisitRootFlags flags) {
@@ -2917,221 +2922,6 @@ void Runtime::RegisterAppInfo(const std::string& package_name,
   }
 
   jit_->StartProfileSaver(profile_output_filename, code_paths, ref_profile_filename);
-}
-
-// Transaction support.
-bool Runtime::IsActiveTransaction() const {
-  return !preinitialization_transactions_.empty() && !GetTransaction()->IsRollingBack();
-}
-
-void Runtime::EnterTransactionMode(bool strict, mirror::Class* root) {
-  DCHECK(IsAotCompiler());
-  ArenaPool* arena_pool = nullptr;
-  ArenaStack* arena_stack = nullptr;
-  if (preinitialization_transactions_.empty()) {  // Top-level transaction?
-    // Make initialized classes visibly initialized now. If that happened during the transaction
-    // and then the transaction was aborted, we would roll back the status update but not the
-    // ClassLinker's bookkeeping structures, so these classes would never be visibly initialized.
-    {
-      Thread* self = Thread::Current();
-      StackHandleScope<1> hs(self);
-      HandleWrapper<mirror::Class> h(hs.NewHandleWrapper(&root));
-      ScopedThreadSuspension sts(self, ThreadState::kNative);
-      GetClassLinker()->MakeInitializedClassesVisiblyInitialized(Thread::Current(), /*wait=*/ true);
-    }
-    // Pass the runtime `ArenaPool` to the transaction.
-    arena_pool = GetArenaPool();
-  } else {
-    // Pass the `ArenaStack` from previous transaction to the new one.
-    arena_stack = preinitialization_transactions_.front().GetArenaStack();
-  }
-  preinitialization_transactions_.emplace_front(strict, root, arena_stack, arena_pool);
-}
-
-void Runtime::ExitTransactionMode() {
-  DCHECK(IsAotCompiler());
-  DCHECK(IsActiveTransaction());
-  preinitialization_transactions_.pop_front();
-}
-
-void Runtime::RollbackAndExitTransactionMode() {
-  DCHECK(IsAotCompiler());
-  DCHECK(IsActiveTransaction());
-  preinitialization_transactions_.front().Rollback();
-  preinitialization_transactions_.pop_front();
-}
-
-bool Runtime::IsTransactionAborted() const {
-  if (!IsActiveTransaction()) {
-    return false;
-  } else {
-    DCHECK(IsAotCompiler());
-    return GetTransaction()->IsAborted();
-  }
-}
-
-void Runtime::RollbackAllTransactions() {
-  // If transaction is aborted, all transactions will be kept in the list.
-  // Rollback and exit all of them.
-  while (IsActiveTransaction()) {
-    RollbackAndExitTransactionMode();
-  }
-}
-
-bool Runtime::IsActiveStrictTransactionMode() const {
-  return IsActiveTransaction() && GetTransaction()->IsStrict();
-}
-
-const Transaction* Runtime::GetTransaction() const {
-  DCHECK(!preinitialization_transactions_.empty());
-  return &preinitialization_transactions_.front();
-}
-
-Transaction* Runtime::GetTransaction() {
-  DCHECK(!preinitialization_transactions_.empty());
-  return &preinitialization_transactions_.front();
-}
-
-void Runtime::AbortTransactionAndThrowAbortError(Thread* self, const std::string& abort_message) {
-  DCHECK(IsAotCompiler());
-  DCHECK(IsActiveTransaction());
-  // Throwing an exception may cause its class initialization. If we mark the transaction
-  // aborted before that, we may warn with a false alarm. Throwing the exception before
-  // marking the transaction aborted avoids that.
-  // But now the transaction can be nested, and abort the transaction will relax the constraints
-  // for constructing stack trace.
-  GetTransaction()->Abort(abort_message);
-  GetTransaction()->ThrowAbortError(self, &abort_message);
-}
-
-void Runtime::ThrowTransactionAbortError(Thread* self) {
-  DCHECK(IsAotCompiler());
-  DCHECK(IsActiveTransaction());
-  // Passing nullptr means we rethrow an exception with the earlier transaction abort message.
-  GetTransaction()->ThrowAbortError(self, nullptr);
-}
-
-void Runtime::AbortTransactionF(Thread* self, const char* fmt, ...) {
-  va_list args;
-  va_start(args, fmt);
-  AbortTransactionV(self, fmt, args);
-  va_end(args);
-}
-
-void Runtime::AbortTransactionV(Thread* self, const char* fmt, va_list args) {
-  CHECK(IsActiveTransaction());
-  // Constructs abort message.
-  std::string abort_msg;
-  android::base::StringAppendV(&abort_msg, fmt, args);
-  // Throws an exception so we can abort the transaction and rollback every change.
-  AbortTransactionAndThrowAbortError(self, abort_msg);
-}
-
-void Runtime::RecordWriteFieldBoolean(mirror::Object* obj,
-                                      MemberOffset field_offset,
-                                      uint8_t value,
-                                      bool is_volatile) {
-  DCHECK(IsAotCompiler());
-  DCHECK(IsActiveTransaction());
-  GetTransaction()->RecordWriteFieldBoolean(obj, field_offset, value, is_volatile);
-}
-
-void Runtime::RecordWriteFieldByte(mirror::Object* obj,
-                                   MemberOffset field_offset,
-                                   int8_t value,
-                                   bool is_volatile) {
-  DCHECK(IsAotCompiler());
-  DCHECK(IsActiveTransaction());
-  GetTransaction()->RecordWriteFieldByte(obj, field_offset, value, is_volatile);
-}
-
-void Runtime::RecordWriteFieldChar(mirror::Object* obj,
-                                   MemberOffset field_offset,
-                                   uint16_t value,
-                                   bool is_volatile) {
-  DCHECK(IsAotCompiler());
-  DCHECK(IsActiveTransaction());
-  GetTransaction()->RecordWriteFieldChar(obj, field_offset, value, is_volatile);
-}
-
-void Runtime::RecordWriteFieldShort(mirror::Object* obj,
-                                    MemberOffset field_offset,
-                                    int16_t value,
-                                    bool is_volatile) {
-  DCHECK(IsAotCompiler());
-  DCHECK(IsActiveTransaction());
-  GetTransaction()->RecordWriteFieldShort(obj, field_offset, value, is_volatile);
-}
-
-void Runtime::RecordWriteField32(mirror::Object* obj,
-                                 MemberOffset field_offset,
-                                 uint32_t value,
-                                 bool is_volatile) {
-  DCHECK(IsAotCompiler());
-  DCHECK(IsActiveTransaction());
-  GetTransaction()->RecordWriteField32(obj, field_offset, value, is_volatile);
-}
-
-void Runtime::RecordWriteField64(mirror::Object* obj,
-                                 MemberOffset field_offset,
-                                 uint64_t value,
-                                 bool is_volatile) {
-  DCHECK(IsAotCompiler());
-  DCHECK(IsActiveTransaction());
-  GetTransaction()->RecordWriteField64(obj, field_offset, value, is_volatile);
-}
-
-void Runtime::RecordWriteFieldReference(mirror::Object* obj,
-                                        MemberOffset field_offset,
-                                        ObjPtr<mirror::Object> value,
-                                        bool is_volatile) {
-  DCHECK(IsAotCompiler());
-  DCHECK(IsActiveTransaction());
-  GetTransaction()->RecordWriteFieldReference(obj, field_offset, value.Ptr(), is_volatile);
-}
-
-void Runtime::RecordWriteArray(mirror::Array* array, size_t index, uint64_t value) {
-  DCHECK(IsAotCompiler());
-  DCHECK(IsActiveTransaction());
-  GetTransaction()->RecordWriteArray(array, index, value);
-}
-
-void Runtime::RecordStrongStringInsertion(ObjPtr<mirror::String> s) {
-  DCHECK(IsAotCompiler());
-  DCHECK(IsActiveTransaction());
-  GetTransaction()->RecordStrongStringInsertion(s);
-}
-
-void Runtime::RecordWeakStringInsertion(ObjPtr<mirror::String> s) {
-  DCHECK(IsAotCompiler());
-  DCHECK(IsActiveTransaction());
-  GetTransaction()->RecordWeakStringInsertion(s);
-}
-
-void Runtime::RecordStrongStringRemoval(ObjPtr<mirror::String> s) {
-  DCHECK(IsAotCompiler());
-  DCHECK(IsActiveTransaction());
-  GetTransaction()->RecordStrongStringRemoval(s);
-}
-
-void Runtime::RecordWeakStringRemoval(ObjPtr<mirror::String> s) {
-  DCHECK(IsAotCompiler());
-  DCHECK(IsActiveTransaction());
-  GetTransaction()->RecordWeakStringRemoval(s);
-}
-
-void Runtime::RecordResolveString(ObjPtr<mirror::DexCache> dex_cache,
-                                  dex::StringIndex string_idx) {
-  DCHECK(IsAotCompiler());
-  DCHECK(IsActiveTransaction());
-  GetTransaction()->RecordResolveString(dex_cache, string_idx);
-}
-
-void Runtime::RecordResolveMethodType(ObjPtr<mirror::DexCache> dex_cache,
-                                      dex::ProtoIndex proto_idx) {
-  DCHECK(IsAotCompiler());
-  DCHECK(IsActiveTransaction());
-  GetTransaction()->RecordResolveMethodType(dex_cache, proto_idx);
 }
 
 void Runtime::SetFaultMessage(const std::string& message) {
