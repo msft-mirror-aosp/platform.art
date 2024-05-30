@@ -749,14 +749,18 @@ static void WaitUntilSingleThreaded() {
 #if defined(__linux__)
   // Read num_threads field from /proc/self/stat, avoiding higher-level IO libraries that may
   // break atomicity of the read.
-  static constexpr size_t kNumTries = 1000;
+  static constexpr size_t kNumTries = 1500;
   static constexpr size_t kNumThreadsIndex = 20;
+  static constexpr ssize_t BUF_SIZE = 500;
+  static constexpr ssize_t BUF_PRINT_SIZE = 150;  // Only log this much on failure to limit length.
+  static_assert(BUF_SIZE > BUF_PRINT_SIZE);
+  char buf[BUF_SIZE];
+  ssize_t bytes_read = -1;
+  uint64_t millis = 0;
   for (size_t tries = 0; tries < kNumTries; ++tries) {
-    static constexpr int BUF_SIZE = 500;
-    char buf[BUF_SIZE];
     int stat_fd = open("/proc/self/stat", O_RDONLY | O_CLOEXEC);
     CHECK(stat_fd >= 0) << strerror(errno);
-    ssize_t bytes_read = TEMP_FAILURE_RETRY(read(stat_fd, buf, BUF_SIZE));
+    bytes_read = TEMP_FAILURE_RETRY(read(stat_fd, buf, BUF_SIZE));
     CHECK(bytes_read >= 0) << strerror(errno);
     int ret = close(stat_fd);
     DCHECK(ret == 0) << strerror(errno);
@@ -777,9 +781,14 @@ static void WaitUntilSingleThreaded() {
     if (buf[pos] == '1') {
       return;  //  num_threads == 1; success.
     }
+    if (millis == 0) {
+      millis = MilliTime();
+    }
     usleep(1000);
   }
-  LOG(FATAL) << "Failed to reach single-threaded state";
+  buf[std::min(BUF_PRINT_SIZE, bytes_read)] = '\0';  // Truncate buf before printing.
+  LOG(FATAL) << "Failed to reach single-threaded state: bytes_read = " << bytes_read
+             << " stat contents = \"" << buf << "...\" wait_time = " << MilliTime() - millis;
 #else  // Not Linux; shouldn't matter, but this has a high probability of working slowly.
   usleep(20'000);
 #endif
