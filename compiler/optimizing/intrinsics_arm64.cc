@@ -2053,7 +2053,7 @@ static const char* GetConstString(HInstruction* candidate, uint32_t* utf16_lengt
   if (candidate->IsLoadString()) {
     HLoadString* load_string = candidate->AsLoadString();
     const DexFile& dex_file = load_string->GetDexFile();
-    return dex_file.StringDataAndUtf16LengthByIdx(load_string->GetStringIndex(), utf16_length);
+    return dex_file.GetStringDataAndUtf16Length(load_string->GetStringIndex(), utf16_length);
   }
   return nullptr;
 }
@@ -3445,27 +3445,26 @@ void IntrinsicCodeGeneratorARM64::VisitDoubleIsInfinite(HInvoke* invoke) {
   GenIsInfinite(invoke->GetLocations(), /* is64bit= */ true, GetVIXLAssembler());
 }
 
-#define VISIT_INTRINSIC(name, low, high, type, start_index) \
-  void IntrinsicLocationsBuilderARM64::Visit ##name ##ValueOf(HInvoke* invoke) { \
-    InvokeRuntimeCallingConvention calling_convention; \
-    IntrinsicVisitor::ComputeValueOfLocations( \
-        invoke, \
-        codegen_, \
-        low, \
-        high - low + 1, \
-        calling_convention.GetReturnLocation(DataType::Type::kReference), \
-        Location::RegisterLocation(calling_convention.GetRegisterAt(0).GetCode())); \
-  } \
-  void IntrinsicCodeGeneratorARM64::Visit ##name ##ValueOf(HInvoke* invoke) { \
-    IntrinsicVisitor::ValueOfInfo info = \
-        IntrinsicVisitor::ComputeValueOfInfo( \
-            invoke, \
-            codegen_->GetCompilerOptions(), \
-            WellKnownClasses::java_lang_ ##name ##_value, \
-            low, \
-            high - low + 1, \
-            start_index); \
-    HandleValueOf(invoke, info, type); \
+#define VISIT_INTRINSIC(name, low, high, type, start_index)                              \
+  void IntrinsicLocationsBuilderARM64::Visit##name##ValueOf(HInvoke* invoke) {           \
+    InvokeRuntimeCallingConvention calling_convention;                                   \
+    IntrinsicVisitor::ComputeValueOfLocations(                                           \
+        invoke,                                                                          \
+        codegen_,                                                                        \
+        low,                                                                             \
+        (high) - (low) + 1,                                                              \
+        calling_convention.GetReturnLocation(DataType::Type::kReference),                \
+        Location::RegisterLocation(calling_convention.GetRegisterAt(0).GetCode()));      \
+  }                                                                                      \
+  void IntrinsicCodeGeneratorARM64::Visit##name##ValueOf(HInvoke* invoke) {              \
+    IntrinsicVisitor::ValueOfInfo info =                                                 \
+        IntrinsicVisitor::ComputeValueOfInfo(invoke,                                     \
+                                             codegen_->GetCompilerOptions(),             \
+                                             WellKnownClasses::java_lang_##name##_value, \
+                                             low,                                        \
+                                             (high) - (low) + 1,                         \
+                                             start_index);                               \
+    HandleValueOf(invoke, info, type);                                                   \
   }
   BOXED_TYPES(VISIT_INTRINSIC)
 #undef VISIT_INTRINSIC
@@ -4501,7 +4500,7 @@ static void GenerateVarHandleInstanceFieldChecks(HInvoke* invoke,
     __ Cbz(object, slow_path->GetEntryLabel());
   }
 
-  if (!optimizations.GetUseKnownBootImageVarHandle()) {
+  if (!optimizations.GetUseKnownImageVarHandle()) {
     UseScratchRegisterScope temps(masm);
     Register temp = temps.AcquireW();
     Register temp2 = temps.AcquireW();
@@ -4628,7 +4627,7 @@ static VarHandleSlowPathARM64* GenerateVarHandleChecks(HInvoke* invoke,
                                                        DataType::Type type) {
   size_t expected_coordinates_count = GetExpectedVarHandleCoordinatesCount(invoke);
   VarHandleOptimizations optimizations(invoke);
-  if (optimizations.GetUseKnownBootImageVarHandle()) {
+  if (optimizations.GetUseKnownImageVarHandle()) {
     DCHECK_NE(expected_coordinates_count, 2u);
     if (expected_coordinates_count == 0u || optimizations.GetSkipObjectNullCheck()) {
       return nullptr;
@@ -4639,7 +4638,7 @@ static VarHandleSlowPathARM64* GenerateVarHandleChecks(HInvoke* invoke,
       new (codegen->GetScopedAllocator()) VarHandleSlowPathARM64(invoke, order);
   codegen->AddSlowPath(slow_path);
 
-  if (!optimizations.GetUseKnownBootImageVarHandle()) {
+  if (!optimizations.GetUseKnownImageVarHandle()) {
     GenerateVarHandleAccessModeAndVarTypeChecks(invoke, codegen, slow_path, type);
   }
   GenerateVarHandleCoordinateChecks(invoke, codegen, slow_path);
@@ -4674,7 +4673,7 @@ static void GenerateVarHandleTarget(HInvoke* invoke,
   size_t expected_coordinates_count = GetExpectedVarHandleCoordinatesCount(invoke);
 
   if (expected_coordinates_count <= 1u) {
-    if (VarHandleOptimizations(invoke).GetUseKnownBootImageVarHandle()) {
+    if (VarHandleOptimizations(invoke).GetUseKnownImageVarHandle()) {
       ScopedObjectAccess soa(Thread::Current());
       ArtField* target_field = GetBootImageVarHandleField(invoke);
       if (expected_coordinates_count == 0u) {

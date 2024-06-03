@@ -19,8 +19,11 @@ package com.android.server.art;
 import static com.android.server.art.ArtFileManager.ProfileLists;
 import static com.android.server.art.ArtFileManager.UsableArtifactLists;
 import static com.android.server.art.ArtFileManager.WritableArtifactLists;
+import static com.android.server.art.DexMetadataHelper.DexMetadataInfo;
+import static com.android.server.art.DexUseManagerLocal.SecondaryDexInfo;
 import static com.android.server.art.PrimaryDexUtils.DetailedPrimaryDexInfo;
 import static com.android.server.art.PrimaryDexUtils.PrimaryDexInfo;
+import static com.android.server.art.ProfilePath.WritableProfilePath;
 import static com.android.server.art.ReasonMapping.BatchDexoptReason;
 import static com.android.server.art.ReasonMapping.BootReason;
 import static com.android.server.art.Utils.Abi;
@@ -38,7 +41,10 @@ import android.annotation.SystemApi;
 import android.annotation.SystemService;
 import android.app.job.JobInfo;
 import android.apphibernation.AppHibernationManager;
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.os.Binder;
 import android.os.Build;
 import android.os.CancellationSignal;
@@ -51,12 +57,12 @@ import android.os.UserHandle;
 import android.os.UserManager;
 import android.os.storage.StorageManager;
 import android.text.TextUtils;
-import android.util.Log;
 import android.util.Pair;
 
 import androidx.annotation.RequiresApi;
 
 import com.android.internal.annotations.VisibleForTesting;
+import com.android.modules.utils.build.SdkLevel;
 import com.android.server.LocalManagerRegistry;
 import com.android.server.art.model.ArtFlags;
 import com.android.server.art.model.ArtManagedFileStats;
@@ -68,6 +74,7 @@ import com.android.server.art.model.DexoptParams;
 import com.android.server.art.model.DexoptResult;
 import com.android.server.art.model.DexoptStatus;
 import com.android.server.art.model.OperationProgress;
+import com.android.server.art.prereboot.PreRebootStatsReporter;
 import com.android.server.pm.PackageManagerLocal;
 import com.android.server.pm.pkg.AndroidPackage;
 import com.android.server.pm.pkg.AndroidPackageSplit;
@@ -114,9 +121,6 @@ import java.util.stream.Stream;
  */
 @SystemApi(client = SystemApi.Client.SYSTEM_SERVER)
 public final class ArtManagerLocal {
-    /** @hide */
-    public static final String TAG = "ArtService";
-
     private static final String[] CLASSPATHS_FOR_BOOT_IMAGE_PROFILE = {
             "BOOTCLASSPATH", "SYSTEMSERVERCLASSPATH", "STANDALONE_SYSTEMSERVER_JARS"};
 
@@ -124,6 +128,12 @@ public final class ArtManagerLocal {
     @VisibleForTesting public static final long DOWNGRADE_THRESHOLD_ABOVE_LOW_BYTES = 500_000_000;
 
     @NonNull private final Injector mInjector;
+
+    private boolean mShouldCommitPreRebootStagedFiles = false;
+
+    // A temporary object for holding stats while staged files are being committed, used in two
+    // places: `onBoot` and the `BroadcastReceiver` of `ACTION_BOOT_COMPLETED`.
+    @Nullable private PreRebootStatsReporter.AfterRebootSession mStatsAfterRebootSession = null;
 
     @Deprecated
     public ArtManagerLocal() {
@@ -168,7 +178,7 @@ public final class ArtManagerLocal {
     public int handleShellCommand(@NonNull Binder target, @NonNull ParcelFileDescriptor in,
             @NonNull ParcelFileDescriptor out, @NonNull ParcelFileDescriptor err,
             @NonNull String[] args) {
-        return new ArtShellCommand(this, mInjector.getPackageManagerLocal())
+        return new ArtShellCommand(this, mInjector.getPackageManagerLocal(), mInjector.getContext())
                 .exec(target, in.getFileDescriptor(), out.getFileDescriptor(),
                         err.getFileDescriptor(), args);
     }
@@ -199,7 +209,11 @@ public final class ArtManagerLocal {
         try (var pin = mInjector.createArtdPin()) {
             long freedBytes = 0;
             WritableArtifactLists list =
-                    mInjector.getArtFileManager().getWritableArtifacts(pkgState, pkg);
+                    mInjector.getArtFileManager().getWritableArtifacts(pkgState, pkg,
+                            ArtFileManager.Options.builder()
+                                    .setForPrimaryDex(true)
+                                    .setForSecondaryDex(true)
+                                    .build());
             for (ArtifactsPath artifacts : list.artifacts()) {
                 freedBytes += mInjector.getArtd().deleteArtifacts(artifacts);
             }
@@ -246,10 +260,12 @@ public final class ArtManagerLocal {
 
         PackageState pkgState = Utils.getPackageStateOrThrow(snapshot, packageName);
         AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
-        List<Pair<DetailedDexInfo, Abi>> dexAndAbis = mInjector.getArtFileManager().getDexAndAbis(
-                pkgState, pkg, (flags & ArtFlags.FLAG_FOR_PRIMARY_DEX) != 0,
-                (flags & ArtFlags.FLAG_FOR_SECONDARY_DEX) != 0,
-                false /* excludeObsoleteDexesAndLoaders */);
+        List<Pair<DetailedDexInfo, Abi>> dexAndAbis =
+                mInjector.getArtFileManager().getDexAndAbis(pkgState, pkg,
+                        ArtFileManager.Options.builder()
+                                .setForPrimaryDex((flags & ArtFlags.FLAG_FOR_PRIMARY_DEX) != 0)
+                                .setForSecondaryDex((flags & ArtFlags.FLAG_FOR_SECONDARY_DEX) != 0)
+                                .build());
 
         try (var pin = mInjector.createArtdPin()) {
             List<DexContainerFileDexoptStatus> statuses = new ArrayList<>();
@@ -307,7 +323,10 @@ public final class ArtManagerLocal {
             // secondary dex files. If there are unknown secondary dex files, their profiles will be
             // deleted by `cleanup`.
             ProfileLists list = mInjector.getArtFileManager().getProfiles(pkgState, pkg,
-                    true /* alsoForSecondaryDex */, false /* excludeForObsoleteDexesAndLoaders */);
+                    ArtFileManager.Options.builder()
+                            .setForPrimaryDex(true)
+                            .setForSecondaryDex(true)
+                            .build());
             for (ProfilePath profile : list.allProfiles()) {
                 mInjector.getArtd().deleteProfile(profile);
             }
@@ -472,8 +491,7 @@ public final class ArtManagerLocal {
                     dexoptResults.put(ArtFlags.PASS_DOWNGRADE, downgradeResult);
                 }
             }
-            Log.i(TAG,
-                    "Dexopting " + params.getPackages().size() + " packages with reason=" + reason);
+            AsLog.i("Dexopting " + params.getPackages().size() + " packages with reason=" + reason);
             DexoptResult mainResult = mInjector.getDexoptHelper().dexopt(snapshot,
                     params.getPackages(), params.getDexoptParams(), cancellationSignal,
                     dexoptExecutor, progressCallbackExecutor,
@@ -728,18 +746,22 @@ public final class ArtManagerLocal {
             PackageState pkgState = Utils.getPackageStateOrThrow(snapshot, packageName);
             AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
             PrimaryDexInfo dexInfo = PrimaryDexUtils.getDexInfoBySplitName(pkg, splitName);
+            DexMetadataPath dmPath = AidlUtils.buildDexMetadataPath(dexInfo.dexPath());
+            DexMetadataInfo dmInfo = mInjector.getDexMetadataHelper().getDexMetadataInfo(dmPath);
 
             List<ProfilePath> profiles = new ArrayList<>();
 
+            // Doesn't support Pre-reboot.
             InitProfileResult result = Utils.getOrInitReferenceProfile(mInjector.getArtd(),
-                    dexInfo.dexPath(), PrimaryDexUtils.buildRefProfilePath(pkgState, dexInfo),
+                    dexInfo.dexPath(),
+                    PrimaryDexUtils.buildRefProfilePathAsInput(pkgState, dexInfo),
                     PrimaryDexUtils.getExternalProfiles(dexInfo),
+                    dmInfo.config().getEnableEmbeddedProfile(),
                     PrimaryDexUtils.buildOutputProfile(pkgState, dexInfo, Process.SYSTEM_UID,
-                            Process.SYSTEM_UID, false /* isPublic */));
+                            Process.SYSTEM_UID, false /* isPublic */, false /* isPreReboot */));
             if (!result.externalProfileErrors().isEmpty()) {
-                Log.e(TAG,
-                        "Error occurred when initializing from external profiles: "
-                                + result.externalProfileErrors());
+                AsLog.e("Error occurred when initializing from external profiles: "
+                        + result.externalProfileErrors());
             }
 
             ProfilePath refProfile = result.profile();
@@ -751,8 +773,10 @@ public final class ArtManagerLocal {
             profiles.addAll(
                     PrimaryDexUtils.getCurProfiles(mInjector.getUserManager(), pkgState, dexInfo));
 
-            OutputProfile output = PrimaryDexUtils.buildOutputProfile(pkgState, dexInfo,
-                    Process.SYSTEM_UID, Process.SYSTEM_UID, false /* isPublic */);
+            // Doesn't support Pre-reboot.
+            OutputProfile output =
+                    PrimaryDexUtils.buildOutputProfile(pkgState, dexInfo, Process.SYSTEM_UID,
+                            Process.SYSTEM_UID, false /* isPublic */, false /* isPreReboot */);
 
             try {
                 return mergeProfilesAndGetFd(profiles, output, List.of(dexInfo.dexPath()), options);
@@ -792,7 +816,7 @@ public final class ArtManagerLocal {
         List<ProfilePath> profiles = new ArrayList<>();
 
         // System server profiles.
-        profiles.add(AidlUtils.buildProfilePathForPrimaryRef(
+        profiles.add(AidlUtils.buildProfilePathForPrimaryRefAsInput(
                 Utils.PLATFORM_PACKAGE_NAME, PrimaryDexUtils.PROFILE_PRIMARY));
         for (UserHandle handle :
                 mInjector.getUserManager().getUserHandles(true /* excludeDying */)) {
@@ -807,15 +831,15 @@ public final class ArtManagerLocal {
             if (Utils.canDexoptPackage(appPkgState, null /* appHibernationManager */)) {
                 AndroidPackage appPkg = Utils.getPackageOrThrow(appPkgState);
                 ProfileLists list = mInjector.getArtFileManager().getProfiles(appPkgState, appPkg,
-                        false /* alsoForSecondaryDex */,
-                        true /* excludeForObsoleteDexesAndLoaders */);
+                        ArtFileManager.Options.builder().setForPrimaryDex(true).build());
                 profiles.addAll(list.allProfiles());
             }
         });
 
+        // Doesn't support Pre-reboot.
         OutputProfile output = AidlUtils.buildOutputProfileForPrimary(Utils.PLATFORM_PACKAGE_NAME,
                 PrimaryDexUtils.PROFILE_PRIMARY, Process.SYSTEM_UID, Process.SYSTEM_UID,
-                false /* isPublic */);
+                false /* isPublic */, false /* isPreReboot */);
 
         List<String> dexPaths = Arrays.stream(CLASSPATHS_FOR_BOOT_IMAGE_PROFILE)
                                         .map(envVar -> Constants.getenv(envVar))
@@ -847,8 +871,49 @@ public final class ArtManagerLocal {
             @Nullable @CallbackExecutor Executor progressCallbackExecutor,
             @Nullable Consumer<OperationProgress> progressCallback) {
         try (var snapshot = mInjector.getPackageManagerLocal().withFilteredSnapshot()) {
+            if ((bootReason.equals(ReasonMapping.REASON_BOOT_AFTER_OTA)
+                        || bootReason.equals(ReasonMapping.REASON_BOOT_AFTER_MAINLINE_UPDATE))
+                    && SdkLevel.isAtLeastV()) {
+                // The staged files have to be committed in two phases, one during boot, for primary
+                // dex files, and another after boot complete, for secondary dex files. We need to
+                // commit files for primary dex files early because apps will start using them as
+                // soon as the package manager is initialized. We need to wait until boot complete
+                // to commit files for secondary dex files because they are not decrypted before
+                // then.
+                mShouldCommitPreRebootStagedFiles = true;
+                mStatsAfterRebootSession =
+                        mInjector.getPreRebootStatsReporter().new AfterRebootSession();
+                commitPreRebootStagedFiles(snapshot, false /* forSecondary */);
+            }
             dexoptPackages(snapshot, bootReason, new CancellationSignal(), progressCallbackExecutor,
                     progressCallback != null ? Map.of(ArtFlags.PASS_MAIN, progressCallback) : null);
+        }
+    }
+
+    /**
+     * Notifies this class that {@link Context#registerReceiver} is ready for use.
+     *
+     * Should be used by {@link DexUseManagerLocal} ONLY.
+     *
+     * @hide
+     */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    void systemReady() {
+        if (mShouldCommitPreRebootStagedFiles) {
+            mInjector.getContext().registerReceiver(new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    context.unregisterReceiver(this);
+                    if (!SdkLevel.isAtLeastV()) {
+                        throw new IllegalStateException("Broadcast receiver unexpectedly called");
+                    }
+                    try (var snapshot = mInjector.getPackageManagerLocal().withFilteredSnapshot()) {
+                        commitPreRebootStagedFiles(snapshot, true /* forSecondary */);
+                    }
+                    mStatsAfterRebootSession.reportAsync();
+                    mStatsAfterRebootSession = null;
+                }
+            }, new IntentFilter(Intent.ACTION_BOOT_COMPLETED));
         }
     }
 
@@ -865,10 +930,9 @@ public final class ArtManagerLocal {
      *         names</b>, e.g., {@code com.google.android.art}).
      */
     @SuppressLint("UnflaggedApi") // Flag support for mainline is not available.
-    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
     public void onApexStaged(@NonNull String[] stagedApexModuleNames) {
-        // TODO(b/311377497): Check system requirements.
-        mInjector.getPreRebootDexoptJob().schedule();
+        mInjector.getPreRebootDexoptJob().onUpdateReady(null /* otaSlot */);
     }
 
     /**
@@ -939,7 +1003,11 @@ public final class ArtManagerLocal {
             }
 
             ProfileLists profileLists = mInjector.getArtFileManager().getProfiles(pkgState, pkg,
-                    true /* alsoForSecondaryDex */, true /* excludeForObsoleteDexesAndLoaders */);
+                    ArtFileManager.Options.builder()
+                            .setForPrimaryDex(true)
+                            .setForSecondaryDex(true)
+                            .setExcludeForObsoleteDexesAndLoaders(true)
+                            .build());
             for (ProfilePath profile : profileLists.refProfiles()) {
                 refProfilesSize += artd.getProfileSize(profile);
             }
@@ -1012,8 +1080,11 @@ public final class ArtManagerLocal {
                 }
                 AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
                 ProfileLists profileLists = mInjector.getArtFileManager().getProfiles(pkgState, pkg,
-                        true /* alsoForSecondaryDex */,
-                        true /* excludeForObsoleteDexesAndLoaders */);
+                        ArtFileManager.Options.builder()
+                                .setForPrimaryDex(true)
+                                .setForSecondaryDex(true)
+                                .setExcludeForObsoleteDexesAndLoaders(true)
+                                .build());
                 profilesToKeep.addAll(profileLists.allProfiles());
                 if (!Utils.shouldSkipDexoptDueToHibernation(
                             pkgState, mInjector.getAppHibernationManager())) {
@@ -1024,11 +1095,64 @@ public final class ArtManagerLocal {
                     runtimeArtifactsToKeep.addAll(artifactLists.runtimeArtifacts());
                 }
             }
-            return mInjector.getArtd().cleanup(
-                    profilesToKeep, artifactsToKeep, vdexFilesToKeep, runtimeArtifactsToKeep);
+            return mInjector.getArtd().cleanup(profilesToKeep, artifactsToKeep, vdexFilesToKeep,
+                    runtimeArtifactsToKeep,
+                    SdkLevel.isAtLeastV() && mInjector.getPreRebootDexoptJob().hasStarted());
         } catch (RemoteException e) {
             Utils.logArtdException(e);
             return 0;
+        }
+    }
+
+    /** @param forSecondary true for secondary dex files; false for primary dex files. */
+    @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    private void commitPreRebootStagedFiles(
+            @NonNull PackageManagerLocal.FilteredSnapshot snapshot, boolean forSecondary) {
+        try (var pin = mInjector.createArtdPin()) {
+            // Because we don't know for which packages the Pre-reboot Dexopt job has generated
+            // staged files, we call artd for all dexoptable packages, which is a superset of the
+            // packages that we actually expect to have staged files.
+            for (PackageState pkgState : snapshot.getPackageStates().values()) {
+                if (!Utils.canDexoptPackage(pkgState, null /* appHibernationManager */)) {
+                    continue;
+                }
+                AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
+                var options = ArtFileManager.Options.builder()
+                                      .setForPrimaryDex(!forSecondary)
+                                      .setForSecondaryDex(forSecondary)
+                                      .setExcludeForObsoleteDexesAndLoaders(true)
+                                      .build();
+                List<ArtifactsPath> artifacts =
+                        mInjector.getArtFileManager()
+                                .getWritableArtifacts(pkgState, pkg, options)
+                                .artifacts();
+                List<WritableProfilePath> profiles = mInjector.getArtFileManager()
+                                                             .getProfiles(pkgState, pkg, options)
+                                                             .refProfiles()
+                                                             .stream()
+                                                             .map(AidlUtils::toWritableProfilePath)
+                                                             .collect(Collectors.toList());
+                try {
+                    // The artd method commits all files somewhat transactionally. Here, we are
+                    // committing files transactionally at the package level just for simplicity. In
+                    // fact, we only need transaction on the split level: the artifacts and the
+                    // profile of the same split must be committed transactionally. Consider the
+                    // case where the staged artifacts and profile have less methods than the active
+                    // ones generated by background dexopt, committing the artifacts while failing
+                    // to commit the profile can potentially cause a permanent performance
+                    // regression.
+                    if (mInjector.getArtd().commitPreRebootStagedFiles(artifacts, profiles)) {
+                        mStatsAfterRebootSession.recordPackageWithArtifacts(
+                                pkgState.getPackageName());
+                    }
+                } catch (ServiceSpecificException e) {
+                    AsLog.e("Failed to commit Pre-reboot staged files for package '"
+                                    + pkgState.getPackageName() + "'",
+                            e);
+                }
+            }
+        } catch (RemoteException e) {
+            Utils.logArtdException(e);
         }
     }
 
@@ -1048,7 +1172,7 @@ public final class ArtManagerLocal {
      *
      * @hide
      */
-    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
     @NonNull
     PreRebootDexoptJob getPreRebootDexoptJob() {
         return mInjector.getPreRebootDexoptJob();
@@ -1068,15 +1192,14 @@ public final class ArtManagerLocal {
                                             .filter(pkg -> !excludedPackages.contains(pkg))
                                             .collect(Collectors.toList());
             if (!packages.isEmpty()) {
-                Log.i(TAG, "Storage is low. Downgrading " + packages.size() + " inactive packages");
+                AsLog.i("Storage is low. Downgrading " + packages.size() + " inactive packages");
                 DexoptParams params =
                         new DexoptParams.Builder(ReasonMapping.REASON_INACTIVE).build();
                 return mInjector.getDexoptHelper().dexopt(snapshot, packages, params,
                         cancellationSignal, executor, progressCallbackExecutor, progressCallback);
             } else {
-                Log.i(TAG,
-                        "Storage is low, but downgrading is disabled or there's nothing to "
-                                + "downgrade");
+                AsLog.i("Storage is low, but downgrading is disabled or there's nothing to "
+                        + "downgrade");
             }
         }
         return null;
@@ -1088,7 +1211,7 @@ public final class ArtManagerLocal {
             return mInjector.getStorageManager().getAllocatableBytes(StorageManager.UUID_DEFAULT)
                     < DOWNGRADE_THRESHOLD_ABOVE_LOW_BYTES;
         } catch (IOException e) {
-            Log.e(TAG, "Failed to check storage. Assuming storage not low", e);
+            AsLog.e("Failed to check storage. Assuming storage not low", e);
             return false;
         }
     }
@@ -1128,9 +1251,8 @@ public final class ArtManagerLocal {
                                                     ArtFlags.FLAG_FORCE_MERGE_PROFILE)
                                             .build();
 
-        Log.i(TAG,
-                "Dexopting " + packageNames.size() + " packages with reason="
-                        + dexoptParams.getReason() + " (supplementary pass)");
+        AsLog.i("Dexopting " + packageNames.size()
+                + " packages with reason=" + dexoptParams.getReason() + " (supplementary pass)");
         return mInjector.getDexoptHelper().dexopt(snapshot, packageNames, dexoptParams,
                 cancellationSignal, dexoptExecutor, progressCallbackExecutor, progressCallback);
     }
@@ -1331,8 +1453,10 @@ public final class ArtManagerLocal {
          * 1. The default compiler filter for the given reason.
          * 2. The compiler filter set explicitly by {@link DexoptParams.Builder#setCompilerFilter}.
          * 3. ART Service's internal adjustments to upgrade the compiler filter, based on whether
-         *    the package is System UI, etc.
-         * 4. The adjustments made by this callback.
+         *    the package is System UI, etc. (Not applicable if the dexopt is initiated by a shell
+         *    command with an explicit "-m" flag.)
+         * 4. The adjustments made by this callback. (Not applicable if the dexopt is initiated by a
+         *    shell command with an explicit "-m" flag.)
          * 5. ART Service's internal adjustments to downgrade the compiler filter, based on whether
          *    the profile is available, etc.
          *
@@ -1472,7 +1596,7 @@ public final class ArtManagerLocal {
             return mBgDexoptJob;
         }
 
-        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+        @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
         @NonNull
         public synchronized PreRebootDexoptJob getPreRebootDexoptJob() {
             if (mPrDexoptJob == null) {
@@ -1525,6 +1649,18 @@ public final class ArtManagerLocal {
         @NonNull
         public ArtFileManager getArtFileManager() {
             return new ArtFileManager(getContext());
+        }
+
+        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+        @NonNull
+        public DexMetadataHelper getDexMetadataHelper() {
+            return new DexMetadataHelper();
+        }
+
+        @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+        @NonNull
+        public PreRebootStatsReporter getPreRebootStatsReporter() {
+            return new PreRebootStatsReporter();
         }
     }
 }

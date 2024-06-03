@@ -21,6 +21,7 @@ package {
     // to get the below license kinds:
     //   SPDX-license-identifier-Apache-2.0
     default_applicable_licenses: ["art_license"],
+    default_team: "trendy_team_art_performance",
 }
 
 cc_defaults {
@@ -278,6 +279,9 @@ art_cc_library {
 
 art_cc_defaults {
     name: "art_libdexfile_tests_defaults",
+    defaults: [
+        "art_libunwindstack_static_defaults", // Must be statically linked in standalone tests
+    ],
     tidy_timeout_srcs: [
         "dex/dex_file_verifier_test.cc",
     ],
@@ -310,9 +314,6 @@ art_cc_defaults {
         ":art-gtest-jars-VerifierDeps",
     ],
     header_libs: ["jni_headers"],
-    shared_libs: [
-        "libunwindstack",
-    ],
 }
 
 // Version of ART gtest `art_libdexfile_tests` bundled with the ART APEX on target.
@@ -376,9 +377,6 @@ cc_library_headers {
 
 art_cc_defaults {
     name: "art_libdexfile_external_tests_defaults",
-    defaults: [
-        "art_module_source_build_defaults",
-    ],
     test_suites: ["general-tests"],
     srcs: [
         "external/dex_file_ext_c_test.c",
@@ -458,19 +456,16 @@ art_cc_library_static {
 
 art_cc_defaults {
     name: "art_libdexfile_support_tests_defaults",
-    defaults: [
-        "art_module_source_build_defaults",
-    ],
     test_suites: ["general-tests"],
     srcs: [
         "external/dex_file_supp_test.cc",
     ],
     shared_libs: [
-        "libbase",
         "libdexfile",
         "liblog",
     ],
     static_libs: [
+        "libbase", // Must be statically linked in standalone tests
         "libdexfile_support",
     ],
 }
@@ -537,7 +532,6 @@ art_cc_test {
     name: "art_libdexfile_support_static_tests",
     test_suites: ["general-tests"],
     defaults: [
-        "art_module_source_build_defaults",
         "art_test_defaults",
         "libdexfile_support_static_defaults",
     ],

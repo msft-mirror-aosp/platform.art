@@ -41,7 +41,6 @@
 #include "base/arena_allocator.h"
 #include "base/arena_bit_vector.h"
 #include "base/casts.h"
-#include "base/enums.h"
 #include "base/file_utils.h"
 #include "base/hash_map.h"
 #include "base/hash_set.h"
@@ -52,6 +51,7 @@
 #include "base/metrics/metrics.h"
 #include "base/mutex-inl.h"
 #include "base/os.h"
+#include "base/pointer_size.h"
 #include "base/quasi_atomic.h"
 #include "base/scoped_arena_containers.h"
 #include "base/scoped_flock.h"
@@ -410,6 +410,15 @@ void ClassLinker::ForceClassInitialized(Thread* self, Handle<mirror::Class> klas
   MakeInitializedClassesVisiblyInitialized(self, /*wait=*/true);
 }
 
+const void* ClassLinker::FindBootJniStub(JniStubKey key) {
+  auto it = boot_image_jni_stubs_.find(key);
+  if (it == boot_image_jni_stubs_.end()) {
+    return nullptr;
+  } else {
+    return it->second;
+  }
+}
+
 ClassLinker::VisiblyInitializedCallback* ClassLinker::MarkClassInitialized(
     Thread* self, Handle<mirror::Class> klass) {
   if (kRuntimeISA == InstructionSet::kX86 || kRuntimeISA == InstructionSet::kX86_64) {
@@ -618,6 +627,8 @@ ClassLinker::ClassLinker(InternTable* intern_table, bool fast_class_not_found_ex
       visibly_initialize_classes_with_membarier_(RegisterMemBarrierForClassInitialization()),
       critical_native_code_with_clinit_check_lock_("critical native code with clinit check lock"),
       critical_native_code_with_clinit_check_(),
+      boot_image_jni_stubs_(JniStubKeyHash(Runtime::Current()->GetInstructionSet()),
+                            JniStubKeyEquals(Runtime::Current()->GetInstructionSet())),
       cha_(Runtime::Current()->IsAotCompiler() ? nullptr : new ClassHierarchyAnalysis()) {
   // For CHA disabled during Aot, see b/34193647.
 
@@ -854,8 +865,13 @@ bool ClassLinker::InitWithoutImage(std::vector<std::unique_ptr<const DexFile>> b
   }
 
   // Object, String, ClassExt and DexCache need to be rerun through FindSystemClass to finish init
+  // We also need to immediately clear the finalizable flag for Object so that other classes are
+  // not erroneously marked as finalizable. (Object defines an empty finalizer, so that other
+  // classes can override it but it is not itself finalizable.)
   mirror::Class::SetStatus(java_lang_Object, ClassStatus::kNotReady, self);
   CheckSystemClass(self, java_lang_Object, "Ljava/lang/Object;");
+  CHECK(java_lang_Object->IsFinalizable());
+  java_lang_Object->ClearFinalizable();
   CHECK_EQ(java_lang_Object->GetObjectSize(), mirror::Object::InstanceSize());
   mirror::Class::SetStatus(java_lang_String, ClassStatus::kNotReady, self);
   CheckSystemClass(self, java_lang_String, "Ljava/lang/String;");
@@ -902,6 +918,14 @@ bool ClassLinker::InitWithoutImage(std::vector<std::unique_ptr<const DexFile>> b
 
   CHECK_EQ(object_array_string.Get(),
            FindSystemClass(self, GetClassRootDescriptor(ClassRoot::kJavaLangStringArrayClass)));
+
+  // The Enum class declares a "final" finalize() method to prevent subclasses from introducing
+  // a finalizer but it is not itself consedered finalizable. Load the Enum class now and clear
+  // the finalizable flag to prevent subclasses from being marked as finalizable.
+  CHECK_EQ(LookupClass(self, "Ljava/lang/Enum;", /*class_loader=*/ nullptr), nullptr);
+  Handle<mirror::Class> java_lang_Enum = hs.NewHandle(FindSystemClass(self, "Ljava/lang/Enum;"));
+  CHECK(java_lang_Enum->IsFinalizable());
+  java_lang_Enum->ClearFinalizable();
 
   // End of special init trickery, all subsequent classes may be loaded via FindSystemClass.
 
@@ -1440,6 +1464,19 @@ bool ClassLinker::InitFromBootImage(std::string* error_msg) {
                       error_msg)) {
     return false;
   }
+  // We never use AOT code for debuggable.
+  if (!runtime->IsJavaDebuggable()) {
+    for (gc::space::ImageSpace* space : spaces) {
+      const ImageHeader& header = space->GetImageHeader();
+      header.VisitJniStubMethods([&](ArtMethod* method)
+          REQUIRES_SHARED(Locks::mutator_lock_) {
+        const void* stub = method->GetOatMethodQuickCode(image_pointer_size_);
+        boot_image_jni_stubs_.Put(std::make_pair(JniStubKey(method), stub));
+        return method;
+      }, space->Begin(), image_pointer_size_);
+    }
+  }
+
   InitializeObjectVirtualMethodHashes(GetClassRoot<mirror::Object>(this),
                                       image_pointer_size_,
                                       ArrayRef<uint32_t>(object_virtual_method_hashes_));
@@ -3326,7 +3363,7 @@ ObjPtr<mirror::Class> ClassLinker::FindClass(Thread* self,
     // capable class loaders.  (All class loaders are considered parallel capable on Android.)
     ObjPtr<mirror::Class> loader_class = class_loader->GetClass();
     const char* loader_class_name =
-        loader_class->GetDexFile().StringByTypeIdx(loader_class->GetDexTypeIndex());
+        loader_class->GetDexFile().GetTypeDescriptor(loader_class->GetDexTypeIndex());
     LOG(WARNING) << "Initiating class loader of type " << DescriptorToDot(loader_class_name)
         << " is not well-behaved; it returned a different Class for racing loadClass(\""
         << DescriptorToDot(descriptor) << "\").";
@@ -3678,10 +3715,19 @@ void ClassLinker::FixupStaticTrampolines(Thread* self, ObjPtr<mirror::Class> kla
   }
 
   instrumentation::Instrumentation* instrumentation = runtime->GetInstrumentation();
+  bool enable_boot_jni_stub = !runtime->IsJavaDebuggable();
   for (size_t method_index = 0; method_index < num_direct_methods; ++method_index) {
     ArtMethod* method = klass->GetDirectMethod(method_index, pointer_size);
     if (method->NeedsClinitCheckBeforeCall()) {
-      instrumentation->UpdateMethodsCode(method, instrumentation->GetCodeForInvoke(method));
+      const void* quick_code = instrumentation->GetCodeForInvoke(method);
+      if (method->IsNative() && IsQuickGenericJniStub(quick_code) && enable_boot_jni_stub) {
+        const void* boot_jni_stub = FindBootJniStub(method);
+        if (boot_jni_stub != nullptr) {
+          // Use boot JNI stub if found.
+          quick_code = boot_jni_stub;
+        }
+      }
+      instrumentation->UpdateMethodsCode(method, quick_code);
     }
   }
   // Ignore virtual methods on the iterator.
@@ -3698,10 +3744,67 @@ inline void EnsureThrowsInvocationError(ClassLinker* class_linker, ArtMethod* me
       class_linker->GetImagePointerSize());
 }
 
-static void LinkCode(ClassLinker* class_linker,
-                     ArtMethod* method,
-                     const OatFile::OatClass* oat_class,
-                     uint32_t class_def_method_index) REQUIRES_SHARED(Locks::mutator_lock_) {
+class ClassLinker::OatClassCodeIterator {
+ public:
+  explicit OatClassCodeIterator(const OatFile::OatClass& oat_class)
+      : begin_(oat_class.methods_pointer_ != nullptr && oat_class.oat_file_->IsExecutable()
+                   ? oat_class.oat_file_->Begin()
+                   : nullptr),
+        bitmap_(oat_class.bitmap_),
+        current_(oat_class.methods_pointer_ != nullptr && oat_class.oat_file_->IsExecutable()
+                     ? oat_class.methods_pointer_
+                     : nullptr),
+        method_index_(0u),
+        num_methods_(oat_class.num_methods_) {
+    DCHECK_EQ(bitmap_ != nullptr, oat_class.GetType() == OatClassType::kSomeCompiled);
+  }
+
+  const void* GetAndAdvance(uint32_t method_index) {
+    if (kIsDebugBuild) {
+      CHECK_EQ(method_index, method_index_);
+      ++method_index_;
+    }
+    if (current_ == nullptr) {
+      // We may not have a valid `num_methods_` to perform the next `DCHECK()`.
+      return nullptr;
+    }
+    DCHECK_LT(method_index, num_methods_);
+    DCHECK(begin_ != nullptr);
+    if (bitmap_ == nullptr || BitVector::IsBitSet(bitmap_, method_index)) {
+      DCHECK_NE(current_->code_offset_, 0u);
+      const void* result = begin_ + current_->code_offset_;
+      ++current_;
+      return result;
+    } else {
+      return nullptr;
+    }
+  }
+
+  void SkipAbstract(uint32_t method_index) {
+    if (kIsDebugBuild) {
+      CHECK_EQ(method_index, method_index_);
+      ++method_index_;
+      if (current_ != nullptr) {
+        CHECK_LT(method_index, num_methods_);
+        CHECK(bitmap_ != nullptr);
+        CHECK(!BitVector::IsBitSet(bitmap_, method_index));
+      }
+    }
+  }
+
+ private:
+  const uint8_t* const begin_;
+  const uint32_t* const bitmap_;
+  const OatMethodOffsets* current_;
+
+  // Debug mode members.
+  uint32_t method_index_;
+  const uint32_t num_methods_;
+};
+
+inline void ClassLinker::LinkCode(ArtMethod* method,
+                                  uint32_t class_def_method_index,
+                                  /*inout*/ OatClassCodeIterator* occi) {
   ScopedAssertNoThreadSuspension sants(__FUNCTION__);
   Runtime* const runtime = Runtime::Current();
   if (runtime->IsAotCompiler()) {
@@ -3714,16 +3817,18 @@ static void LinkCode(ClassLinker* class_linker,
   DCHECK(!method->GetDeclaringClass()->IsVisiblyInitialized());  // Actually ClassStatus::Idx.
 
   if (!method->IsInvokable()) {
-    EnsureThrowsInvocationError(class_linker, method);
+    EnsureThrowsInvocationError(this, method);
+    occi->SkipAbstract(class_def_method_index);
     return;
   }
 
-  const void* quick_code = nullptr;
-  if (oat_class != nullptr) {
-    // Every kind of method should at least get an invoke stub from the oat_method.
-    // non-abstract methods also get their code pointers.
-    const OatFile::OatMethod oat_method = oat_class->GetOatMethod(class_def_method_index);
-    quick_code = oat_method.GetQuickCode();
+  const void* quick_code = occi->GetAndAdvance(class_def_method_index);
+  if (method->IsNative() && quick_code == nullptr) {
+    const void* boot_jni_stub = FindBootJniStub(method);
+    if (boot_jni_stub != nullptr) {
+      // Use boot JNI stub if found.
+      quick_code = boot_jni_stub;
+    }
   }
   runtime->GetInstrumentation()->InitializeMethodsCode(method, quick_code);
 
@@ -3815,6 +3920,29 @@ LinearAlloc* ClassLinker::GetOrCreateAllocatorForClassLoader(ObjPtr<mirror::Clas
   return allocator;
 }
 
+// Helper class for iterating over method annotations, using their ordering in the dex file.
+// Since direct and virtual methods are separated (but each section is ordered), we shall use
+// separate iterators for loading direct and virtual methods.
+class ClassLinker::MethodAnnotationsIterator {
+ public:
+  MethodAnnotationsIterator(const DexFile& dex_file,
+                            const dex::AnnotationsDirectoryItem* annotations_dir)
+      : current_((annotations_dir != nullptr) ? dex_file.GetMethodAnnotations(annotations_dir)
+                                              : nullptr),
+        end_((annotations_dir != nullptr) ? current_ + annotations_dir->methods_size_ : nullptr) {}
+
+  const dex::MethodAnnotationsItem* AdvanceTo(uint32_t method_idx) {
+    while (current_ != end_ && current_->method_idx_ < method_idx) {
+      ++current_;
+    }
+    return (current_ != end_ && current_->method_idx_ == method_idx) ? current_ : nullptr;
+  }
+
+ private:
+  const dex::MethodAnnotationsItem* current_;
+  const dex::MethodAnnotationsItem* const end_;
+};
+
 void ClassLinker::LoadClass(Thread* self,
                             const DexFile& dex_file,
                             const dex::ClassDef& dex_class_def,
@@ -3850,7 +3978,7 @@ void ClassLinker::LoadClass(Thread* self,
     const OatFile::OatClass oat_class = (runtime->IsStarted() && !runtime->IsAotCompiler())
         ? OatFile::FindOatClass(dex_file, klass->GetDexClassDefIndex(), &has_oat_class)
         : OatFile::OatClass::Invalid();
-    const OatFile::OatClass* oat_class_ptr = has_oat_class ? &oat_class : nullptr;
+    OatClassCodeIterator occi(oat_class);
     klass->SetMethodsPtr(
         AllocArtMethodArray(self, allocator, accessor.NumMethods()),
         accessor.NumDirectMethods(),
@@ -3858,6 +3986,10 @@ void ClassLinker::LoadClass(Thread* self,
     size_t class_def_method_index = 0;
     uint32_t last_dex_method_index = dex::kDexNoIndex;
     size_t last_class_def_method_index = 0;
+
+    // Initialize separate `MethodAnnotationsIterator`s for direct and virtual methods.
+    MethodAnnotationsIterator mai_direct(dex_file, dex_file.GetAnnotationsDirectory(dex_class_def));
+    MethodAnnotationsIterator mai_virtual = mai_direct;
 
     uint16_t hotness_threshold = runtime->GetJITOptions()->GetWarmupThreshold();
     // Use the visitor since the ranged based loops are bit slower from seeking. Seeking to the
@@ -3882,8 +4014,8 @@ void ClassLinker::LoadClass(Thread* self,
         }, [&](const ClassAccessor::Method& method) REQUIRES_SHARED(Locks::mutator_lock_) {
           ArtMethod* art_method = klass->GetDirectMethodUnchecked(class_def_method_index,
               image_pointer_size_);
-          LoadMethod(dex_file, method, klass.Get(), art_method);
-          LinkCode(this, art_method, oat_class_ptr, class_def_method_index);
+          LoadMethod(dex_file, method, klass.Get(), &mai_direct, art_method);
+          LinkCode(art_method, class_def_method_index, &occi);
           uint32_t it_method_index = method.GetIndex();
           if (last_dex_method_index == it_method_index) {
             // duplicate case
@@ -3900,8 +4032,8 @@ void ClassLinker::LoadClass(Thread* self,
               class_def_method_index - accessor.NumDirectMethods(),
               image_pointer_size_);
           art_method->ResetCounter(hotness_threshold);
-          LoadMethod(dex_file, method, klass.Get(), art_method);
-          LinkCode(this, art_method, oat_class_ptr, class_def_method_index);
+          LoadMethod(dex_file, method, klass.Get(), &mai_virtual, art_method);
+          LinkCode(art_method, class_def_method_index, &occi);
           ++class_def_method_index;
         });
 
@@ -3943,14 +4075,15 @@ void ClassLinker::LoadField(const ClassAccessor::Field& field,
 void ClassLinker::LoadMethod(const DexFile& dex_file,
                              const ClassAccessor::Method& method,
                              ObjPtr<mirror::Class> klass,
-                             ArtMethod* dst) {
+                             /*inout*/ MethodAnnotationsIterator* mai,
+                             /*out*/ ArtMethod* dst) {
   ScopedAssertNoThreadSuspension sants(__FUNCTION__);
 
   const uint32_t dex_method_idx = method.GetIndex();
   const dex::MethodId& method_id = dex_file.GetMethodId(dex_method_idx);
   uint32_t name_utf16_length;
-  const char* method_name = dex_file.StringDataAndUtf16LengthByIdx(method_id.name_idx_,
-                                                                   &name_utf16_length);
+  const char* method_name = dex_file.GetStringDataAndUtf16Length(method_id.name_idx_,
+                                                                 &name_utf16_length);
   std::string_view shorty = dex_file.GetShortyView(dex_file.GetProtoId(method_id.proto_idx_));
 
   dst->SetDexMethodIndex(dex_method_idx);
@@ -3967,24 +4100,11 @@ void ClassLinker::LoadMethod(const DexFile& dex_file,
            memcmp(ascii_name, method_name, length) == 0;
   };
   if (UNLIKELY(has_ascii_name("finalize", sizeof("finalize") - 1u))) {
-    // Set finalizable flag on declaring class.
+    // Set finalizable flag on declaring class if the method has the right signature.
+    // When initializing without a boot image, `Object` and `Enum` shall have the finalizable
+    // flag cleared immediately after loading these classes, see  `InitWithoutImage()`.
     if (shorty == "V") {
-      // Void return type.
-      if (klass->GetClassLoader() != nullptr) {  // All non-boot finalizer methods are flagged.
-        klass->SetFinalizable();
-      } else {
-        std::string_view klass_descriptor =
-            dex_file.GetTypeDescriptorView(dex_file.GetTypeId(klass->GetDexTypeIndex()));
-        // The Enum class declares a "final" finalize() method to prevent subclasses from
-        // introducing a finalizer. We don't want to set the finalizable flag for Enum or its
-        // subclasses, so we exclude it here.
-        // We also want to avoid setting the flag on Object, where we know that finalize() is
-        // empty.
-        if (klass_descriptor != "Ljava/lang/Object;" &&
-            klass_descriptor != "Ljava/lang/Enum;") {
-          klass->SetFinalizable();
-        }
-      }
+      klass->SetFinalizable();
     }
   } else if (method_name[0] == '<') {
     // Fix broken access flags for initializers. Bug 11157540.
@@ -4005,9 +4125,11 @@ void ClassLinker::LoadMethod(const DexFile& dex_file,
 
   if (UNLIKELY((access_flags & kAccNative) != 0u)) {
     // Check if the native method is annotated with @FastNative or @CriticalNative.
-    const dex::ClassDef& class_def = dex_file.GetClassDef(klass->GetDexClassDefIndex());
-    access_flags |=
-        annotations::GetNativeMethodAnnotationAccessFlags(dex_file, class_def, dex_method_idx);
+    const dex::MethodAnnotationsItem* method_annotations = mai->AdvanceTo(dex_method_idx);
+    if (method_annotations != nullptr) {
+      access_flags |=
+          annotations::GetNativeMethodAnnotationAccessFlags(dex_file, *method_annotations);
+    }
     dst->SetAccessFlags(access_flags);
     DCHECK(!dst->IsAbstract());
     DCHECK(!dst->HasCodeItem());
@@ -4024,8 +4146,9 @@ void ClassLinker::LoadMethod(const DexFile& dex_file,
     DCHECK_EQ(method.GetCodeItemOffset(), 0u);
     dst->SetDataPtrSize(nullptr, image_pointer_size_);  // Single implementation not set yet.
   } else {
-    const dex::ClassDef& class_def = dex_file.GetClassDef(klass->GetDexClassDefIndex());
-    if (annotations::MethodIsNeverCompile(dex_file, class_def, dex_method_idx)) {
+    const dex::MethodAnnotationsItem* method_annotations = mai->AdvanceTo(dex_method_idx);
+    if (method_annotations != nullptr &&
+        annotations::MethodIsNeverCompile(dex_file, *method_annotations)) {
       access_flags |= kAccCompileDontBother;
     }
     dst->SetAccessFlags(access_flags);
@@ -4040,9 +4163,13 @@ void ClassLinker::LoadMethod(const DexFile& dex_file,
     }
   }
 
-  if (Runtime::Current()->IsZygote() &&
+  if ((access_flags & kAccAbstract) == 0u &&
+      Runtime::Current()->IsZygote() &&
       !Runtime::Current()->GetJITOptions()->GetProfileSaverOptions().GetProfileBootClassPath()) {
+    DCHECK(!ArtMethod::IsAbstract(access_flags));
+    DCHECK(!ArtMethod::IsIntrinsic(access_flags));
     dst->SetMemorySharedMethod();
+    dst->SetHotCounter();
   }
 }
 
@@ -4091,7 +4218,7 @@ void ClassLinker::RegisterDexFileLocked(const DexFile& dex_file,
     CHECK_EQ(dex_cache_location, dex_file_suffix);
   }
 
-  // Check if we need to initialize OatFile data (.data.bimg.rel.ro and .bss
+  // Check if we need to initialize OatFile data (.data.img.rel.ro and .bss
   // sections) needed for code execution and register the oat code range.
   const OatFile* oat_file =
       (dex_file.GetOatDexFile() != nullptr) ? dex_file.GetOatDexFile()->GetOatFile() : nullptr;
@@ -5734,13 +5861,13 @@ bool ClassLinker::InitializeClass(Thread* self,
       WrapExceptionInInitializer(klass);
       mirror::Class::SetStatus(klass, ClassStatus::kErrorResolved, self);
       success = false;
-    } else if (Runtime::Current()->IsTransactionAborted()) {
+    } else if (Runtime::Current()->IsActiveTransaction() && IsTransactionAborted()) {
       // The exception thrown when the transaction aborted has been caught and cleared
       // so we need to throw it again now.
       VLOG(compiler) << "Return from class initializer of "
                      << mirror::Class::PrettyDescriptor(klass.Get())
                      << " without exception while transaction was aborted: re-throw it now.";
-      runtime->ThrowTransactionAbortError(self);
+      ThrowTransactionAbortError(self);
       mirror::Class::SetStatus(klass, ClassStatus::kErrorResolved, self);
       success = false;
     } else {
@@ -6280,7 +6407,7 @@ bool ClassLinker::LinkClass(Thread* self,
       const ObjPtr<mirror::ClassLoader> class_loader = h_new_class.Get()->GetClassLoader();
       ClassTable* const table = InsertClassTableForClassLoader(class_loader);
       const ObjPtr<mirror::Class> existing =
-          table->UpdateClass(descriptor, h_new_class.Get(), ComputeModifiedUtf8Hash(descriptor));
+          table->UpdateClass(h_new_class.Get(), ComputeModifiedUtf8Hash(descriptor));
       CHECK_EQ(existing, klass.Get());
       WriteBarrierOnClassLoaderLocked(class_loader, h_new_class.Get());
     }
@@ -6472,7 +6599,7 @@ class MethodNameAndSignatureComparator final : public ValueObject {
 
   ALWAYS_INLINE std::string_view GetNameView() {
     if (name_view_.empty()) {
-      name_view_ = dex_file_->StringViewByIdx(mid_->name_idx_);
+      name_view_ = dex_file_->GetStringView(mid_->name_idx_);
     }
     return name_view_;
   }
@@ -6485,7 +6612,7 @@ class MethodNameAndSignatureComparator final : public ValueObject {
     if (dex_file_ == other_dex_file) {
       return mid_->name_idx_ == other_mid.name_idx_ && mid_->proto_idx_ == other_mid.proto_idx_;
     }
-    return GetNameView() == other_dex_file->StringViewByIdx(other_mid.name_idx_) &&
+    return GetNameView() == other_dex_file->GetStringView(other_mid.name_idx_) &&
            dex_file_->GetMethodSignature(*mid_) == other_dex_file->GetMethodSignature(other_mid);
   }
 
@@ -6504,8 +6631,15 @@ static ObjPtr<mirror::Class> GetImtOwner(ObjPtr<mirror::Class> klass)
   DCHECK(imt != nullptr);
   while (klass->HasSuperClass()) {
     ObjPtr<mirror::Class> super_class = klass->GetSuperClass();
-    if (super_class->ShouldHaveImt() && imt != super_class->GetImt(kRuntimePointerSize)) {
+    // Abstract classes cannot have IMTs, so we skip them.
+    while (super_class->IsAbstract()) {
+      DCHECK(super_class->HasSuperClass());
+      super_class = super_class->GetSuperClass();
+    }
+    DCHECK(super_class->ShouldHaveImt());
+    if (imt != super_class->GetImt(kRuntimePointerSize)) {
       // IMT not shared with the super class, return the current class.
+      DCHECK_EQ(klass->GetImt(kRuntimePointerSize), imt) << klass->PrettyClass();
       return klass;
     }
     klass = super_class;
@@ -6528,6 +6662,10 @@ ArtMethod* ClassLinker::AddMethodToConflictTable(ObjPtr<mirror::Class> klass,
   DCHECK(imt_owner != nullptr);
 
   LinearAlloc* linear_alloc = GetAllocatorForClassLoader(imt_owner->GetClassLoader());
+  // If the imt owner is in an image, the imt is also there and not in the
+  // linear alloc.
+  DCHECK_IMPLIES(runtime->GetHeap()->FindSpaceFromObject(imt_owner, /*fail_ok=*/true) == nullptr,
+                 linear_alloc->Contains(klass->GetImt(kRuntimePointerSize)));
 
   // Create a new entry if the existing one is the shared conflict method.
   ArtMethod* new_conflict_method = (conflict_method == runtime->GetImtConflictMethod())
@@ -7187,7 +7325,7 @@ void CheckVTableHasNoDuplicates(Thread* self, Handle<mirror::Class> klass)
           // This call writes `name_len` and it is therefore necessary that the
           // initializer for `name_len` comes before it, otherwise the value
           // from the call would be overwritten by that initializer.
-          name(dex_file->StringDataAndUtf16LengthByIdx(mid.name_idx_, &name_len)),
+          name(dex_file->GetStringDataAndUtf16Length(mid.name_idx_, &name_len)),
           signature(dex_file->GetMethodSignature(mid)) {
       // The `name_len` has been initialized to the UTF16 length. Calculate length in bytes.
       if (name[name_len] != 0) {
@@ -9773,7 +9911,7 @@ ObjPtr<mirror::String> ClassLinker::DoResolveString(dex::StringIndex string_idx,
                                                     Handle<mirror::DexCache> dex_cache) {
   const DexFile& dex_file = *dex_cache->GetDexFile();
   uint32_t utf16_length;
-  const char* utf8_data = dex_file.StringDataAndUtf16LengthByIdx(string_idx, &utf16_length);
+  const char* utf8_data = dex_file.GetStringDataAndUtf16Length(string_idx, &utf16_length);
   ObjPtr<mirror::String> string = intern_table_->InternStrong(utf16_length, utf8_data);
   if (string != nullptr) {
     dex_cache->SetResolvedString(string_idx, string);
@@ -9786,7 +9924,7 @@ ObjPtr<mirror::String> ClassLinker::DoLookupString(dex::StringIndex string_idx,
   DCHECK(dex_cache != nullptr);
   const DexFile& dex_file = *dex_cache->GetDexFile();
   uint32_t utf16_length;
-  const char* utf8_data = dex_file.StringDataAndUtf16LengthByIdx(string_idx, &utf16_length);
+  const char* utf8_data = dex_file.GetStringDataAndUtf16Length(string_idx, &utf16_length);
   ObjPtr<mirror::String> string =
       intern_table_->LookupStrong(Thread::Current(), utf16_length, utf8_data);
   if (string != nullptr) {
@@ -9805,7 +9943,7 @@ ObjPtr<mirror::Class> ClassLinker::DoLookupResolvedType(dex::TypeIndex type_idx,
                                                         ObjPtr<mirror::ClassLoader> class_loader) {
   DCHECK(dex_cache->GetClassLoader() == class_loader);
   const DexFile& dex_file = *dex_cache->GetDexFile();
-  const char* descriptor = dex_file.StringByTypeIdx(type_idx);
+  const char* descriptor = dex_file.GetTypeDescriptor(type_idx);
   ObjPtr<mirror::Class> type = LookupResolvedType(descriptor, class_loader);
   if (type != nullptr) {
     DCHECK(type->IsResolved());
@@ -9853,7 +9991,7 @@ ObjPtr<mirror::Class> ClassLinker::DoResolveType(dex::TypeIndex type_idx,
                                                  Handle<mirror::ClassLoader> class_loader) {
   DCHECK(dex_cache->GetClassLoader() == class_loader.Get());
   Thread* self = Thread::Current();
-  const char* descriptor = dex_cache->GetDexFile()->StringByTypeIdx(type_idx);
+  const char* descriptor = dex_cache->GetDexFile()->GetTypeDescriptor(type_idx);
   ObjPtr<mirror::Class> resolved = FindClass(self, descriptor, class_loader);
   if (resolved != nullptr) {
     // TODO: we used to throw here if resolved's class loader was not the
@@ -11020,7 +11158,8 @@ bool ClassLinker::DenyAccessBasedOnPublicSdk([[maybe_unused]] ArtField* art_fiel
   UNREACHABLE();
 }
 
-bool ClassLinker::DenyAccessBasedOnPublicSdk([[maybe_unused]] const char* type_descriptor) const {
+bool ClassLinker::DenyAccessBasedOnPublicSdk(
+    [[maybe_unused]] std::string_view type_descriptor) const {
   // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
   LOG(FATAL) << "UNREACHABLE";
   UNREACHABLE();
@@ -11032,6 +11171,167 @@ void ClassLinker::SetEnablePublicSdkChecks([[maybe_unused]] bool enabled) {
   UNREACHABLE();
 }
 
+bool ClassLinker::TransactionWriteConstraint(
+    [[maybe_unused]] Thread* self, [[maybe_unused]] ObjPtr<mirror::Object> obj) {
+  // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
+  LOG(FATAL) << "UNREACHABLE";
+  UNREACHABLE();
+}
+
+bool ClassLinker::TransactionWriteValueConstraint(
+    [[maybe_unused]] Thread* self, [[maybe_unused]] ObjPtr<mirror::Object> value) {
+  // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
+  LOG(FATAL) << "UNREACHABLE";
+  UNREACHABLE();
+}
+
+bool ClassLinker::TransactionAllocationConstraint(
+    [[maybe_unused]] Thread* self, [[maybe_unused]] ObjPtr<mirror::Class> klass) {
+  // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
+  LOG(FATAL) << "UNREACHABLE";
+  UNREACHABLE();
+}
+
+void ClassLinker::RecordWriteFieldBoolean([[maybe_unused]] mirror::Object* obj,
+                                          [[maybe_unused]] MemberOffset field_offset,
+                                          [[maybe_unused]] uint8_t value,
+                                          [[maybe_unused]] bool is_volatile) {
+  // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
+  LOG(FATAL) << "UNREACHABLE";
+  UNREACHABLE();
+}
+
+void ClassLinker::RecordWriteFieldByte([[maybe_unused]] mirror::Object* obj,
+                                       [[maybe_unused]] MemberOffset field_offset,
+                                       [[maybe_unused]] int8_t value,
+                                       [[maybe_unused]] bool is_volatile) {
+  // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
+  LOG(FATAL) << "UNREACHABLE";
+  UNREACHABLE();
+}
+
+void ClassLinker::RecordWriteFieldChar([[maybe_unused]] mirror::Object* obj,
+                                       [[maybe_unused]] MemberOffset field_offset,
+                                       [[maybe_unused]] uint16_t value,
+                                       [[maybe_unused]] bool is_volatile) {
+  // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
+  LOG(FATAL) << "UNREACHABLE";
+  UNREACHABLE();
+}
+
+void ClassLinker::RecordWriteFieldShort([[maybe_unused]] mirror::Object* obj,
+                                        [[maybe_unused]] MemberOffset field_offset,
+                                        [[maybe_unused]] int16_t value,
+                                        [[maybe_unused]] bool is_volatile) {
+  // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
+  LOG(FATAL) << "UNREACHABLE";
+  UNREACHABLE();
+}
+
+void ClassLinker::RecordWriteField32([[maybe_unused]] mirror::Object* obj,
+                                     [[maybe_unused]] MemberOffset field_offset,
+                                     [[maybe_unused]] uint32_t value,
+                                     [[maybe_unused]] bool is_volatile) {
+  // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
+  LOG(FATAL) << "UNREACHABLE";
+  UNREACHABLE();
+}
+
+void ClassLinker::RecordWriteField64([[maybe_unused]] mirror::Object* obj,
+                                     [[maybe_unused]] MemberOffset field_offset,
+                                     [[maybe_unused]] uint64_t value,
+                                     [[maybe_unused]] bool is_volatile) {
+  // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
+  LOG(FATAL) << "UNREACHABLE";
+  UNREACHABLE();
+}
+
+void ClassLinker::RecordWriteFieldReference([[maybe_unused]] mirror::Object* obj,
+                                            [[maybe_unused]] MemberOffset field_offset,
+                                            [[maybe_unused]] ObjPtr<mirror::Object> value,
+                                            [[maybe_unused]] bool is_volatile) {
+  // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
+  LOG(FATAL) << "UNREACHABLE";
+  UNREACHABLE();
+}
+
+void ClassLinker::RecordWriteArray([[maybe_unused]] mirror::Array* array,
+                                   [[maybe_unused]] size_t index,
+                                   [[maybe_unused]] uint64_t value) {
+  // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
+  LOG(FATAL) << "UNREACHABLE";
+  UNREACHABLE();
+}
+
+void ClassLinker::RecordStrongStringInsertion([[maybe_unused]] ObjPtr<mirror::String> s) {
+  // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
+  LOG(FATAL) << "UNREACHABLE";
+  UNREACHABLE();
+}
+
+void ClassLinker::RecordWeakStringInsertion([[maybe_unused]] ObjPtr<mirror::String> s) {
+  // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
+  LOG(FATAL) << "UNREACHABLE";
+  UNREACHABLE();
+}
+
+void ClassLinker::RecordStrongStringRemoval([[maybe_unused]] ObjPtr<mirror::String> s) {
+  // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
+  LOG(FATAL) << "UNREACHABLE";
+  UNREACHABLE();
+}
+
+void ClassLinker::RecordWeakStringRemoval([[maybe_unused]] ObjPtr<mirror::String> s) {
+  // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
+  LOG(FATAL) << "UNREACHABLE";
+  UNREACHABLE();
+}
+
+void ClassLinker::RecordResolveString([[maybe_unused]] ObjPtr<mirror::DexCache> dex_cache,
+                                      [[maybe_unused]] dex::StringIndex string_idx) {
+  // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
+  LOG(FATAL) << "UNREACHABLE";
+  UNREACHABLE();
+}
+
+void ClassLinker::RecordResolveMethodType([[maybe_unused]] ObjPtr<mirror::DexCache> dex_cache,
+                                          [[maybe_unused]] dex::ProtoIndex proto_idx) {
+  // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
+  LOG(FATAL) << "UNREACHABLE";
+  UNREACHABLE();
+}
+
+void ClassLinker::ThrowTransactionAbortError([[maybe_unused]] Thread* self) {
+  // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
+  LOG(FATAL) << "UNREACHABLE";
+  UNREACHABLE();
+}
+
+void ClassLinker::AbortTransactionF(
+    [[maybe_unused]] Thread* self, [[maybe_unused]] const char* fmt, ...) {
+  // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
+  LOG(FATAL) << "UNREACHABLE";
+  UNREACHABLE();
+}
+
+void ClassLinker::AbortTransactionV([[maybe_unused]] Thread* self,
+                                    [[maybe_unused]] const char* fmt,
+                                    [[maybe_unused]] va_list args) {
+  // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
+  LOG(FATAL) << "UNREACHABLE";
+  UNREACHABLE();
+}
+
+bool ClassLinker::IsTransactionAborted() const {
+  // Should not be called on ClassLinker, only on AotClassLinker that overrides this.
+  LOG(FATAL) << "UNREACHABLE";
+  UNREACHABLE();
+}
+
+void ClassLinker::VisitTransactionRoots([[maybe_unused]] RootVisitor* visitor) {
+  // Nothing to do for normal `ClassLinker`, only `AotClassLinker` handles transactions.
+}
+
 void ClassLinker::RemoveDexFromCaches(const DexFile& dex_file) {
   ReaderMutexLock mu(Thread::Current(), *Locks::dex_lock_);
 
@@ -11039,6 +11339,28 @@ void ClassLinker::RemoveDexFromCaches(const DexFile& dex_file) {
   if (it != dex_caches_.end()) {
       dex_caches_.erase(it);
   }
+}
+
+// GetClassLoadersVisitor collects visited class loaders.
+class GetClassLoadersVisitor : public ClassLoaderVisitor {
+ public:
+  explicit GetClassLoadersVisitor(VariableSizedHandleScope* class_loaders)
+      : class_loaders_(class_loaders) {}
+
+  void Visit(ObjPtr<mirror::ClassLoader> class_loader)
+      REQUIRES_SHARED(Locks::classlinker_classes_lock_, Locks::mutator_lock_) override {
+    DCHECK(class_loader != nullptr);
+    class_loaders_->NewHandle(class_loader);
+  }
+
+ private:
+  VariableSizedHandleScope* const class_loaders_;
+};
+
+void ClassLinker::GetClassLoaders(Thread* self, VariableSizedHandleScope* handles) {
+  GetClassLoadersVisitor class_loader_visitor(handles);
+  ReaderMutexLock mu(self, *Locks::classlinker_classes_lock_);
+  VisitClassLoaders(&class_loader_visitor);
 }
 
 // Instantiate ClassLinker::AllocClass.

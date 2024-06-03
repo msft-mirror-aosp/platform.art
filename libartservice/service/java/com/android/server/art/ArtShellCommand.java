@@ -31,6 +31,7 @@ import static com.android.server.art.model.DexoptStatus.DexContainerFileDexoptSt
 
 import android.annotation.NonNull;
 import android.annotation.Nullable;
+import android.content.Context;
 import android.os.Binder;
 import android.os.Build;
 import android.os.CancellationSignal;
@@ -39,18 +40,19 @@ import android.os.Process;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.system.StructStat;
-import android.util.Log;
 
 import androidx.annotation.RequiresApi;
 
 import com.android.internal.annotations.GuardedBy;
 import com.android.modules.utils.BasicShellCommandHandler;
+import com.android.modules.utils.build.SdkLevel;
 import com.android.server.art.model.ArtFlags;
 import com.android.server.art.model.DeleteResult;
 import com.android.server.art.model.DexoptParams;
 import com.android.server.art.model.DexoptResult;
 import com.android.server.art.model.DexoptStatus;
 import com.android.server.art.model.OperationProgress;
+import com.android.server.art.prereboot.PreRebootDriver;
 import com.android.server.pm.PackageManagerLocal;
 import com.android.server.pm.pkg.AndroidPackage;
 import com.android.server.pm.pkg.PackageState;
@@ -85,22 +87,22 @@ import java.util.stream.Collectors;
  */
 @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
 public final class ArtShellCommand extends BasicShellCommandHandler {
-    private static final String TAG = ArtManagerLocal.TAG;
-
     /** The default location for profile dumps. */
     private final static String PROFILE_DEBUG_LOCATION = "/data/misc/profman";
 
     private final ArtManagerLocal mArtManagerLocal;
     private final PackageManagerLocal mPackageManagerLocal;
+    private final Context mContext;
 
     @GuardedBy("sCancellationSignalMap")
     @NonNull
     private static final Map<String, CancellationSignal> sCancellationSignalMap = new HashMap<>();
 
     public ArtShellCommand(@NonNull ArtManagerLocal artManagerLocal,
-            @NonNull PackageManagerLocal packageManagerLocal) {
+            @NonNull PackageManagerLocal packageManagerLocal, @NonNull Context context) {
         mArtManagerLocal = artManagerLocal;
         mPackageManagerLocal = packageManagerLocal;
+        mContext = context;
     }
 
     @Override
@@ -181,6 +183,12 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
                 pw.println("Profiles cleared");
                 return 0;
             }
+            case "on-ota-staged": {
+                return handleOnOtaStaged(pw);
+            }
+            case "pr-dexopt-job": {
+                return handlePrDexoptJob(pw);
+            }
             default:
                 pw.printf("Error: Unknown 'art' sub-command '%s'\n", subcmd);
                 pw.println("See 'pm help' for help");
@@ -201,6 +209,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
         boolean legacyClearProfile = false;
         boolean verbose = false;
         boolean forceMergeProfile = false;
+        boolean forceCompilerFilter = false;
 
         String opt;
         while ((opt = getNextOption()) != null) {
@@ -213,6 +222,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
                     break;
                 case "-m":
                     compilerFilter = getNextArgRequired();
+                    forceCompilerFilter = true;
                     break;
                 case "-p":
                     priorityClass = parsePriorityClass(getNextArgRequired());
@@ -302,6 +312,10 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
         if (forceMergeProfile) {
             paramsBuilder.setFlags(
                     ArtFlags.FLAG_FORCE_MERGE_PROFILE, ArtFlags.FLAG_FORCE_MERGE_PROFILE);
+        }
+        if (forceCompilerFilter) {
+            paramsBuilder.setFlags(
+                    ArtFlags.FLAG_FORCE_COMPILER_FILTER, ArtFlags.FLAG_FORCE_COMPILER_FILTER);
         }
         if (splitArg != null) {
             if (scopeFlags != 0) {
@@ -631,6 +645,86 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
         return 0;
     }
 
+    private int handleOnOtaStaged(@NonNull PrintWriter pw) {
+        if (!SdkLevel.isAtLeastV()) {
+            pw.println("Error: Unsupported command 'on-ota-staged'");
+            return 1;
+        }
+
+        int uid = Binder.getCallingUid();
+        if (uid != Process.ROOT_UID) {
+            throw new SecurityException("Only root can call 'on-ota-staged'");
+        }
+
+        String otaSlot = null;
+
+        String opt;
+        while ((opt = getNextOption()) != null) {
+            switch (opt) {
+                case "--slot":
+                    otaSlot = getNextArgRequired();
+                    break;
+                default:
+                    pw.println("Error: Unknown option: " + opt);
+                    return 1;
+            }
+        }
+
+        if (otaSlot == null) {
+            pw.println("Error: '--slot' must be specified");
+            return 1;
+        }
+
+        int code = mArtManagerLocal.getPreRebootDexoptJob().onUpdateReady(otaSlot);
+
+        switch (code) {
+            case ArtFlags.SCHEDULE_SUCCESS:
+                pw.println("Job scheduled");
+                return 0;
+            case ArtFlags.SCHEDULE_DISABLED_BY_SYSPROP:
+                pw.println("Job disabled by system property");
+                return 1;
+            case ArtFlags.SCHEDULE_JOB_SCHEDULER_FAILURE:
+                pw.println("Failed to schedule job");
+                return 1;
+            default:
+                // Can't happen.
+                throw new IllegalStateException("Unknown result code: " + code);
+        }
+    }
+
+    private int handlePrDexoptJob(@NonNull PrintWriter pw) {
+        if (!SdkLevel.isAtLeastV()) {
+            pw.println("Error: Unsupported command 'pr-dexopt-job'");
+            return 1;
+        }
+
+        boolean isTest = false;
+
+        String opt = getNextOption();
+        if ("--test".equals(opt)) {
+            isTest = true;
+        } else if (opt != null) {
+            pw.println("Error: Unknown option: " + opt);
+            return 1;
+        }
+
+        if (isTest) {
+            try {
+                mArtManagerLocal.getPreRebootDexoptJob().test();
+                pw.println("Success");
+                return 0;
+            } catch (Exception e) {
+                pw.println("Failure");
+                e.printStackTrace(pw);
+                return 2; // "1" is for general errors. Use "2" for the test failure.
+            }
+        }
+
+        pw.println("Error: No option specified");
+        return 1;
+    }
+
     @Override
     public void onHelp() {
         // No one should call this. The help text should be printed by the `onHelp` handler of `cmd
@@ -780,6 +874,12 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
         pw.println("    This command is different from 'pm compile -r REASON -a'. For example, it");
         pw.println("    only dexopts a subset of apps, and it runs dexopt in parallel. See the");
         pw.println("    API documentation for 'ArtManagerLocal.dexoptPackages' for details.");
+        pw.println();
+        pw.println("  on-ota-staged --slot SLOT");
+        pw.println("    Notifies ART Service that an OTA update is staged. A Pre-reboot Dexopt");
+        pw.println("    job is scheduled for it.");
+        pw.println("    Options:");
+        pw.println("      --slot SLOT The slot that contains the OTA update, '_a' or '_b'.");
     }
 
     private void enforceRootOrShell() {

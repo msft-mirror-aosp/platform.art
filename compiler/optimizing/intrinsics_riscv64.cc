@@ -636,27 +636,26 @@ void IntrinsicCodeGeneratorRISCV64::VisitLongDivideUnsigned(HInvoke* invoke) {
   GenerateDivideUnsigned(invoke, codegen_);
 }
 
-#define VISIT_INTRINSIC(name, low, high, type, start_index) \
-  void IntrinsicLocationsBuilderRISCV64::Visit ##name ##ValueOf(HInvoke* invoke) { \
-    InvokeRuntimeCallingConvention calling_convention; \
-    IntrinsicVisitor::ComputeValueOfLocations( \
-        invoke, \
-        codegen_, \
-        low, \
-        high - low + 1, \
-        calling_convention.GetReturnLocation(DataType::Type::kReference), \
-        Location::RegisterLocation(calling_convention.GetRegisterAt(0))); \
-  } \
-  void IntrinsicCodeGeneratorRISCV64::Visit ##name ##ValueOf(HInvoke* invoke) { \
-    IntrinsicVisitor::ValueOfInfo info = \
-        IntrinsicVisitor::ComputeValueOfInfo( \
-            invoke, \
-            codegen_->GetCompilerOptions(), \
-            WellKnownClasses::java_lang_ ##name ##_value, \
-            low, \
-            high - low + 1, \
-            start_index); \
-    HandleValueOf(invoke, info, type); \
+#define VISIT_INTRINSIC(name, low, high, type, start_index)                              \
+  void IntrinsicLocationsBuilderRISCV64::Visit##name##ValueOf(HInvoke* invoke) {         \
+    InvokeRuntimeCallingConvention calling_convention;                                   \
+    IntrinsicVisitor::ComputeValueOfLocations(                                           \
+        invoke,                                                                          \
+        codegen_,                                                                        \
+        low,                                                                             \
+        (high) - (low) + 1,                                                              \
+        calling_convention.GetReturnLocation(DataType::Type::kReference),                \
+        Location::RegisterLocation(calling_convention.GetRegisterAt(0)));                \
+  }                                                                                      \
+  void IntrinsicCodeGeneratorRISCV64::Visit##name##ValueOf(HInvoke* invoke) {            \
+    IntrinsicVisitor::ValueOfInfo info =                                                 \
+        IntrinsicVisitor::ComputeValueOfInfo(invoke,                                     \
+                                             codegen_->GetCompilerOptions(),             \
+                                             WellKnownClasses::java_lang_##name##_value, \
+                                             low,                                        \
+                                             (high) - (low) + 1,                         \
+                                             start_index);                               \
+    HandleValueOf(invoke, info, type);                                                   \
   }
   BOXED_TYPES(VISIT_INTRINSIC)
 #undef VISIT_INTRINSIC
@@ -767,8 +766,8 @@ void IntrinsicCodeGeneratorRISCV64::VisitReferenceGetReferent(HInvoke* invoke) {
                                                     out,
                                                     obj.AsRegister<XRegister>(),
                                                     referent_offset,
-                                                    /*maybe_temp=*/ locations->GetTemp(0),
-                                                    /*needs_null_check=*/ false);
+                                                    /*temp=*/locations->GetTemp(0),
+                                                    /*needs_null_check=*/false);
   } else {
     codegen_->GetInstructionVisitor()->Load(
         out, obj.AsRegister<XRegister>(), referent_offset, DataType::Type::kReference);
@@ -2797,6 +2796,210 @@ void IntrinsicCodeGeneratorRISCV64::VisitJdkUnsafeGetAndSetReference(HInvoke* in
   GenUnsafeGetAndUpdate(invoke, DataType::Type::kReference, codegen_, GetAndUpdateOp::kSet);
 }
 
+void IntrinsicLocationsBuilderRISCV64::VisitStringCompareTo(HInvoke* invoke) {
+  LocationSummary* locations =
+      new (allocator_) LocationSummary(invoke,
+                                       invoke->InputAt(1)->CanBeNull()
+                                           ? LocationSummary::kCallOnSlowPath
+                                           : LocationSummary::kNoCall,
+                                       kIntrinsified);
+  locations->SetInAt(0, Location::RequiresRegister());
+  locations->SetInAt(1, Location::RequiresRegister());
+  locations->AddTemp(Location::RequiresRegister());
+  locations->AddTemp(Location::RequiresRegister());
+  locations->AddTemp(Location::RequiresRegister());
+  // Need temporary registers for String compression's feature.
+  if (mirror::kUseStringCompression) {
+    locations->AddTemp(Location::RequiresRegister());
+  }
+  locations->SetOut(Location::RequiresRegister(), Location::kOutputOverlap);
+}
+
+void IntrinsicCodeGeneratorRISCV64::VisitStringCompareTo(HInvoke* invoke) {
+  Riscv64Assembler* assembler = GetAssembler();
+  DCHECK(assembler->IsExtensionEnabled(Riscv64Extension::kZbb));
+  LocationSummary* locations = invoke->GetLocations();
+
+  XRegister str = locations->InAt(0).AsRegister<XRegister>();
+  XRegister arg = locations->InAt(1).AsRegister<XRegister>();
+  XRegister out = locations->Out().AsRegister<XRegister>();
+
+  XRegister temp0 = locations->GetTemp(0).AsRegister<XRegister>();
+  XRegister temp1 = locations->GetTemp(1).AsRegister<XRegister>();
+  XRegister temp2 = locations->GetTemp(2).AsRegister<XRegister>();
+  XRegister temp3 = kNoXRegister;
+  if (mirror::kUseStringCompression) {
+    temp3 = locations->GetTemp(3).AsRegister<XRegister>();
+  }
+
+  Riscv64Label loop;
+  Riscv64Label find_char_diff;
+  Riscv64Label end;
+  Riscv64Label different_compression;
+
+  // Get offsets of count and value fields within a string object.
+  const int32_t count_offset = mirror::String::CountOffset().Int32Value();
+  const int32_t value_offset = mirror::String::ValueOffset().Int32Value();
+
+  // Note that the null check must have been done earlier.
+  DCHECK(!invoke->CanDoImplicitNullCheckOn(invoke->InputAt(0)));
+
+  // Take slow path and throw if input can be and is null.
+  SlowPathCodeRISCV64* slow_path = nullptr;
+  const bool can_slow_path = invoke->InputAt(1)->CanBeNull();
+  if (can_slow_path) {
+    slow_path = new (codegen_->GetScopedAllocator()) IntrinsicSlowPathRISCV64(invoke);
+    codegen_->AddSlowPath(slow_path);
+    __ Beqz(arg, slow_path->GetEntryLabel());
+  }
+
+  // Reference equality check, return 0 if same reference.
+  __ Sub(out, str, arg);
+  __ Beqz(out, &end);
+
+  if (mirror::kUseStringCompression) {
+    // Load `count` fields of this and argument strings.
+    __ Loadwu(temp3, str, count_offset);
+    __ Loadwu(temp2, arg, count_offset);
+    // Clean out compression flag from lengths.
+    __ Srliw(temp0, temp3, 1u);
+    __ Srliw(temp1, temp2, 1u);
+  } else {
+    // Load lengths of this and argument strings.
+    __ Loadwu(temp0, str, count_offset);
+    __ Loadwu(temp1, arg, count_offset);
+  }
+  // out = length diff.
+  __ Subw(out, temp0, temp1);
+
+  // Find the length of the shorter string
+  __ Minu(temp0, temp0, temp1);
+  // Shorter string is empty?
+  __ Beqz(temp0, &end);
+
+  if (mirror::kUseStringCompression) {
+    // Extract both compression flags
+    __ Andi(temp3, temp3, 1);
+    __ Andi(temp2, temp2, 1);
+    __ Bne(temp2, temp3, &different_compression);
+  }
+  // Store offset of string value in preparation for comparison loop.
+  __ Li(temp1, value_offset);
+  if (mirror::kUseStringCompression) {
+    // For string compression, calculate the number of bytes to compare (not chars).
+    __ Sll(temp0, temp0, temp3);
+  }
+
+  // Assertions that must hold in order to compare strings 8 bytes at a time.
+  DCHECK_ALIGNED(value_offset, 8);
+  static_assert(IsAligned<8>(kObjectAlignment), "String of odd length is not zero padded");
+
+  constexpr size_t char_size = DataType::Size(DataType::Type::kUint16);
+  static_assert(char_size == 2u, "Char expected to be 2 bytes wide");
+
+  ScratchRegisterScope scratch_scope(assembler);
+  XRegister temp4 = scratch_scope.AllocateXRegister();
+
+  // Loop to compare 4x16-bit characters at a time (ok because of string data alignment).
+  __ Bind(&loop);
+  __ Add(temp4, str, temp1);
+  __ Ld(temp4, temp4, 0);
+  __ Add(temp2, arg, temp1);
+  __ Ld(temp2, temp2, 0);
+  __ Bne(temp4, temp2, &find_char_diff);
+  __ Addi(temp1, temp1, char_size * 4);
+  // With string compression, we have compared 8 bytes, otherwise 4 chars.
+  __ Addi(temp0, temp0, (mirror::kUseStringCompression) ? -8 : -4);
+  __ Bgtz(temp0, &loop);
+  __ J(&end);
+
+  // Find the single character difference.
+  __ Bind(&find_char_diff);
+  // Get the bit position of the first character that differs.
+  __ Xor(temp1, temp2, temp4);
+  __ Ctz(temp1, temp1);
+
+  // If the number of chars remaining <= the index where the difference occurs (0-3), then
+  // the difference occurs outside the remaining string data, so just return length diff (out).
+  __ Srliw(temp1, temp1, (mirror::kUseStringCompression) ? 3 : 4);
+  __ Ble(temp0, temp1, &end);
+
+  // Extract the characters and calculate the difference.
+  __ Slliw(temp1, temp1, (mirror::kUseStringCompression) ? 3 : 4);
+  if (mirror:: kUseStringCompression) {
+    __ Slliw(temp3, temp3, 3u);
+    __ Andn(temp1, temp1, temp3);
+  }
+  __ Srl(temp2, temp2, temp1);
+  __ Srl(temp4, temp4, temp1);
+  if (mirror::kUseStringCompression) {
+    __ Li(temp0, -256);           // ~0xff
+    __ Sllw(temp0, temp0, temp3);  // temp3 = 0 or 8, temp0 := ~0xff or ~0xffff
+    __ Andn(temp4, temp4, temp0);  // Extract 8 or 16 bits.
+    __ Andn(temp2, temp2, temp0);  // Extract 8 or 16 bits.
+  } else {
+    __ ZextH(temp4, temp4);
+    __ ZextH(temp2, temp2);
+  }
+
+  __ Subw(out, temp4, temp2);
+
+  if (mirror::kUseStringCompression) {
+    __ J(&end);
+    __ Bind(&different_compression);
+
+    // Comparison for different compression style.
+    constexpr size_t c_char_size = DataType::Size(DataType::Type::kInt8);
+    static_assert(c_char_size == 1u, "Compressed char expected to be 1 byte wide");
+
+    // `temp1` will hold the compressed data pointer, `temp2` the uncompressed data pointer.
+    __ Xor(temp4, str, arg);
+    __ Addi(temp3, temp3, -1);    // -1 if str is compressed, 0 otherwise
+    __ And(temp2, temp4, temp3);  // str^arg if str is compressed, 0 otherwise
+    __ Xor(temp1, temp2, arg);    // str if str is compressed, arg otherwise
+    __ Xor(temp2, temp2, str);    // arg if str is compressed, str otherwise
+
+    // We want to free up the temp3, currently holding `str` compression flag, for comparison.
+    // So, we move it to the bottom bit of the iteration count `temp0` which we then need to treat
+    // as unsigned. This will allow `addi temp0, temp0, -2; bgtz different_compression_loop`
+    // to serve as the loop condition.
+    __ Sh1Add(temp0, temp0, temp3);
+
+    // Adjust temp1 and temp2 from string pointers to data pointers.
+    __ Addi(temp1, temp1, value_offset);
+    __ Addi(temp2, temp2, value_offset);
+
+    Riscv64Label different_compression_loop;
+    Riscv64Label different_compression_diff;
+
+    __ Bind(&different_compression_loop);
+    __ Lbu(temp4, temp1, 0);
+    __ Addiw(temp1, temp1, c_char_size);
+    __ Lhu(temp3, temp2, 0);
+    __ Addi(temp2, temp2, char_size);
+    __ Sub(temp4, temp4, temp3);
+    __ Bnez(temp4, &different_compression_diff);
+    __ Addi(temp0, temp0, -2);
+    __ Bgtz(temp0, &different_compression_loop);
+    __ J(&end);
+
+    // Calculate the difference.
+    __ Bind(&different_compression_diff);
+    static_assert(static_cast<uint32_t>(mirror::StringCompressionFlag::kCompressed) == 0u,
+                  "Expecting 0=compressed, 1=uncompressed");
+    __ Andi(temp0, temp0, 1);
+    __ Addi(temp0, temp0, -1);
+    __ Xor(out, temp4, temp0);
+    __ Sub(out, out, temp0);
+  }
+
+  __ Bind(&end);
+
+  if (can_slow_path) {
+    __ Bind(slow_path->GetExitLabel());
+  }
+}
+
 class VarHandleSlowPathRISCV64 : public IntrinsicSlowPathRISCV64 {
  public:
   VarHandleSlowPathRISCV64(HInvoke* invoke, std::memory_order order)
@@ -2994,7 +3197,7 @@ static void GenerateVarHandleInstanceFieldChecks(HInvoke* invoke,
     __ Beqz(object, slow_path->GetEntryLabel());
   }
 
-  if (!optimizations.GetUseKnownBootImageVarHandle()) {
+  if (!optimizations.GetUseKnownImageVarHandle()) {
     ScratchRegisterScope srs(assembler);
     XRegister temp = srs.AllocateXRegister();
 
@@ -3117,7 +3320,7 @@ static VarHandleSlowPathRISCV64* GenerateVarHandleChecks(HInvoke* invoke,
                                                          DataType::Type type) {
   size_t expected_coordinates_count = GetExpectedVarHandleCoordinatesCount(invoke);
   VarHandleOptimizations optimizations(invoke);
-  if (optimizations.GetUseKnownBootImageVarHandle()) {
+  if (optimizations.GetUseKnownImageVarHandle()) {
     DCHECK_NE(expected_coordinates_count, 2u);
     if (expected_coordinates_count == 0u || optimizations.GetSkipObjectNullCheck()) {
       return nullptr;
@@ -3128,7 +3331,7 @@ static VarHandleSlowPathRISCV64* GenerateVarHandleChecks(HInvoke* invoke,
       new (codegen->GetScopedAllocator()) VarHandleSlowPathRISCV64(invoke, order);
   codegen->AddSlowPath(slow_path);
 
-  if (!optimizations.GetUseKnownBootImageVarHandle()) {
+  if (!optimizations.GetUseKnownImageVarHandle()) {
     GenerateVarHandleAccessModeAndVarTypeChecks(invoke, codegen, slow_path, type);
   }
   GenerateVarHandleCoordinateChecks(invoke, codegen, slow_path);
@@ -3164,7 +3367,7 @@ static void GenerateVarHandleTarget(HInvoke* invoke,
   size_t expected_coordinates_count = GetExpectedVarHandleCoordinatesCount(invoke);
 
   if (expected_coordinates_count <= 1u) {
-    if (VarHandleOptimizations(invoke).GetUseKnownBootImageVarHandle()) {
+    if (VarHandleOptimizations(invoke).GetUseKnownImageVarHandle()) {
       ScopedObjectAccess soa(Thread::Current());
       ArtField* target_field = GetBootImageVarHandleField(invoke);
       if (expected_coordinates_count == 0u) {
@@ -4837,6 +5040,185 @@ void IntrinsicCodeGeneratorRISCV64::VisitMathMultiplyHigh(HInvoke* invoke) {
 
   // Get high 64 of the multiply
   __ Mulh(out, x, y);
+}
+
+void IntrinsicLocationsBuilderRISCV64::VisitStringGetCharsNoCheck(HInvoke* invoke) {
+  LocationSummary* locations =
+      new (allocator_) LocationSummary(invoke, LocationSummary::kNoCall, kIntrinsified);
+
+  locations->SetInAt(0, Location::RequiresRegister());
+  locations->SetInAt(1, Location::RequiresRegister());
+  locations->SetInAt(2, Location::RequiresRegister());
+  locations->SetInAt(3, Location::RequiresRegister());
+  locations->SetInAt(4, Location::RequiresRegister());
+
+  locations->AddTemp(Location::RequiresRegister());
+  locations->AddTemp(Location::RequiresRegister());
+  locations->AddTemp(Location::RequiresRegister());
+}
+
+void IntrinsicCodeGeneratorRISCV64::VisitStringGetCharsNoCheck(HInvoke* invoke) {
+  Riscv64Assembler* assembler = GetAssembler();
+  LocationSummary* locations = invoke->GetLocations();
+
+  // In Java sizeof(Char) is 2.
+  constexpr size_t char_size = DataType::Size(DataType::Type::kUint16);
+  static_assert(char_size == 2u);
+
+  // Location of data in the destination char array buffer.
+  const uint32_t array_data_offset = mirror::Array::DataOffset(char_size).Uint32Value();
+
+  // Location of char array data in the source string.
+  const uint32_t string_value_offset = mirror::String::ValueOffset().Uint32Value();
+
+  // void getCharsNoCheck(int srcBegin, int srcEnd, char[] dst, int dstBegin);
+
+  // The source string.
+  XRegister source_string_object = locations->InAt(0).AsRegister<XRegister>();
+  // Index of the first character.
+  XRegister source_begin_index = locations->InAt(1).AsRegister<XRegister>();
+  // Index that immediately follows the last character.
+  XRegister source_end_index = locations->InAt(2).AsRegister<XRegister>();
+  // The destination array.
+  XRegister destination_array_object = locations->InAt(3).AsRegister<XRegister>();
+  // The start offset in the destination array.
+  XRegister destination_begin_offset = locations->InAt(4).AsRegister<XRegister>();
+
+  XRegister source_ptr = locations->GetTemp(0).AsRegister<XRegister>();
+  XRegister destination_ptr = locations->GetTemp(1).AsRegister<XRegister>();
+  XRegister number_of_chars = locations->GetTemp(2).AsRegister<XRegister>();
+
+  ScratchRegisterScope temps(assembler);
+  XRegister tmp = temps.AllocateXRegister();
+
+  Riscv64Label done;
+
+  // Calculate the length(number_of_chars) of the string.
+  __ Subw(number_of_chars, source_end_index, source_begin_index);
+
+  // If the string has zero length then exit.
+  __ Beqz(number_of_chars, &done);
+
+  // Prepare a register with the destination address
+  // to start copying to the address:
+  // 1. set the address from which the data in the
+  //    destination array begins (destination_array_object + array_data_offset);
+  __ Addi(destination_ptr, destination_array_object, array_data_offset);
+  // 2. it is necessary to add the start offset relative to the beginning
+  //    of the data in the destination array,
+  //    yet, due to sizeof(Char) being 2, formerly scaling must be performed
+  //    (destination_begin_offset * 2 that equals to destination_begin_offset << 1);
+  __ Sh1Add(destination_ptr, destination_begin_offset, destination_ptr);
+
+  // Prepare a register with the source address
+  // to start copying from the address:
+  // 1. set the address from which the data in the
+  //    source string begins (source_string_object + string_value_offset).
+  // Other manipulations will be performed later,
+  // since they depend on whether the string is compressed or not.
+  __ Addi(source_ptr, source_string_object, string_value_offset);
+
+  // The string can be compressed. It is a way to store strings more compactly.
+  // In this instance, every character is located in one byte (instead of two).
+  Riscv64Label compressed_string_preloop;
+
+  // Information about whether the string is compressed or not is located
+  // in the area intended for storing the length of the string.
+  // The least significant bit of the string's length is used
+  // as the compression flag if STRING_COMPRESSION_ENABLED.
+  if (mirror::kUseStringCompression) {
+    // Location of count in string.
+    const uint32_t count_offset = mirror::String::CountOffset().Uint32Value();
+    // String's length.
+    __ Loadwu(tmp, source_string_object, count_offset);
+
+    // Checking the string for compression.
+    // If so, move to the "compressed_string_preloop".
+    __ Andi(tmp, tmp, 0x1);
+    __ Beqz(tmp, &compressed_string_preloop);
+  }
+
+  // Continue preparing the source register:
+  // proceed similarly to what was done for the destination register.
+  __ Sh1Add(source_ptr, source_begin_index, source_ptr);
+
+  // If the string is not compressed, then perform ordinary copying.
+  // Copying will occur 4 characters (8 bytes) at a time, immediately after there are
+  // less than 4 characters left, move to the "remainder_loop" and copy the remaining
+  // characters one character (2 bytes) at a time.
+  // Note: Unaligned addresses are acceptable here and it is not required to embed
+  // additional code to correct them.
+  Riscv64Label main_loop;
+  Riscv64Label remainder_loop;
+
+  // If initially there are less than 4 characters,
+  // then we directly calculate the remainder.
+  __ Addi(tmp, number_of_chars, -4);
+  __ Bltz(tmp, &remainder_loop);
+
+  // Otherwise, save the value to the counter and continue.
+  __ Mv(number_of_chars, tmp);
+
+  // Main loop. Loads and stores 4 16-bit Java characters at a time.
+  __ Bind(&main_loop);
+
+  __ Loadd(tmp, source_ptr, 0);
+  __ Addi(source_ptr, source_ptr, char_size * 4);
+  __ Stored(tmp, destination_ptr, 0);
+  __ Addi(destination_ptr, destination_ptr, char_size * 4);
+
+  __ Addi(number_of_chars, number_of_chars, -4);
+
+  __ Bgez(number_of_chars, &main_loop);
+
+  // Restore the previous counter value.
+  __ Addi(number_of_chars, number_of_chars, 4);
+  __ Beqz(number_of_chars, &done);
+
+  // Remainder loop for < 4 characters case and remainder handling.
+  // Loads and stores one 16-bit Java character at a time.
+  __ Bind(&remainder_loop);
+
+  __ Loadhu(tmp, source_ptr, 0);
+  __ Addi(source_ptr, source_ptr, char_size);
+
+  __ Storeh(tmp, destination_ptr, 0);
+  __ Addi(destination_ptr, destination_ptr, char_size);
+
+  __ Addi(number_of_chars, number_of_chars, -1);
+  __ Bgtz(number_of_chars, &remainder_loop);
+
+  Riscv64Label compressed_string_loop;
+  if (mirror::kUseStringCompression) {
+    __ J(&done);
+
+    // Below is the copying under the string compression circumstance mentioned above.
+    // Every character in the source string occupies only one byte (instead of two).
+    constexpr size_t compressed_char_size = DataType::Size(DataType::Type::kInt8);
+    static_assert(compressed_char_size == 1u);
+
+    __ Bind(&compressed_string_preloop);
+
+    // Continue preparing the source register:
+    // proceed identically to what was done for the destination register,
+    // yet take into account that only one byte yields for every source character,
+    // hence we need to extend it to two ones when copying it to the destination address.
+    // Against this background scaling for source_begin_index is not needed.
+    __ Add(source_ptr, source_ptr, source_begin_index);
+
+    // Copy loop for compressed strings. Copying one 8-bit character to 16-bit one at a time.
+    __ Bind(&compressed_string_loop);
+
+    __ Loadbu(tmp, source_ptr, 0);
+    __ Addi(source_ptr, source_ptr, compressed_char_size);
+    __ Storeh(tmp, destination_ptr, 0);
+    __ Addi(destination_ptr, destination_ptr, char_size);
+
+    __ Addi(number_of_chars, number_of_chars, -1);
+    __ Bgtz(number_of_chars, &compressed_string_loop);
+  }
+
+  __ Bind(&done);
 }
 
 #define MARK_UNIMPLEMENTED(Name) UNIMPLEMENTED_INTRINSIC(RISCV64, Name)

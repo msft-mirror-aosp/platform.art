@@ -18,9 +18,9 @@
 
 #include "art_field-inl.h"
 #include "barrier.h"
-#include "base/enums.h"
 #include "base/file_utils.h"
 #include "base/histogram-inl.h"
+#include "base/pointer_size.h"
 #include "base/quasi_atomic.h"
 #include "base/stl_util.h"
 #include "base/systrace.h"
@@ -583,7 +583,7 @@ class ConcurrentCopying::FlipCallback : public Closure {
     if (UNLIKELY(runtime->IsActiveTransaction())) {
       CHECK(runtime->IsAotCompiler());
       TimingLogger::ScopedTiming split3("(Paused)VisitTransactionRoots", cc->GetTimings());
-      runtime->VisitTransactionRoots(cc);
+      runtime->GetClassLinker()->VisitTransactionRoots(cc);
     }
     if (kUseBakerReadBarrier && kGrayDirtyImmuneObjects) {
       cc->GrayAllNewlyDirtyImmuneObjects();

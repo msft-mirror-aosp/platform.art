@@ -118,8 +118,9 @@ void CheckNterpAsmConstants() {
 inline void UpdateHotness(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_) {
   // The hotness we will add to a method when we perform a
   // field/method/class/string lookup.
-  constexpr uint16_t kNterpHotnessLookup = 0xff;
-  method->UpdateCounter(kNterpHotnessLookup);
+  bool increase_hotness_for_ui = Runtime::Current()->InJankPerceptibleProcessState() &&
+       Thread::Current()->IsJitSensitiveThread();
+  method->UpdateCounter(increase_hotness_for_ui ? 0x6ff : 0xf);
 }
 
 template<typename T>
@@ -692,7 +693,10 @@ extern "C" jit::OsrData* NterpHotMethod(ArtMethod* method, uint16_t* dex_pc_ptr,
     DCHECK_EQ(Thread::Current()->GetSharedMethodHotness(), 0u);
     Thread::Current()->ResetSharedMethodHotness();
   } else {
+    // Move the counter to the initial threshold in case we have to re-JIT it.
     method->ResetCounter(runtime->GetJITOptions()->GetWarmupThreshold());
+    // Mark the method as warm for the profile saver.
+    method->SetPreviouslyWarm();
   }
   jit::Jit* jit = runtime->GetJit();
   if (jit != nullptr && jit->UseJitCompilation()) {

@@ -71,8 +71,6 @@ static constexpr int32_t kFClassNaNMinValue = 0x100;
   V(FP16LessEquals)                             \
   V(FP16Min)                                    \
   V(FP16Max)                                    \
-  V(StringCompareTo)                            \
-  V(StringGetCharsNoCheck)                      \
   V(StringStringIndexOf)                        \
   V(StringStringIndexOfAfter)                   \
   V(StringBufferAppend)                         \
@@ -545,7 +543,7 @@ class CodeGeneratorRISCV64 : public CodeGenerator {
       const HInvokeStaticOrDirect::DispatchInfo& desired_dispatch_info, ArtMethod* method) override;
 
   // The PcRelativePatchInfo is used for PC-relative addressing of methods/strings/types,
-  // whether through .data.bimg.rel.ro, .bss, or directly in the boot image.
+  // whether through .data.img.rel.ro, .bss, or directly in the boot image.
   //
   // The 20-bit and 12-bit parts of the 32-bit PC-relative offset are patched separately,
   // necessitating two patches/infos. There can be more than two patches/infos if the
@@ -591,6 +589,9 @@ class CodeGeneratorRISCV64 : public CodeGenerator {
   PcRelativePatchInfo* NewBootImageTypePatch(const DexFile& dex_file,
                                              dex::TypeIndex type_index,
                                              const PcRelativePatchInfo* info_high = nullptr);
+  PcRelativePatchInfo* NewAppImageTypePatch(const DexFile& dex_file,
+                                            dex::TypeIndex type_index,
+                                            const PcRelativePatchInfo* info_high = nullptr);
   PcRelativePatchInfo* NewTypeBssEntryPatch(HLoadClass* load_class,
                                             const PcRelativePatchInfo* info_high = nullptr);
   PcRelativePatchInfo* NewBootImageStringPatch(const DexFile& dex_file,
@@ -821,6 +822,8 @@ class CodeGeneratorRISCV64 : public CodeGenerator {
   ArenaDeque<PcRelativePatchInfo> method_bss_entry_patches_;
   // PC-relative type patch info for kBootImageLinkTimePcRelative.
   ArenaDeque<PcRelativePatchInfo> boot_image_type_patches_;
+  // PC-relative type patch info for kAppImageRelRo.
+  ArenaDeque<PcRelativePatchInfo> app_image_type_patches_;
   // PC-relative type patch info for kBssEntry.
   ArenaDeque<PcRelativePatchInfo> type_bss_entry_patches_;
   // PC-relative public type patch info for kBssEntryPublic.

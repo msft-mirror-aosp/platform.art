@@ -322,9 +322,12 @@ class ProfileCompilationInfo {
   //
   // Note: if an annotation is provided, the methods/classes will be associated with the group
   // (dex_file, sample_annotation). Each group keeps its unique set of methods/classes.
+  // `is_test` should be set to true for unit tests which create artificial dex
+  // files.
   bool AddMethods(const std::vector<ProfileMethodInfo>& methods,
                   MethodHotness::Flag flags,
-                  const ProfileSampleAnnotation& annotation = ProfileSampleAnnotation::kNone);
+                  const ProfileSampleAnnotation& annotation = ProfileSampleAnnotation::kNone,
+                  bool is_test = false);
 
   // Find a type index in the `dex_file` if there is a `TypeId` for it. Otherwise,
   // find or insert the descriptor in "extra descriptors" and return an artificial
@@ -333,7 +336,7 @@ class ProfileCompilationInfo {
   // The returned type index can be used, if valid, for `AddClass()` or (TODO) as
   // a type index for inline caches.
   dex::TypeIndex FindOrCreateTypeIndex(const DexFile& dex_file, TypeReference class_ref);
-  dex::TypeIndex FindOrCreateTypeIndex(const DexFile& dex_file, const char* descriptor);
+  dex::TypeIndex FindOrCreateTypeIndex(const DexFile& dex_file, std::string_view descriptor);
 
   // Add a class with the specified `type_index` to the profile. The `type_index`
   // can be either a normal index for a `TypeId` in the dex file, or an artificial
@@ -368,18 +371,8 @@ class ProfileCompilationInfo {
   // Add a class with the specified `descriptor` to the profile.
   // Returns `true` on success, `false` on failure.
   bool AddClass(const DexFile& dex_file,
-                const char* descriptor,
-                const ProfileSampleAnnotation& annotation = ProfileSampleAnnotation::kNone);
-  bool AddClass(const DexFile& dex_file,
-                const std::string& descriptor,
-                const ProfileSampleAnnotation& annotation = ProfileSampleAnnotation::kNone) {
-    return AddClass(dex_file, descriptor.c_str(), annotation);
-  }
-  bool AddClass(const DexFile& dex_file,
                 std::string_view descriptor,
-                const ProfileSampleAnnotation& annotation = ProfileSampleAnnotation::kNone) {
-    return AddClass(dex_file, std::string(descriptor).c_str(), annotation);
-  }
+                const ProfileSampleAnnotation& annotation = ProfileSampleAnnotation::kNone);
 
   // Add multiple type ids for classes in a single dex file. Iterator is for type_ids not
   // class_defs.
@@ -411,7 +404,8 @@ class ProfileCompilationInfo {
   // Note: see AddMethods docs for the handling of annotations.
   bool AddMethod(const ProfileMethodInfo& pmi,
                  MethodHotness::Flag flags,
-                 const ProfileSampleAnnotation& annotation = ProfileSampleAnnotation::kNone);
+                 const ProfileSampleAnnotation& annotation = ProfileSampleAnnotation::kNone,
+                 bool is_test = false);
 
   // Bulk add sampled methods and/or hot methods for a single dex, fast since it only has one
   // GetOrAddDexFileData call.
@@ -684,7 +678,7 @@ class ProfileCompilationInfo {
     DCHECK(type_index.IsValid());
     uint32_t num_type_ids = dex_file->NumTypeIds();
     if (type_index.index_ < num_type_ids) {
-      return dex_file->StringByTypeIdx(type_index);
+      return dex_file->GetTypeDescriptor(type_index);
     } else {
       return extra_descriptors_[type_index.index_ - num_type_ids].c_str();
     }

@@ -25,8 +25,8 @@
 #include "android-base/strings.h"
 #include "art_method-inl.h"
 #include "base/compiler_filter.h"
-#include "base/enums.h"
 #include "base/logging.h"  // For VLOG.
+#include "base/pointer_size.h"
 #include "base/scoped_arena_containers.h"
 #include "base/stl_util.h"
 #include "base/systrace.h"
@@ -335,7 +335,6 @@ class ProfileSaver::GetClassesAndMethodsHelper {
       REQUIRES_SHARED(Locks::mutator_lock_)
       : startup_(startup),
         profile_boot_class_path_(options.GetProfileBootClassPath()),
-        hot_method_sample_threshold_(CalculateHotMethodSampleThreshold(startup, options)),
         extra_flags_(GetExtraMethodHotnessFlags(options)),
         annotation_(annotation),
         arena_stack_(Runtime::Current()->GetArenaPool()),
@@ -358,10 +357,6 @@ class ProfileSaver::GetClassesAndMethodsHelper {
   void CollectClasses(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_);
   void UpdateProfile(const std::set<std::string>& locations, ProfileCompilationInfo* profile_info);
 
-  uint32_t GetHotMethodSampleThreshold() const {
-    return hot_method_sample_threshold_;
-  }
-
   size_t GetNumberOfHotMethods() const {
     return number_of_hot_methods_;
   }
@@ -371,22 +366,6 @@ class ProfileSaver::GetClassesAndMethodsHelper {
   }
 
  private:
-  // GetClassLoadersVisitor collects visited class loaders.
-  class GetClassLoadersVisitor : public ClassLoaderVisitor {
-   public:
-    explicit GetClassLoadersVisitor(VariableSizedHandleScope* class_loaders)
-        : class_loaders_(class_loaders) {}
-
-    void Visit(ObjPtr<mirror::ClassLoader> class_loader)
-        REQUIRES_SHARED(Locks::classlinker_classes_lock_, Locks::mutator_lock_) override {
-      DCHECK(class_loader != nullptr);
-      class_loaders_->NewHandle(class_loader);
-    }
-
-   private:
-    VariableSizedHandleScope* const class_loaders_;
-  };
-
   class CollectInternalVisitor {
    public:
     explicit CollectInternalVisitor(GetClassesAndMethodsHelper* helper)
@@ -425,19 +404,6 @@ class ProfileSaver::GetClassesAndMethodsHelper {
 
   using DexFileRecordsMap = ScopedArenaHashMap<const DexFile*, DexFileRecords*>;
 
-  static uint32_t CalculateHotMethodSampleThreshold(bool startup,
-                                                    const ProfileSaverOptions& options) {
-    Runtime* runtime = Runtime::Current();
-    if (startup) {
-      const bool is_low_ram = runtime->GetHeap()->IsLowMemoryMode();
-      return options.GetHotStartupMethodSamples(is_low_ram);
-    } else if (runtime->GetJit() != nullptr) {
-      return runtime->GetJit()->WarmMethodThreshold();
-    } else {
-      return std::numeric_limits<uint32_t>::max();
-    }
-  }
-
   ALWAYS_INLINE static bool ShouldCollectClasses(bool startup) {
     // We only record classes for the startup case. This may change in the future.
     return startup;
@@ -450,7 +416,6 @@ class ProfileSaver::GetClassesAndMethodsHelper {
 
   const bool startup_;
   const bool profile_boot_class_path_;
-  const uint32_t hot_method_sample_threshold_;
   const uint32_t extra_flags_;
   const ProfileCompilationInfo::ProfileSampleAnnotation annotation_;
   ArenaStack arena_stack_;
@@ -568,12 +533,7 @@ void ProfileSaver::GetClassesAndMethodsHelper::CollectClasses(Thread* self) {
   // a member variable to keep them alive and prevent unloading their classes,
   // so that methods referenced in collected `DexFileRecords` remain valid.
   class_loaders_.emplace(self);
-  {
-    GetClassLoadersVisitor class_loader_visitor(&class_loaders_.value());
-    ClassLinker* const class_linker = Runtime::Current()->GetClassLinker();
-    ReaderMutexLock mu(self, *Locks::classlinker_classes_lock_);
-    class_linker->VisitClassLoaders(&class_loader_visitor);
-  }
+  Runtime::Current()->GetClassLinker()->GetClassLoaders(self, &class_loaders_.value());
 
   // Collect classes and their method array pointers.
   if (profile_boot_class_path_) {
@@ -630,7 +590,6 @@ void ProfileSaver::GetClassesAndMethodsHelper::UpdateProfile(const std::set<std:
                                                              ProfileCompilationInfo* profile_info) {
   // Move members to local variables to allow the compiler to optimize this properly.
   const bool startup = startup_;
-  const uint32_t hot_method_sample_threshold = hot_method_sample_threshold_;
   const uint32_t base_flags =
       (startup ? Hotness::kFlagStartup : Hotness::kFlagPostStartup) | extra_flags_;
 
@@ -640,10 +599,9 @@ void ProfileSaver::GetClassesAndMethodsHelper::UpdateProfile(const std::set<std:
 
   uint16_t initial_value = Runtime::Current()->GetJITOptions()->GetWarmupThreshold();
   auto get_method_flags = [&](ArtMethod& method) {
-    // Mark methods as hot if they have more than hot_method_sample_threshold
-    // samples. This means they will get compiled by the compiler driver.
-    if (method.PreviouslyWarm() ||
-        method.CounterHasReached(hot_method_sample_threshold, initial_value)) {
+    // Mark methods as hot if they are marked as such (warm for the runtime
+    // means hot for the profile).
+    if (method.PreviouslyWarm()) {
       ++number_of_hot_methods;
       return enum_cast<ProfileCompilationInfo::MethodHotness::Flag>(base_flags | Hotness::kFlagHot);
     } else if (method.CounterHasChanged(initial_value)) {
@@ -681,9 +639,9 @@ void ProfileSaver::GetClassesAndMethodsHelper::UpdateProfile(const std::set<std:
         DCHECK(ShouldCollectClasses(startup));
         DCHECK(class_record.methods == nullptr);  // No methods to process.
         array_class_descriptor.assign(class_record.array_dimension, '[');
-        array_class_descriptor += dex_file->StringByTypeIdx(class_record.type_index);
+        array_class_descriptor += dex_file->GetTypeDescriptorView(class_record.type_index);
         dex::TypeIndex type_index =
-            profile_info->FindOrCreateTypeIndex(*dex_file, array_class_descriptor.c_str());
+            profile_info->FindOrCreateTypeIndex(*dex_file, array_class_descriptor);
         if (type_index.IsValid()) {
           profile_info->AddClass(profile_index, type_index);
         }
@@ -737,7 +695,7 @@ void ProfileSaver::GetClassesAndMethodsHelper::UpdateProfile(const std::set<std:
           array_class_descriptor.assign(dim, '[');
           array_class_descriptor += Primitive::Descriptor(enum_cast<Primitive::Type>(i));
           dex::TypeIndex type_index =
-              profile_info->FindOrCreateTypeIndex(*dex_file, array_class_descriptor.c_str());
+              profile_info->FindOrCreateTypeIndex(*dex_file, array_class_descriptor);
           if (type_index.IsValid()) {
             profile_info->AddClass(profile_index, type_index);
           }
@@ -771,7 +729,6 @@ void ProfileSaver::FetchAndCacheResolvedClassesAndMethods(bool startup) {
     profiler_pthread = profiler_pthread_;
   }
 
-  uint32_t hot_method_sample_threshold = 0u;
   size_t number_of_hot_methods = 0u;
   size_t number_of_sampled_methods = 0u;
   {
@@ -786,7 +743,6 @@ void ProfileSaver::FetchAndCacheResolvedClassesAndMethods(bool startup) {
 
     ScopedObjectAccess soa(self);
     GetClassesAndMethodsHelper helper(startup, options_, GetProfileSampleAnnotation());
-    hot_method_sample_threshold = helper.GetHotMethodSampleThreshold();
     helper.CollectClasses(self);
 
     // Release the mutator lock. We shall need to re-acquire the lock for a moment to
@@ -821,8 +777,7 @@ void ProfileSaver::FetchAndCacheResolvedClassesAndMethods(bool startup) {
   }
   VLOG(profiler) << "Profile saver recorded " << number_of_hot_methods
                  << " hot methods and " << number_of_sampled_methods
-                 << " sampled methods with threshold " << hot_method_sample_threshold
-                 << " in " << PrettyDuration(NanoTime() - start_time);
+                 << " sampled methods in " << PrettyDuration(NanoTime() - start_time);
 }
 
 bool ProfileSaver::ProcessProfilingInfo(

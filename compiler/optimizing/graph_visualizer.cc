@@ -408,6 +408,7 @@ class HGraphVisualizerPrinter final : public HGraphDelegateVisitor {
 
   void VisitLoadClass(HLoadClass* load_class) override {
     StartAttributeStream("load_kind") << load_class->GetLoadKind();
+    StartAttributeStream("in_image") << std::boolalpha << load_class->IsInImage();
     StartAttributeStream("class_name")
         << load_class->GetDexFile().PrettyType(load_class->GetTypeIndex());
     StartAttributeStream("gen_clinit_check")
@@ -641,6 +642,12 @@ class HGraphVisualizerPrinter final : public HGraphDelegateVisitor {
     if (HDataProcWithShifterOp::IsShiftOp(instruction->GetOpKind())) {
       StartAttributeStream("shift") << instruction->GetShiftAmount();
     }
+  }
+#endif
+
+#if defined(ART_ENABLE_CODEGEN_riscv64)
+  void VisitRiscv64ShiftAdd(HRiscv64ShiftAdd* instruction) override {
+    StartAttributeStream("distance") << instruction->GetDistance();
   }
 #endif
 

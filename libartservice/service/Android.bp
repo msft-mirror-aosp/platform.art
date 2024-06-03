@@ -32,7 +32,7 @@ cc_defaults {
     ],
     export_include_dirs: ["native"],
     shared_libs: [
-        "libbase",
+        "liblog", // Used by "JNIHelp.h".
         "libnativehelper",
     ],
 }
@@ -48,6 +48,7 @@ cc_library {
         "libart",
         "libartbase",
         "libarttools", // Contains "libc++fs".
+        "libbase",
     ],
 }
 
@@ -65,6 +66,7 @@ cc_library {
         "libartd",
         "libartbased",
         "libarttools", // Contains "libc++fs".
+        "libbase",
     ],
 }
 
@@ -81,6 +83,7 @@ java_defaults {
     libs: [
         "androidx.annotation_annotation",
         "auto_value_annotations",
+        "sdk_module-lib_current_framework-configinfrastructure",
         "sdk_module-lib_current_framework-permission-s",
         // TODO(b/256866172): Transitive dependency, for r8 only.
         "framework-statsd.stubs.module_lib",
@@ -94,6 +97,7 @@ java_defaults {
         "art-statslog-art-java",
         "artd-aidl-java",
         "dexopt_chroot_setup-aidl-java",
+        "modules-utils-build",
         "modules-utils-package-state",
         "modules-utils-shell-command-handler",
         "service-art-proto-java",
@@ -202,6 +206,7 @@ art_cc_test {
     ],
     shared_libs: [
         "libarttools",
+        "libbase",
     ],
 }
 
@@ -215,6 +220,7 @@ art_cc_test {
     ],
     static_libs: [
         "libarttools",
+        "libbase",
     ],
 }
 
@@ -226,9 +232,8 @@ android_test {
         "javatests/**/*.java",
     ],
 
-    // disable the target when prebuilt modules are used
-    defaults: [
-        "art_module_source_build_java_defaults",
+    libs: [
+        "sdk_module-lib_current_framework-configinfrastructure",
     ],
 
     static_libs: [

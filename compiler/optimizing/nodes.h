@@ -143,6 +143,8 @@ enum GraphAnalysisResult {
   kAnalysisSuccess,
 };
 
+std::ostream& operator<<(std::ostream& os, GraphAnalysisResult ga);
+
 template <typename T>
 static inline typename std::make_unsigned<T>::type MakeUnsigned(T x) {
   return static_cast<typename std::make_unsigned<T>::type>(x);
@@ -1665,7 +1667,11 @@ class HLoopInformationOutwardIterator : public ValueObject {
 
 #define FOR_EACH_CONCRETE_INSTRUCTION_ARM64(M)
 
+#if defined(ART_ENABLE_CODEGEN_riscv64)
+#define FOR_EACH_CONCRETE_INSTRUCTION_RISCV64(M) M(Riscv64ShiftAdd, Instruction)
+#else
 #define FOR_EACH_CONCRETE_INSTRUCTION_RISCV64(M)
+#endif
 
 #ifndef ART_ENABLE_CODEGEN_x86
 #define FOR_EACH_CONCRETE_INSTRUCTION_X86(M)
@@ -1692,6 +1698,7 @@ class HLoopInformationOutwardIterator : public ValueObject {
   FOR_EACH_CONCRETE_INSTRUCTION_SHARED(M)                               \
   FOR_EACH_CONCRETE_INSTRUCTION_ARM(M)                                  \
   FOR_EACH_CONCRETE_INSTRUCTION_ARM64(M)                                \
+  FOR_EACH_CONCRETE_INSTRUCTION_RISCV64(M)                              \
   FOR_EACH_CONCRETE_INSTRUCTION_X86(M)                                  \
   FOR_EACH_CONCRETE_INSTRUCTION_X86_64(M)                               \
   FOR_EACH_CONCRETE_INSTRUCTION_X86_COMMON(M)
@@ -3883,10 +3890,22 @@ class HUnaryOperation : public HExpression<1> {
   HConstant* TryStaticEvaluation(HInstruction* input) const;
 
   // Apply this operation to `x`.
-  virtual HConstant* Evaluate(HIntConstant* x) const = 0;
-  virtual HConstant* Evaluate(HLongConstant* x) const = 0;
-  virtual HConstant* Evaluate(HFloatConstant* x) const = 0;
-  virtual HConstant* Evaluate(HDoubleConstant* x) const = 0;
+  virtual HConstant* Evaluate([[maybe_unused]] HIntConstant* x) const {
+    LOG(FATAL) << DebugName() << " is not defined for int values";
+    UNREACHABLE();
+  }
+  virtual HConstant* Evaluate([[maybe_unused]] HLongConstant* x) const {
+    LOG(FATAL) << DebugName() << " is not defined for long values";
+    UNREACHABLE();
+  }
+  virtual HConstant* Evaluate([[maybe_unused]] HFloatConstant* x) const {
+    LOG(FATAL) << DebugName() << " is not defined for float values";
+    UNREACHABLE();
+  }
+  virtual HConstant* Evaluate([[maybe_unused]] HDoubleConstant* x) const {
+    LOG(FATAL) << DebugName() << " is not defined for double values";
+    UNREACHABLE();
+  }
 
   DECLARE_ABSTRACT_INSTRUCTION(UnaryOperation);
 
@@ -3967,15 +3986,31 @@ class HBinaryOperation : public HExpression<2> {
     LOG(FATAL) << DebugName() << " is not defined for the (null, null) case.";
     UNREACHABLE();
   }
-  virtual HConstant* Evaluate(HIntConstant* x, HIntConstant* y) const = 0;
-  virtual HConstant* Evaluate(HLongConstant* x, HLongConstant* y) const = 0;
+  virtual HConstant* Evaluate([[maybe_unused]] HIntConstant* x,
+                              [[maybe_unused]] HIntConstant* y) const {
+    LOG(FATAL) << DebugName() << " is not defined for the (int, int) case.";
+    UNREACHABLE();
+  }
+  virtual HConstant* Evaluate([[maybe_unused]] HLongConstant* x,
+                              [[maybe_unused]] HLongConstant* y) const {
+    LOG(FATAL) << DebugName() << " is not defined for the (long, long) case.";
+    UNREACHABLE();
+  }
   virtual HConstant* Evaluate([[maybe_unused]] HLongConstant* x,
                               [[maybe_unused]] HIntConstant* y) const {
     LOG(FATAL) << DebugName() << " is not defined for the (long, int) case.";
     UNREACHABLE();
   }
-  virtual HConstant* Evaluate(HFloatConstant* x, HFloatConstant* y) const = 0;
-  virtual HConstant* Evaluate(HDoubleConstant* x, HDoubleConstant* y) const = 0;
+  virtual HConstant* Evaluate([[maybe_unused]] HFloatConstant* x,
+                              [[maybe_unused]] HFloatConstant* y) const {
+    LOG(FATAL) << DebugName() << " is not defined for float values";
+    UNREACHABLE();
+  }
+  virtual HConstant* Evaluate([[maybe_unused]] HDoubleConstant* x,
+                              [[maybe_unused]] HDoubleConstant* y) const {
+    LOG(FATAL) << DebugName() << " is not defined for double values";
+    UNREACHABLE();
+  }
 
   // Returns an input that can legally be used as the right input and is
   // constant, or null.
@@ -4352,16 +4387,6 @@ class HBelow final : public HCondition {
   HConstant* Evaluate(HLongConstant* x, HLongConstant* y) const override {
     return MakeConstantCondition(Compute(x->GetValue(), y->GetValue()), GetDexPc());
   }
-  HConstant* Evaluate([[maybe_unused]] HFloatConstant* x,
-                      [[maybe_unused]] HFloatConstant* y) const override {
-    LOG(FATAL) << DebugName() << " is not defined for float values";
-    UNREACHABLE();
-  }
-  HConstant* Evaluate([[maybe_unused]] HDoubleConstant* x,
-                      [[maybe_unused]] HDoubleConstant* y) const override {
-    LOG(FATAL) << DebugName() << " is not defined for double values";
-    UNREACHABLE();
-  }
 
   DECLARE_INSTRUCTION(Below);
 
@@ -4393,16 +4418,6 @@ class HBelowOrEqual final : public HCondition {
   }
   HConstant* Evaluate(HLongConstant* x, HLongConstant* y) const override {
     return MakeConstantCondition(Compute(x->GetValue(), y->GetValue()), GetDexPc());
-  }
-  HConstant* Evaluate([[maybe_unused]] HFloatConstant* x,
-                      [[maybe_unused]] HFloatConstant* y) const override {
-    LOG(FATAL) << DebugName() << " is not defined for float values";
-    UNREACHABLE();
-  }
-  HConstant* Evaluate([[maybe_unused]] HDoubleConstant* x,
-                      [[maybe_unused]] HDoubleConstant* y) const override {
-    LOG(FATAL) << DebugName() << " is not defined for double values";
-    UNREACHABLE();
   }
 
   DECLARE_INSTRUCTION(BelowOrEqual);
@@ -4436,16 +4451,6 @@ class HAbove final : public HCondition {
   HConstant* Evaluate(HLongConstant* x, HLongConstant* y) const override {
     return MakeConstantCondition(Compute(x->GetValue(), y->GetValue()), GetDexPc());
   }
-  HConstant* Evaluate([[maybe_unused]] HFloatConstant* x,
-                      [[maybe_unused]] HFloatConstant* y) const override {
-    LOG(FATAL) << DebugName() << " is not defined for float values";
-    UNREACHABLE();
-  }
-  HConstant* Evaluate([[maybe_unused]] HDoubleConstant* x,
-                      [[maybe_unused]] HDoubleConstant* y) const override {
-    LOG(FATAL) << DebugName() << " is not defined for double values";
-    UNREACHABLE();
-  }
 
   DECLARE_INSTRUCTION(Above);
 
@@ -4477,16 +4482,6 @@ class HAboveOrEqual final : public HCondition {
   }
   HConstant* Evaluate(HLongConstant* x, HLongConstant* y) const override {
     return MakeConstantCondition(Compute(x->GetValue(), y->GetValue()), GetDexPc());
-  }
-  HConstant* Evaluate([[maybe_unused]] HFloatConstant* x,
-                      [[maybe_unused]] HFloatConstant* y) const override {
-    LOG(FATAL) << DebugName() << " is not defined for float values";
-    UNREACHABLE();
-  }
-  HConstant* Evaluate([[maybe_unused]] HDoubleConstant* x,
-                      [[maybe_unused]] HDoubleConstant* y) const override {
-    LOG(FATAL) << DebugName() << " is not defined for double values";
-    UNREACHABLE();
   }
 
   DECLARE_INSTRUCTION(AboveOrEqual);
@@ -4710,7 +4705,7 @@ enum class MethodLoadKind {
   // Used for boot image methods referenced by boot image code.
   kBootImageLinkTimePcRelative,
 
-  // Load from an entry in the .data.bimg.rel.ro using a PC-relative load.
+  // Load from a boot image entry in the .data.img.rel.ro using a PC-relative load.
   // Used for app->boot calls with relocatable image.
   kBootImageRelRo,
 
@@ -5789,21 +5784,6 @@ class HShl final : public HBinaryOperation {
     return GetBlock()->GetGraph()->GetLongConstant(
         Compute(value->GetValue(), distance->GetValue(), kMaxLongShiftDistance), GetDexPc());
   }
-  HConstant* Evaluate([[maybe_unused]] HLongConstant* value,
-                      [[maybe_unused]] HLongConstant* distance) const override {
-    LOG(FATAL) << DebugName() << " is not defined for the (long, long) case.";
-    UNREACHABLE();
-  }
-  HConstant* Evaluate([[maybe_unused]] HFloatConstant* value,
-                      [[maybe_unused]] HFloatConstant* distance) const override {
-    LOG(FATAL) << DebugName() << " is not defined for float values";
-    UNREACHABLE();
-  }
-  HConstant* Evaluate([[maybe_unused]] HDoubleConstant* value,
-                      [[maybe_unused]] HDoubleConstant* distance) const override {
-    LOG(FATAL) << DebugName() << " is not defined for double values";
-    UNREACHABLE();
-  }
 
   DECLARE_INSTRUCTION(Shl);
 
@@ -5834,21 +5814,6 @@ class HShr final : public HBinaryOperation {
   HConstant* Evaluate(HLongConstant* value, HIntConstant* distance) const override {
     return GetBlock()->GetGraph()->GetLongConstant(
         Compute(value->GetValue(), distance->GetValue(), kMaxLongShiftDistance), GetDexPc());
-  }
-  HConstant* Evaluate([[maybe_unused]] HLongConstant* value,
-                      [[maybe_unused]] HLongConstant* distance) const override {
-    LOG(FATAL) << DebugName() << " is not defined for the (long, long) case.";
-    UNREACHABLE();
-  }
-  HConstant* Evaluate([[maybe_unused]] HFloatConstant* value,
-                      [[maybe_unused]] HFloatConstant* distance) const override {
-    LOG(FATAL) << DebugName() << " is not defined for float values";
-    UNREACHABLE();
-  }
-  HConstant* Evaluate([[maybe_unused]] HDoubleConstant* value,
-                      [[maybe_unused]] HDoubleConstant* distance) const override {
-    LOG(FATAL) << DebugName() << " is not defined for double values";
-    UNREACHABLE();
   }
 
   DECLARE_INSTRUCTION(Shr);
@@ -5883,21 +5848,6 @@ class HUShr final : public HBinaryOperation {
     return GetBlock()->GetGraph()->GetLongConstant(
         Compute(value->GetValue(), distance->GetValue(), kMaxLongShiftDistance), GetDexPc());
   }
-  HConstant* Evaluate([[maybe_unused]] HLongConstant* value,
-                      [[maybe_unused]] HLongConstant* distance) const override {
-    LOG(FATAL) << DebugName() << " is not defined for the (long, long) case.";
-    UNREACHABLE();
-  }
-  HConstant* Evaluate([[maybe_unused]] HFloatConstant* value,
-                      [[maybe_unused]] HFloatConstant* distance) const override {
-    LOG(FATAL) << DebugName() << " is not defined for float values";
-    UNREACHABLE();
-  }
-  HConstant* Evaluate([[maybe_unused]] HDoubleConstant* value,
-                      [[maybe_unused]] HDoubleConstant* distance) const override {
-    LOG(FATAL) << DebugName() << " is not defined for double values";
-    UNREACHABLE();
-  }
 
   DECLARE_INSTRUCTION(UShr);
 
@@ -5925,16 +5875,6 @@ class HAnd final : public HBinaryOperation {
   HConstant* Evaluate(HLongConstant* x, HLongConstant* y) const override {
     return GetBlock()->GetGraph()->GetLongConstant(
         Compute(x->GetValue(), y->GetValue()), GetDexPc());
-  }
-  HConstant* Evaluate([[maybe_unused]] HFloatConstant* x,
-                      [[maybe_unused]] HFloatConstant* y) const override {
-    LOG(FATAL) << DebugName() << " is not defined for float values";
-    UNREACHABLE();
-  }
-  HConstant* Evaluate([[maybe_unused]] HDoubleConstant* x,
-                      [[maybe_unused]] HDoubleConstant* y) const override {
-    LOG(FATAL) << DebugName() << " is not defined for double values";
-    UNREACHABLE();
   }
 
   DECLARE_INSTRUCTION(And);
@@ -5964,16 +5904,6 @@ class HOr final : public HBinaryOperation {
     return GetBlock()->GetGraph()->GetLongConstant(
         Compute(x->GetValue(), y->GetValue()), GetDexPc());
   }
-  HConstant* Evaluate([[maybe_unused]] HFloatConstant* x,
-                      [[maybe_unused]] HFloatConstant* y) const override {
-    LOG(FATAL) << DebugName() << " is not defined for float values";
-    UNREACHABLE();
-  }
-  HConstant* Evaluate([[maybe_unused]] HDoubleConstant* x,
-                      [[maybe_unused]] HDoubleConstant* y) const override {
-    LOG(FATAL) << DebugName() << " is not defined for double values";
-    UNREACHABLE();
-  }
 
   DECLARE_INSTRUCTION(Or);
 
@@ -6001,16 +5931,6 @@ class HXor final : public HBinaryOperation {
   HConstant* Evaluate(HLongConstant* x, HLongConstant* y) const override {
     return GetBlock()->GetGraph()->GetLongConstant(
         Compute(x->GetValue(), y->GetValue()), GetDexPc());
-  }
-  HConstant* Evaluate([[maybe_unused]] HFloatConstant* x,
-                      [[maybe_unused]] HFloatConstant* y) const override {
-    LOG(FATAL) << DebugName() << " is not defined for float values";
-    UNREACHABLE();
-  }
-  HConstant* Evaluate([[maybe_unused]] HDoubleConstant* x,
-                      [[maybe_unused]] HDoubleConstant* y) const override {
-    LOG(FATAL) << DebugName() << " is not defined for double values";
-    UNREACHABLE();
   }
 
   DECLARE_INSTRUCTION(Xor);
@@ -6045,21 +5965,6 @@ class HRor final : public HBinaryOperation {
   HConstant* Evaluate(HLongConstant* value, HIntConstant* distance) const override {
     return GetBlock()->GetGraph()->GetLongConstant(
         Compute(value->GetValue(), distance->GetValue(), kMaxLongShiftDistance), GetDexPc());
-  }
-  HConstant* Evaluate([[maybe_unused]] HLongConstant* value,
-                      [[maybe_unused]] HLongConstant* distance) const override {
-    LOG(FATAL) << DebugName() << " is not defined for the (long, long) case.";
-    UNREACHABLE();
-  }
-  HConstant* Evaluate([[maybe_unused]] HFloatConstant* value,
-                      [[maybe_unused]] HFloatConstant* distance) const override {
-    LOG(FATAL) << DebugName() << " is not defined for float values";
-    UNREACHABLE();
-  }
-  HConstant* Evaluate([[maybe_unused]] HDoubleConstant* value,
-                      [[maybe_unused]] HDoubleConstant* distance) const override {
-    LOG(FATAL) << DebugName() << " is not defined for double values";
-    UNREACHABLE();
   }
 
   DECLARE_INSTRUCTION(Ror);
@@ -6132,14 +6037,6 @@ class HNot final : public HUnaryOperation {
   HConstant* Evaluate(HLongConstant* x) const override {
     return GetBlock()->GetGraph()->GetLongConstant(Compute(x->GetValue()), GetDexPc());
   }
-  HConstant* Evaluate([[maybe_unused]] HFloatConstant* x) const override {
-    LOG(FATAL) << DebugName() << " is not defined for float values";
-    UNREACHABLE();
-  }
-  HConstant* Evaluate([[maybe_unused]] HDoubleConstant* x) const override {
-    LOG(FATAL) << DebugName() << " is not defined for double values";
-    UNREACHABLE();
-  }
 
   DECLARE_INSTRUCTION(Not);
 
@@ -6165,18 +6062,6 @@ class HBooleanNot final : public HUnaryOperation {
 
   HConstant* Evaluate(HIntConstant* x) const override {
     return GetBlock()->GetGraph()->GetIntConstant(Compute(x->GetValue()), GetDexPc());
-  }
-  HConstant* Evaluate([[maybe_unused]] HLongConstant* x) const override {
-    LOG(FATAL) << DebugName() << " is not defined for long values";
-    UNREACHABLE();
-  }
-  HConstant* Evaluate([[maybe_unused]] HFloatConstant* x) const override {
-    LOG(FATAL) << DebugName() << " is not defined for float values";
-    UNREACHABLE();
-  }
-  HConstant* Evaluate([[maybe_unused]] HDoubleConstant* x) const override {
-    LOG(FATAL) << DebugName() << " is not defined for double values";
-    UNREACHABLE();
   }
 
   DECLARE_INSTRUCTION(BooleanNot);
@@ -6856,9 +6741,13 @@ class HLoadClass final : public HInstruction {
     // Used for boot image classes referenced by boot image code.
     kBootImageLinkTimePcRelative,
 
-    // Load from an entry in the .data.bimg.rel.ro using a PC-relative load.
+    // Load from a boot image entry in the .data.img.rel.ro using a PC-relative load.
     // Used for boot image classes referenced by apps in AOT-compiled code.
     kBootImageRelRo,
+
+    // Load from an app image entry in the .data.img.rel.ro using a PC-relative load.
+    // Used for app image classes referenced by apps in AOT-compiled code.
+    kAppImageRelRo,
 
     // Load from an entry in the .bss section using a PC-relative load.
     // Used for classes outside boot image referenced by AOT-compiled app and boot image code.
@@ -6915,7 +6804,7 @@ class HLoadClass final : public HInstruction {
     SetPackedField<LoadKindField>(
         is_referrers_class ? LoadKind::kReferrersClass : LoadKind::kRuntimeCall);
     SetPackedFlag<kFlagNeedsAccessCheck>(needs_access_check);
-    SetPackedFlag<kFlagIsInBootImage>(false);
+    SetPackedFlag<kFlagIsInImage>(false);
     SetPackedFlag<kFlagGenerateClInitCheck>(false);
     SetPackedFlag<kFlagValidLoadedClassRTI>(false);
   }
@@ -6931,6 +6820,7 @@ class HLoadClass final : public HInstruction {
   bool HasPcRelativeLoadKind() const {
     return GetLoadKind() == LoadKind::kBootImageLinkTimePcRelative ||
            GetLoadKind() == LoadKind::kBootImageRelRo ||
+           GetLoadKind() == LoadKind::kAppImageRelRo ||
            GetLoadKind() == LoadKind::kBssEntry ||
            GetLoadKind() == LoadKind::kBssEntryPublic ||
            GetLoadKind() == LoadKind::kBssEntryPackage;
@@ -6968,8 +6858,8 @@ class HLoadClass final : public HInstruction {
   bool CanThrow() const override {
     return NeedsAccessCheck() ||
            MustGenerateClinitCheck() ||
-           // If the class is in the boot image, the lookup in the runtime call cannot throw.
-           ((GetLoadKind() == LoadKind::kRuntimeCall || NeedsBss()) && !IsInBootImage());
+           // If the class is in the boot or app image, the lookup in the runtime call cannot throw.
+           ((GetLoadKind() == LoadKind::kRuntimeCall || NeedsBss()) && !IsInImage());
   }
 
   ReferenceTypeInfo GetLoadedClassRTI() {
@@ -6996,7 +6886,7 @@ class HLoadClass final : public HInstruction {
 
   bool IsReferrersClass() const { return GetLoadKind() == LoadKind::kReferrersClass; }
   bool NeedsAccessCheck() const { return GetPackedFlag<kFlagNeedsAccessCheck>(); }
-  bool IsInBootImage() const { return GetPackedFlag<kFlagIsInBootImage>(); }
+  bool IsInImage() const { return GetPackedFlag<kFlagIsInImage>(); }
   bool MustGenerateClinitCheck() const { return GetPackedFlag<kFlagGenerateClInitCheck>(); }
 
   bool MustResolveTypeOnSlowPath() const {
@@ -7011,8 +6901,8 @@ class HLoadClass final : public HInstruction {
     return must_resolve_type_on_slow_path;
   }
 
-  void MarkInBootImage() {
-    SetPackedFlag<kFlagIsInBootImage>(true);
+  void MarkInImage() {
+    SetPackedFlag<kFlagIsInImage>(true);
   }
 
   void AddSpecialInput(HInstruction* special_input);
@@ -7034,10 +6924,11 @@ class HLoadClass final : public HInstruction {
 
  private:
   static constexpr size_t kFlagNeedsAccessCheck    = kNumberOfGenericPackedBits;
-  static constexpr size_t kFlagIsInBootImage       = kFlagNeedsAccessCheck + 1;
+  // Whether the type is in an image (boot image or app image).
+  static constexpr size_t kFlagIsInImage           = kFlagNeedsAccessCheck + 1;
   // Whether this instruction must generate the initialization check.
   // Used for code generation.
-  static constexpr size_t kFlagGenerateClInitCheck = kFlagIsInBootImage + 1;
+  static constexpr size_t kFlagGenerateClInitCheck = kFlagIsInImage + 1;
   static constexpr size_t kFieldLoadKind           = kFlagGenerateClInitCheck + 1;
   static constexpr size_t kFieldLoadKindSize =
       MinimumBitsToStore(static_cast<size_t>(LoadKind::kLast));
@@ -7049,6 +6940,7 @@ class HLoadClass final : public HInstruction {
   static bool HasTypeReference(LoadKind load_kind) {
     return load_kind == LoadKind::kReferrersClass ||
         load_kind == LoadKind::kBootImageLinkTimePcRelative ||
+        load_kind == LoadKind::kAppImageRelRo ||
         load_kind == LoadKind::kBssEntry ||
         load_kind == LoadKind::kBssEntryPublic ||
         load_kind == LoadKind::kBssEntryPackage ||
@@ -7094,6 +6986,7 @@ inline void HLoadClass::AddSpecialInput(HInstruction* special_input) {
   // including literal pool loads, which are PC-relative too.
   DCHECK(GetLoadKind() == LoadKind::kBootImageLinkTimePcRelative ||
          GetLoadKind() == LoadKind::kBootImageRelRo ||
+         GetLoadKind() == LoadKind::kAppImageRelRo ||
          GetLoadKind() == LoadKind::kBssEntry ||
          GetLoadKind() == LoadKind::kBssEntryPublic ||
          GetLoadKind() == LoadKind::kBssEntryPackage ||
@@ -7111,7 +7004,7 @@ class HLoadString final : public HInstruction {
     // Used for boot image strings referenced by boot image code.
     kBootImageLinkTimePcRelative,
 
-    // Load from an entry in the .data.bimg.rel.ro using a PC-relative load.
+    // Load from a boot image entry in the .data.img.rel.ro using a PC-relative load.
     // Used for boot image strings referenced by apps in AOT-compiled code.
     kBootImageRelRo,
 
@@ -8541,6 +8434,9 @@ class HIntermediateAddress final : public HExpression<2> {
 #endif
 #if defined(ART_ENABLE_CODEGEN_x86) || defined(ART_ENABLE_CODEGEN_x86_64)
 #include "nodes_x86.h"
+#endif
+#if defined(ART_ENABLE_CODEGEN_riscv64)
+#include "nodes_riscv64.h"
 #endif
 
 namespace art HIDDEN {

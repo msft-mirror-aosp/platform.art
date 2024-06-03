@@ -28,9 +28,9 @@
 #include "base/atomic.h"
 #include "base/bit_field.h"
 #include "base/bit_utils.h"
-#include "base/enums.h"
 #include "base/locks.h"
 #include "base/macros.h"
+#include "base/pointer_size.h"
 #include "base/safe_map.h"
 #include "base/value_object.h"
 #include "entrypoints/jni/jni_entrypoints.h"
@@ -1550,7 +1550,7 @@ class EXPORT Thread {
   // checkpoint. Useful mostly to discover why a thread isn't responding to a suspend request or
   // checkpoint. The caller should "suspend" (in the Java sense) 'thread' before invoking this, so
   // 'thread' can't get deallocated before we access it.
-  NO_RETURN void AbortInThis(std::string message);
+  NO_RETURN void AbortInThis(const std::string& message);
 
   // Returns true if StrictMode events are traced for the current thread.
   static bool IsSensitiveThread() {

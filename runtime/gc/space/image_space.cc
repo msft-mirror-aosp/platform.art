@@ -37,13 +37,12 @@
 #include "base/array_ref.h"
 #include "base/bit_memory_region.h"
 #include "base/callee_save_type.h"
-#include "base/enums.h"
 #include "base/file_utils.h"
 #include "base/globals.h"
 #include "base/macros.h"
 #include "base/memfd.h"
 #include "base/os.h"
-#include "base/scoped_flock.h"
+#include "base/pointer_size.h"
 #include "base/stl_util.h"
 #include "base/string_view_cpp20.h"
 #include "base/systrace.h"
@@ -995,24 +994,34 @@ class ImageSpace::Loader {
                               /*out*/std::string* error_msg)
         REQUIRES_SHARED(Locks::mutator_lock_) {
     TimingLogger::ScopedTiming timing("MapImageFile", logger);
-    std::string temp_error_msg;
+
+    // The runtime might not be available at this point if we're running dex2oat or oatdump, in
+    // which case we just truncate the madvise optimization limit completely.
+    Runtime* runtime = Runtime::Current();
+    const size_t madvise_size_limit = runtime ? runtime->GetMadviseWillNeedSizeArt() : 0;
+
     const bool is_compressed = image_header.HasCompressedBlock();
     if (!is_compressed && allow_direct_mapping) {
       uint8_t* address = (image_reservation != nullptr) ? image_reservation->Begin() : nullptr;
       // The reserved memory size is aligned up to kElfSegmentAlignment to ensure
       // that the next reserved area will be aligned to the value.
-      return MemMap::MapFileAtAddress(address,
-                                      CondRoundUp<kPageSizeAgnostic>(image_header.GetImageSize(),
-                                                                     kElfSegmentAlignment),
-                                      PROT_READ | PROT_WRITE,
-                                      MAP_PRIVATE,
-                                      fd,
-                                      /*start=*/ 0,
-                                      /*low_4gb=*/ true,
-                                      image_filename,
-                                      /*reuse=*/ false,
-                                      image_reservation,
-                                      error_msg);
+      MemMap map = MemMap::MapFileAtAddress(
+          address,
+          CondRoundUp<kPageSizeAgnostic>(image_header.GetImageSize(), kElfSegmentAlignment),
+          PROT_READ | PROT_WRITE,
+          MAP_PRIVATE,
+          fd,
+          /*start=*/0,
+          /*low_4gb=*/true,
+          image_filename,
+          /*reuse=*/false,
+          image_reservation,
+          error_msg);
+      if (map.IsValid()) {
+        Runtime::MadviseFileForRange(
+            madvise_size_limit, map.Size(), map.Begin(), map.End(), image_filename);
+      }
+      return map;
     }
 
     // Reserve output and copy/decompress into it.
@@ -1040,17 +1049,8 @@ class ImageSpace::Loader {
         return MemMap::Invalid();
       }
 
-      Runtime* runtime = Runtime::Current();
-      // The runtime might not be available at this point if we're running
-      // dex2oat or oatdump.
-      if (runtime != nullptr) {
-        size_t madvise_size_limit = runtime->GetMadviseWillNeedSizeArt();
-        Runtime::MadviseFileForRange(madvise_size_limit,
-                                     temp_map.Size(),
-                                     temp_map.Begin(),
-                                     temp_map.End(),
-                                     image_filename);
-      }
+      Runtime::MadviseFileForRange(
+          madvise_size_limit, temp_map.Size(), temp_map.Begin(), temp_map.End(), image_filename);
 
       if (is_compressed) {
         memcpy(map.Begin(), &image_header, sizeof(ImageHeader));
@@ -2618,6 +2618,9 @@ class ImageSpace::BootImageLoader {
       };
       image_header.VisitPackedImTables(method_table_visitor, space->Begin(), kPointerSize);
       image_header.VisitPackedImtConflictTables(method_table_visitor, space->Begin(), kPointerSize);
+      image_header.VisitJniStubMethods</*kUpdate=*/ true>(method_table_visitor,
+                                                          space->Begin(),
+                                                          kPointerSize);
 
       // Patch the intern table.
       if (image_header.GetInternedStringsSection().Size() != 0u) {
@@ -2808,8 +2811,6 @@ class ImageSpace::BootImageLoader {
                                    /*out*/std::string* error_msg)
       REQUIRES_SHARED(Locks::mutator_lock_) {
     if (art_fd.get() != -1) {
-      // No need to lock memfd for which we hold the only file descriptor
-      // (see locking with ScopedFlock for normal files below).
       VLOG(startup) << "Using image file " << image_filename.c_str() << " for image location "
                     << image_location << " for compiled extension";
 
@@ -2826,15 +2827,6 @@ class ImageSpace::BootImageLoader {
       // the `image_file` as we no longer need it.
       return result;
     }
-
-    // Note that we must not use the file descriptor associated with
-    // ScopedFlock::GetFile to Init the image file. We want the file
-    // descriptor (and the associated exclusive lock) to be released when
-    // we leave Create.
-    ScopedFlock image = LockedFile::Open(image_filename.c_str(),
-                                         /*flags=*/ O_RDONLY,
-                                         /*block=*/ true,
-                                         error_msg);
 
     VLOG(startup) << "Using image file " << image_filename.c_str() << " for image location "
                   << image_location;
@@ -3344,9 +3336,6 @@ bool ImageSpace::LoadBootImage(const std::vector<std::string>& boot_class_path,
                          &apex_versions);
   loader.FindImageFiles();
 
-  // Collect all the errors.
-  std::vector<std::string> error_msgs;
-
   std::string error_msg;
   if (loader.LoadFromSystem(extra_reservation_size,
                             allow_in_memory_compilation,
@@ -3355,22 +3344,10 @@ bool ImageSpace::LoadBootImage(const std::vector<std::string>& boot_class_path,
                             &error_msg)) {
     return true;
   }
-  error_msgs.push_back(error_msg);
-
-  std::ostringstream oss;
-  bool first = true;
-  for (const auto& msg : error_msgs) {
-    if (first) {
-      first = false;
-    } else {
-      oss << "\n    ";
-    }
-    oss << msg;
-  }
-
   LOG(ERROR) << "Could not create image space with image file '"
-      << Join(image_locations, kComponentSeparator) << "'. Attempting to fall back to imageless "
-      << "running. Error was: " << oss.str();
+             << Join(image_locations, kComponentSeparator)
+             << "'. Attempting to fall back to imageless running. Error was: "
+             << error_msg;
 
   return false;
 }

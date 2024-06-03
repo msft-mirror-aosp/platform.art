@@ -30,6 +30,7 @@
 #include "base/macros.h"
 #include "base/mutex.h"
 #include "base/scoped_arena_allocator.h"
+#include "base/systrace.h"
 #include "base/timing_logger.h"
 #include "builder.h"
 #include "code_generator.h"
@@ -535,6 +536,7 @@ bool OptimizingCompiler::RunArchOptimizations(HGraph* graph,
 #if defined(ART_ENABLE_CODEGEN_riscv64)
     case InstructionSet::kRiscv64: {
       OptimizationDef riscv64_optimizations[] = {
+          OptDef(OptimizationPass::kInstructionSimplifierRiscv64),
           OptDef(OptimizationPass::kSideEffectsAnalysis),
           OptDef(OptimizationPass::kGlobalValueNumbering, "GVN$after_arch"),
           OptDef(OptimizationPass::kCriticalNativeAbiFixupRiscv64)
@@ -589,7 +591,6 @@ NO_INLINE  // Avoid increasing caller's frame size by large stack-allocated obje
 static void AllocateRegisters(HGraph* graph,
                               CodeGenerator* codegen,
                               PassObserver* pass_observer,
-                              RegisterAllocator::Strategy strategy,
                               OptimizingCompilerStats* stats) {
   {
     PassScope scope(PrepareForRegisterAllocation::kPrepareForRegisterAllocationPassName,
@@ -607,7 +608,7 @@ static void AllocateRegisters(HGraph* graph,
   {
     PassScope scope(RegisterAllocator::kRegisterAllocatorPassName, pass_observer);
     std::unique_ptr<RegisterAllocator> register_allocator =
-        RegisterAllocator::Create(&local_allocator, codegen, liveness, strategy);
+        RegisterAllocator::Create(&local_allocator, codegen, liveness);
     register_allocator->AllocateRegisters();
   }
 }
@@ -781,6 +782,7 @@ CodeGenerator* OptimizingCompiler::TryCompile(ArenaAllocator* allocator,
   }
 
   if (Compiler::IsPathologicalCase(*code_item, method_idx, dex_file)) {
+    SCOPED_TRACE << "Not compiling because of pathological case";
     MaybeRecordStat(compilation_stats_.get(), MethodCompilationStat::kNotCompiledPathological);
     return nullptr;
   }
@@ -791,6 +793,7 @@ CodeGenerator* OptimizingCompiler::TryCompile(ArenaAllocator* allocator,
   if ((compiler_options.GetCompilerFilter() == CompilerFilter::kSpace)
       && (CodeItemInstructionAccessor(dex_file, code_item).InsnsSizeInCodeUnits() >
           kSpaceFilterOptimizingThreshold)) {
+    SCOPED_TRACE << "Not compiling because of space filter";
     MaybeRecordStat(compilation_stats_.get(), MethodCompilationStat::kNotCompiledSpaceFilter);
     return nullptr;
   }
@@ -865,6 +868,7 @@ CodeGenerator* OptimizingCompiler::TryCompile(ArenaAllocator* allocator,
                           compilation_stats_.get());
     GraphAnalysisResult result = builder.BuildGraph();
     if (result != kAnalysisSuccess) {
+      SCOPED_TRACE << "Not compiling because of " << result;
       switch (result) {
         case kAnalysisSkipped: {
           MaybeRecordStat(compilation_stats_.get(),
@@ -927,20 +931,19 @@ CodeGenerator* OptimizingCompiler::TryCompile(ArenaAllocator* allocator,
     // However, we may have run out of memory trying to create it, so in this
     // case just abort the compilation.
     if (graph->GetProfilingInfo() == nullptr) {
+      SCOPED_TRACE << "Not compiling because of out of memory";
       MaybeRecordStat(compilation_stats_.get(), MethodCompilationStat::kJitOutOfMemoryForCommit);
       return nullptr;
     }
   }
 
-  RegisterAllocator::Strategy regalloc_strategy =
-    compiler_options.GetRegisterAllocationStrategy();
   AllocateRegisters(graph,
                     codegen.get(),
                     &pass_observer,
-                    regalloc_strategy,
                     compilation_stats_.get());
 
   if (UNLIKELY(codegen->GetFrameSize() > codegen->GetMaximumFrameSize())) {
+    SCOPED_TRACE << "Not compiling because of stack frame too large";
     LOG(WARNING) << "Stack frame size is " << codegen->GetFrameSize()
                  << " which is larger than the maximum of " << codegen->GetMaximumFrameSize()
                  << " bytes. Method: " << graph->PrettyMethod();
@@ -1038,7 +1041,6 @@ CodeGenerator* OptimizingCompiler::TryCompileIntrinsic(
   AllocateRegisters(graph,
                     codegen.get(),
                     &pass_observer,
-                    compiler_options.GetRegisterAllocationStrategy(),
                     compilation_stats_.get());
   if (!codegen->IsLeafMethod()) {
     VLOG(compiler) << "Intrinsic method is not leaf: " << method->GetIntrinsic()

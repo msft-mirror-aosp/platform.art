@@ -80,7 +80,6 @@ CompilerOptions::CompilerOptions()
       initialize_app_image_classes_(false),
       check_profiled_methods_(ProfileMethodsCheck::kNone),
       max_image_block_size_(std::numeric_limits<uint32_t>::max()),
-      register_allocation_strategy_(RegisterAllocator::kRegisterAllocatorDefault),
       passes_to_run_(nullptr) {
 }
 
@@ -115,20 +114,6 @@ bool CompilerOptions::ParseDumpInitFailures(const std::string& option, std::stri
   return true;
 }
 
-bool CompilerOptions::ParseRegisterAllocationStrategy(const std::string& option,
-                                                      std::string* error_msg) {
-  if (option == "linear-scan") {
-    register_allocation_strategy_ = RegisterAllocator::Strategy::kRegisterAllocatorLinearScan;
-  } else if (option == "graph-color") {
-    LOG(ERROR) << "Graph coloring allocator has been removed, using linear scan instead.";
-    register_allocation_strategy_ = RegisterAllocator::Strategy::kRegisterAllocatorLinearScan;
-  } else {
-    *error_msg = "Unrecognized register allocation strategy. Try linear-scan.";
-    return false;
-  }
-  return true;
-}
-
 bool CompilerOptions::ParseCompilerOptions(const std::vector<std::string>& options,
                                            bool ignore_unrecognized,
                                            std::string* error_msg) {
@@ -150,8 +135,8 @@ bool CompilerOptions::IsImageClass(const char* descriptor) const {
   return image_classes_.find(std::string_view(descriptor)) != image_classes_.end();
 }
 
-bool CompilerOptions::IsPreloadedClass(const char* pretty_descriptor) const {
-  return preloaded_classes_.find(std::string_view(pretty_descriptor)) != preloaded_classes_.end();
+bool CompilerOptions::IsPreloadedClass(std::string_view pretty_descriptor) const {
+  return preloaded_classes_.find(pretty_descriptor) != preloaded_classes_.end();
 }
 
 bool CompilerOptions::ShouldCompileWithClinitCheck(ArtMethod* method) const {

@@ -569,7 +569,6 @@ class ReleaseTargetChecker:
     self._checker.check_native_library('libandroidio')
 
     # Check internal native library dependencies.
-    self._checker.check_native_library('libcrypto')
     self._checker.check_native_library('libexpat')
 
 
@@ -682,7 +681,6 @@ class TestingTargetChecker:
     self._checker.check_art_test_executable('art_dexdump_tests')
     self._checker.check_art_test_executable('art_dexlayout_tests')
     self._checker.check_art_test_executable('art_dexlist_tests')
-    self._checker.check_art_test_executable('art_dexopt_chroot_setup_tests')
     self._checker.check_art_test_executable('art_dexoptanalyzer_tests')
     self._checker.check_art_test_executable('art_disassembler_tests')
     self._checker.check_art_test_executable('art_imgdiag_tests')

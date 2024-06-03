@@ -27,12 +27,12 @@
 #include <vector>
 
 #include "base/array_ref.h"
-#include "base/enums.h"
 #include "base/hash_map.h"
 #include "base/intrusive_forward_list.h"
 #include "base/locks.h"
 #include "base/macros.h"
 #include "base/mutex.h"
+#include "base/pointer_size.h"
 #include "dex/class_accessor.h"
 #include "dex/dex_file_types.h"
 #include "gc_root.h"
@@ -41,6 +41,7 @@
 #include "jni.h"
 #include "mirror/class.h"
 #include "mirror/object.h"
+#include "oat/jni_stub_hash_map.h"
 #include "oat/oat_file.h"
 #include "verifier/verifier_enums.h"
 
@@ -63,9 +64,9 @@ class OatFile;
 template<class T> class ObjectLock;
 class Runtime;
 class ScopedObjectAccessAlreadyRunnable;
-class SdkChecker;
 template<size_t kNumReferences> class PACKED(4) StackHandleScope;
 class Thread;
+class VariableSizedHandleScope;
 
 enum VisitRootFlags : uint8_t;
 
@@ -786,6 +787,10 @@ class EXPORT ClassLinker {
       REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!Locks::classlinker_classes_lock_);
 
+  void GetClassLoaders(Thread* self, VariableSizedHandleScope* handles)
+      REQUIRES_SHARED(Locks::mutator_lock_)
+      REQUIRES(!Locks::classlinker_classes_lock_);
+
   // Returns null if not found.
   // This returns a pointer to the class-table, without requiring any locking - including the
   // boot class-table. It is the caller's responsibility to access this under lock, if required.
@@ -874,20 +879,100 @@ class EXPORT ClassLinker {
       REQUIRES_SHARED(Locks::mutator_lock_)
       REQUIRES(!Locks::dex_lock_, !Roles::uninterruptible_);
 
-  // Verifies if the method is accesible according to the SdkChecker (if installed).
+  // Verifies if the method is accessible according to the SdkChecker (if installed).
   virtual bool DenyAccessBasedOnPublicSdk(ArtMethod* art_method) const
       REQUIRES_SHARED(Locks::mutator_lock_);
-  // Verifies if the field is accesible according to the SdkChecker (if installed).
+  // Verifies if the field is accessible according to the SdkChecker (if installed).
   virtual bool DenyAccessBasedOnPublicSdk(ArtField* art_field) const
       REQUIRES_SHARED(Locks::mutator_lock_);
-  // Verifies if the descriptor is accesible according to the SdkChecker (if installed).
-  virtual bool DenyAccessBasedOnPublicSdk(const char* type_descriptor) const;
+  // Verifies if the descriptor is accessible according to the SdkChecker (if installed).
+  virtual bool DenyAccessBasedOnPublicSdk(std::string_view type_descriptor) const;
   // Enable or disable public sdk checks.
   virtual void SetEnablePublicSdkChecks(bool enabled);
+
+  // Transaction constraint checks for AOT compilation.
+  virtual bool TransactionWriteConstraint(Thread* self, ObjPtr<mirror::Object> obj)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+  virtual bool TransactionWriteValueConstraint(Thread* self, ObjPtr<mirror::Object> value)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+  virtual bool TransactionAllocationConstraint(Thread* self, ObjPtr<mirror::Class> klass)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // Transaction bookkeeping for AOT compilation.
+  virtual void RecordWriteFieldBoolean(mirror::Object* obj,
+                                       MemberOffset field_offset,
+                                       uint8_t value,
+                                       bool is_volatile);
+  virtual void RecordWriteFieldByte(mirror::Object* obj,
+                                    MemberOffset field_offset,
+                                    int8_t value,
+                                    bool is_volatile);
+  virtual void RecordWriteFieldChar(mirror::Object* obj,
+                                    MemberOffset field_offset,
+                                    uint16_t value,
+                                    bool is_volatile);
+  virtual void RecordWriteFieldShort(mirror::Object* obj,
+                                     MemberOffset field_offset,
+                                     int16_t value,
+                                     bool is_volatile);
+  virtual void RecordWriteField32(mirror::Object* obj,
+                                  MemberOffset field_offset,
+                                  uint32_t value,
+                                  bool is_volatile);
+  virtual void RecordWriteField64(mirror::Object* obj,
+                                  MemberOffset field_offset,
+                                  uint64_t value,
+                                  bool is_volatile);
+  virtual void RecordWriteFieldReference(mirror::Object* obj,
+                                         MemberOffset field_offset,
+                                         ObjPtr<mirror::Object> value,
+                                         bool is_volatile)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+  virtual void RecordWriteArray(mirror::Array* array, size_t index, uint64_t value)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+  virtual void RecordStrongStringInsertion(ObjPtr<mirror::String> s)
+      REQUIRES(Locks::intern_table_lock_);
+  virtual void RecordWeakStringInsertion(ObjPtr<mirror::String> s)
+      REQUIRES(Locks::intern_table_lock_);
+  virtual void RecordStrongStringRemoval(ObjPtr<mirror::String> s)
+      REQUIRES(Locks::intern_table_lock_);
+  virtual void RecordWeakStringRemoval(ObjPtr<mirror::String> s)
+      REQUIRES(Locks::intern_table_lock_);
+  virtual void RecordResolveString(ObjPtr<mirror::DexCache> dex_cache, dex::StringIndex string_idx)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+  virtual void RecordResolveMethodType(ObjPtr<mirror::DexCache> dex_cache,
+                                       dex::ProtoIndex proto_idx)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // Aborting transactions for AOT compilation.
+  virtual void ThrowTransactionAbortError(Thread* self)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+  virtual void AbortTransactionF(Thread* self, const char* fmt, ...)
+      __attribute__((__format__(__printf__, 3, 4)))
+      REQUIRES_SHARED(Locks::mutator_lock_);
+  virtual void AbortTransactionV(Thread* self, const char* fmt, va_list args)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+  virtual bool IsTransactionAborted() const;
+
+  // Vist transaction roots for AOT compilation.
+  virtual void VisitTransactionRoots(RootVisitor* visitor)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
   void RemoveDexFromCaches(const DexFile& dex_file);
   ClassTable* GetBootClassTable() REQUIRES_SHARED(Locks::classlinker_classes_lock_) {
     return boot_class_table_.get();
   }
+  // Find a matching JNI stub from boot images that we could reuse as entrypoint.
+  const void* FindBootJniStub(ArtMethod* method)
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+    return FindBootJniStub(JniStubKey(method));
+  }
+
+  const void* FindBootJniStub(uint32_t flags, std::string_view shorty) {
+    return FindBootJniStub(JniStubKey(flags, shorty));
+  }
+
+  const void* FindBootJniStub(JniStubKey key);
 
  protected:
   virtual bool InitializeClass(Thread* self,
@@ -912,6 +997,8 @@ class EXPORT ClassLinker {
   class LinkFieldsHelper;
   template <PointerSize kPointerSize>
   class LinkMethodsHelper;
+  class MethodAnnotationsIterator;
+  class OatClassCodeIterator;
   class VisiblyInitializedCallback;
 
   struct ClassLoaderData {
@@ -1031,8 +1118,13 @@ class EXPORT ClassLinker {
   void LoadMethod(const DexFile& dex_file,
                   const ClassAccessor::Method& method,
                   ObjPtr<mirror::Class> klass,
-                  ArtMethod* dst)
+                  /*inout*/ MethodAnnotationsIterator* mai,
+                  /*out*/ ArtMethod* dst)
       REQUIRES_SHARED(Locks::mutator_lock_);
+
+  void LinkCode(ArtMethod* method,
+                uint32_t class_def_method_index,
+                /*inout*/ OatClassCodeIterator* occi) REQUIRES_SHARED(Locks::mutator_lock_);
 
   void FixupStaticTrampolines(Thread* self, ObjPtr<mirror::Class> klass)
       REQUIRES_SHARED(Locks::mutator_lock_);
@@ -1409,6 +1501,10 @@ class EXPORT ClassLinker {
   Mutex critical_native_code_with_clinit_check_lock_;
   std::map<ArtMethod*, void*> critical_native_code_with_clinit_check_
       GUARDED_BY(critical_native_code_with_clinit_check_lock_);
+
+  // Load unique JNI stubs from boot images. If the subsequently loaded native methods could find a
+  // matching stub, then reuse it without JIT/AOT compilation.
+  JniStubHashMap<const void*> boot_image_jni_stubs_;
 
   std::unique_ptr<ClassHierarchyAnalysis> cha_;
 

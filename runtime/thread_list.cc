@@ -17,6 +17,9 @@
 #include "thread_list.h"
 
 #include <dirent.h>
+#include <nativehelper/scoped_local_ref.h>
+#include <nativehelper/scoped_utf_chars.h>
+#include <sys/resource.h>  // For getpriority()
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -26,10 +29,6 @@
 #include <vector>
 
 #include "android-base/stringprintf.h"
-#include "nativehelper/scoped_local_ref.h"
-#include "nativehelper/scoped_utf_chars.h"
-#include "unwindstack/AndroidUnwinder.h"
-
 #include "art_field-inl.h"
 #include "base/aborting.h"
 #include "base/histogram-inl.h"
@@ -52,6 +51,7 @@
 #include "scoped_thread_state_change-inl.h"
 #include "thread.h"
 #include "trace.h"
+#include "unwindstack/AndroidUnwinder.h"
 #include "well_known_classes.h"
 
 #if ART_USE_FUTEXES
@@ -705,29 +705,6 @@ static bool WaitOnceForSuspendBarrier(AtomicInteger* barrier,
 
 #endif  // ART_USE_FUTEXES
 
-// Return a short string describing the scheduling state of the thread with the given tid.
-static std::string GetThreadState(pid_t t) {
-#if defined(__linux__)
-  static constexpr int BUF_SIZE = 90;
-  char file_name_buf[BUF_SIZE];
-  char buf[BUF_SIZE];
-  snprintf(file_name_buf, BUF_SIZE, "/proc/%d/stat", t);
-  int stat_fd = open(file_name_buf, O_RDONLY | O_CLOEXEC);
-  if (stat_fd < 0) {
-    return std::string("failed to get thread state: ") + std::string(strerror(errno));
-  }
-  CHECK(stat_fd >= 0) << strerror(errno);
-  ssize_t bytes_read = TEMP_FAILURE_RETRY(read(stat_fd, buf, BUF_SIZE));
-  CHECK(bytes_read >= 0) << strerror(errno);
-  int ret = close(stat_fd);
-  DCHECK(ret == 0) << strerror(errno);
-  buf[BUF_SIZE - 1] = '\0';
-  return buf;
-#else
-  return "unknown state";
-#endif
-}
-
 std::optional<std::string> ThreadList::WaitForSuspendBarrier(AtomicInteger* barrier,
                                                              pid_t t,
                                                              int attempt_of_4) {
@@ -737,6 +714,16 @@ std::optional<std::string> ThreadList::WaitForSuspendBarrier(AtomicInteger* barr
 #endif
   uint64_t timeout_ns =
       attempt_of_4 == 0 ? thread_suspend_timeout_ns_ : thread_suspend_timeout_ns_ / 4;
+  if (attempt_of_4 != 1 && getpriority(PRIO_PROCESS, 0 /* this thread */) > 0) {
+    // We're a low priority thread, and thus have a longer ANR timeout. Double the suspend
+    // timeout. To avoid the getpriority system call in the common case, we fail to double the
+    // first of 4 waits, but then triple the third one to compensate.
+    if (attempt_of_4 == 3) {
+      timeout_ns *= 3;
+    } else {
+      timeout_ns *= 2;
+    }
+  }
   bool collect_state = (t != 0 && (attempt_of_4 == 0 || attempt_of_4 == 4));
   int32_t cur_val = barrier->load(std::memory_order_acquire);
   if (cur_val <= 0) {
@@ -754,7 +741,7 @@ std::optional<std::string> ThreadList::WaitForSuspendBarrier(AtomicInteger* barr
   }
 
   // Long wait; gather information in case of timeout.
-  std::string sampled_state = collect_state ? GetThreadState(t) : "";
+  std::string sampled_state = collect_state ? GetOsThreadStatQuick(t) : "";
   while (i < kSuspendBarrierIters) {
     if (WaitOnceForSuspendBarrier(barrier, cur_val, timeout_ns)) {
       ++i;
@@ -770,7 +757,7 @@ std::optional<std::string> ThreadList::WaitForSuspendBarrier(AtomicInteger* barr
       return std::nullopt;
     }
   }
-  return collect_state ? "Target states: [" + sampled_state + ", " + GetThreadState(t) + "]" +
+  return collect_state ? "Target states: [" + sampled_state + ", " + GetOsThreadStatQuick(t) + "]" +
                              std::to_string(cur_val) + "@" + std::to_string((uintptr_t)barrier) +
                              " Final wait time: " + PrettyDuration(NanoTime() - start_time) :
                          "";
