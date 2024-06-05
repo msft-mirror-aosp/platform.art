@@ -82,16 +82,19 @@ public class PreRebootDriver {
      *
      * @param otaSlot The slot that contains the OTA update, "_a" or "_b", or null for a Mainline
      *         update.
+     * @param mapSnapshotsForOta Whether to map/unmap snapshots. Only applicable to an OTA update.
      */
-    public boolean run(@Nullable String otaSlot, @NonNull CancellationSignal cancellationSignal,
-            @NonNull PreRebootStatsReporter statsReporter) {
+    public boolean run(@Nullable String otaSlot, boolean mapSnapshotsForOta,
+            @NonNull CancellationSignal cancellationSignal) {
+        var statsReporter = new PreRebootStatsReporter();
+        boolean success = false;
         try {
             statsReporter.recordJobStarted();
-            if (!setUp(otaSlot)) {
-                statsReporter.recordJobEnded(Status.STATUS_FAILED);
+            if (!setUp(otaSlot, mapSnapshotsForOta)) {
                 return false;
             }
             runFromChroot(cancellationSignal);
+            success = true;
             return true;
         } catch (RemoteException e) {
             Utils.logArtdException(e);
@@ -100,18 +103,18 @@ public class PreRebootDriver {
         } catch (ReflectiveOperationException | IOException | ErrnoException e) {
             AsLog.e("Failed to run pre-reboot dexopt", e);
         } finally {
+            // No need to pass `mapSnapshotsForOta` because `setUp` stores this information in a
+            // temp file.
             tearDown(false /* throwing */);
+            statsReporter.recordJobEnded(success);
         }
-        // Only report the failed case here. The finished and cancelled cases are reported by
-        // PreRebootManager.
-        statsReporter.recordJobEnded(Status.STATUS_FAILED);
         return false;
     }
 
     public void test() {
         boolean teardownAttempted = false;
         try {
-            if (!setUp(null /* otaSlot */)) {
+            if (!setUp(null /* otaSlot */, false /* mapSnapshotsForOta */)) {
                 throw new AssertionError("System requirement check failed");
             }
             // Ideally, we should try dexopting some packages here. However, it's not trivial to
@@ -129,8 +132,9 @@ public class PreRebootDriver {
         }
     }
 
-    private boolean setUp(@Nullable String otaSlot) throws RemoteException {
-        mInjector.getDexoptChrootSetup().setUp(otaSlot);
+    private boolean setUp(@Nullable String otaSlot, boolean mapSnapshotsForOta)
+            throws RemoteException {
+        mInjector.getDexoptChrootSetup().setUp(otaSlot, mapSnapshotsForOta);
         if (!mInjector.getArtd().checkPreRebootSystemRequirements(CHROOT_DIR)) {
             return false;
         }
