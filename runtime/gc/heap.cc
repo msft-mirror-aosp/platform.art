@@ -16,20 +16,18 @@
 
 #include "heap.h"
 
+#include <sys/types.h>
+#include <unistd.h>
+
 #include <limits>
-#include "android-base/thread_annotations.h"
-#if defined(__BIONIC__) || defined(__GLIBC__)
-#include <malloc.h>  // For mallinfo()
-#endif
 #include <memory>
 #include <random>
-#include <unistd.h>
-#include <sys/types.h>
+#include <sstream>
 #include <vector>
 
-#include "android-base/stringprintf.h"
-
 #include "allocation_listener.h"
+#include "android-base/stringprintf.h"
+#include "android-base/thread_annotations.h"
 #include "art_field-inl.h"
 #include "backtrace_helper.h"
 #include "base/allocator.h"
@@ -107,6 +105,10 @@
 #include "thread_list.h"
 #include "verify_object-inl.h"
 #include "well_known_classes.h"
+
+#if defined(__BIONIC__) || defined(__GLIBC__) || defined(ANDROID_HOST_MUSL)
+#include <malloc.h>  // For mallinfo()
+#endif
 
 namespace art {
 
@@ -2655,7 +2657,7 @@ void Heap::TraceHeapSize(size_t heap_size) {
 
 size_t Heap::GetNativeBytes() {
   size_t malloc_bytes;
-#if defined(__BIONIC__) || defined(__GLIBC__)
+#if defined(__BIONIC__) || defined(__GLIBC__) || defined(ANDROID_HOST_MUSL)
   IF_GLIBC(size_t mmapped_bytes;)
   struct mallinfo mi = mallinfo();
   // In spite of the documentation, the jemalloc version of this call seems to do what we want,
@@ -4756,6 +4758,12 @@ bool Heap::AddHeapTask(gc::HeapTask* task) {
   }
   GetTaskProcessor()->AddTask(self, task);
   return true;
+}
+
+std::string Heap::GetForegroundCollectorName() {
+  std::ostringstream oss;
+  oss << foreground_collector_type_;
+  return oss.str();
 }
 
 }  // namespace gc

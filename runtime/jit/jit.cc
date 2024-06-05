@@ -17,6 +17,7 @@
 #include "jit.h"
 
 #include <dlfcn.h>
+#include <sys/resource.h>
 
 #include "art_method-inl.h"
 #include "base/enums.h"
@@ -71,7 +72,7 @@ static constexpr uint32_t kJitStressDefaultOptimizeThreshold = kJitDefaultOptimi
 static constexpr uint32_t kJitSlowStressDefaultOptimizeThreshold =
     kJitStressDefaultOptimizeThreshold / 2;
 
-static constexpr uint32_t kJitDefaultWarmupThreshold = 0x3fff;
+static constexpr uint32_t kJitDefaultWarmupThreshold = 0xffff;
 // Different warm-up threshold constants. These default to the equivalent warmup thresholds divided
 // by 2, but can be overridden at the command-line.
 static constexpr uint32_t kJitStressDefaultWarmupThreshold = kJitDefaultWarmupThreshold / 2;
@@ -1619,6 +1620,13 @@ static void* RunPollingThread(void* arg) {
       /* create_peer= */ false);
   CHECK(thread_attached);
 
+  if (getpriority(PRIO_PROCESS, 0 /* this thread */) == 0) {
+    // Slightly reduce thread priority, mostly so the suspend logic notices that we're
+    // not a high priority thread, and can time out more slowly. May fail on host.
+    (void)setpriority(PRIO_PROCESS, 0 /* this thread */, 1);
+  } else {
+    PLOG(ERROR) << "Unexpected BootImagePollingThread priority: " << getpriority(PRIO_PROCESS, 0);
+  }
   {
     // Prevent other threads from running while we are remapping the boot image
     // ArtMethod's. Native threads might still be running, but they cannot
