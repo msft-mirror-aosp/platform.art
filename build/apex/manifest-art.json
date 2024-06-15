@@ -4,7 +4,7 @@
 
   // Placeholder module version to be replaced during build.
   // Do not change!
-  "version": 350815000,
+  "version": 350816000,
 
   "provideNativeLibs": [
     "libjdwp.so"
