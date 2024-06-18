@@ -118,11 +118,8 @@
 #endif
 
 #if ART_USE_FUTEXES
-#include "linux/futex.h"
-#include "sys/syscall.h"
-#ifndef SYS_futex
-#define SYS_futex __NR_futex
-#endif
+#include <linux/futex.h>
+#include <sys/syscall.h>
 #endif  // ART_USE_FUTEXES
 
 #pragma clang diagnostic push
@@ -2698,7 +2695,7 @@ Thread::~Thread() {
   SetCachedThreadName(nullptr);  // Deallocate name.
   delete tlsPtr_.deps_or_stack_trace_sample.stack_trace_sample;
 
-  CHECK_EQ(tlsPtr_.method_trace_buffer, nullptr);
+  CHECK_EQ(tlsPtr_.method_trace_buffer, nullptr) << Trace::GetDebugInformation();
 
   Runtime::Current()->GetHeap()->AssertThreadLocalBuffersAreRevoked(this);
 

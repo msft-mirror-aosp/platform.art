@@ -56,7 +56,6 @@
 #include "base/scoped_arena_containers.h"
 #include "base/scoped_flock.h"
 #include "base/stl_util.h"
-#include "base/string_view_cpp20.h"
 #include "base/systrace.h"
 #include "base/time_utils.h"
 #include "base/unix_file/fd_file.h"
@@ -139,6 +138,7 @@
 #include "nterp_helpers-inl.h"
 #include "nterp_helpers.h"
 #include "oat/image-inl.h"
+#include "oat/jni_stub_hash_map-inl.h"
 #include "oat/oat.h"
 #include "oat/oat_file-inl.h"
 #include "oat/oat_file.h"
@@ -408,6 +408,14 @@ void ClassLinker::ForceClassInitialized(Thread* self, Handle<mirror::Class> klas
   }
   ScopedThreadSuspension sts(self, ThreadState::kSuspended);
   MakeInitializedClassesVisiblyInitialized(self, /*wait=*/true);
+}
+
+const void* ClassLinker::FindBootJniStub(ArtMethod* method) {
+  return FindBootJniStub(JniStubKey(method));
+}
+
+const void* ClassLinker::FindBootJniStub(uint32_t flags, std::string_view shorty) {
+  return FindBootJniStub(JniStubKey(flags, shorty));
 }
 
 const void* ClassLinker::FindBootJniStub(JniStubKey key) {
@@ -4163,9 +4171,13 @@ void ClassLinker::LoadMethod(const DexFile& dex_file,
     }
   }
 
-  if (Runtime::Current()->IsZygote() &&
+  if ((access_flags & kAccAbstract) == 0u &&
+      Runtime::Current()->IsZygote() &&
       !Runtime::Current()->GetJITOptions()->GetProfileSaverOptions().GetProfileBootClassPath()) {
+    DCHECK(!ArtMethod::IsAbstract(access_flags));
+    DCHECK(!ArtMethod::IsIntrinsic(access_flags));
     dst->SetMemorySharedMethod();
+    dst->SetHotCounter();
   }
 }
 
