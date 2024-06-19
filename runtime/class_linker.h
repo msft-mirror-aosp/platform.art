@@ -964,9 +964,13 @@ class EXPORT ClassLinker {
   }
   // Find a matching JNI stub from boot images that we could reuse as entrypoint.
   const void* FindBootJniStub(ArtMethod* method)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+    return FindBootJniStub(JniStubKey(method));
+  }
 
-  const void* FindBootJniStub(uint32_t flags, std::string_view shorty);
+  const void* FindBootJniStub(uint32_t flags, std::string_view shorty) {
+    return FindBootJniStub(JniStubKey(flags, shorty));
+  }
 
   const void* FindBootJniStub(JniStubKey key);
 

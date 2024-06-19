@@ -21,12 +21,10 @@
 #include <string_view>
 
 #include "arch/instruction_set.h"
+#include "art_method.h"
 #include "base/hash_map.h"
-#include "base/locks.h"
 
 namespace art HIDDEN {
-
-class ArtMethod;
 
 class JniStubKey {
  public:
@@ -34,9 +32,14 @@ class JniStubKey {
   JniStubKey(const JniStubKey& other) = default;
   JniStubKey& operator=(const JniStubKey& other) = default;
 
-  JniStubKey(uint32_t flags, std::string_view shorty);
+  JniStubKey(uint32_t flags, std::string_view shorty)
+      : flags_(flags & (kAccStatic | kAccSynchronized | kAccFastNative | kAccCriticalNative)),
+        shorty_(shorty) {
+    DCHECK(ArtMethod::IsNative(flags));
+  }
 
-  explicit JniStubKey(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_);
+  explicit JniStubKey(ArtMethod* method) REQUIRES_SHARED(Locks::mutator_lock_)
+      : JniStubKey(method->GetAccessFlags(), method->GetShortyView()) {}
 
   uint32_t Flags() const {
     return flags_;

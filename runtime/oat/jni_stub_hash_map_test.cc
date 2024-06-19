@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "oat/jni_stub_hash_map-inl.h"
+#include "jni_stub_hash_map.h"
 
 #include <gtest/gtest.h>
 
@@ -34,18 +34,19 @@
 #include "base/utils.h"
 #include "class_linker.h"
 #include "common_compiler_test.h"
+#include "common_compiler_test.cc"
 #include "compiler.h"
 #include "gc/heap.h"
 #include "gc/space/image_space.h"
 #include "handle.h"
 #include "handle_scope.h"
 #include "handle_scope-inl.h"
+#include "image.h"
+#include "image-inl.h"
 #include "jni.h"
 #include "mirror/class.h"
 #include "mirror/class_loader.h"
 #include "mirror/dex_cache.h"
-#include "oat/image-inl.h"
-#include "oat/oat_quick_method_header.h"
 #include "obj_ptr.h"
 #include "runtime.h"
 #include "scoped_thread_state_change.h"
@@ -96,35 +97,61 @@ class JniStubHashMapTest : public CommonCompilerTest {
 
   void SetBaseMethod(std::string_view base_method_name, std::string_view base_method_sig) {
     jni_stub_hash_map_.clear();
-    ScopedObjectAccess soa(Thread::Current());
+    Thread* self = Thread::Current();
+    ScopedObjectAccess soa(self);
     ObjPtr<mirror::Class> klass = soa.Decode<mirror::Class>(jklass_);
     base_method_ = klass->FindClassMethod(base_method_name, base_method_sig, pointer_size_);
     ASSERT_TRUE(base_method_ != nullptr);
     ASSERT_TRUE(base_method_->IsNative());
 
-    base_method_code_ = JniCompileCode(base_method_);
+    OneCompiledMethodStorage base_method_storage;
+    StackHandleScope<1> hs(self);
+    std::unique_ptr<Compiler> compiler(
+        Compiler::Create(*compiler_options_, &base_method_storage));
+    const DexFile& dex_file = *base_method_->GetDexFile();
+    Handle<mirror::DexCache> dex_cache =
+        hs.NewHandle(GetClassLinker()->FindDexCache(self, dex_file));
+    compiler->JniCompile(base_method_->GetAccessFlags(),
+                         base_method_->GetDexMethodIndex(),
+                         dex_file,
+                         dex_cache);
+    ArrayRef<const uint8_t> code = base_method_storage.GetCode();
+    base_method_code_.assign(code.begin(), code.end());
 
     jni_stub_hash_map_.insert(std::make_pair(JniStubKey(base_method_), base_method_));
   }
 
   void CompareMethod(std::string_view cmp_method_name, std::string_view cmp_method_sig) {
-    ScopedObjectAccess soa(Thread::Current());
+    Thread* self = Thread::Current();
+    ScopedObjectAccess soa(self);
     ObjPtr<mirror::Class> klass = soa.Decode<mirror::Class>(jklass_);
     ArtMethod* cmp_method = klass->FindClassMethod(cmp_method_name, cmp_method_sig, pointer_size_);
     ASSERT_TRUE(cmp_method != nullptr);
     ASSERT_TRUE(cmp_method->IsNative());
 
-    std::vector<uint8_t> cmp_method_code = JniCompileCode(cmp_method);
+    OneCompiledMethodStorage cmp_method_storage;
+    StackHandleScope<1> hs(self);
+    std::unique_ptr<Compiler> compiler(
+        Compiler::Create(*compiler_options_, &cmp_method_storage));
+    const DexFile& dex_file = *cmp_method->GetDexFile();
+    Handle<mirror::DexCache> dex_cache =
+        hs.NewHandle(GetClassLinker()->FindDexCache(self, dex_file));
+    compiler->JniCompile(cmp_method->GetAccessFlags(),
+                         cmp_method->GetDexMethodIndex(),
+                         dex_file,
+                         dex_cache);
 
+    ArrayRef<const uint8_t> method_code = ArrayRef<const uint8_t>(base_method_code_);
+    ArrayRef<const uint8_t> cmp_method_code = cmp_method_storage.GetCode();
     auto it = jni_stub_hash_map_.find(JniStubKey(cmp_method));
     if (it != jni_stub_hash_map_.end()) {
-      ASSERT_EQ(base_method_code_, cmp_method_code)
+      ASSERT_EQ(method_code, cmp_method_code)
           << "base method: " << base_method_->PrettyMethod() << ", compared method: "
           << cmp_method->PrettyMethod();
     } else if (strict_check_){
       // If the compared method maps to a different entry, then its compiled JNI stub should be
       // also different from the base one.
-      ASSERT_NE(base_method_code_, cmp_method_code)
+      ASSERT_NE(method_code, cmp_method_code)
           << "base method: " << base_method_->PrettyMethod() << ", compared method: "
           << cmp_method->PrettyMethod();
     }
