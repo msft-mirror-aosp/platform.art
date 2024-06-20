@@ -138,6 +138,7 @@
 #include "nterp_helpers-inl.h"
 #include "nterp_helpers.h"
 #include "oat/image-inl.h"
+#include "oat/jni_stub_hash_map-inl.h"
 #include "oat/oat.h"
 #include "oat/oat_file-inl.h"
 #include "oat/oat_file.h"
@@ -147,6 +148,7 @@
 #include "profile/profile_compilation_info.h"
 #include "runtime.h"
 #include "runtime_callbacks.h"
+#include "scoped_assert_no_transaction_checks.h"
 #include "scoped_thread_state_change-inl.h"
 #include "startup_completed_task.h"
 #include "thread-inl.h"
@@ -407,6 +409,14 @@ void ClassLinker::ForceClassInitialized(Thread* self, Handle<mirror::Class> klas
   }
   ScopedThreadSuspension sts(self, ThreadState::kSuspended);
   MakeInitializedClassesVisiblyInitialized(self, /*wait=*/true);
+}
+
+const void* ClassLinker::FindBootJniStub(ArtMethod* method) {
+  return FindBootJniStub(JniStubKey(method));
+}
+
+const void* ClassLinker::FindBootJniStub(uint32_t flags, std::string_view shorty) {
+  return FindBootJniStub(JniStubKey(flags, shorty));
 }
 
 const void* ClassLinker::FindBootJniStub(JniStubKey key) {
@@ -4650,7 +4660,7 @@ ObjPtr<mirror::Class> ClassLinker::CreateArrayClass(Thread* self,
   auto visitor = [this, array_class_size, component_type](ObjPtr<mirror::Object> obj,
                                                           size_t usable_size)
       REQUIRES_SHARED(Locks::mutator_lock_) {
-    ScopedAssertNoNewTransactionRecords sanntr("CreateArrayClass");
+    ScopedAssertNoTransactionChecks santc("CreateArrayClass");
     mirror::Class::InitializeClassVisitor init_class(array_class_size);
     init_class(obj, usable_size);
     ObjPtr<mirror::Class> klass = ObjPtr<mirror::Class>::DownCast(obj);

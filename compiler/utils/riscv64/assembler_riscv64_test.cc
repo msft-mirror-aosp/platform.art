@@ -2480,10 +2480,7 @@ TEST_F(AssemblerRISCV64Test, Jalr_WithoutC) {
             "Jalr_WithoutC");
 }
 
-// The clang assembler we're currently using for testing (clang 18.0.0) does not auto-forward
-// `beq zero, rs2, offset` to `c.beqz` but newer clang assembler versions (clang 18.0.1) do.
-// TODO (riscv64): Enable this test when we're using a clang assembler that auto-forwards.
-TEST_F(AssemblerRISCV64Test, DISABLED_Beq) {
+TEST_F(AssemblerRISCV64Test, Beq) {
   DriverStr(
       RepeatRRIbS(
           &Riscv64Assembler::Beq, /*imm_bits=*/-12, /*shift=*/1, "beq {reg1}, {reg2}, {imm}\n"),
@@ -2498,10 +2495,7 @@ TEST_F(AssemblerRISCV64Test, Beq_WithoutC) {
       "Beq_WithoutC");
 }
 
-// The clang assembler we're currently using for testing (clang 18.0.0) does not auto-forward
-// `bne zero, rs2, offset` to `c.bnez` but newer clang assembler versions (clang 18.0.1) do.
-// TODO (riscv64): Enable this test when we're using a clang assembler that auto-forwards.
-TEST_F(AssemblerRISCV64Test, DISABLED_Bne) {
+TEST_F(AssemblerRISCV64Test, Bne) {
   DriverStr(
       RepeatRRIbS(
           &Riscv64Assembler::Bne, /*imm_bits=*/-12, /*shift=*/1, "bne {reg1}, {reg2}, {imm}\n"),
@@ -8756,9 +8750,7 @@ TEST_F(AssemblerRISCV64Test, BcondBackward5KiB_WithoutC) {
   TestBcondBackward("BcondBackward5KiB_WithoutC", 5 * KB, "1", GetPrintBcondOppositeAndJ("2"));
 }
 
-// Disabled: We do not implement `kLongCondCBranch` (c.b<cond>z + tail),
-// so there is a mismatch with clang output.
-TEST_F(AssemblerRISCV64Test, DISABLED_BcondForward2MiB) {
+TEST_F(AssemblerRISCV64Test, BcondForward2MiB) {
   TestBcondForward("BcondForward2MiB", 2 * MB, "1", GetPrintBcondOppositeAndTail("2", "3"));
 }
 
@@ -8768,9 +8760,7 @@ TEST_F(AssemblerRISCV64Test, BcondForward2MiB_WithoutC) {
       "BcondForward2MiB_WithoutC", 2 * MB, "1", GetPrintBcondOppositeAndTail("2", "3"));
 }
 
-// Disabled: We do not implement `kLongCondCBranch` (c.b<cond>z + tail),
-// so there is a mismatch with clang output.
-TEST_F(AssemblerRISCV64Test, DISABLED_BcondBackward2MiB) {
+TEST_F(AssemblerRISCV64Test, BcondBackward2MiB) {
   TestBcondBackward("BcondBackward2MiB", 2 * MB, "1", GetPrintBcondOppositeAndTail("2", "3"));
 }
 
@@ -9208,9 +9198,7 @@ TEST_F(AssemblerRISCV64Test, BeqA0A1MaxOffset21Backward_WithoutC) {
                       "1");
 }
 
-// Disabled: We do not implement `kLongCondCBranch` (c.b<cond>z + tail),
-// so there is a mismatch with clang output.
-TEST_F(AssemblerRISCV64Test, DISABLED_BeqA0ZeroOverMaxOffset21Forward) {
+TEST_F(AssemblerRISCV64Test, BeqA0ZeroOverMaxOffset21Forward) {
   TestBeqzA0Forward("BeqA0ZeroOverMaxOffset21Forward",
                     MaxOffset21ForwardDistance() - /*J*/ 4u + /*Exceed max*/ 2u,
                     GetPrintBcondOppositeAndTail("2", "3"),
@@ -9225,9 +9213,7 @@ TEST_F(AssemblerRISCV64Test, BeqA0ZeroOverMaxOffset21Forward_WithoutC) {
                     "1");
 }
 
-// Disabled: We do not implement `kLongCondCBranch` (c.b<cond>z + tail),
-// so there is a mismatch with clang output.
-TEST_F(AssemblerRISCV64Test, DISABLED_BneA0ZeroOverMaxOffset21Forward) {
+TEST_F(AssemblerRISCV64Test, BneA0ZeroOverMaxOffset21Forward) {
   TestBnezA0Forward("BneA0ZeroOverMaxOffset21Forward",
                     MaxOffset21ForwardDistance() - /*J*/ 4u + /*Exceed max*/ 2u,
                     GetPrintBcondOppositeAndTail("2", "3"),
@@ -9257,9 +9243,7 @@ TEST_F(AssemblerRISCV64Test, BeqA0A1OverMaxOffset21Forward_WithoutC) {
                      "1");
 }
 
-// Disabled: We do not implement `kLongCondCBranch` (c.b<cond>z + tail),
-// so there is a mismatch with clang output.
-TEST_F(AssemblerRISCV64Test, DISABLED_BeqA0ZeroOverMaxOffset21Backward) {
+TEST_F(AssemblerRISCV64Test, BeqA0ZeroOverMaxOffset21Backward) {
   TestBeqzA0Backward("BeqA0ZeroOverMaxOffset21Backward",
                      MaxOffset21BackwardDistance() - /*C.BNEZ*/ 2u + /*Exceed max*/ 2u,
                      GetPrintBcondOppositeAndTail("2", "3"),
@@ -9274,9 +9258,7 @@ TEST_F(AssemblerRISCV64Test, BeqA0ZeroOverMaxOffset21Backward_WithoutC) {
                      "1");
 }
 
-// Disabled: We do not implement `kLongCondCBranch` (c.b<cond>z + tail),
-// so there is a mismatch with clang output.
-TEST_F(AssemblerRISCV64Test, DISABLED_BneA0ZeroOverMaxOffset21Backward) {
+TEST_F(AssemblerRISCV64Test, BneA0ZeroOverMaxOffset21Backward) {
   TestBnezA0Backward("BneA0ZeroOverMaxOffset21Backward",
                      MaxOffset21BackwardDistance() - /*C.BEQZ*/ 2u + /*Exceed max*/ 2u,
                      GetPrintBcondOppositeAndTail("2", "3"),
