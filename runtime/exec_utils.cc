@@ -17,15 +17,9 @@
 #include "exec_utils.h"
 
 #include <poll.h>
-#include <signal.h>
-#include <sys/prctl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
-#ifdef __BIONIC__
-#include <sys/pidfd.h>
-#endif
 
 #include <chrono>
 #include <climits>
@@ -47,6 +41,7 @@
 #include "android-base/strings.h"
 #include "android-base/unique_fd.h"
 #include "base/macros.h"
+#include "base/pidfd.h"
 #include "base/utils.h"
 #include "runtime.h"
 
@@ -67,11 +62,9 @@ std::string ToCommandLine(const std::vector<std::string>& args) {
 // If there is a runtime (Runtime::Current != nullptr) then the subprocess is created with the
 // same environment that existed when the runtime was started.
 // Returns the process id of the child process on success, -1 otherwise.
-// The child is killed as soon as the caller thread dies, the caller thread needs to stay around and
-// wait for the child. Therefore, this function is most suitable to be used by
-// `ExecAndReturnResult`, which does the wait. It's not suitable to be used for fire-and-forget
-// exec's.
-pid_t ExecWithoutWait(const std::vector<std::string>& arg_vector, std::string* error_msg) {
+pid_t ExecWithoutWait(const std::vector<std::string>& arg_vector,
+                      bool new_process_group,
+                      std::string* error_msg) {
   // Convert the args to char pointers.
   const char* program = arg_vector[0].c_str();
   std::vector<char*> args;
@@ -86,13 +79,8 @@ pid_t ExecWithoutWait(const std::vector<std::string>& arg_vector, std::string* e
   if (pid == 0) {
     // no allocation allowed between fork and exec
 
-    // change process groups, so we don't get reaped by ProcessManager
-    setpgid(0, 0);
-
-    // Kill the child process when the parent process dies.
-    if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) {
-      // This should never happen.
-      PLOG(FATAL) << "Failed to call prctl";
+    if (new_process_group) {
+      setpgid(0, 0);
     }
 
     // (b/30160149): protect subprocesses from modifications to LD_LIBRARY_PATH, etc.
@@ -265,12 +253,18 @@ int ExecUtils::ExecAndReturnCode(const std::vector<std::string>& arg_vector,
 ExecResult ExecUtils::ExecAndReturnResult(const std::vector<std::string>& arg_vector,
                                           int timeout_sec,
                                           std::string* error_msg) const {
-  return ExecAndReturnResult(arg_vector, timeout_sec, ExecCallbacks(), /*stat=*/nullptr, error_msg);
+  return ExecAndReturnResult(arg_vector,
+                             timeout_sec,
+                             ExecCallbacks(),
+                             /*new_process_group=*/false,
+                             /*stat=*/nullptr,
+                             error_msg);
 }
 
 ExecResult ExecUtils::ExecAndReturnResult(const std::vector<std::string>& arg_vector,
                                           int timeout_sec,
                                           const ExecCallbacks& callbacks,
+                                          bool new_process_group,
                                           /*out*/ ProcessStat* stat,
                                           /*out*/ std::string* error_msg) const {
   if (timeout_sec > INT_MAX / 1000) {
@@ -279,7 +273,7 @@ ExecResult ExecUtils::ExecAndReturnResult(const std::vector<std::string>& arg_ve
   }
 
   // Start subprocess.
-  pid_t pid = ExecWithoutWait(arg_vector, error_msg);
+  pid_t pid = ExecWithoutWait(arg_vector, new_process_group, error_msg);
   if (pid == -1) {
     return {.status = ExecResult::kStartFailed};
   }
@@ -336,17 +330,7 @@ bool ExecUtils::Exec(const std::vector<std::string>& arg_vector, std::string* er
   return true;
 }
 
-unique_fd ExecUtils::PidfdOpen(pid_t pid) const {
-#ifdef __BIONIC__
-  return unique_fd(pidfd_open(pid, /*flags=*/0));
-#else
-  // There is no glibc wrapper for pidfd_open.
-#ifndef SYS_pidfd_open
-  constexpr int SYS_pidfd_open = 434;
-#endif
-  return unique_fd(syscall(SYS_pidfd_open, pid, /*flags=*/0));
-#endif
-}
+unique_fd ExecUtils::PidfdOpen(pid_t pid) const { return art::PidfdOpen(pid, /*flags=*/0); }
 
 std::string ExecUtils::GetProcStat(pid_t pid) const {
   std::string stat_content;

@@ -93,9 +93,6 @@ art_debug_binaries_both = [
 // Debug binaries for which the "first" version is preferred.
 art_debug_binaries_first = [
     "dexanalyze",
-    "dexdiag",
-    "dexlayout",
-    "dexlayoutd",
     "dexoptanalyzerd",
     "oatdumpd",
     "profmand",
@@ -302,6 +299,23 @@ apex_test {
     installable: false,
 }
 
+// Same as "com.android.art" APEX, but also contains "imgdiag" binary.
+// Used to collect dirty-image-objects.
+apex_test {
+    name: "test_imgdiag_com.android.art",
+    defaults: ["com.android.art-defaults"],
+    multilib: {
+        both: {
+            binaries: ["imgdiag"],
+        },
+    },
+    key: "com.android.art.key",
+    manifest: "test_apex_manifest.json",
+    file_contexts: ":com.android.art-file_contexts",
+    certificate: ":com.android.art.certificate",
+    installable: false,
+}
+
 // Release version of the ART APEX module (not containing debug
 // variants nor tools), included in user builds. Also used for
 // storage-constrained devices in userdebug and eng builds.
@@ -331,9 +345,7 @@ art_gtests = [
     "art_compiler_tests",
     "art_dex2oat_tests",
     "art_dexanalyze_tests",
-    "art_dexdiag_tests",
     "art_dexdump_tests",
-    "art_dexlayout_tests",
     "art_dexlist_tests",
     "art_disassembler_tests",
     "art_dexoptanalyzer_tests",
