@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2019 The Android Open Source Project
+ * Copyright (C) 2024 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,15 +14,10 @@
  * limitations under the License.
  */
 
-#if ASM_DEFINE_INCLUDE_DEPENDENCIES
-#include "dex/standard_dex_file.h"
-#endif
-
-ASM_DEFINE(CODE_ITEM_REGISTERS_SIZE_OFFSET,
-           art::StandardDexFile::CodeItem::RegistersSizeOffset())
-ASM_DEFINE(CODE_ITEM_INS_SIZE_OFFSET,
-           art::StandardDexFile::CodeItem::InsSizeOffset())
-ASM_DEFINE(CODE_ITEM_OUTS_SIZE_OFFSET,
-           art::StandardDexFile::CodeItem::OutsSizeOffset())
-ASM_DEFINE(CODE_ITEM_INSNS_OFFSET,
-           art::StandardDexFile::CodeItem::InsnsOffset())
+// This definition is used for compiling but the class used at runtime is in src2/.
+public abstract class ProtectedAbstract {
+    protected /*abstract*/ void foo() {
+        // No body in src2/.
+        throw new Error("Unreachable");
+    }
+}
