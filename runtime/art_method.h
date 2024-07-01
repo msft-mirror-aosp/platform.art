@@ -779,7 +779,11 @@ class EXPORT ArtMethod final {
   }
   ALWAYS_INLINE void SetEntryPointFromQuickCompiledCodePtrSize(
       const void* entry_point_from_quick_compiled_code, PointerSize pointer_size)
-      REQUIRES_SHARED(Locks::mutator_lock_);
+      REQUIRES_SHARED(Locks::mutator_lock_) {
+    SetNativePointer(EntryPointFromQuickCompiledCodeOffset(pointer_size),
+                     entry_point_from_quick_compiled_code,
+                     pointer_size);
+  }
 
   static constexpr MemberOffset DataOffset(PointerSize pointer_size) {
     return MemberOffset(PtrSizedFieldsOffset(pointer_size) + OFFSETOF_MEMBER(
@@ -1011,7 +1015,6 @@ class EXPORT ArtMethod final {
   ALWAYS_INLINE void UpdateCounter(int32_t new_samples);
   ALWAYS_INLINE void SetHotCounter();
   ALWAYS_INLINE bool CounterIsHot();
-  ALWAYS_INLINE bool CounterHasReached(uint16_t samples, uint16_t threshold);
   ALWAYS_INLINE uint16_t GetCounter();
   ALWAYS_INLINE bool CounterHasChanged(uint16_t threshold);
 
@@ -1047,11 +1050,6 @@ class EXPORT ArtMethod final {
       REQUIRES_SHARED(Locks::mutator_lock_);
   // Returns the JNI native function name for the overloaded method 'm'.
   std::string JniLongName()
-      REQUIRES_SHARED(Locks::mutator_lock_);
-
-  // Update entry points by passing them through the visitor.
-  template <typename Visitor>
-  ALWAYS_INLINE void UpdateEntrypoints(const Visitor& visitor, PointerSize pointer_size)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Visit the individual members of an ArtMethod.  Used by imgdiag.
@@ -1209,8 +1207,6 @@ class EXPORT ArtMethod final {
 
   // Used by GetName and GetNameView to share common code.
   const char* GetRuntimeMethodName() REQUIRES_SHARED(Locks::mutator_lock_);
-
-  friend class RuntimeImageHelper;  // For SetNativePointer.
 
   DISALLOW_COPY_AND_ASSIGN(ArtMethod);  // Need to use CopyFrom to deal with 32 vs 64 bits.
 };

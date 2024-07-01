@@ -664,22 +664,6 @@ void ArtMethod::VisitArrayRoots(RootVisitorType& visitor,
   }
 }
 
-template <typename Visitor>
-inline void ArtMethod::UpdateEntrypoints(const Visitor& visitor, PointerSize pointer_size) {
-  if (IsNative()) {
-    const void* old_native_code = GetEntryPointFromJniPtrSize(pointer_size);
-    const void* new_native_code = visitor(old_native_code);
-    if (old_native_code != new_native_code) {
-      SetEntryPointFromJniPtrSize(new_native_code, pointer_size);
-    }
-  }
-  const void* old_code = GetEntryPointFromQuickCompiledCodePtrSize(pointer_size);
-  const void* new_code = visitor(old_code);
-  if (old_code != new_code) {
-    SetEntryPointFromQuickCompiledCodePtrSize(new_code, pointer_size);
-  }
-}
-
 template <ReadBarrierOption kReadBarrierOption>
 inline bool ArtMethod::StillNeedsClinitCheck() {
   if (!NeedsClinitCheckBeforeCall()) {
@@ -775,13 +759,6 @@ inline void ArtMethod::UpdateCounter(int32_t new_samples) {
 inline bool ArtMethod::CounterIsHot() {
   DCHECK(!IsAbstract());
   return hotness_count_ == 0;
-}
-
-inline bool ArtMethod::CounterHasReached(uint16_t samples, uint16_t threshold) {
-  DCHECK(!IsAbstract());
-  DCHECK_EQ(threshold, Runtime::Current()->GetJITOptions()->GetWarmupThreshold());
-  DCHECK_LE(samples, threshold);
-  return hotness_count_ <= (threshold - samples);
 }
 
 inline uint16_t ArtMethod::GetCounter() {
