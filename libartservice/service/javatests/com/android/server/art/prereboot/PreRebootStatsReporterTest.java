@@ -18,6 +18,7 @@ package com.android.server.art.prereboot;
 
 import static com.android.server.art.model.DexoptStatus.DexContainerFileDexoptStatus;
 import static com.android.server.art.proto.PreRebootStats.JobRun;
+import static com.android.server.art.proto.PreRebootStats.JobType;
 import static com.android.server.art.proto.PreRebootStats.Status;
 
 import static com.google.common.truth.Truth.assertThat;
@@ -76,9 +77,10 @@ public class PreRebootStatsReporterTest {
         var reporter = new PreRebootStatsReporter(mInjector);
 
         doReturn(50l).when(mInjector).getCurrentTimeMillis();
-        reporter.recordJobScheduled();
+        reporter.recordJobScheduled(true /* isAsync */, false /* isOtaUpdate */);
         checkProto(PreRebootStats.newBuilder()
                            .setStatus(Status.STATUS_SCHEDULED)
+                           .setJobType(JobType.JOB_TYPE_MAINLINE)
                            .setJobScheduledTimestampMillis(50)
                            .build());
 
@@ -87,12 +89,14 @@ public class PreRebootStatsReporterTest {
             reporter.recordJobStarted();
             checkProto(PreRebootStats.newBuilder()
                                .setStatus(Status.STATUS_STARTED)
+                               .setJobType(JobType.JOB_TYPE_MAINLINE)
                                .setJobScheduledTimestampMillis(50)
                                .addJobRuns(JobRun.newBuilder().setJobStartedTimestampMillis(200))
                                .setSkippedPackageCount(0)
                                .setOptimizedPackageCount(0)
                                .setFailedPackageCount(0)
                                .setTotalPackageCount(0)
+                               .setPackagesWithArtifactsBeforeRebootCount(0)
                                .build());
 
             var reporterInChroot = new PreRebootStatsReporter(mInjector);
@@ -100,21 +104,24 @@ public class PreRebootStatsReporterTest {
 
             progressSession.recordProgress(1 /* skippedPackageCount */,
                     2 /* optimizedPackageCount */, 3 /* failedPackageCount */,
-                    10 /* totalPackageCount */);
+                    10 /* totalPackageCount */, 4 /* packagesWithArtifactsBeforeRebootCount */);
             checkProto(PreRebootStats.newBuilder()
                                .setStatus(Status.STATUS_STARTED)
+                               .setJobType(JobType.JOB_TYPE_MAINLINE)
                                .setJobScheduledTimestampMillis(50)
                                .addJobRuns(JobRun.newBuilder().setJobStartedTimestampMillis(200))
                                .setSkippedPackageCount(1)
                                .setOptimizedPackageCount(2)
                                .setFailedPackageCount(3)
                                .setTotalPackageCount(10)
+                               .setPackagesWithArtifactsBeforeRebootCount(4)
                                .build());
 
             doReturn(300l).when(mInjector).getCurrentTimeMillis();
-            reporter.recordJobEnded(true /* success */);
+            reporter.recordJobEnded(true /* success */, false /* systemRequirementCheckFailed */);
             checkProto(PreRebootStats.newBuilder()
                                .setStatus(Status.STATUS_CANCELLED)
+                               .setJobType(JobType.JOB_TYPE_MAINLINE)
                                .setJobScheduledTimestampMillis(50)
                                .addJobRuns(JobRun.newBuilder()
                                                    .setJobStartedTimestampMillis(200)
@@ -123,6 +130,7 @@ public class PreRebootStatsReporterTest {
                                .setOptimizedPackageCount(2)
                                .setFailedPackageCount(3)
                                .setTotalPackageCount(10)
+                               .setPackagesWithArtifactsBeforeRebootCount(4)
                                .build());
         }
 
@@ -131,6 +139,7 @@ public class PreRebootStatsReporterTest {
             reporter.recordJobStarted();
             checkProto(PreRebootStats.newBuilder()
                                .setStatus(Status.STATUS_STARTED)
+                               .setJobType(JobType.JOB_TYPE_MAINLINE)
                                .setJobScheduledTimestampMillis(50)
                                .addJobRuns(JobRun.newBuilder()
                                                    .setJobStartedTimestampMillis(200)
@@ -140,6 +149,7 @@ public class PreRebootStatsReporterTest {
                                .setOptimizedPackageCount(0)
                                .setFailedPackageCount(0)
                                .setTotalPackageCount(0)
+                               .setPackagesWithArtifactsBeforeRebootCount(0)
                                .build());
 
             var reporterInChroot = new PreRebootStatsReporter(mInjector);
@@ -147,9 +157,10 @@ public class PreRebootStatsReporterTest {
 
             progressSession.recordProgress(1 /* skippedPackageCount */,
                     6 /* optimizedPackageCount */, 3 /* failedPackageCount */,
-                    10 /* totalPackageCount */);
+                    10 /* totalPackageCount */, 8 /* packagesWithArtifactsBeforeRebootCount */);
             checkProto(PreRebootStats.newBuilder()
                                .setStatus(Status.STATUS_STARTED)
+                               .setJobType(JobType.JOB_TYPE_MAINLINE)
                                .setJobScheduledTimestampMillis(50)
                                .addJobRuns(JobRun.newBuilder()
                                                    .setJobStartedTimestampMillis(200)
@@ -159,12 +170,14 @@ public class PreRebootStatsReporterTest {
                                .setOptimizedPackageCount(6)
                                .setFailedPackageCount(3)
                                .setTotalPackageCount(10)
+                               .setPackagesWithArtifactsBeforeRebootCount(8)
                                .build());
 
             doReturn(600l).when(mInjector).getCurrentTimeMillis();
-            reporter.recordJobEnded(true /* success */);
+            reporter.recordJobEnded(true /* success */, false /* systemRequirementCheckFailed */);
             checkProto(PreRebootStats.newBuilder()
                                .setStatus(Status.STATUS_FINISHED)
+                               .setJobType(JobType.JOB_TYPE_MAINLINE)
                                .setJobScheduledTimestampMillis(50)
                                .addJobRuns(JobRun.newBuilder()
                                                    .setJobStartedTimestampMillis(200)
@@ -176,6 +189,7 @@ public class PreRebootStatsReporterTest {
                                .setOptimizedPackageCount(6)
                                .setFailedPackageCount(3)
                                .setTotalPackageCount(10)
+                               .setPackagesWithArtifactsBeforeRebootCount(8)
                                .build());
         }
 
@@ -229,18 +243,19 @@ public class PreRebootStatsReporterTest {
                 1 /* skippedPackageCount */, 10 /* totalPackageCount */,
                 300 /* jobDurationMillis */, 150 /* jobLatencyMillis */,
                 3 /* packagesWithArtifactsAfterRebootCount */,
-                2 /* packagesWithArtifactsUsableAfterRebootCount */, 2 /* jobRunCount */);
+                2 /* packagesWithArtifactsUsableAfterRebootCount */, 2 /* jobRunCount */,
+                8 /* packagesWithArtifactsBeforeRebootCount */,
+                ArtStatsLog.PRE_REBOOT_DEXOPT_JOB_ENDED__JOB_TYPE__JOB_TYPE_MAINLINE);
     }
 
     @Test
-    public void testFailure() throws Exception {
+    public void testSuccessSync() throws Exception {
         var reporter = new PreRebootStatsReporter(mInjector);
 
-        doReturn(50l).when(mInjector).getCurrentTimeMillis();
-        reporter.recordJobScheduled();
+        reporter.recordJobScheduled(false /* isAsync */, true /* isOtaUpdate */);
         checkProto(PreRebootStats.newBuilder()
                            .setStatus(Status.STATUS_SCHEDULED)
-                           .setJobScheduledTimestampMillis(50)
+                           .setJobType(JobType.JOB_TYPE_OTA)
                            .build());
 
         {
@@ -248,26 +263,45 @@ public class PreRebootStatsReporterTest {
             reporter.recordJobStarted();
             checkProto(PreRebootStats.newBuilder()
                                .setStatus(Status.STATUS_STARTED)
-                               .setJobScheduledTimestampMillis(50)
+                               .setJobType(JobType.JOB_TYPE_OTA)
                                .addJobRuns(JobRun.newBuilder().setJobStartedTimestampMillis(200))
                                .setSkippedPackageCount(0)
                                .setOptimizedPackageCount(0)
                                .setFailedPackageCount(0)
                                .setTotalPackageCount(0)
+                               .setPackagesWithArtifactsBeforeRebootCount(0)
+                               .build());
+
+            var reporterInChroot = new PreRebootStatsReporter(mInjector);
+            var progressSession = reporterInChroot.new ProgressSession();
+
+            progressSession.recordProgress(1 /* skippedPackageCount */,
+                    6 /* optimizedPackageCount */, 3 /* failedPackageCount */,
+                    10 /* totalPackageCount */, 8 /* packagesWithArtifactsBeforeRebootCount */);
+            checkProto(PreRebootStats.newBuilder()
+                               .setStatus(Status.STATUS_STARTED)
+                               .setJobType(JobType.JOB_TYPE_OTA)
+                               .addJobRuns(JobRun.newBuilder().setJobStartedTimestampMillis(200))
+                               .setSkippedPackageCount(1)
+                               .setOptimizedPackageCount(6)
+                               .setFailedPackageCount(3)
+                               .setTotalPackageCount(10)
+                               .setPackagesWithArtifactsBeforeRebootCount(8)
                                .build());
 
             doReturn(300l).when(mInjector).getCurrentTimeMillis();
-            reporter.recordJobEnded(false /* success */);
+            reporter.recordJobEnded(true /* success */, false /* systemRequirementCheckFailed */);
             checkProto(PreRebootStats.newBuilder()
-                               .setStatus(Status.STATUS_FAILED)
-                               .setJobScheduledTimestampMillis(50)
+                               .setStatus(Status.STATUS_FINISHED)
+                               .setJobType(JobType.JOB_TYPE_OTA)
                                .addJobRuns(JobRun.newBuilder()
                                                    .setJobStartedTimestampMillis(200)
                                                    .setJobEndedTimestampMillis(300))
-                               .setSkippedPackageCount(0)
-                               .setOptimizedPackageCount(0)
-                               .setFailedPackageCount(0)
-                               .setTotalPackageCount(0)
+                               .setSkippedPackageCount(1)
+                               .setOptimizedPackageCount(6)
+                               .setFailedPackageCount(3)
+                               .setTotalPackageCount(10)
+                               .setPackagesWithArtifactsBeforeRebootCount(8)
                                .build());
         }
 
@@ -279,21 +313,24 @@ public class PreRebootStatsReporterTest {
         }
 
         verify(mInjector).writeStats(ArtStatsLog.PREREBOOT_DEXOPT_JOB_ENDED,
-                ArtStatsLog.PRE_REBOOT_DEXOPT_JOB_ENDED__STATUS__STATUS_FAILED,
-                0 /* optimizedPackageCount */, 0 /* failedPackageCount */,
-                0 /* skippedPackageCount */, 0 /* totalPackageCount */, 100 /* jobDurationMillis */,
-                150 /* jobLatencyMillis */, 0 /* packagesWithArtifactsAfterRebootCount */,
-                0 /* packagesWithArtifactsUsableAfterRebootCount */, 1 /* jobRunCount */);
+                ArtStatsLog.PRE_REBOOT_DEXOPT_JOB_ENDED__STATUS__STATUS_FINISHED,
+                6 /* optimizedPackageCount */, 3 /* failedPackageCount */,
+                1 /* skippedPackageCount */, 10 /* totalPackageCount */,
+                100 /* jobDurationMillis */, -1 /* jobLatencyMillis */,
+                0 /* packagesWithArtifactsAfterRebootCount */,
+                0 /* packagesWithArtifactsUsableAfterRebootCount */, 1 /* jobRunCount */,
+                8 /* packagesWithArtifactsBeforeRebootCount */,
+                ArtStatsLog.PRE_REBOOT_DEXOPT_JOB_ENDED__JOB_TYPE__JOB_TYPE_OTA);
     }
 
-    @Test
-    public void testStarted() throws Exception {
+    private void checkFailure(boolean systemRequirementCheckFailed) throws Exception {
         var reporter = new PreRebootStatsReporter(mInjector);
 
         doReturn(50l).when(mInjector).getCurrentTimeMillis();
-        reporter.recordJobScheduled();
+        reporter.recordJobScheduled(true /* isAsync */, false /* isOtaUpdate */);
         checkProto(PreRebootStats.newBuilder()
                            .setStatus(Status.STATUS_SCHEDULED)
+                           .setJobType(JobType.JOB_TYPE_MAINLINE)
                            .setJobScheduledTimestampMillis(50)
                            .build());
 
@@ -302,12 +339,90 @@ public class PreRebootStatsReporterTest {
             reporter.recordJobStarted();
             checkProto(PreRebootStats.newBuilder()
                                .setStatus(Status.STATUS_STARTED)
+                               .setJobType(JobType.JOB_TYPE_MAINLINE)
                                .setJobScheduledTimestampMillis(50)
                                .addJobRuns(JobRun.newBuilder().setJobStartedTimestampMillis(200))
                                .setSkippedPackageCount(0)
                                .setOptimizedPackageCount(0)
                                .setFailedPackageCount(0)
                                .setTotalPackageCount(0)
+                               .setPackagesWithArtifactsBeforeRebootCount(0)
+                               .build());
+
+            doReturn(300l).when(mInjector).getCurrentTimeMillis();
+            reporter.recordJobEnded(false /* success */, systemRequirementCheckFailed);
+            checkProto(PreRebootStats.newBuilder()
+                               .setStatus(systemRequirementCheckFailed
+                                               ? Status.STATUS_ABORTED_SYSTEM_REQUIREMENTS
+                                               : Status.STATUS_FAILED)
+                               .setJobType(JobType.JOB_TYPE_MAINLINE)
+                               .setJobScheduledTimestampMillis(50)
+                               .addJobRuns(JobRun.newBuilder()
+                                                   .setJobStartedTimestampMillis(200)
+                                                   .setJobEndedTimestampMillis(300))
+                               .setSkippedPackageCount(0)
+                               .setOptimizedPackageCount(0)
+                               .setFailedPackageCount(0)
+                               .setTotalPackageCount(0)
+                               .setPackagesWithArtifactsBeforeRebootCount(0)
+                               .build());
+        }
+
+        {
+            var reporterAfterReboot = new PreRebootStatsReporter(mInjector);
+            var afterRebootSession = reporterAfterReboot.new AfterRebootSession();
+
+            afterRebootSession.report();
+        }
+
+        verify(mInjector).writeStats(ArtStatsLog.PREREBOOT_DEXOPT_JOB_ENDED,
+                systemRequirementCheckFailed
+                        ? ArtStatsLog
+                                  .PRE_REBOOT_DEXOPT_JOB_ENDED__STATUS__STATUS_ABORTED_SYSTEM_REQUIREMENTS
+                        : ArtStatsLog.PRE_REBOOT_DEXOPT_JOB_ENDED__STATUS__STATUS_FAILED,
+                0 /* optimizedPackageCount */, 0 /* failedPackageCount */,
+                0 /* skippedPackageCount */, 0 /* totalPackageCount */, 100 /* jobDurationMillis */,
+                150 /* jobLatencyMillis */, 0 /* packagesWithArtifactsAfterRebootCount */,
+                0 /* packagesWithArtifactsUsableAfterRebootCount */, 1 /* jobRunCount */,
+                0 /* packagesWithArtifactsBeforeRebootCount */,
+                ArtStatsLog.PRE_REBOOT_DEXOPT_JOB_ENDED__JOB_TYPE__JOB_TYPE_MAINLINE);
+    }
+
+    @Test
+    public void testUnexpectedFailure() throws Exception {
+        checkFailure(false /* systemRequirementCheckFailed */);
+    }
+
+    @Test
+    public void testSystemRequirementCheckFailure() throws Exception {
+        checkFailure(true /* systemRequirementCheckFailed */);
+    }
+
+    @Test
+    public void testStarted() throws Exception {
+        var reporter = new PreRebootStatsReporter(mInjector);
+
+        doReturn(50l).when(mInjector).getCurrentTimeMillis();
+        reporter.recordJobScheduled(true /* isAsync */, false /* isOtaUpdate */);
+        checkProto(PreRebootStats.newBuilder()
+                           .setStatus(Status.STATUS_SCHEDULED)
+                           .setJobType(JobType.JOB_TYPE_MAINLINE)
+                           .setJobScheduledTimestampMillis(50)
+                           .build());
+
+        {
+            doReturn(200l).when(mInjector).getCurrentTimeMillis();
+            reporter.recordJobStarted();
+            checkProto(PreRebootStats.newBuilder()
+                               .setStatus(Status.STATUS_STARTED)
+                               .setJobType(JobType.JOB_TYPE_MAINLINE)
+                               .setJobScheduledTimestampMillis(50)
+                               .addJobRuns(JobRun.newBuilder().setJobStartedTimestampMillis(200))
+                               .setSkippedPackageCount(0)
+                               .setOptimizedPackageCount(0)
+                               .setFailedPackageCount(0)
+                               .setTotalPackageCount(0)
+                               .setPackagesWithArtifactsBeforeRebootCount(0)
                                .build());
 
             var reporterInChroot = new PreRebootStatsReporter(mInjector);
@@ -315,15 +430,17 @@ public class PreRebootStatsReporterTest {
 
             progressSession.recordProgress(1 /* skippedPackageCount */,
                     2 /* optimizedPackageCount */, 3 /* failedPackageCount */,
-                    10 /* totalPackageCount */);
+                    10 /* totalPackageCount */, 4 /* packagesWithArtifactsBeforeRebootCount */);
             checkProto(PreRebootStats.newBuilder()
                                .setStatus(Status.STATUS_STARTED)
+                               .setJobType(JobType.JOB_TYPE_MAINLINE)
                                .setJobScheduledTimestampMillis(50)
                                .addJobRuns(JobRun.newBuilder().setJobStartedTimestampMillis(200))
                                .setSkippedPackageCount(1)
                                .setOptimizedPackageCount(2)
                                .setFailedPackageCount(3)
                                .setTotalPackageCount(10)
+                               .setPackagesWithArtifactsBeforeRebootCount(4)
                                .build());
         }
 
@@ -339,7 +456,9 @@ public class PreRebootStatsReporterTest {
                 2 /* optimizedPackageCount */, 3 /* failedPackageCount */,
                 1 /* skippedPackageCount */, 10 /* totalPackageCount */, -1 /* jobDurationMillis */,
                 150 /* jobLatencyMillis */, 0 /* packagesWithArtifactsAfterRebootCount */,
-                0 /* packagesWithArtifactsUsableAfterRebootCount */, 1 /* jobRunCount */);
+                0 /* packagesWithArtifactsUsableAfterRebootCount */, 1 /* jobRunCount */,
+                4 /* packagesWithArtifactsBeforeRebootCount */,
+                ArtStatsLog.PRE_REBOOT_DEXOPT_JOB_ENDED__JOB_TYPE__JOB_TYPE_MAINLINE);
     }
 
     @Test
@@ -347,9 +466,10 @@ public class PreRebootStatsReporterTest {
         var reporter = new PreRebootStatsReporter(mInjector);
 
         doReturn(50l).when(mInjector).getCurrentTimeMillis();
-        reporter.recordJobScheduled();
+        reporter.recordJobScheduled(true /* isAsync */, false /* isOtaUpdate */);
         checkProto(PreRebootStats.newBuilder()
                            .setStatus(Status.STATUS_SCHEDULED)
+                           .setJobType(JobType.JOB_TYPE_MAINLINE)
                            .setJobScheduledTimestampMillis(50)
                            .build());
 
@@ -365,7 +485,37 @@ public class PreRebootStatsReporterTest {
                 0 /* optimizedPackageCount */, 0 /* failedPackageCount */,
                 0 /* skippedPackageCount */, 0 /* totalPackageCount */, -1 /* jobDurationMillis */,
                 -1 /* jobLatencyMillis */, 0 /* packagesWithArtifactsAfterRebootCount */,
-                0 /* packagesWithArtifactsUsableAfterRebootCount */, 0 /* jobRunCount */);
+                0 /* packagesWithArtifactsUsableAfterRebootCount */, 0 /* jobRunCount */,
+                0 /* packagesWithArtifactsBeforeRebootCount */,
+                ArtStatsLog.PRE_REBOOT_DEXOPT_JOB_ENDED__JOB_TYPE__JOB_TYPE_MAINLINE);
+    }
+
+    @Test
+    public void testNotScheduled() throws Exception {
+        var reporter = new PreRebootStatsReporter(mInjector);
+
+        reporter.recordJobNotScheduled(
+                Status.STATUS_NOT_SCHEDULED_DISABLED, false /* isOtaUpdate */);
+        checkProto(PreRebootStats.newBuilder()
+                           .setStatus(Status.STATUS_NOT_SCHEDULED_DISABLED)
+                           .setJobType(JobType.JOB_TYPE_MAINLINE)
+                           .build());
+
+        {
+            var reporterAfterReboot = new PreRebootStatsReporter(mInjector);
+            var afterRebootSession = reporterAfterReboot.new AfterRebootSession();
+
+            afterRebootSession.report();
+        }
+
+        verify(mInjector).writeStats(ArtStatsLog.PREREBOOT_DEXOPT_JOB_ENDED,
+                ArtStatsLog.PRE_REBOOT_DEXOPT_JOB_ENDED__STATUS__STATUS_NOT_SCHEDULED_DISABLED,
+                0 /* optimizedPackageCount */, 0 /* failedPackageCount */,
+                0 /* skippedPackageCount */, 0 /* totalPackageCount */, -1 /* jobDurationMillis */,
+                -1 /* jobLatencyMillis */, 0 /* packagesWithArtifactsAfterRebootCount */,
+                0 /* packagesWithArtifactsUsableAfterRebootCount */, 0 /* jobRunCount */,
+                0 /* packagesWithArtifactsBeforeRebootCount */,
+                ArtStatsLog.PRE_REBOOT_DEXOPT_JOB_ENDED__JOB_TYPE__JOB_TYPE_MAINLINE);
     }
 
     private void checkProto(PreRebootStats expected) throws Exception {

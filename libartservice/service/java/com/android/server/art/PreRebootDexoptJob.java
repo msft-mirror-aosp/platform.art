@@ -17,6 +17,7 @@
 package com.android.server.art;
 
 import static com.android.server.art.model.ArtFlags.ScheduleStatus;
+import static com.android.server.art.proto.PreRebootStats.Status;
 
 import android.annotation.NonNull;
 import android.annotation.Nullable;
@@ -77,6 +78,9 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
     /** The slot that contains the OTA update, "_a" or "_b", or null for a Mainline update. */
     @GuardedBy("this") @Nullable private String mOtaSlot = null;
 
+    /** Whether to map/unmap snapshots. Only applicable to an OTA update. */
+    @GuardedBy("this") private boolean mMapSnapshotsForOta = false;
+
     // Mutations to the global state of Pre-reboot Dexopt, including mounts, staged files, and
     // stats, should only be done when there is no job running and the `this` lock is held, or by
     // the job itself.
@@ -102,18 +106,18 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
         }
 
         mIsRunningJobKnownByJobScheduler = true;
+        @SuppressWarnings("GuardedBy") // https://errorprone.info/bugpattern/GuardedBy#limitations
+        Runnable onJobFinishedLocked = () -> {
+            Utils.check(mIsRunningJobKnownByJobScheduler);
+            mIsRunningJobKnownByJobScheduler = false;
+            // If it failed, it means something went wrong, so we don't reschedule the job because
+            // it will likely fail again. If it's cancelled, the job will be rescheduled because the
+            // return value of `onStopJob` will be respected, and this call will be ignored.
+            jobService.jobFinished(params, false /* wantsReschedule */);
+        };
         // No need to handle exceptions thrown by the future because exceptions are handled inside
         // the future itself.
-        startLocked(() -> {
-            if (mIsRunningJobKnownByJobScheduler) {
-                mIsRunningJobKnownByJobScheduler = false;
-                // If it failed, it means something went wrong, so we don't reschedule the job
-                // because it will likely fail again. If it's cancelled, the job will be rescheduled
-                // because the return value of `onStopJob` will be respected, and this call will be
-                // skipped.
-                jobService.jobFinished(params, false /* wantsReschedule */);
-            }
-        });
+        startLocked(onJobFinishedLocked);
         // "true" means the job will continue running until `jobFinished` is called.
         return true;
     }
@@ -121,8 +125,7 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
     @Override
     public synchronized boolean onStopJob(@NonNull JobParameters params) {
         if (mIsRunningJobKnownByJobScheduler) {
-            cancelGivenLocked(mRunningJob);
-            mIsRunningJobKnownByJobScheduler = false;
+            cancelGivenLocked(mRunningJob, false /* expectInterrupt */);
         }
         // "true" means to execute again with the default retry policy.
         return true;
@@ -138,12 +141,46 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
         cancelAnyLocked();
         resetLocked();
         updateOtaSlotLocked(otaSlot);
+        mMapSnapshotsForOta = true;
         return scheduleLocked();
+    }
+
+    /**
+     * Same as above, but starts the job immediately, instead of going through the job scheduler.
+     *
+     * @param mapSnapshotsForOta whether to map/unmap snapshots. Only applicable to an OTA update.
+     * @return The future of the job, or null if Pre-reboot Dexopt is not enabled.
+     */
+    @Nullable
+    public synchronized CompletableFuture<Void> onUpdateReadyStartNow(
+            @Nullable String otaSlot, boolean mapSnapshotsForOta) {
+        cancelAnyLocked();
+        resetLocked();
+        updateOtaSlotLocked(otaSlot);
+        mMapSnapshotsForOta = mapSnapshotsForOta;
+        if (!isEnabled()) {
+            mInjector.getStatsReporter().recordJobNotScheduled(
+                    Status.STATUS_NOT_SCHEDULED_DISABLED, isOtaUpdate());
+            return null;
+        }
+        mInjector.getStatsReporter().recordJobScheduled(false /* isAsync */, isOtaUpdate());
+        return startLocked(null /* onJobFinishedLocked */);
     }
 
     public synchronized void test() {
         cancelAnyLocked();
         mInjector.getPreRebootDriver().test();
+    }
+
+    /** @see #cancelGivenLocked */
+    public synchronized void cancelGiven(
+            @NonNull CompletableFuture<Void> job, boolean expectInterrupt) {
+        cancelGivenLocked(job, expectInterrupt);
+    }
+
+    /** @see #cancelAnyLocked */
+    public synchronized void cancelAny() {
+        cancelAnyLocked();
     }
 
     @VisibleForTesting
@@ -164,14 +201,8 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
         }
 
         if (!isEnabled()) {
-            return ArtFlags.SCHEDULE_DISABLED_BY_SYSPROP;
-        }
-
-        // If `pm.dexopt.disable_bg_dexopt` is set, the user probably means to disable any dexopt
-        // jobs in the background.
-        if (SystemProperties.getBoolean("pm.dexopt.disable_bg_dexopt", false /* def */)) {
-            AsLog.i("Pre-reboot Dexopt Job is disabled by system property "
-                    + "'pm.dexopt.disable_bg_dexopt'");
+            mInjector.getStatsReporter().recordJobNotScheduled(
+                    Status.STATUS_NOT_SCHEDULED_DISABLED, isOtaUpdate());
             return ArtFlags.SCHEDULE_DISABLED_BY_SYSPROP;
         }
 
@@ -202,10 +233,12 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
 
         if (result == JobScheduler.RESULT_SUCCESS) {
             AsLog.i("Pre-reboot Dexopt Job scheduled");
-            mInjector.getStatsReporter().recordJobScheduled();
+            mInjector.getStatsReporter().recordJobScheduled(true /* isAsync */, isOtaUpdate());
             return ArtFlags.SCHEDULE_SUCCESS;
         } else {
             AsLog.i("Failed to schedule Pre-reboot Dexopt Job");
+            mInjector.getStatsReporter().recordJobNotScheduled(
+                    Status.STATUS_NOT_SCHEDULED_JOB_SCHEDULER, isOtaUpdate());
             return ArtFlags.SCHEDULE_JOB_SCHEDULER_FAILURE;
         }
     }
@@ -236,11 +269,12 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
         Utils.check(mRunningJob == null);
 
         String otaSlot = mOtaSlot;
+        boolean mapSnapshotsForOta = mMapSnapshotsForOta;
         var cancellationSignal = mCancellationSignal = new CancellationSignal();
         mRunningJob = new CompletableFuture().runAsync(() -> {
             markHasStarted(true);
             try {
-                mInjector.getPreRebootDriver().run(otaSlot, cancellationSignal);
+                mInjector.getPreRebootDriver().run(otaSlot, mapSnapshotsForOta, cancellationSignal);
             } catch (RuntimeException e) {
                 AsLog.e("Fatal error", e);
             } finally {
@@ -268,9 +302,12 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
      *
      * When this method exits, it's guaranteed that the given job is not running, but another job
      * might be running.
+     *
+     * @param expectInterrupt if true, this method returns immediately when the thread is
+     *         interrupted, with no guarantee on the job state
      */
     @GuardedBy("this")
-    private void cancelGivenLocked(@NonNull CompletableFuture<Void> job) {
+    private void cancelGivenLocked(@NonNull CompletableFuture<Void> job, boolean expectInterrupt) {
         while (mRunningJob == job) {
             if (!mCancellationSignal.isCanceled()) {
                 mCancellationSignal.cancel();
@@ -279,6 +316,9 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
             try {
                 this.wait();
             } catch (InterruptedException e) {
+                if (expectInterrupt) {
+                    return;
+                }
                 AsLog.wtf("Interrupted", e);
             }
         }
@@ -336,7 +376,18 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
                     syspropEnable, deviceConfigEnable, deviceConfigForceDisable));
             return false;
         }
+        // If `pm.dexopt.disable_bg_dexopt` is set, the user probably means to disable any dexopt
+        // jobs in the background.
+        if (SystemProperties.getBoolean("pm.dexopt.disable_bg_dexopt", false /* def */)) {
+            AsLog.i("Pre-reboot Dexopt Job is disabled by system property "
+                    + "'pm.dexopt.disable_bg_dexopt'");
+            return false;
+        }
         return true;
+    }
+
+    public boolean isAsyncForOta() {
+        return SystemProperties.getBoolean("dalvik.vm.pr_dexopt_async_for_ota", false /* def */);
     }
 
     @GuardedBy("this")
@@ -364,6 +415,11 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
 
     private void markHasStarted(boolean value) {
         ArtJni.setProperty("dalvik.vm.pre-reboot.has-started", String.valueOf(value));
+    }
+
+    @GuardedBy("this")
+    private boolean isOtaUpdate() {
+        return mOtaSlot != null;
     }
 
     /**
