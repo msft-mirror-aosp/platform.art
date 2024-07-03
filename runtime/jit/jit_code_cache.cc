@@ -50,6 +50,7 @@
 #include "jit/profiling_info.h"
 #include "jit/jit_scoped_code_cache_write.h"
 #include "linear_alloc.h"
+#include "mirror/method_type.h"
 #include "oat/oat_file-inl.h"
 #include "oat/oat_quick_method_header.h"
 #include "object_callbacks.h"
@@ -59,6 +60,7 @@
 #include "thread-current-inl.h"
 #include "thread-inl.h"
 #include "thread_list.h"
+#include "well_known_classes-inl.h"
 
 namespace art HIDDEN {
 namespace jit {
@@ -400,16 +402,6 @@ static void DCheckRootsAreValid(const std::vector<Handle<mirror::Object>>& roots
   }
 }
 
-static const uint8_t* GetRootTable(const void* code_ptr, uint32_t* number_of_roots = nullptr) {
-  OatQuickMethodHeader* method_header = OatQuickMethodHeader::FromCodePointer(code_ptr);
-  uint8_t* data = method_header->GetOptimizedCodeInfoPtr();
-  uint32_t roots = GetNumberOfRoots(data);
-  if (number_of_roots != nullptr) {
-    *number_of_roots = roots;
-  }
-  return data - ComputeRootTableSize(roots);
-}
-
 void JitCodeCache::SweepRootTables(IsMarkedVisitor* visitor) {
   Thread* self = Thread::Current();
   ScopedDebugDisallowReadBarriers sddrb(self);
@@ -436,12 +428,34 @@ void JitCodeCache::SweepRootTables(IsMarkedVisitor* visitor) {
         if (new_object != object) {
           roots[i] = GcRoot<mirror::Object>(new_object);
         }
-      } else {
+      } else if (object->IsClass<kDefaultVerifyFlags>()) {
         mirror::Object* new_klass = visitor->IsMarked(object);
         if (new_klass == nullptr) {
           roots[i] = GcRoot<mirror::Object>(Runtime::GetWeakClassSentinel());
         } else if (new_klass != object) {
           roots[i] = GcRoot<mirror::Object>(new_klass);
+        }
+      } else {
+        mirror::Object* new_method_type = visitor->IsMarked(object);
+        if (kIsDebugBuild) {
+          if (new_method_type != nullptr) {
+            // SweepSystemWeaks() is happening in the compaction pause. At that point
+            // IsMarked(object) returns the moved address, but the content is not there yet.
+            if (!Runtime::Current()->GetHeap()->IsPerformingUffdCompaction()) {
+              ObjPtr<mirror::Class> method_type_class =
+                  WellKnownClasses::java_lang_invoke_MethodType.Get<kWithoutReadBarrier>();
+
+              CHECK_EQ((new_method_type->GetClass<kVerifyNone, kWithoutReadBarrier>()),
+                       method_type_class.Ptr());
+            }
+          }
+        }
+        if (new_method_type == nullptr) {
+          roots[i] = nullptr;
+        } else if (new_method_type != object) {
+          // References are updated in VisitRootTables. Reaching this means that ArtMethod is no
+          // longer reachable.
+          roots[i] = GcRoot<mirror::Object>(new_method_type);
         }
       }
     }
@@ -569,6 +583,7 @@ void JitCodeCache::RemoveMethodsIn(Thread* self, const LinearAlloc& alloc) {
         VLOG(jit) << "JIT removed " << it->second->PrettyMethod() << ": " << it->first;
         zombie_code_.erase(it->first);
         processed_zombie_code_.erase(it->first);
+        method_code_map_reversed_.erase(it->second);
         it = method_code_map_.erase(it);
       } else {
         ++it;
@@ -614,6 +629,16 @@ void JitCodeCache::WaitUntilInlineCacheAccessible(Thread* self) {
   }
 }
 
+const uint8_t* JitCodeCache::GetRootTable(const void* code_ptr, uint32_t* number_of_roots) {
+  OatQuickMethodHeader* method_header = OatQuickMethodHeader::FromCodePointer(code_ptr);
+  uint8_t* data = method_header->GetOptimizedCodeInfoPtr();
+  uint32_t num_roots = GetNumberOfRoots(data);
+  if (number_of_roots != nullptr) {
+    *number_of_roots = num_roots;
+  }
+  return data - ComputeRootTableSize(num_roots);
+}
+
 void JitCodeCache::BroadcastForInlineCacheAccess() {
   Thread* self = Thread::Current();
   MutexLock mu(self, *Locks::jit_lock_);
@@ -647,17 +672,6 @@ void JitCodeCache::CopyInlineCacheInto(
       classes->NewHandle(object);
     }
   }
-}
-
-static void ClearMethodCounter(ArtMethod* method, bool was_warm)
-    REQUIRES_SHARED(Locks::mutator_lock_) {
-  if (was_warm) {
-    method->SetPreviouslyWarm();
-  }
-  method->ResetCounter(Runtime::Current()->GetJITOptions()->GetWarmupThreshold());
-  // We add one sample so that the profile knows that the method was executed at least once.
-  // This is required for layout purposes.
-  method->UpdateCounter(/* new_samples= */ 1);
 }
 
 bool JitCodeCache::Commit(Thread* self,
@@ -727,10 +741,9 @@ bool JitCodeCache::Commit(Thread* self,
       bool single_impl_still_valid = true;
       for (ArtMethod* single_impl : cha_single_implementation_list) {
         if (!single_impl->HasSingleImplementation()) {
-          // Simply discard the compiled code. Clear the counter so that it may be recompiled later.
+          // Simply discard the compiled code.
           // Hopefully the class hierarchy will be more stable when compilation is retried.
           single_impl_still_valid = false;
-          ClearMethodCounter(method, /*was_warm=*/ false);
           break;
         }
       }
@@ -767,6 +780,25 @@ bool JitCodeCache::Commit(Thread* self,
       } else {
         ScopedDebugDisallowReadBarriers sddrb(self);
         method_code_map_.Put(code_ptr, method);
+
+        // Searching for MethodType-s in roots. They need to be treated as strongly reachable while
+        // the corresponding ArtMethod is not removed.
+        ObjPtr<mirror::Class> method_type_class =
+            WellKnownClasses::java_lang_invoke_MethodType.Get<kWithoutReadBarrier>();
+
+        for (const Handle<mirror::Object>& root : roots) {
+          ObjPtr<mirror::Class> klass = root->GetClass<kDefaultVerifyFlags, kWithoutReadBarrier>();
+          if (klass == method_type_class ||
+              klass == ReadBarrier::IsMarked(method_type_class.Ptr()) ||
+              ReadBarrier::IsMarked(klass.Ptr()) == method_type_class) {
+            auto it = method_code_map_reversed_.FindOrAdd(method, std::vector<const void*>());
+            std::vector<const void*>& code_ptrs = it->second;
+
+            DCHECK(std::find(code_ptrs.begin(), code_ptrs.end(), code_ptr) == code_ptrs.end());
+            it->second.emplace_back(code_ptr);
+            break;
+          }
+        }
       }
       if (compilation_kind == CompilationKind::kOsr) {
         ScopedDebugDisallowReadBarriers sddrb(self);
@@ -825,7 +857,6 @@ bool JitCodeCache::RemoveMethod(ArtMethod* method, bool release_memory) {
     return false;
   }
 
-  ClearMethodCounter(method, /* was_warm= */ false);
   Runtime::Current()->GetInstrumentation()->InitializeMethodsCode(method, /*aot_code=*/ nullptr);
   VLOG(jit)
       << "JIT removed (osr=" << std::boolalpha << osr << std::noboolalpha << ") "
@@ -872,6 +903,7 @@ bool JitCodeCache::RemoveMethodLocked(ArtMethod* method, bool release_memory) {
         ++it;
       }
     }
+    method_code_map_reversed_.erase(method);
 
     auto osr_it = osr_code_map_.find(method);
     if (osr_it != osr_code_map_.end()) {
@@ -916,6 +948,13 @@ void JitCodeCache::MoveObsoleteMethod(ArtMethod* old_method, ArtMethod* new_meth
       it.second = new_method;
     }
   }
+
+  auto node = method_code_map_reversed_.extract(old_method);
+  if (!node.empty()) {
+    node.key() = new_method;
+    method_code_map_reversed_.insert(std::move(node));
+  }
+
   // Update osr_code_map_ to point to the new method.
   auto code_map = osr_code_map_.find(old_method);
   if (code_map != osr_code_map_.end()) {
@@ -1121,6 +1160,23 @@ void JitCodeCache::RemoveUnmarkedCode(Thread* self) {
     } else {
       OatQuickMethodHeader* header = OatQuickMethodHeader::FromCodePointer(code_ptr);
       method_headers.insert(header);
+
+      auto method_it = method_code_map_.find(header->GetCode());
+
+      if (method_it != method_code_map_.end()) {
+        ArtMethod* method = method_it->second;
+        auto code_ptrs_it = method_code_map_reversed_.find(method);
+
+        if (code_ptrs_it != method_code_map_reversed_.end()) {
+          std::vector<const void*>& code_ptrs = code_ptrs_it->second;
+          RemoveElement(code_ptrs, code_ptr);
+
+          if (code_ptrs.empty()) {
+            method_code_map_reversed_.erase(code_ptrs_it);
+          }
+        }
+      }
+
       method_code_map_.erase(header->GetCode());
       VLOG(jit) << "JIT removed " << *it;
       it = processed_zombie_code_.erase(it);
@@ -1246,15 +1302,6 @@ void JitCodeCache::MaybeUpdateInlineCache(ArtMethod* method,
   ScopedAssertNoThreadSuspension sants("ProfilingInfo");
   info->AddInvokeInfo(dex_pc, cls.Ptr());
 }
-
-void JitCodeCache::ResetHotnessCounter(ArtMethod* method, Thread* self) {
-  ScopedDebugDisallowReadBarriers sddrb(self);
-  MutexLock mu(self, *Locks::jit_lock_);
-  auto it = profiling_infos_.find(method);
-  DCHECK(it != profiling_infos_.end());
-  it->second->ResetCounter();
-}
-
 
 void JitCodeCache::DoCollection(Thread* self) {
   ScopedTrace trace(__FUNCTION__);
@@ -1606,8 +1653,6 @@ bool JitCodeCache::NotifyCompilationOf(ArtMethod* method,
       VLOG(jit) << "Not compiling "
                 << method->PrettyMethod()
                 << " because it has the resolution stub";
-      // Give it a new chance to be hot.
-      ClearMethodCounter(method, /*was_warm=*/ false);
       return false;
     }
   }
@@ -1708,15 +1753,12 @@ void JitCodeCache::InvalidateAllCompiledCode() {
         OatQuickMethodHeader::FromCodePointer(data.GetCode());
     for (ArtMethod* method : data.GetMethods()) {
       if (method->GetEntryPointFromQuickCompiledCode() == method_header->GetEntryPoint()) {
-        ClearMethodCounter(method, /*was_warm=*/true);
         instr->InitializeMethodsCode(method, /*aot_code=*/ nullptr);
       }
     }
   }
   for (const auto& entry : method_code_map_) {
     ArtMethod* meth = entry.second;
-    // We were compiled, so we must be warm.
-    ClearMethodCounter(meth, /*was_warm=*/true);
     if (UNLIKELY(meth->IsObsolete())) {
       linker->SetEntryPointsForObsoleteMethod(meth);
     } else {
@@ -1746,10 +1788,8 @@ void JitCodeCache::InvalidateCompiledCodeFor(ArtMethod* method,
   // Clear the method counter if we are running jitted code since we might want to jit this again in
   // the future.
   if (method_entrypoint == header->GetEntryPoint()) {
-    // The entrypoint is the one to invalidate, so we just update it to the interpreter entry point
-    // and clear the counter to get the method Jitted again.
+    // The entrypoint is the one to invalidate, so we just update it to the interpreter entry point.
     Runtime::Current()->GetInstrumentation()->InitializeMethodsCode(method, /*aot_code=*/ nullptr);
-    ClearMethodCounter(method, /*was_warm=*/ true);
   } else {
     Thread* self = Thread::Current();
     ScopedDebugDisallowReadBarriers sddrb(self);
