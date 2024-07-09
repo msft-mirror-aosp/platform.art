@@ -45,7 +45,6 @@ def parse_args(argv):
   argp.add_argument("--bionic", action="store_true")
   argp.add_argument("--boot", default="")
   argp.add_argument("--chroot", default="")
-  argp.add_argument("--compact-dex-level")
   argp.add_argument("--compiler-only-option", default=[], action="append")
   argp.add_argument("--create-runner", action="store_true")
   argp.add_argument("--diff-min-log-tag", default="E")
@@ -372,9 +371,6 @@ def default_run(ctx, args, **kwargs):
     if arg == "-Xmethod-trace":
       # Method tracing can slow some tests down a lot.
       TIME_OUT_EXTRA += 1200
-  if args.compact_dex_level:
-    arg = args.compact_dex_level
-    COMPILE_FLAGS += f" --compact-dex-level={arg}"
   if JVMTI_REDEFINE_STRESS:
     # APP_IMAGE doesn't really work with jvmti redefine stress
     SECONDARY_APP_IMAGE = False
@@ -803,6 +799,10 @@ def default_run(ctx, args, **kwargs):
       dex2oat_cmdline += f"gdb {GDB_DEX2OAT_EXTRA_ARGS} \
                           -d '{ANDROID_BUILD_TOP}' --args "
 
+    dex2oat_logger = ""
+    if ON_VM:
+      dex2oat_logger = "--runtime-arg -Xuse-stderr-logger"
+
     dex2oat_cmdline += f"'{ANDROID_ART_BIN_DIR}/{dex2oat_binary}' \
                         {COMPILE_FLAGS} \
                         --boot-image={BOOT_IMAGE} \
@@ -811,6 +811,7 @@ def default_run(ctx, args, **kwargs):
                         {app_image} \
                         --generate-mini-debug-info \
                         --instruction-set={ISA} \
+                        {dex2oat_logger} \
                         {class_loader_context}"
 
     if INSTRUCTION_SET_FEATURES != "":
@@ -834,7 +835,7 @@ def default_run(ctx, args, **kwargs):
         # If no arguments need to be passed, just delete the odex file so that the runtime only picks up the vdex file.
         vdex_cmdline = f"rm {DEX_LOCATION}/oat/{ISA}/{name}.odex"
       else:
-        vdex_cmdline = f"{dex2oat_cmdline} {VDEX_ARGS} --compact-dex-level=none --input-vdex={DEX_LOCATION}/oat/{ISA}/{name}.vdex"
+        vdex_cmdline = f"{dex2oat_cmdline} {VDEX_ARGS} --input-vdex={DEX_LOCATION}/oat/{ISA}/{name}.vdex"
     elif TEST_DEX2OAT_DM:
       vdex_cmdline = f"{dex2oat_cmdline} {VDEX_ARGS} --dump-timings --dm-file={DEX_LOCATION}/oat/{ISA}/{name}.dm"
       dex2oat_cmdline = f"{dex2oat_cmdline} --copy-dex-files=false --output-vdex={DEX_LOCATION}/oat/{ISA}/primary.vdex"
