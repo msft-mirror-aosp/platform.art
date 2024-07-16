@@ -2640,24 +2640,20 @@ void InstructionCodeGeneratorRISCV64::GenerateMethodEntryExitHook(HInstruction* 
   __ Addi(tmp, tmp, -1);
   __ Bnez(tmp, slow_path->GetEntryLabel());
 
-  // Check if there is place in the buffer to store a new entry, if no, take the slow path.
-  int32_t trace_buffer_index_offset =
-      Thread::TraceBufferIndexOffset<kRiscv64PointerSize>().Int32Value();
-  __ Loadd(tmp, TR, trace_buffer_index_offset);
-  __ Addi(tmp, tmp, -dchecked_integral_cast<int32_t>(kNumEntriesForWallClock));
-  __ Bltz(tmp, slow_path->GetEntryLabel());
-
-  // Update the index in the `Thread`.
-  __ Stored(tmp, TR, trace_buffer_index_offset);
-
   // Allocate second core scratch register. We can no longer use `Stored()`
   // and similar macro instructions because there is no core scratch register left.
   XRegister tmp2 = temps.AllocateXRegister();
 
-  // Calculate the entry address in the buffer.
-  // /*addr*/ tmp = TR->GetMethodTraceBuffer() + sizeof(void*) * /*index*/ tmp;
+  // Check if there is place in the buffer to store a new entry, if no, take the slow path.
+  int32_t trace_buffer_curr_entry_offset =
+      Thread::TraceBufferCurrPtrOffset<kRiscv64PointerSize>().Int32Value();
+  __ Loadd(tmp, TR, trace_buffer_curr_entry_offset);
   __ Loadd(tmp2, TR, Thread::TraceBufferPtrOffset<kRiscv64PointerSize>().SizeValue());
-  __ Sh3Add(tmp, tmp, tmp2);
+  __ Addi(tmp, tmp, -dchecked_integral_cast<int32_t>(kNumEntriesForWallClock * sizeof(void*)));
+  __ Blt(tmp, tmp2, slow_path->GetEntryLabel());
+
+  // Update the index in the `Thread`.
+  __ Sd(tmp, TR, trace_buffer_curr_entry_offset);
 
   // Record method pointer and trace action.
   __ Ld(tmp2, SP, 0);
@@ -5437,6 +5433,37 @@ void InstructionCodeGeneratorRISCV64::VisitRiscv64ShiftAdd(HRiscv64ShiftAdd* ins
     default:
       LOG(FATAL) << "Unexpected distance of ShiftAdd: " << instruction->GetDistance();
       UNREACHABLE();
+  }
+}
+
+void LocationsBuilderRISCV64::VisitBitwiseNegatedRight(HBitwiseNegatedRight* instruction) {
+  DCHECK(codegen_->GetInstructionSetFeatures().HasZbb());
+  DCHECK(DataType::IsIntegralType(instruction->GetType())) << instruction->GetType();
+
+  LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(instruction);
+  locations->SetInAt(0, Location::RequiresRegister());
+  locations->SetInAt(1, Location::RequiresRegister());
+  locations->SetOut(Location::RequiresRegister(), Location::kNoOutputOverlap);
+}
+
+void InstructionCodeGeneratorRISCV64::VisitBitwiseNegatedRight(HBitwiseNegatedRight* instruction) {
+  LocationSummary* locations = instruction->GetLocations();
+  XRegister lhs = locations->InAt(0).AsRegister<XRegister>();
+  XRegister rhs = locations->InAt(1).AsRegister<XRegister>();
+  XRegister dst = locations->Out().AsRegister<XRegister>();
+
+  switch (instruction->GetOpKind()) {
+    case HInstruction::kAnd:
+      __ Andn(dst, lhs, rhs);
+      break;
+    case HInstruction::kOr:
+      __ Orn(dst, lhs, rhs);
+      break;
+    case HInstruction::kXor:
+      __ Xnor(dst, lhs, rhs);
+      break;
+    default:
+      LOG(FATAL) << "Unreachable";
   }
 }
 
