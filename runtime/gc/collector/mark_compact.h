@@ -80,8 +80,6 @@ class MarkCompact final : public GarbageCollector {
   // InitializePhase(). Therefore, it's safe to update without any memory ordering.
   bool IsCompacting() const { return compacting_; }
 
-  bool IsUsingSigbusFeature() const { return use_uffd_sigbus_; }
-
   // Called by SIGBUS handler. NO_THREAD_SAFETY_ANALYSIS for mutator-lock, which
   // is asserted in the function.
   bool SigbusHandler(siginfo_t* info) REQUIRES(!lock_) NO_THREAD_SAFETY_ANALYSIS;
@@ -489,17 +487,13 @@ class MarkCompact final : public GarbageCollector {
   void RegisterUffd(void* addr, size_t size);
   void UnregisterUffd(uint8_t* start, size_t len);
 
-  // Called by thread-pool workers to read uffd_ and process fault events.
-  void ConcurrentCompaction(uint8_t* buf) REQUIRES_SHARED(Locks::mutator_lock_);
-  // Called by thread-pool workers to compact and copy/map the fault page in
-  // moving space.
+  // Called by SIGBUS handler to compact and copy/map the fault page in moving space.
   void ConcurrentlyProcessMovingPage(uint8_t* fault_page,
                                      uint8_t* buf,
-                                     size_t nr_moving_space_used_pages)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-  // Called by thread-pool workers to process and copy/map the fault page in
-  // linear-alloc.
-  void ConcurrentlyProcessLinearAllocPage(uint8_t* fault_page)
+                                     size_t nr_moving_space_used_pages,
+                                     bool tolerate_enoent) REQUIRES_SHARED(Locks::mutator_lock_);
+  // Called by SIGBUS handler to process and copy/map the fault page in linear-alloc.
+  void ConcurrentlyProcessLinearAllocPage(uint8_t* fault_page, bool tolerate_enoent)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Process concurrently all the pages in linear-alloc. Called by gc-thread.
@@ -526,7 +520,8 @@ class MarkCompact final : public GarbageCollector {
   size_t MapMovingSpacePages(size_t start_idx,
                              size_t arr_len,
                              bool from_fault,
-                             bool return_on_contention) REQUIRES_SHARED(Locks::mutator_lock_);
+                             bool return_on_contention,
+                             bool tolerate_enoent) REQUIRES_SHARED(Locks::mutator_lock_);
 
   bool IsValidFd(int fd) const { return fd >= 0; }
 
@@ -564,7 +559,8 @@ class MarkCompact final : public GarbageCollector {
   // function also uses thread's priority to decide how long we delay before
   // forcing the ioctl operation. If ioctl returns EEXIST, then also function
   // returns. Returns number of bytes (multiple of page-size) mapped.
-  size_t CopyIoctl(void* dst, void* buffer, size_t length, bool return_on_contention);
+  size_t CopyIoctl(
+      void* dst, void* buffer, size_t length, bool return_on_contention, bool tolerate_enoent);
 
   // Called after updating linear-alloc page(s) to map the page. It first
   // updates the state of the pages to kProcessedAndMapping and after ioctl to
@@ -576,7 +572,8 @@ class MarkCompact final : public GarbageCollector {
                                   Atomic<PageState>* state,
                                   size_t length,
                                   bool free_pages,
-                                  bool single_ioctl);
+                                  bool single_ioctl,
+                                  bool tolerate_enoent);
   // Called for clamping of 'info_map_' and other GC data structures, which are
   // small and/or in >4GB address space. There is no real benefit of clamping
   // them synchronously during app forking. It clamps only if clamp_info_map_status_
@@ -801,20 +798,19 @@ class MarkCompact final : public GarbageCollector {
   // Userfault file descriptor, accessed only by the GC itself.
   // kFallbackMode value indicates that we are in the fallback mode.
   int uffd_;
-  // Number of mutator-threads currently executing SIGBUS handler. When the
-  // GC-thread is done with compaction, it set the most significant bit to
-  // indicate that. Mutator threads check for the flag when incrementing in the
-  // handler.
-  std::atomic<SigbusCounterType> sigbus_in_progress_count_;
-  // Number of mutator-threads/uffd-workers working on moving-space page. It
-  // must be 0 before gc-thread can unregister the space after it's done
-  // sequentially compacting all pages of the space.
-  std::atomic<uint16_t> compaction_in_progress_count_;
+  // Counters to synchronize mutator threads and gc-thread at the end of
+  // compaction. Counter 0 represents the number of mutators still working on
+  // moving space pages which started before gc-thread finished compacting pages,
+  // whereas the counter 1 represents those which started afterwards but
+  // before unregistering the space from uffd. Once counter 1 reaches 0, the
+  // gc-thread madvises spaces and data structures like page-status array.
+  // Both the counters are set to 0 before compaction begins. They are or'ed
+  // with kSigbusCounterCompactionDoneMask one-by-one by gc-thread after
+  // compaction to communicate the status to future mutators.
+  std::atomic<SigbusCounterType> sigbus_in_progress_count_[2];
   // When using SIGBUS feature, this counter is used by mutators to claim a page
   // out of compaction buffers to be used for the entire compaction cycle.
   std::atomic<uint16_t> compaction_buffer_counter_;
-  // Used to exit from compaction loop at the end of concurrent compaction
-  uint8_t thread_pool_counter_;
   // True while compacting.
   bool compacting_;
   // Flag indicating whether one-time uffd initialization has been done. It will
@@ -823,9 +819,6 @@ class MarkCompact final : public GarbageCollector {
   // Heap::PostForkChildAction() as it's invoked in app startup path. With
   // this, we register the compaction-termination page on the first GC.
   bool uffd_initialized_;
-  // Flag indicating if we should use sigbus signals instead of threads to
-  // handle userfaults.
-  const bool use_uffd_sigbus_;
   // Clamping statue of `info_map_`. Initialized with 'NotDone'. Once heap is
   // clamped but info_map_ is delayed, we set it to 'Pending'. Once 'info_map_'
   // is also clamped, then we set it to 'Finished'.
@@ -844,7 +837,6 @@ class MarkCompact final : public GarbageCollector {
   class ClassLoaderRootsUpdater;
   class LinearAllocPageUpdater;
   class ImmuneSpaceUpdateObjVisitor;
-  class ConcurrentCompactionGcTask;
 
   DISALLOW_IMPLICIT_CONSTRUCTORS(MarkCompact);
 };
