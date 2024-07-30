@@ -18,22 +18,7 @@ LOCAL_PATH := $(call my-dir)
 
 art_path := $(LOCAL_PATH)
 
-include $(art_path)/tools/veridex/Android.mk
-
-########################################################################
-# clean-oat rules
-#
-
 include $(art_path)/build/Android.common_path.mk
-
-.PHONY: clean-oat
-clean-oat: clean-oat-host
-
-.PHONY: clean-oat-host
-clean-oat-host:
-	find $(OUT_DIR) '(' -name '*.oat' -o -name '*.odex' -o -name '*.art' -o -name '*.vdex' ')' -a -type f | xargs rm -f
-	rm -rf $(TMPDIR)/*/test-*/dalvik-cache/*
-	rm -rf $(TMPDIR)/android-data/dalvik-cache/*
 
 ########################################################################
 # cpplint rules to style check art source files
@@ -41,41 +26,9 @@ clean-oat-host:
 include $(art_path)/build/Android.cpplint.mk
 
 ########################################################################
-# The art-tools package depends on helpers and tools that are useful for developers. Similar
-# dependencies exist for the APEX builds for these tools (see build/apex/Android.bp).
-
-ifneq ($(HOST_OS),darwin)
-include $(CLEAR_VARS)
-LOCAL_MODULE := art-tools
-LOCAL_LICENSE_KINDS := SPDX-license-identifier-Apache-2.0
-LOCAL_LICENSE_CONDITIONS := notice
-LOCAL_NOTICE_FILE := $(LOCAL_PATH)/NOTICE
-LOCAL_IS_HOST_MODULE := true
-
-LOCAL_REQUIRED_MODULES := \
-    ahat \
-    dexdump \
-    hprof-conv \
-
-# A subset of the tools are disabled when HOST_PREFER_32_BIT is defined as make reports that
-# they are not supported on host (b/129323791). This is likely due to art_apex disabling host
-# APEX builds when HOST_PREFER_32_BIT is set (b/120617876).
-ifneq ($(HOST_PREFER_32_BIT),true)
-LOCAL_REQUIRED_MODULES += \
-    dexdiag \
-    dexlist \
-    oatdump \
-
-endif
-
-include $(BUILD_PHONY_PACKAGE)
-endif # HOST_OS != darwin
-
-########################################################################
 # product rules
 
 include $(art_path)/tools/ahat/Android.mk
-include $(art_path)/tools/dexfuzz/Android.mk
 
 ART_HOST_DEPENDENCIES := \
   $(ART_HOST_EXECUTABLES) \

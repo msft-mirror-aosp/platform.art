@@ -25,9 +25,10 @@
 #include <string_view>
 #include <vector>
 
-#include "android-base/logging.h"
-#include "android-base/strings.h"
+#include <android-base/logging.h>
+#include <android-base/strings.h>
 
+#include "aot_class_linker.h"
 #include "art_field-inl.h"
 #include "art_method-inl.h"
 #include "base/arena_allocator.h"
@@ -37,7 +38,6 @@
 #include "base/logging.h"  // For VLOG
 #include "base/pointer_size.h"
 #include "base/stl_util.h"
-#include "base/string_view_cpp20.h"
 #include "base/systrace.h"
 #include "base/time_utils.h"
 #include "base/timing_logger.h"
@@ -73,7 +73,6 @@
 #include "mirror/object-refvisitor-inl.h"
 #include "mirror/object_array-inl.h"
 #include "mirror/throwable.h"
-#include "oat/aot_class_linker.h"
 #include "object_lock.h"
 #include "profile/profile_compilation_info.h"
 #include "runtime.h"
@@ -434,14 +433,19 @@ static bool ShouldCompileBasedOnProfile(const CompilerOptions& compiler_options,
         compiler_options.GetProfileCompilationInfo();
     DCHECK(profile_compilation_info != nullptr);
 
-    // Compile only hot methods, it is the profile saver's job to decide
-    // what startup methods to mark as hot.
     bool result = profile_compilation_info->IsHotMethod(profile_index, method_ref.index);
+
+    // On non-low RAM devices, compile startup methods to potentially speed up
+    // startup.
+    if (!result && !Runtime::Current()->GetHeap()->IsLowMemoryMode()) {
+      result = profile_compilation_info->IsStartupMethod(profile_index, method_ref.index);
+    }
 
     if (kDebugProfileGuidedCompilation) {
       LOG(INFO) << "[ProfileGuidedCompilation] "
           << (result ? "Compiled" : "Skipped") << " method:" << method_ref.PrettyMethod(true);
     }
+
 
     return result;
   }
@@ -2300,7 +2304,7 @@ class InitializeClassVisitor : public CompilationVisitor {
             // We need to initialize static fields, we only do this for image classes that aren't
             // marked with the $NoPreloadHolder (which implies this should not be initialized
             // early).
-            can_init_static_fields = !EndsWith(std::string_view(descriptor), "$NoPreloadHolder;");
+            can_init_static_fields = !std::string_view(descriptor).ends_with("$NoPreloadHolder;");
           } else {
             CHECK(is_app_image);
             // The boot image case doesn't need to recursively initialize the dependencies with
@@ -2427,7 +2431,7 @@ class InitializeClassVisitor : public CompilationVisitor {
 
     if (compiler_options.CompileArtTest()) {
       // For stress testing and unit-testing the clinit check in compiled code feature.
-      if (kIsDebugBuild || EndsWith(std::string_view(descriptor), "$NoPreloadHolder;")) {
+      if (kIsDebugBuild || std::string_view(descriptor).ends_with("$NoPreloadHolder;")) {
         klass->SetInBootImageAndNotInPreloadedClasses();
       }
     }

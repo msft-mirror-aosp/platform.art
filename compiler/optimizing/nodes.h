@@ -143,6 +143,8 @@ enum GraphAnalysisResult {
   kAnalysisSuccess,
 };
 
+std::ostream& operator<<(std::ostream& os, GraphAnalysisResult ga);
+
 template <typename T>
 static inline typename std::make_unsigned<T>::type MakeUnsigned(T x) {
   return static_cast<typename std::make_unsigned<T>::type>(x);
@@ -1525,6 +1527,7 @@ class HLoopInformationOutwardIterator : public ValueObject {
   M(ArraySet, Instruction)                                              \
   M(Below, Condition)                                                   \
   M(BelowOrEqual, Condition)                                            \
+  M(BitwiseNegatedRight, BinaryOperation)                               \
   M(BooleanNot, UnaryOperation)                                         \
   M(BoundsCheck, Instruction)                                           \
   M(BoundType, Instruction)                                             \
@@ -1655,7 +1658,6 @@ class HLoopInformationOutwardIterator : public ValueObject {
 #define FOR_EACH_CONCRETE_INSTRUCTION_SHARED(M)
 #else
 #define FOR_EACH_CONCRETE_INSTRUCTION_SHARED(M)                         \
-  M(BitwiseNegatedRight, Instruction)                                   \
   M(DataProcWithShifterOp, Instruction)                                 \
   M(MultiplyAccumulate, Instruction)                                    \
   M(IntermediateAddressIndex, Instruction)
@@ -7216,6 +7218,8 @@ class HLoadMethodType final : public HInstruction {
   enum class LoadKind {
     // Load from an entry in the .bss section using a PC-relative load.
     kBssEntry,
+    // Load from the root table associated with the JIT compiled method.
+    kJitTableAddress,
     // Load using a single runtime call.
     kRuntimeCall,
 
@@ -7252,6 +7256,10 @@ class HLoadMethodType final : public HInstruction {
 
   dex::ProtoIndex GetProtoIndex() const { return proto_index_; }
 
+  Handle<mirror::MethodType> GetMethodType() const { return method_type_; }
+
+  void SetMethodType(Handle<mirror::MethodType> method_type) { method_type_ = method_type; }
+
   const DexFile& GetDexFile() const { return dex_file_; }
 
   static SideEffects SideEffectsForArchRuntimeCalls() {
@@ -7281,6 +7289,8 @@ class HLoadMethodType final : public HInstruction {
 
   const dex::ProtoIndex proto_index_;
   const DexFile& dex_file_;
+
+  Handle<mirror::MethodType> method_type_;
 };
 
 std::ostream& operator<<(std::ostream& os, HLoadMethodType::LoadKind rhs);
@@ -7291,6 +7301,7 @@ inline void HLoadMethodType::SetLoadKind(LoadKind load_kind) {
   DCHECK(GetBlock() == nullptr);
   DCHECK(GetEnvironment() == nullptr);
   DCHECK_EQ(GetLoadKind(), LoadKind::kRuntimeCall);
+  DCHECK_IMPLIES(GetLoadKind() == LoadKind::kJitTableAddress, GetMethodType() != nullptr);
   SetPackedField<LoadKindField>(load_kind);
 }
 
@@ -8385,6 +8396,63 @@ class HParallelMove final : public HExpression<0> {
 
  private:
   ArenaVector<MoveOperands> moves_;
+};
+
+class HBitwiseNegatedRight final : public HBinaryOperation {
+ public:
+  HBitwiseNegatedRight(DataType::Type result_type,
+                       InstructionKind op,
+                       HInstruction* left,
+                       HInstruction* right,
+                       uint32_t dex_pc = kNoDexPc)
+      : HBinaryOperation(
+            kBitwiseNegatedRight, result_type, left, right, SideEffects::None(), dex_pc),
+        op_kind_(op) {
+    DCHECK(op == HInstruction::kAnd || op == HInstruction::kOr || op == HInstruction::kXor) << op;
+  }
+
+  template <typename T, typename U>
+  auto Compute(T x, U y) const -> decltype(x & ~y) {
+    static_assert(std::is_same<decltype(x & ~y), decltype(x | ~y)>::value &&
+                      std::is_same<decltype(x & ~y), decltype(x ^ ~y)>::value,
+                  "Inconsistent negated bitwise types");
+    switch (op_kind_) {
+      case HInstruction::kAnd:
+        return x & ~y;
+      case HInstruction::kOr:
+        return x | ~y;
+      case HInstruction::kXor:
+        return x ^ ~y;
+      default:
+        LOG(FATAL) << "Unreachable";
+        UNREACHABLE();
+    }
+  }
+
+  bool InstructionDataEquals(const HInstruction* other) const override {
+    return op_kind_ == other->AsBitwiseNegatedRight()->op_kind_;
+  }
+
+  HConstant* Evaluate(HIntConstant* x, HIntConstant* y) const override {
+    return GetBlock()->GetGraph()->GetIntConstant(Compute(x->GetValue(), y->GetValue()),
+                                                  GetDexPc());
+  }
+
+  HConstant* Evaluate(HLongConstant* x, HLongConstant* y) const override {
+    return GetBlock()->GetGraph()->GetLongConstant(Compute(x->GetValue(), y->GetValue()),
+                                                   GetDexPc());
+  }
+
+  InstructionKind GetOpKind() const { return op_kind_; }
+
+  DECLARE_INSTRUCTION(BitwiseNegatedRight);
+
+ protected:
+  DEFAULT_COPY_CONSTRUCTOR(BitwiseNegatedRight);
+
+ private:
+  // Specifies the bitwise operation, which will be then negated.
+  const InstructionKind op_kind_;
 };
 
 // This instruction computes an intermediate address pointing in the 'middle' of an object. The

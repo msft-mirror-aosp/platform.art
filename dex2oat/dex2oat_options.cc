@@ -194,12 +194,12 @@ static void AddImageMappings(Builder& builder) {
                     "images.")
           .IntoKey(M::MultiImage)
       .Define("--dirty-image-objects=_")
-          .WithType<std::string>()
+          .WithType<std::vector<std::string>>().AppendValues()
           .WithHelp("list of known dirty objects in the image. The image writer will group them"
                     " together")
           .IntoKey(M::DirtyImageObjects)
       .Define("--dirty-image-objects-fd=_")
-          .WithType<int>()
+          .WithType<std::vector<int>>().AppendValues()
           .WithHelp("Specify a file descriptor for reading the list of known dirty objects in\n"
                     "the image. The image writer will group them together")
           .IntoKey(M::DirtyImageObjectsFd)
@@ -417,11 +417,9 @@ Parser CreateDex2oatArgumentParser() {
                     "\n"
                     "Example: --class-loader-context=PCL[lib1.dex:lib2.dex];DLC[lib3.dex]")
           .IntoKey(M::StoredClassLoaderContext)
+      // TODO(b/325430813): Obsolete argument that only prints a warning if used. Delete altogether.
       .Define("--compact-dex-level=_")
-          .WithType<CompactDexLevel>()
-          .WithValueMap({{"none", CompactDexLevel::kCompactDexLevelNone},
-                         {"fast", CompactDexLevel::kCompactDexLevelFast}})
-          .WithHelp("This flag is obsolete and does nothing.")
+          .WithType<std::string>()
           .IntoKey(M::CompactDexLevel)
       .Define("--runtime-arg _")
           .WithType<std::vector<std::string>>().AppendValues()
