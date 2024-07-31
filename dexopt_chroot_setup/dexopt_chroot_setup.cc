@@ -357,13 +357,24 @@ ScopedAStatus DexoptChrootSetup::init() {
   }
   std::lock_guard<std::mutex> lock(mu_, std::adopt_lock);
 
+  if (OS::FileExists(PathInChroot("/linkerconfig/ld.config.txt").c_str())) {
+    return Fatal("init must not be repeatedly called");
+  }
+
   OR_RETURN_NON_FATAL(InitChroot());
   return ScopedAStatus::ok();
 }
 
-ScopedAStatus DexoptChrootSetup::tearDown() {
-  if (!mu_.try_lock()) {
-    return Fatal("Unexpected concurrent calls");
+ScopedAStatus DexoptChrootSetup::tearDown(bool in_allowConcurrent) {
+  if (in_allowConcurrent) {
+    // Normally, we don't expect concurrent calls, but this method may be called upon system server
+    // restart when another call initiated by the previous system_server instance is still being
+    // processed.
+    mu_.lock();
+  } else {
+    if (!mu_.try_lock()) {
+      return Fatal("Unexpected concurrent calls");
+    }
   }
   std::lock_guard<std::mutex> lock(mu_, std::adopt_lock);
 
@@ -403,6 +414,11 @@ Result<void> DexoptChrootSetup::SetUpChroot(const std::optional<std::string>& ot
 
   if (!IsOtaUpdate(ota_slot)) {  // Mainline update
     OR_RETURN(BindMount("/", CHROOT_DIR));
+    // Normally, we don't need to bind-mount "/system" because it's a part of the image mounted at
+    // "/". However, when readonly partitions are remounted read-write, an overlay is created at
+    // "/system", so we need to bind-mount "/system" to handle this case. On devices where readonly
+    // partitions are not remounted, bind-mounting "/system" doesn't hurt.
+    OR_RETURN(BindMount("/system", PathInChroot("/system")));
     for (const std::string& partition : additional_system_partitions) {
       // Some additional partitions are optional, but that's okay. The root filesystem (mounted at
       // `/`) has empty directories for additional partitions. If additional partitions don't exist,

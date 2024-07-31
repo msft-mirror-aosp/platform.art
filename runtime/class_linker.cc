@@ -643,7 +643,9 @@ ClassLinker::ClassLinker(InternTable* intern_table, bool fast_class_not_found_ex
   CHECK(intern_table_ != nullptr);
   static_assert(kFindArrayCacheSize == arraysize(find_array_class_cache_),
                 "Array cache size wrong.");
-  std::fill_n(find_array_class_cache_, kFindArrayCacheSize, GcRoot<mirror::Class>(nullptr));
+  for (size_t i = 0; i < kFindArrayCacheSize; i++) {
+    find_array_class_cache_[i].store(GcRoot<mirror::Class>(nullptr), std::memory_order_relaxed);
+  }
 }
 
 void ClassLinker::CheckSystemClass(Thread* self, Handle<mirror::Class> c1, const char* descriptor) {
@@ -2823,9 +2825,13 @@ void ClassLinker::FinishArrayClassSetup(ObjPtr<mirror::Class> array_class) {
   array_class->SetVTable(java_lang_Object->GetVTable());
   array_class->SetPrimitiveType(Primitive::kPrimNot);
   ObjPtr<mirror::Class> component_type = array_class->GetComponentType();
-  array_class->SetClassFlags(component_type->IsPrimitive()
-                                 ? mirror::kClassFlagNoReferenceFields
-                                 : mirror::kClassFlagObjectArray);
+  DCHECK_LT(component_type->GetPrimitiveTypeSizeShift(), 4u);
+  uint32_t class_flags =
+      component_type->GetPrimitiveTypeSizeShift() << mirror::kArrayComponentSizeShiftShift;
+  class_flags |= component_type->IsPrimitive()
+                     ? (mirror::kClassFlagNoReferenceFields | mirror::kClassFlagPrimitiveArray)
+                     : mirror::kClassFlagObjectArray;
+  array_class->SetClassFlags(class_flags);
   array_class->SetClassLoader(component_type->GetClassLoader());
   array_class->SetStatusForPrimitiveOrArray(ClassStatus::kLoaded);
   array_class->PopulateEmbeddedVTable(image_pointer_size_);
@@ -10927,7 +10933,9 @@ jobject ClassLinker::CreatePathClassLoader(Thread* self,
 }
 
 void ClassLinker::DropFindArrayClassCache() {
-  std::fill_n(find_array_class_cache_, kFindArrayCacheSize, GcRoot<mirror::Class>(nullptr));
+  for (size_t i = 0; i < kFindArrayCacheSize; i++) {
+    find_array_class_cache_[i].store(GcRoot<mirror::Class>(nullptr), std::memory_order_relaxed);
+  }
   find_array_class_cache_next_victim_ = 0;
 }
 
