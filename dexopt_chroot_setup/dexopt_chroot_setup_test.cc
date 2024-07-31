@@ -89,7 +89,7 @@ class DexoptChrootSetupTest : public CommonArtTest {
       return;
     }
     scratch_dir_.reset();
-    dexopt_chroot_setup_->tearDown();
+    dexopt_chroot_setup_->tearDown(/*in_allowConcurrent=*/false);
     CommonArtTest::TearDown();
   }
 
@@ -171,24 +171,30 @@ TEST_F(DexoptChrootSetupTest, Run) {
   std::string error_msg;
   EXPECT_TRUE(Exec(args.Get(), &error_msg)) << error_msg;
 
-  // Check that `setUp` can be repetitively called, to simulate the case where an instance of the
+  // Check that `setUp` can be repeatedly called, to simulate the case where an instance of the
   // caller (typically system_server) called `setUp` and crashed later, and a new instance called
   // `setUp` again.
   ASSERT_STATUS_OK(
       dexopt_chroot_setup_->setUp(/*in_otaSlot=*/std::nullopt, /*in_mapSnapshotsForOta=*/false));
   ASSERT_STATUS_OK(dexopt_chroot_setup_->init());
 
-  ASSERT_STATUS_OK(dexopt_chroot_setup_->tearDown());
+  // Check that `init` cannot be repeatedly called.
+  ndk::ScopedAStatus status = dexopt_chroot_setup_->init();
+  EXPECT_FALSE(status.isOk());
+  EXPECT_EQ(status.getExceptionCode(), EX_ILLEGAL_STATE);
+  EXPECT_STREQ(status.getMessage(), "init must not be repeatedly called");
+
+  ASSERT_STATUS_OK(dexopt_chroot_setup_->tearDown(/*in_allowConcurrent=*/false));
 
   EXPECT_FALSE(std::filesystem::exists(DexoptChrootSetup::CHROOT_DIR));
 
-  // Check that `tearDown` can be repetitively called too.
-  ASSERT_STATUS_OK(dexopt_chroot_setup_->tearDown());
+  // Check that `tearDown` can be repeatedly called too.
+  ASSERT_STATUS_OK(dexopt_chroot_setup_->tearDown(/*in_allowConcurrent=*/false));
 
   // Check that `setUp` can be followed directly by a `tearDown`.
   ASSERT_STATUS_OK(
       dexopt_chroot_setup_->setUp(/*in_otaSlot=*/std::nullopt, /*in_mapSnapshotsForOta=*/false));
-  ASSERT_STATUS_OK(dexopt_chroot_setup_->tearDown());
+  ASSERT_STATUS_OK(dexopt_chroot_setup_->tearDown(/*in_allowConcurrent=*/false));
   EXPECT_FALSE(std::filesystem::exists(DexoptChrootSetup::CHROOT_DIR));
 }
 
