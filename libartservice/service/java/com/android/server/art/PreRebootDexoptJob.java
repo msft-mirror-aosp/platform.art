@@ -48,6 +48,11 @@ import java.time.Duration;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 /**
  * The Pre-reboot Dexopt job.
@@ -69,6 +74,7 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
     @NonNull private final Injector mInjector;
 
     // Job state variables. The monitor of `this` is notified when `mRunningJob` is changed.
+    // `mRunningJob` and `mCancellationSignal` have the same nullness.
     @GuardedBy("this") @Nullable private CompletableFuture<Void> mRunningJob = null;
     @GuardedBy("this") @Nullable private CancellationSignal mCancellationSignal = null;
 
@@ -81,6 +87,26 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
     /** Whether to map/unmap snapshots. Only applicable to an OTA update. */
     @GuardedBy("this") private boolean mMapSnapshotsForOta = false;
 
+    /**
+     * Offloads `onStartJob` and `onStopJob` calls from the main thread while keeping the execution
+     * order as the main thread does.
+     */
+    @NonNull
+    private final ThreadPoolExecutor mSerializedExecutor =
+            new ThreadPoolExecutor(1 /* corePoolSize */, 1 /* maximumPoolSize */,
+                    60 /* keepAliveTime */, TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>());
+
+    /**
+     * A separate thread for executing `mRunningJob`. We avoid using any known thread / thread pool
+     * such as {@link java.util.concurrent.ForkJoinPool} and {@link
+     * com.android.internal.os.BackgroundThread} because we don't want to block other things that
+     * use known threads / thread pools.
+     */
+    @NonNull
+    private final ThreadPoolExecutor mExecutor =
+            new ThreadPoolExecutor(1 /* corePoolSize */, 1 /* maximumPoolSize */,
+                    60 /* keepAliveTime */, TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>());
+
     // Mutations to the global state of Pre-reboot Dexopt, including mounts, staged files, and
     // stats, should only be done when there is no job running and the `this` lock is held, or by
     // the job itself.
@@ -92,17 +118,32 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
     @VisibleForTesting
     public PreRebootDexoptJob(@NonNull Injector injector) {
         mInjector = injector;
+        // Recycle the thread if it's not used for `keepAliveTime`.
+        mSerializedExecutor.allowsCoreThreadTimeOut();
+        mExecutor.allowsCoreThreadTimeOut();
+        if (hasStarted()) {
+            maybeCleanUpChrootAsyncForStartup();
+        }
     }
 
     @Override
-    public synchronized boolean onStartJob(
+    public boolean onStartJob(
+            @NonNull BackgroundDexoptJobService jobService, @NonNull JobParameters params) {
+        mSerializedExecutor.execute(() -> onStartJobImpl(jobService, params));
+        // "true" means the job will continue running until `jobFinished` is called.
+        return true;
+    }
+
+    @VisibleForTesting
+    public synchronized void onStartJobImpl(
             @NonNull BackgroundDexoptJobService jobService, @NonNull JobParameters params) {
         JobInfo pendingJob = mInjector.getJobScheduler().getPendingJob(JOB_ID);
         if (pendingJob == null
                 || !params.getExtras().getString("ticket").equals(
                         pendingJob.getExtras().getString("ticket"))) {
             // Job expired. We can only get here due to a race, and this should be very rare.
-            return false;
+            Utils.check(!mIsRunningJobKnownByJobScheduler);
+            return;
         }
 
         mIsRunningJobKnownByJobScheduler = true;
@@ -118,17 +159,20 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
         // No need to handle exceptions thrown by the future because exceptions are handled inside
         // the future itself.
         startLocked(onJobFinishedLocked);
-        // "true" means the job will continue running until `jobFinished` is called.
-        return true;
     }
 
     @Override
-    public synchronized boolean onStopJob(@NonNull JobParameters params) {
+    public boolean onStopJob(@NonNull JobParameters params) {
+        mSerializedExecutor.execute(() -> onStopJobImpl(params));
+        // "true" means to execute again with the default retry policy.
+        return true;
+    }
+
+    @VisibleForTesting
+    public synchronized void onStopJobImpl(@NonNull JobParameters params) {
         if (mIsRunningJobKnownByJobScheduler) {
             cancelGivenLocked(mRunningJob, false /* expectInterrupt */);
         }
-        // "true" means to execute again with the default retry policy.
-        return true;
     }
 
     /**
@@ -183,6 +227,31 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
         cancelAnyLocked();
     }
 
+    /** Cleans up chroot if it exists. Only expected to be called on system server startup. */
+    private synchronized void maybeCleanUpChrootAsyncForStartup() {
+        // We only get here when there was a system server restart (probably due to a crash). In
+        // this case, it's possible that a previous Pre-reboot Dexopt job didn't end normally and
+        // left over a chroot, so we need to clean it up.
+        // We assign this operation to `mRunningJob` to block other operations on their calls to
+        // `cancelAnyLocked`.
+        // `mCancellationSignal` is a placeholder and the signal actually ignored. It's created just
+        // for keeping the invariant that `mRunningJob` and `mCancellationSignal` have the same
+        // nullness, to make other code simpler.
+        mCancellationSignal = new CancellationSignal();
+        mRunningJob = new CompletableFuture().runAsync(() -> {
+            try {
+                mInjector.getPreRebootDriver().maybeCleanUpChroot();
+            } finally {
+                synchronized (this) {
+                    mRunningJob = null;
+                    mCancellationSignal = null;
+                    this.notifyAll();
+                }
+            }
+        }, mExecutor);
+        this.notifyAll();
+    }
+
     @VisibleForTesting
     public synchronized void waitForRunningJob() {
         while (mRunningJob != null) {
@@ -192,6 +261,11 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
                 AsLog.wtf("Interrupted", e);
             }
         }
+    }
+
+    @VisibleForTesting
+    public synchronized boolean hasRunningJob() {
+        return mRunningJob != null;
     }
 
     @GuardedBy("this")
@@ -291,7 +365,7 @@ public class PreRebootDexoptJob implements ArtServiceJobInterface {
                     this.notifyAll();
                 }
             }
-        });
+        }, mExecutor);
         this.notifyAll();
         return mRunningJob;
     }
