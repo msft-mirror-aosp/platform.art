@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "arch/context.h"
 #include "art_method-inl.h"
 #include "base/callee_save_type.h"
 #include "base/pointer_size.h"
@@ -238,6 +239,10 @@ class QuickArgumentVisitor {
   // | RBX/R3          |    callee save
   // | RDX/R2          |    arg2
   // | RCX/R1          |    arg3
+  // | XMM15           |    callee save
+  // | XMM14           |    callee save
+  // | XMM13           |    callee save
+  // | XMM12           |    callee save
   // | XMM7            |    float arg 8
   // | XMM6            |    float arg 7
   // | XMM5            |    float arg 6
@@ -2519,6 +2524,7 @@ extern "C" void artJniMethodEntryHook(Thread* self)
 
 extern "C" Context* artMethodEntryHook(ArtMethod* method, Thread* self, ArtMethod** sp)
     REQUIRES_SHARED(Locks::mutator_lock_) {
+  ScopedQuickEntrypointChecks sqec(self);
   instrumentation::Instrumentation* instr = Runtime::Current()->GetInstrumentation();
   if (instr->HasFastMethodEntryListenersOnly()) {
     instr->MethodEnterEvent(self, method);
@@ -2544,11 +2550,12 @@ extern "C" Context* artMethodEntryHook(ArtMethod* method, Thread* self, ArtMetho
 }
 
 extern "C" Context* artMethodExitHook(Thread* self,
-                                 ArtMethod** sp,
-                                 uint64_t* gpr_result,
-                                 uint64_t* fpr_result,
-                                 uint32_t frame_size)
+                                      ArtMethod** sp,
+                                      uint64_t* gpr_result,
+                                      uint64_t* fpr_result,
+                                      uint32_t frame_size)
   REQUIRES_SHARED(Locks::mutator_lock_) {
+  ScopedQuickEntrypointChecks sqec(self);
   DCHECK_EQ(reinterpret_cast<uintptr_t>(self), reinterpret_cast<uintptr_t>(Thread::Current()));
   // Instrumentation exit stub must not be entered with a pending exception.
   CHECK(!self->IsExceptionPending())
@@ -2597,7 +2604,10 @@ extern "C" Context* artMethodExitHook(Thread* self,
   if (self->IsExceptionPending() || self->ObserveAsyncException()) {
     // The exception was thrown from the method exit callback. We should not call method unwind
     // callbacks for this case.
-    return self->QuickDeliverException(/* is_method_exit_exception= */ true);
+    std::unique_ptr<Context> context =
+        self->QuickDeliverException(/* is_method_exit_exception= */ true);
+    DCHECK(context != nullptr);
+    return context.release();
   }
 
   // We should deoptimize here if the caller requires a deoptimization or if the current method
@@ -2612,7 +2622,11 @@ extern "C" Context* artMethodExitHook(Thread* self,
         ret_val, is_ref, self->GetException(), false, deopt_method_type);
     // Method exit callback has already been run for this method. So tell the deoptimizer to skip
     // callbacks for this frame.
-    return artDeoptimize(self, /*skip_method_exit_callbacks = */ true);
+    std::unique_ptr<Context> context = self->Deoptimize(DeoptimizationKind::kFullFrame,
+                                                        /* single_frame= */ false,
+                                                        /* skip_method_exit_callbacks= */ true);
+    DCHECK(context != nullptr);
+    return context.release();
   }
 
   // No exception or deoptimization.
