@@ -2220,19 +2220,18 @@ void InstructionCodeGeneratorARMVIXL::GenerateMethodEntryExitHook(HInstruction* 
   __ B(gt, slow_path->GetEntryLabel());
 
   // Check if there is place in the buffer to store a new entry, if no, take slow path.
-  uint32_t trace_buffer_index_offset =
-      Thread::TraceBufferIndexOffset<kArmPointerSize>().Int32Value();
-  vixl32::Register index = value;
-  __ Ldr(index, MemOperand(tr, trace_buffer_index_offset));
-  __ Subs(index, index, kNumEntriesForWallClock);
+  uint32_t trace_buffer_curr_entry_offset =
+      Thread::TraceBufferCurrPtrOffset<kArmPointerSize>().Int32Value();
+  vixl32::Register curr_entry = value;
+  vixl32::Register init_entry = addr;
+  __ Ldr(curr_entry, MemOperand(tr, trace_buffer_curr_entry_offset));
+  __ Subs(curr_entry, curr_entry, static_cast<uint32_t>(kNumEntriesForWallClock * sizeof(void*)));
+  __ Ldr(init_entry, MemOperand(tr, Thread::TraceBufferPtrOffset<kArmPointerSize>().SizeValue()));
+  __ Cmp(curr_entry, init_entry);
   __ B(lt, slow_path->GetEntryLabel());
 
   // Update the index in the `Thread`.
-  __ Str(index, MemOperand(tr, trace_buffer_index_offset));
-  // Calculate the entry address in the buffer.
-  // addr = base_addr + sizeof(void*) * index
-  __ Ldr(addr, MemOperand(tr, Thread::TraceBufferPtrOffset<kArmPointerSize>().SizeValue()));
-  __ Add(addr, addr, Operand(index, LSL, TIMES_4));
+  __ Str(curr_entry, MemOperand(tr, trace_buffer_curr_entry_offset));
 
   // Record method pointer and trace action.
   __ Ldr(tmp, MemOperand(sp, 0));
@@ -2244,9 +2243,9 @@ void InstructionCodeGeneratorARMVIXL::GenerateMethodEntryExitHook(HInstruction* 
     static_assert(enum_cast<int32_t>(TraceAction::kTraceMethodExit) == 1);
     __ Orr(tmp, tmp, Operand(enum_cast<int32_t>(TraceAction::kTraceMethodExit)));
   }
-  __ Str(tmp, MemOperand(addr, kMethodOffsetInBytes));
+  __ Str(tmp, MemOperand(curr_entry, kMethodOffsetInBytes));
 
-  vixl32::Register tmp1 = index;
+  vixl32::Register tmp1 = init_entry;
   // See Architecture Reference Manual ARMv7-A and ARMv7-R edition section B4.1.34.
   __ Mrrc(/* lower 32-bit */ tmp,
           /* higher 32-bit */ tmp1,
@@ -2255,7 +2254,7 @@ void InstructionCodeGeneratorARMVIXL::GenerateMethodEntryExitHook(HInstruction* 
           /* crm= */ 14);
   static_assert(kHighTimestampOffsetInBytes ==
                 kTimestampOffsetInBytes + static_cast<uint32_t>(kRuntimePointerSize));
-  __ Strd(tmp, tmp1, MemOperand(addr, kTimestampOffsetInBytes));
+  __ Strd(tmp, tmp1, MemOperand(curr_entry, kTimestampOffsetInBytes));
   __ Bind(slow_path->GetExitLabel());
 }
 
@@ -5757,14 +5756,16 @@ void InstructionCodeGeneratorARMVIXL::VisitBooleanNot(HBooleanNot* bool_not) {
 void LocationsBuilderARMVIXL::VisitCompare(HCompare* compare) {
   LocationSummary* locations =
       new (GetGraph()->GetAllocator()) LocationSummary(compare, LocationSummary::kNoCall);
-  switch (compare->InputAt(0)->GetType()) {
+  switch (compare->GetComparisonType()) {
     case DataType::Type::kBool:
     case DataType::Type::kUint8:
     case DataType::Type::kInt8:
     case DataType::Type::kUint16:
     case DataType::Type::kInt16:
     case DataType::Type::kInt32:
-    case DataType::Type::kInt64: {
+    case DataType::Type::kUint32:
+    case DataType::Type::kInt64:
+    case DataType::Type::kUint64: {
       locations->SetInAt(0, Location::RequiresRegister());
       locations->SetInAt(1, Location::RequiresRegister());
       // Output overlaps because it is written before doing the low comparison.
@@ -5791,9 +5792,14 @@ void InstructionCodeGeneratorARMVIXL::VisitCompare(HCompare* compare) {
 
   vixl32::Label less, greater, done;
   vixl32::Label* final_label = codegen_->GetFinalLabel(compare, &done);
-  DataType::Type type = compare->InputAt(0)->GetType();
-  vixl32::Condition less_cond = vixl32::Condition::None();
+  DataType::Type type = compare->GetComparisonType();
+  vixl32::Condition less_cond = vixl32::ConditionType::lt;
+  vixl32::Condition greater_cond = vixl32::ConditionType::gt;
   switch (type) {
+    case DataType::Type::kUint32:
+      less_cond = vixl32::ConditionType::lo;
+      // greater_cond - is not needed below
+      FALLTHROUGH_INTENDED;
     case DataType::Type::kBool:
     case DataType::Type::kUint8:
     case DataType::Type::kInt8:
@@ -5802,18 +5808,22 @@ void InstructionCodeGeneratorARMVIXL::VisitCompare(HCompare* compare) {
     case DataType::Type::kInt32: {
       // Emit move to `out` before the `Cmp`, as `Mov` might affect the status flags.
       __ Mov(out, 0);
-      __ Cmp(RegisterFrom(left), RegisterFrom(right));  // Signed compare.
-      less_cond = lt;
+      __ Cmp(RegisterFrom(left), RegisterFrom(right));
       break;
     }
+    case DataType::Type::kUint64:
+      less_cond = vixl32::ConditionType::lo;
+      greater_cond = vixl32::ConditionType::hi;
+      FALLTHROUGH_INTENDED;
     case DataType::Type::kInt64: {
-      __ Cmp(HighRegisterFrom(left), HighRegisterFrom(right));  // Signed compare.
-      __ B(lt, &less, /* is_far_target= */ false);
-      __ B(gt, &greater, /* is_far_target= */ false);
+      __ Cmp(HighRegisterFrom(left), HighRegisterFrom(right));  // High part compare.
+      __ B(less_cond, &less, /* is_far_target= */ false);
+      __ B(greater_cond, &greater, /* is_far_target= */ false);
       // Emit move to `out` before the last `Cmp`, as `Mov` might affect the status flags.
       __ Mov(out, 0);
       __ Cmp(LowRegisterFrom(left), LowRegisterFrom(right));  // Unsigned compare.
-      less_cond = lo;
+      less_cond = vixl32::ConditionType::lo;
+      // greater_cond - is not needed below
       break;
     }
     case DataType::Type::kFloat32:
@@ -6118,14 +6128,14 @@ void LocationsBuilderARMVIXL::HandleFieldGet(HInstruction* instruction,
   bool volatile_for_double = field_info.IsVolatile()
       && (field_info.GetFieldType() == DataType::Type::kFloat64)
       && !codegen_->GetInstructionSetFeatures().HasAtomicLdrdAndStrd();
-  // The output overlaps in case of volatile long: we don't want the
-  // code generated by GenerateWideAtomicLoad to overwrite the
-  // object's location.  Likewise, in the case of an object field get
-  // with read barriers enabled, we do not want the load to overwrite
-  // the object's location, as we need it to emit the read barrier.
+  // The output overlaps in case of volatile long: we don't want the code generated by
+  // `GenerateWideAtomicLoad()` to overwrite the object's location.  Likewise, in the case
+  // of an object field get with non-Baker read barriers enabled, we do not want the load
+  // to overwrite the object's location, as we need it to emit the read barrier.
+  // Baker read barrier implementation with introspection does not have this restriction.
   bool overlap =
       (field_info.IsVolatile() && (field_info.GetFieldType() == DataType::Type::kInt64)) ||
-      object_field_get_with_read_barrier;
+      (object_field_get_with_read_barrier && !kUseBakerReadBarrier);
 
   if (DataType::IsFloatingPointType(instruction->GetType())) {
     locations->SetOut(Location::RequiresFpuRegister());
@@ -6571,12 +6581,12 @@ void LocationsBuilderARMVIXL::VisitArrayGet(HArrayGet* instruction) {
   if (DataType::IsFloatingPointType(instruction->GetType())) {
     locations->SetOut(Location::RequiresFpuRegister(), Location::kNoOutputOverlap);
   } else {
-    // The output overlaps in the case of an object array get with
-    // read barriers enabled: we do not want the move to overwrite the
-    // array's location, as we need it to emit the read barrier.
-    locations->SetOut(
-        Location::RequiresRegister(),
-        object_array_get_with_read_barrier ? Location::kOutputOverlap : Location::kNoOutputOverlap);
+    // The output overlaps for an object array get for non-Baker read barriers: we do not want
+    // the load to overwrite the object's location, as we need it to emit the read barrier.
+    // Baker read barrier implementation with introspection does not have this restriction.
+    bool overlap = object_array_get_with_read_barrier && !kUseBakerReadBarrier;
+    locations->SetOut(Location::RequiresRegister(),
+                      overlap ? Location::kOutputOverlap : Location::kNoOutputOverlap);
   }
   if (object_array_get_with_read_barrier && kUseBakerReadBarrier) {
     if (instruction->GetIndex()->IsConstant()) {

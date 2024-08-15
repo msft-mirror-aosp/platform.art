@@ -106,9 +106,7 @@ ART_TEST_MODULES_COMMON := \
     art_compiler_host_tests \
     art_compiler_tests \
     art_dexanalyze_tests \
-    art_dexdiag_tests \
     art_dexdump_tests \
-    art_dexlayout_tests \
     art_dexlist_tests \
     art_dexoptanalyzer_tests \
     art_disassembler_tests \
@@ -251,9 +249,6 @@ $$(gtest_build_rule) : $$(gtest_exe) $$(gtest_deps)
 .PHONY: $$(gtest_rule)
 $$(gtest_rule): $$(gtest_output)
 
-# Re-run the tests, even if nothing changed. Until the build system has a dedicated "no cache"
-# option, claim to write a file that is never produced.
-$$(gtest_output): .KATI_IMPLICIT_OUTPUTS := $$(gtest_output)-nocache
 # Limit concurrent runs. Each test itself is already highly parallel (and thus memory hungry).
 $$(gtest_output): .KATI_NINJA_POOL := highmem_pool
 $$(gtest_output): NAME := $$(gtest_rule)
@@ -273,7 +268,7 @@ else
 # under ASAN.
 $$(gtest_output): $$(gtest_exe) $$(gtest_deps)
 	$(hide) ($$(call ART_TEST_SKIP,$$(NAME)) && set -o pipefail && \
-		ASAN_OPTIONS=detect_leaks=1 timeout --foreground -k 120s 3600s \
+		ASAN_OPTIONS=detect_leaks=1 timeout --foreground -k 180s 3600s \
 			$(HOST_OUT_EXECUTABLES)/signal_dumper -s 15 \
 				$$< --gtest_output=xml:$$@ 2>&1 | tee $$<.tmp.out >&2 && \
 		{ $$(call ART_TEST_PASSED,$$(NAME)) ; rm $$<.tmp.out ; }) || \
