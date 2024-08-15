@@ -187,12 +187,14 @@ void ArtMethod::ThrowInvocationTimeError(ObjPtr<mirror::Object> receiver) {
     // IllegalAccessError.
     DCHECK(IsAbstract());
     ObjPtr<mirror::Class> current = receiver->GetClass();
+    std::string_view name = GetNameView();
+    Signature signature = GetSignature();
     while (current != nullptr) {
       for (ArtMethod& method : current->GetDeclaredMethodsSlice(kRuntimePointerSize)) {
         ArtMethod* np_method = method.GetInterfaceMethodIfProxy(kRuntimePointerSize);
         if (!np_method->IsStatic() &&
-            np_method->GetNameView() == GetNameView() &&
-            np_method->GetSignature() == GetSignature()) {
+            np_method->GetNameView() == name &&
+            np_method->GetSignature() == signature) {
           if (!np_method->IsPublic()) {
             ThrowIllegalAccessErrorForImplementingMethod(receiver->GetClass(), np_method, this);
             return;
@@ -340,9 +342,6 @@ uint32_t ArtMethod::FindCatchBlock(Handle<mirror::Class> exception_type,
       // removed by a pro-guard like tool.
       // Note: this is not RI behavior. RI would have failed when loading the class.
       self->ClearException();
-      // Delete any long jump context as this routine is called during a stack walk which will
-      // release its in use context at the end.
-      delete self->GetLongJumpContext();
       LOG(WARNING) << "Unresolved exception class when finding catch block: "
         << DescriptorToDot(GetTypeDescriptorFromTypeIdx(iter_type_idx));
     } else if (iter_exception_type->IsAssignableFrom(exception_type.Get())) {
@@ -922,35 +921,6 @@ ALWAYS_INLINE static inline void DoGetAccessFlagsHelper(ArtMethod* method)
   CHECK(method->IsRuntimeMethod() ||
         method->GetDeclaringClass<kReadBarrierOption>()->IsIdxLoaded() ||
         method->GetDeclaringClass<kReadBarrierOption>()->IsErroneous());
-}
-
-template <typename T>
-const void* Exchange(uintptr_t ptr, uintptr_t new_value) {
-  std::atomic<T>* atomic_addr = reinterpret_cast<std::atomic<T>*>(ptr);
-  return reinterpret_cast<const void*>(
-      atomic_addr->exchange(dchecked_integral_cast<T>(new_value), std::memory_order_relaxed));
-}
-
-void ArtMethod::SetEntryPointFromQuickCompiledCodePtrSize(
-    const void* entry_point_from_quick_compiled_code, PointerSize pointer_size) {
-  const void* current_entry_point = GetEntryPointFromQuickCompiledCodePtrSize(pointer_size);
-  if (current_entry_point == entry_point_from_quick_compiled_code) {
-    return;
-  }
-
-  // Do an atomic exchange to avoid potentially unregistering JIT code twice.
-  MemberOffset offset = EntryPointFromQuickCompiledCodeOffset(pointer_size);
-  uintptr_t new_value = reinterpret_cast<uintptr_t>(entry_point_from_quick_compiled_code);
-  uintptr_t ptr = reinterpret_cast<uintptr_t>(this) + offset.Uint32Value();
-  const void* old_value = (pointer_size == PointerSize::k32)
-      ? Exchange<uint32_t>(ptr, new_value)
-      : Exchange<uint64_t>(ptr, new_value);
-
-  jit::Jit* jit = Runtime::Current()->GetJit();
-  if (jit != nullptr &&
-      jit->GetCodeCache()->ContainsPc(old_value)) {
-    jit->GetCodeCache()->AddZombieCode(this, old_value);
-  }
 }
 
 }  // namespace art

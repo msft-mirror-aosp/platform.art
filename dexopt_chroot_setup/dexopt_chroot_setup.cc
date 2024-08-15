@@ -22,9 +22,12 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <iterator>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -39,6 +42,7 @@
 #include "android-base/no_destructor.h"
 #include "android-base/properties.h"
 #include "android-base/result.h"
+#include "android-base/scopeguard.h"
 #include "android-base/strings.h"
 #include "android/binder_auto_utils.h"
 #include "android/binder_manager.h"
@@ -46,6 +50,7 @@
 #include "base/file_utils.h"
 #include "base/macros.h"
 #include "base/os.h"
+#include "base/stl_util.h"
 #include "exec_utils.h"
 #include "fstab/fstab.h"
 #include "tools/binder_utils.h"
@@ -58,9 +63,9 @@ namespace dexopt_chroot_setup {
 namespace {
 
 using ::android::base::ConsumePrefix;
-using ::android::base::EndsWith;
 using ::android::base::Error;
 using ::android::base::Join;
+using ::android::base::make_scope_guard;
 using ::android::base::NoDestructor;
 using ::android::base::ReadFileToString;
 using ::android::base::Result;
@@ -86,6 +91,8 @@ const NoDestructor<std::string> kSnapshotMappedFile(
     std::string(DexoptChrootSetup::PRE_REBOOT_DEXOPT_DIR) + "/snapshot_mapped");
 constexpr mode_t kChrootDefaultMode = 0755;
 constexpr std::chrono::milliseconds kSnapshotCtlTimeout = std::chrono::seconds(60);
+constexpr std::array<const char*, 4> kExternalLibDirs = {
+    "/system/lib", "/system/lib64", "/system_ext/lib", "/system_ext/lib64"};
 
 bool IsOtaUpdate(const std::optional<std::string>& ota_slot) { return ota_slot.has_value(); }
 
@@ -121,6 +128,20 @@ Result<void> CreateDir(const std::string& path) {
     return Errorf("Failed to create dir '{}': {}", path, ec.message());
   }
   return {};
+}
+
+Result<void> Unmount(const std::string& target, bool logging = true) {
+  if (umount2(target.c_str(), UMOUNT_NOFOLLOW) == 0) {
+    LOG_IF(INFO, logging) << ART_FORMAT("Unmounted '{}'", target);
+    return {};
+  }
+  LOG(WARNING) << ART_FORMAT(
+      "Failed to umount2 '{}': {}. Retrying with MNT_DETACH", target, strerror(errno));
+  if (umount2(target.c_str(), UMOUNT_NOFOLLOW | MNT_DETACH) == 0) {
+    LOG_IF(INFO, logging) << ART_FORMAT("Unmounted '{}' with MNT_DETACH", target);
+    return {};
+  }
+  return ErrnoErrorf("Failed to umount2 '{}'", target);
 }
 
 Result<void> BindMount(const std::string& source, const std::string& target) {
@@ -186,31 +207,43 @@ Result<void> BindMount(const std::string& source, const std::string& target) {
             /*fs_type=*/nullptr,
             MS_BIND,
             /*data=*/nullptr) != 0) {
-    return ErrnoErrorf("Failed to bind-mount '{}' at '{}'", source, *kBindMountTmpDir);
+    return ErrnoErrorf("Failed to bind-mount '{}' at '{}' ('{}' -> '{}')",
+                       source,
+                       *kBindMountTmpDir,
+                       source,
+                       target);
   }
+  auto cleanup = make_scope_guard([&]() {
+    Result<void> result = Unmount(*kBindMountTmpDir, /*logging=*/false);
+    if (!result.ok()) {
+      LOG(ERROR) << result.error().message();
+    }
+  });
   if (mount(/*source=*/nullptr,
             kBindMountTmpDir->c_str(),
             /*fs_type=*/nullptr,
             MS_SLAVE,
             /*data=*/nullptr) != 0) {
-    return ErrnoErrorf("Failed to make mount slave for '{}'", *kBindMountTmpDir);
+    return ErrnoErrorf(
+        "Failed to make mount slave for '{}' ('{}' -> '{}')", *kBindMountTmpDir, source, target);
   }
   if (mount(kBindMountTmpDir->c_str(),
             target.c_str(),
             /*fs_type=*/nullptr,
             MS_BIND,
             /*data=*/nullptr) != 0) {
-    return ErrnoErrorf("Failed to bind-mount '{}' at '{}'", *kBindMountTmpDir, target);
-  }
-  if (umount2(kBindMountTmpDir->c_str(), UMOUNT_NOFOLLOW) != 0) {
-    return ErrnoErrorf("Failed to umount2 '{}'", *kBindMountTmpDir);
+    return ErrnoErrorf("Failed to bind-mount '{}' at '{}' ('{}' -> '{}')",
+                       *kBindMountTmpDir,
+                       target,
+                       source,
+                       target);
   }
   LOG(INFO) << ART_FORMAT("Bind-mounted '{}' at '{}'", source, target);
   return {};
 }
 
 Result<void> BindMountRecursive(const std::string& source, const std::string& target) {
-  CHECK(!EndsWith(source, '/'));
+  CHECK(!source.ends_with('/'));
   OR_RETURN(BindMount(source, target));
 
   // Mount and make slave one by one. Do not use MS_REC because we don't want to mount a child if
@@ -222,7 +255,7 @@ Result<void> BindMountRecursive(const std::string& source, const std::string& ta
   // The list is in mount order.
   std::vector<FstabEntry> entries = OR_RETURN(GetProcMountsDescendantsOfPath(source));
   for (const FstabEntry& entry : entries) {
-    CHECK(!EndsWith(entry.mount_point, '/'));
+    CHECK(!entry.mount_point.ends_with('/'));
     std::string_view sub_dir = entry.mount_point;
     CHECK(ConsumePrefix(&sub_dir, source));
     if (sub_dir.empty()) {
@@ -266,7 +299,7 @@ Result<std::vector<std::string>> GetSupportedFilesystems() {
   return filesystems;
 }
 
-Result<void> Mount(const std::string& block_device, const std::string& target) {
+Result<void> Mount(const std::string& block_device, const std::string& target, bool is_optional) {
   static const NoDestructor<Result<std::vector<std::string>>> supported_filesystems(
       GetSupportedFilesystems());
   if (!supported_filesystems->ok()) {
@@ -284,6 +317,10 @@ Result<void> Mount(const std::string& block_device, const std::string& target) {
           "Mounted '{}' at '{}' with type '{}'", block_device, target, filesystem);
       return {};
     } else {
+      if (errno == ENOENT && is_optional) {
+        LOG(INFO) << ART_FORMAT("Skipped non-existing block device '{}'", block_device);
+        return {};
+      }
       error_msgs.push_back(ART_FORMAT("Tried '{}': {}", filesystem, strerror(errno)));
       if (errno != EINVAL && errno != EBUSY) {
         // If the filesystem type is wrong, `errno` must be either `EINVAL` or `EBUSY`. For example,
@@ -324,7 +361,8 @@ Result<std::optional<std::string>> LoadOtaSlotFile() {
 
 }  // namespace
 
-ScopedAStatus DexoptChrootSetup::setUp(const std::optional<std::string>& in_otaSlot) {
+ScopedAStatus DexoptChrootSetup::setUp(const std::optional<std::string>& in_otaSlot,
+                                       bool in_mapSnapshotsForOta) {
   if (!mu_.try_lock()) {
     return Fatal("Unexpected concurrent calls");
   }
@@ -333,7 +371,7 @@ ScopedAStatus DexoptChrootSetup::setUp(const std::optional<std::string>& in_otaS
   if (in_otaSlot.has_value() && (in_otaSlot.value() != "_a" && in_otaSlot.value() != "_b")) {
     return Fatal(ART_FORMAT("Invalid OTA slot '{}'", in_otaSlot.value()));
   }
-  OR_RETURN_NON_FATAL(SetUpChroot(in_otaSlot));
+  OR_RETURN_NON_FATAL(SetUpChroot(in_otaSlot, in_mapSnapshotsForOta));
   return ScopedAStatus::ok();
 }
 
@@ -343,13 +381,24 @@ ScopedAStatus DexoptChrootSetup::init() {
   }
   std::lock_guard<std::mutex> lock(mu_, std::adopt_lock);
 
+  if (OS::FileExists(PathInChroot("/linkerconfig/ld.config.txt").c_str())) {
+    return Fatal("init must not be repeatedly called");
+  }
+
   OR_RETURN_NON_FATAL(InitChroot());
   return ScopedAStatus::ok();
 }
 
-ScopedAStatus DexoptChrootSetup::tearDown() {
-  if (!mu_.try_lock()) {
-    return Fatal("Unexpected concurrent calls");
+ScopedAStatus DexoptChrootSetup::tearDown(bool in_allowConcurrent) {
+  if (in_allowConcurrent) {
+    // Normally, we don't expect concurrent calls, but this method may be called upon system server
+    // restart when another call initiated by the previous system_server instance is still being
+    // processed.
+    mu_.lock();
+  } else {
+    if (!mu_.try_lock()) {
+      return Fatal("Unexpected concurrent calls");
+    }
   }
   std::lock_guard<std::mutex> lock(mu_, std::adopt_lock);
 
@@ -369,7 +418,8 @@ Result<void> DexoptChrootSetup::Start() {
   return {};
 }
 
-Result<void> DexoptChrootSetup::SetUpChroot(const std::optional<std::string>& ota_slot) const {
+Result<void> DexoptChrootSetup::SetUpChroot(const std::optional<std::string>& ota_slot,
+                                            bool map_snapshots_for_ota) const {
   // Set the default permission mode for new files and dirs to be `kChrootDefaultMode`.
   umask(~kChrootDefaultMode & 0777);
 
@@ -388,33 +438,49 @@ Result<void> DexoptChrootSetup::SetUpChroot(const std::optional<std::string>& ot
 
   if (!IsOtaUpdate(ota_slot)) {  // Mainline update
     OR_RETURN(BindMount("/", CHROOT_DIR));
+    // Normally, we don't need to bind-mount "/system" because it's a part of the image mounted at
+    // "/". However, when readonly partitions are remounted read-write, an overlay is created at
+    // "/system", so we need to bind-mount "/system" to handle this case. On devices where readonly
+    // partitions are not remounted, bind-mounting "/system" doesn't hurt.
+    OR_RETURN(BindMount("/system", PathInChroot("/system")));
     for (const std::string& partition : additional_system_partitions) {
+      // Some additional partitions are optional, but that's okay. The root filesystem (mounted at
+      // `/`) has empty directories for additional partitions. If additional partitions don't exist,
+      // we'll just be bind-mounting empty directories.
       OR_RETURN(BindMount("/" + partition, PathInChroot("/" + partition)));
     }
   } else {
     CHECK(ota_slot.value() == "_a" || ota_slot.value() == "_b");
 
-    // Write the file early in case `snapshotctl map` fails in the middle, leaving some devices
-    // mapped. We don't assume that `snapshotctl map` is transactional.
-    if (!WriteStringToFile("", *kSnapshotMappedFile)) {
-      return ErrnoErrorf("Failed to write '{}'", *kSnapshotMappedFile);
-    }
+    if (map_snapshots_for_ota) {
+      // Write the file early in case `snapshotctl map` fails in the middle, leaving some devices
+      // mapped. We don't assume that `snapshotctl map` is transactional.
+      if (!WriteStringToFile("", *kSnapshotMappedFile)) {
+        return ErrnoErrorf("Failed to write '{}'", *kSnapshotMappedFile);
+      }
 
-    // Run `snapshotctl map` through init to map block devices. We can't run it ourselves because it
-    // requires the UID to be 0. See `sys.snapshotctl.map` in `init.rc`.
-    if (!SetProperty("sys.snapshotctl.map", "requested")) {
-      return Errorf("Failed to request snapshotctl map");
-    }
-    if (!WaitForProperty("sys.snapshotctl.map", "finished", kSnapshotCtlTimeout)) {
-      return Errorf("snapshotctl timed out");
-    }
+      // Run `snapshotctl map` through init to map block devices. We can't run it ourselves because
+      // it requires the UID to be 0. See `sys.snapshotctl.map` in `init.rc`.
+      if (!SetProperty("sys.snapshotctl.map", "requested")) {
+        return Errorf("Failed to request snapshotctl map");
+      }
+      if (!WaitForProperty("sys.snapshotctl.map", "finished", kSnapshotCtlTimeout)) {
+        return Errorf("snapshotctl timed out");
+      }
 
-    // We don't know whether snapshotctl succeeded or not, but if it failed, the mount operation
-    // below will fail with `ENOENT`.
-    OR_RETURN(Mount(GetBlockDeviceName("system", ota_slot.value()), CHROOT_DIR));
-    for (const std::string& partition : additional_system_partitions) {
+      // We don't know whether snapshotctl succeeded or not, but if it failed, the mount operation
+      // below will fail with `ENOENT`.
       OR_RETURN(
-          Mount(GetBlockDeviceName(partition, ota_slot.value()), PathInChroot("/" + partition)));
+          Mount(GetBlockDeviceName("system", ota_slot.value()), CHROOT_DIR, /*is_optional=*/false));
+    } else {
+      // update_engine has mounted `system` at `/postinstall` for us.
+      OR_RETURN(BindMount("/postinstall", CHROOT_DIR));
+    }
+
+    for (const std::string& partition : additional_system_partitions) {
+      OR_RETURN(Mount(GetBlockDeviceName(partition, ota_slot.value()),
+                      PathInChroot("/" + partition),
+                      /*is_optional=*/true));
     }
   }
 
@@ -471,10 +537,54 @@ Result<void> DexoptChrootSetup::InitChroot() const {
       .Add("/linkerconfig");
   OR_RETURN(Run("linkerconfig", args.Get()));
 
+  // Platform libraries communicate with things outside of chroot through unstable APIs. Examples
+  // are `libbinder_ndk.so` talking to `servicemanager` and `libcgrouprc.so` reading
+  // `/dev/cgroup_info/cgroup.rc`. To work around incompatibility issues, we bind-mount the old
+  // platform library directories into chroot so that both sides of a communication are old and
+  // therefore align with each other.
+  // After bind-mounting old platform libraries, the chroot environment has a combination of new
+  // modules and old platform libraries. We currently use the new linker config in such an
+  // environment, which is potentially problematic. If we start to see problems, we should consider
+  // generating a more correct linker config in a more complex way.
+  if (IsOtaUpdate(ota_slot)) {
+    std::vector<const char*> existing_lib_dirs;
+    std::copy_if(kExternalLibDirs.begin(),
+                 kExternalLibDirs.end(),
+                 std::back_inserter(existing_lib_dirs),
+                 OS::DirectoryExists);
+    if (existing_lib_dirs.empty()) {
+      return Errorf("Unexpectedly missing platform library directories. Tried '{}'",
+                    android::base::Join(kExternalLibDirs, "', '"));
+    }
+
+    // We should bind-mount all existing lib dirs or none of them. Try the first one to decide what
+    // to do next.
+    Result<void> result = BindMount(existing_lib_dirs[0], PathInChroot(existing_lib_dirs[0]));
+    if (result.ok()) {
+      for (size_t i = 1; i < existing_lib_dirs.size(); i++) {
+        OR_RETURN(BindMount(existing_lib_dirs[i], PathInChroot(existing_lib_dirs[i])));
+      }
+    } else if (result.error().code() == EACCES) {
+      // We don't have the permission to do so on V. We'll have to use new libs.
+      LOG(WARNING) << result.error().message();
+    } else {
+      return result;
+    }
+  }
+
   return {};
 }
 
 Result<void> DexoptChrootSetup::TearDownChroot() const {
+  // Make sure we have unmounted old platform library directories before running apexd, as apexd
+  // expects new libraries.
+  std::vector<FstabEntry> entries = OR_RETURN(GetProcMountsDescendantsOfPath(CHROOT_DIR));
+  for (const FstabEntry entry : entries) {
+    if (ContainsElement(kExternalLibDirs, entry.mount_point.substr(strlen(CHROOT_DIR)))) {
+      OR_RETURN(Unmount(entry.mount_point));
+    }
+  }
+
   std::vector<FstabEntry> apex_entries =
       OR_RETURN(GetProcMountsDescendantsOfPath(PathInChroot("/apex")));
   // If there is only one entry, it's /apex itself.
@@ -500,12 +610,9 @@ Result<void> DexoptChrootSetup::TearDownChroot() const {
   }
 
   // The list is in mount order.
-  std::vector<FstabEntry> entries = OR_RETURN(GetProcMountsDescendantsOfPath(CHROOT_DIR));
+  entries = OR_RETURN(GetProcMountsDescendantsOfPath(CHROOT_DIR));
   for (auto it = entries.rbegin(); it != entries.rend(); it++) {
-    if (umount2(it->mount_point.c_str(), UMOUNT_NOFOLLOW) != 0) {
-      return ErrnoErrorf("Failed to umount2 '{}'", it->mount_point);
-    }
-    LOG(INFO) << ART_FORMAT("Unmounted '{}'", it->mount_point);
+    OR_RETURN(Unmount(it->mount_point));
   }
 
   std::error_code ec;
@@ -517,9 +624,8 @@ Result<void> DexoptChrootSetup::TearDownChroot() const {
     LOG(INFO) << ART_FORMAT("Removed '{}'", CHROOT_DIR);
   }
 
-  if (!OR_RETURN(GetProcMountsDescendantsOfPath(*kBindMountTmpDir)).empty() &&
-      umount2(kBindMountTmpDir->c_str(), UMOUNT_NOFOLLOW) != 0) {
-    return ErrnoErrorf("Failed to umount2 '{}'", *kBindMountTmpDir);
+  if (!OR_RETURN(GetProcMountsDescendantsOfPath(*kBindMountTmpDir)).empty()) {
+    OR_RETURN(Unmount(*kBindMountTmpDir));
   }
 
   std::filesystem::remove_all(*kBindMountTmpDir, ec);

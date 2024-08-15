@@ -377,11 +377,10 @@ Heap::Heap(size_t initial_size,
        * verification is enabled, we limit the size of allocation stacks to speed up their
        * searching.
        */
-      max_allocation_stack_size_(kGCALotMode
-          ? kGcAlotAllocationStackSize
-          : (kVerifyObjectSupport > kVerifyObjectModeFast)
-              ? kVerifyObjectAllocationStackSize
-              : kDefaultAllocationStackSize),
+      max_allocation_stack_size_(kGCALotMode ? kGcAlotAllocationStackSize :
+                                 (kVerifyObjectSupport > kVerifyObjectModeFast) ?
+                                               kVerifyObjectAllocationStackSize :
+                                               kDefaultAllocationStackSize),
       current_allocator_(kAllocatorTypeDlMalloc),
       current_non_moving_allocator_(kAllocatorTypeNonMoving),
       bump_pointer_space_(nullptr),
@@ -432,7 +431,8 @@ Heap::Heap(size_t initial_size,
       boot_image_spaces_(),
       boot_images_start_address_(0u),
       boot_images_size_(0u),
-      pre_oome_gc_count_(0u) {
+      pre_oome_gc_count_(0u),
+      non_movable_zygote_objects_() {
   if (VLOG_IS_ON(heap) || VLOG_IS_ON(startup)) {
     LOG(INFO) << "Heap() entering";
   }
@@ -2016,15 +2016,16 @@ mirror::Object* Heap::AllocateInternalWithGc(Thread* self,
   // then there is no hope, so we throw OOME.
   collector::GcType tried_type = next_gc_type_;
   if (last_gc < tried_type) {
-    const bool gc_ran = PERFORM_SUSPENDING_OPERATION(
-        CollectGarbageInternal(tried_type, kGcCauseForAlloc, false, starting_gc_num + 1)
-        != collector::kGcTypeNone);
+    VLOG(gc) << "Starting a blocking GC " << kGcCauseForAlloc;
+    PERFORM_SUSPENDING_OPERATION(
+        CollectGarbageInternal(tried_type, kGcCauseForAlloc, false, starting_gc_num + 1));
 
     if ((was_default_allocator && allocator != GetCurrentAllocator()) ||
         (!instrumented && EntrypointsInstrumented())) {
       return nullptr;
     }
-    if (gc_ran && have_reclaimed_enough()) {
+    // Check this even if we didn't actually run a GC; if we didn't someone else probably did.
+    if (have_reclaimed_enough()) {
       mirror::Object* ptr = TryToAllocate<true, false>(self, allocator,
                                                        alloc_size, bytes_allocated,
                                                        usable_size, bytes_tl_bulk_allocated);
@@ -2053,11 +2054,22 @@ mirror::Object* Heap::AllocateInternalWithGc(Thread* self,
   // "GC thrashing", or
   // (b) GC was sufficiently productive (reclaimed min_freed_to_continue bytes) AND allowed us to
   // satisfy the allocation request.
+  bool gc_ran;
+  int gc_attempts = 0;
+  // A requested GC can fail to run because either someone else beat us to it, or because we can't
+  // run a GC in this state. In the latter case, we return quickly. Just try a small number of
+  // times.
+  static constexpr int kMaxGcAttempts = 5;
   do {
     bytes_freed_before = GetBytesFreedEver();
     pre_oome_gc_count_.fetch_add(1, std::memory_order_relaxed);
-    PERFORM_SUSPENDING_OPERATION(
-        CollectGarbageInternal(gc_plan_.back(), kGcCauseForAlloc, true, GC_NUM_ANY));
+    // TODO(b/353333767): Do this only if nobody else beats us to it. If we're having trouble
+    // allocating, probably other threads are in the same boat.
+    starting_gc_num = GetCurrentGcNum();
+    gc_ran = PERFORM_SUSPENDING_OPERATION(
+        CollectGarbageInternal(gc_plan_.back(), kGcCauseForAlloc, true, starting_gc_num + 1) !=
+        collector::kGcTypeNone);
+    ++gc_attempts;
     if ((was_default_allocator && allocator != GetCurrentAllocator()) ||
         (!instrumented && EntrypointsInstrumented())) {
       return nullptr;
@@ -2108,7 +2120,8 @@ mirror::Object* Heap::AllocateInternalWithGc(Thread* self,
     // issue, and there is no other thread allocating, GCs will quickly become unsuccessful, and we
     // will stop then. If another thread is allocating aggressively, this may go on for a while,
     // but we are still making progress somewhere.
-  } while (GetBytesFreedEver() - bytes_freed_before > min_freed_to_continue);
+  } while ((!gc_ran && gc_attempts < kMaxGcAttempts) ||
+           GetBytesFreedEver() - bytes_freed_before > min_freed_to_continue);
 #undef PERFORM_SUSPENDING_OPERATION
   // Throw an OOM error.
   {
@@ -2365,7 +2378,7 @@ class ZygoteCompactingCollector final : public collector::SemiSpace {
     bin_live_bitmap_ = space->GetLiveBitmap();
     bin_mark_bitmap_ = space->GetMarkBitmap();
     uintptr_t prev = reinterpret_cast<uintptr_t>(space->Begin());
-    WriterMutexLock mu(Thread::Current(), *Locks::heap_bitmap_lock_);
+    Heap* heap = Runtime::Current()->GetHeap();
     // Note: This requires traversing the space in increasing order of object addresses.
     auto visitor = [&](mirror::Object* obj) REQUIRES_SHARED(Locks::mutator_lock_) {
       uintptr_t object_addr = reinterpret_cast<uintptr_t>(obj);
@@ -2373,7 +2386,11 @@ class ZygoteCompactingCollector final : public collector::SemiSpace {
       // Add the bin consisting of the end of the previous object to the start of the current object.
       AddBin(bin_size, prev);
       prev = object_addr + RoundUp(obj->SizeOf<kDefaultVerifyFlags>(), kObjectAlignment);
+      if (!obj->IsClass()) {
+        heap->AddNonMovableZygoteObject(obj);
+      }
     };
+    WriterMutexLock mu(Thread::Current(), *Locks::heap_bitmap_lock_);
     bin_live_bitmap_->Walk(visitor);
     // Add the last bin which spans after the last object to the end of the space.
     AddBin(reinterpret_cast<uintptr_t>(space->End()) - prev, prev);
@@ -2479,6 +2496,10 @@ void Heap::IncrementFreedEver() {
 // FIXME: BUT it did exceed... http://b/197647048
 #  pragma clang diagnostic ignored "-Wframe-larger-than="
 void Heap::PreZygoteFork() {
+  // Opportunistically log here; empirically logs from the initial PreZygoteFork() are lost.
+  // But for the main zygote, this is typically entered at least twice.
+  LOG(INFO) << "PreZygoteFork(): non_movable_zygote_objects_.size() = "
+            << non_movable_zygote_objects_.size();
   if (!HasZygoteSpace()) {
     // We still want to GC in case there is some unreachable non moving objects that could cause a
     // suboptimal bin packing when we compact the zygote space.
@@ -2506,6 +2527,18 @@ void Heap::PreZygoteFork() {
   // there.
   non_moving_space_->GetMemMap()->Protect(PROT_READ | PROT_WRITE);
   const bool same_space = non_moving_space_ == main_space_;
+  // We create the ZygoteSpace by performing a semi-space collection to copy the main allocation
+  // space into what was the non-moving space. We do so by ignoring and overwriting the meta-
+  // information from the non-moving (dlmalloc) space. An initial pass identifies unused sections
+  // of the heap that we usually try to copy into first. We copy any remaining objects past the
+  // previous end of the old non-moving space. Eeverything up to the last allocated object in the
+  // old non-moving space then becomes ZygoteSpace. Everything after that becomes the new
+  // non-moving space.
+  // There is a subtlety here in that Object.clone() treats objects allocated as non-movable
+  // differently from other objects, and this ZygoteSpace creation process doesn't automatically
+  // preserve that distinction. Thus we must explicitly track this in non_movable_zygote_objects_.
+  // Otherwise we have to treat the entire ZygoteSpace as non-movable, which could cause some
+  // weird programming styles to eventually render most of the heap non-movable.
   if (kCompactZygote) {
     // Temporarily disable rosalloc verification because the zygote
     // compaction will mess up the rosalloc internal metadata.
@@ -2534,6 +2567,9 @@ void Heap::PreZygoteFork() {
     zygote_collector.SetToSpace(&target_space);
     zygote_collector.SetSwapSemiSpaces(false);
     zygote_collector.Run(kGcCauseCollectorTransition, false);
+    uint32_t num_nonmovable = non_movable_zygote_objects_.size();
+    // For an AOSP boot, we saw num_nonmovable around a dozen.
+    DCHECK_LT(num_nonmovable, 1000u) << " Too many nonmovable zygote objects?";
     if (reset_main_space) {
       main_space_->GetMemMap()->Protect(PROT_READ | PROT_WRITE);
       madvise(main_space_->Begin(), main_space_->Capacity(), MADV_DONTNEED);
@@ -3651,47 +3687,46 @@ void Heap::RosAllocVerification(TimingLogger* timings, const char* name) {
 collector::GcType Heap::WaitForGcToComplete(GcCause cause, Thread* self) {
   ScopedThreadStateChange tsc(self, ThreadState::kWaitingForGcToComplete);
   MutexLock mu(self, *gc_complete_lock_);
-  return WaitForGcToCompleteLocked(cause, self);
+  return WaitForGcToCompleteLocked(cause, self, /* only_one= */ true);
 }
 
-collector::GcType Heap::WaitForGcToCompleteLocked(GcCause cause, Thread* self) {
+collector::GcType Heap::WaitForGcToCompleteLocked(GcCause cause, Thread* self, bool only_one) {
   gc_complete_cond_->CheckSafeToWait(self);
   collector::GcType last_gc_type = collector::kGcTypeNone;
   GcCause last_gc_cause = kGcCauseNone;
-  uint64_t wait_start = NanoTime();
-  while (collector_type_running_ != kCollectorTypeNone) {
-    if (!task_processor_->IsRunningThread(self)) {
-      // The current thread is about to wait for a currently running
-      // collection to finish. If the waiting thread is not the heap
-      // task daemon thread, the currently running collection is
-      // considered as a blocking GC.
-      running_collection_is_blocking_ = true;
-      VLOG(gc) << "Waiting for a blocking GC " << cause;
+  if (collector_type_running_ != kCollectorTypeNone) {
+    uint64_t wait_start = NanoTime();
+    uint32_t starting_gc_num = GetCurrentGcNum();
+    while (collector_type_running_ != kCollectorTypeNone &&
+           (!only_one || GCNumberLt(GetCurrentGcNum(), starting_gc_num + 1))) {
+      if (!task_processor_->IsRunningThread(self)) {
+        // The current thread is about to wait for a currently running
+        // collection to finish. If the waiting thread is not the heap
+        // task daemon thread, the currently running collection is
+        // considered as a blocking GC.
+        running_collection_is_blocking_ = true;
+        VLOG(gc) << "Waiting for a blocking GC " << cause;
+      }
+      SCOPED_TRACE << "GC: Wait For Completion " << cause;
+      // We must wait, change thread state then sleep on gc_complete_cond_;
+      gc_complete_cond_->Wait(self);
+      last_gc_type = last_gc_type_;
+      last_gc_cause = last_gc_cause_;
     }
-    SCOPED_TRACE << "GC: Wait For Completion " << cause;
-    // We must wait, change thread state then sleep on gc_complete_cond_;
-    gc_complete_cond_->Wait(self);
-    last_gc_type = last_gc_type_;
-    last_gc_cause = last_gc_cause_;
-  }
-  uint64_t wait_time = NanoTime() - wait_start;
-  total_wait_time_ += wait_time;
-  if (wait_time > long_pause_log_threshold_) {
-    LOG(INFO) << "WaitForGcToComplete blocked " << cause << " on " << last_gc_cause << " for "
-              << PrettyDuration(wait_time);
+    uint64_t wait_time = NanoTime() - wait_start;
+    total_wait_time_ += wait_time;
+    if (wait_time > long_pause_log_threshold_) {
+      LOG(INFO) << "WaitForGcToComplete blocked " << cause << " on " << last_gc_cause << " for "
+                << PrettyDuration(wait_time);
+    }
   }
   if (!task_processor_->IsRunningThread(self)) {
     // The current thread is about to run a collection. If the thread
     // is not the heap task daemon thread, it's considered as a
     // blocking GC (i.e., blocking itself).
     running_collection_is_blocking_ = true;
-    // Don't log fake "GC" types that are only used for debugger or hidden APIs. If we log these,
-    // it results in log spam. kGcCauseExplicit is already logged in LogGC, so avoid it here too.
-    if (cause == kGcCauseForAlloc ||
-        cause == kGcCauseDisableMovingGc) {
-      VLOG(gc) << "Starting a blocking GC " << cause;
-    }
   }
+  DCHECK(only_one || collector_type_running_ == kCollectorTypeNone);
   return last_gc_type;
 }
 
@@ -3724,7 +3759,32 @@ void Heap::SetIdealFootprint(size_t target_footprint) {
   target_footprint_.store(target_footprint, std::memory_order_relaxed);
 }
 
-bool Heap::IsMovableObject(ObjPtr<mirror::Object> obj) const {
+bool Heap::IsNonMovable(ObjPtr<mirror::Object> obj) const {
+  DCHECK(!obj.Ptr()->IsClass());  // We do not correctly track classes in zygote space.
+  if (GetNonMovingSpace()->Contains(obj.Ptr())) {
+    return true;
+  }
+  if (zygote_space_ != nullptr && zygote_space_->Contains(obj.Ptr())) {
+    return non_movable_zygote_objects_.contains(
+        mirror::CompressedReference<mirror::Object>::FromMirrorPtr(obj.Ptr()));
+  }
+  return false;  // E.g. in LargeObjectsSpace.
+}
+
+bool Heap::PossiblyAllocatedMovable(ObjPtr<mirror::Object> obj) const {
+  // The CC collector may copy movable objects into NonMovingSpace. It does that only when it
+  // runs out of space, so we assume this does not affect ZygoteSpace.
+  if (!gUseReadBarrier && GetNonMovingSpace()->Contains(obj.Ptr())) {
+    return false;
+  }
+  if (zygote_space_ != nullptr && zygote_space_->Contains(obj.Ptr())) {
+    return !non_movable_zygote_objects_.contains(
+        mirror::CompressedReference<mirror::Object>::FromMirrorPtr(obj.Ptr()));
+  }
+  return true;
+}
+
+bool Heap::ObjectMayMove(ObjPtr<mirror::Object> obj) const {
   if (kMovingCollector) {
     space::Space* space = FindContinuousSpaceFromObject(obj.Ptr(), true);
     if (space != nullptr) {
@@ -4814,6 +4874,20 @@ std::string Heap::GetForegroundCollectorName() {
   std::ostringstream oss;
   oss << foreground_collector_type_;
   return oss.str();
+}
+
+bool Heap::HasAppImageSpaceFor(const std::string& dex_location) const {
+  ScopedObjectAccess soa(Thread::Current());
+  for (space::ContinuousSpace* space : continuous_spaces_) {
+    // An image space is either a boot image space or an app image space.
+    if (space->IsImageSpace() &&
+        !IsBootImageAddress(space->Begin()) &&
+        (space->AsImageSpace()->GetOatFile()->GetOatDexFiles()[0]->GetDexFileLocation() ==
+              dex_location)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 }  // namespace gc

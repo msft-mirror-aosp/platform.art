@@ -118,7 +118,6 @@ using ::android::base::ParseInt;
 using ::android::base::ReadFileToString;
 using ::android::base::Result;
 using ::android::base::Split;
-using ::android::base::StartsWith;
 using ::android::base::Tokenize;
 using ::android::base::Trim;
 using ::android::base::WriteStringToFd;
@@ -789,7 +788,7 @@ ndk::ScopedAStatus Artd::getProfileVisibility(const ProfilePath& in_profile,
 
 ndk::ScopedAStatus Artd::getArtifactsVisibility(const ArtifactsPath& in_artifactsPath,
                                                 FileVisibility* _aidl_return) {
-  RETURN_FATAL_IF_ARG_IS_PRE_REBOOT(in_artifactsPath, "artifactsPath");
+  // `in_artifactsPath` can be either a Pre-reboot path or an ordinary one.
   std::string oat_path = OR_RETURN_FATAL(BuildArtifactsPath(in_artifactsPath)).oat_path;
   *_aidl_return = OR_RETURN_NON_FATAL(GetFileVisibility(oat_path));
   return ScopedAStatus::ok();
@@ -1171,36 +1170,15 @@ ndk::ScopedAStatus Artd::dexopt(
   LOG(INFO) << "Running dex2oat: " << Join(art_exec_args.Get(), /*separator=*/" ")
             << "\nOpened FDs: " << fd_logger;
 
-  ExecCallbacks callbacks{
-      .on_start =
-          [&](pid_t pid) {
-            std::lock_guard<std::mutex> lock(cancellation_signal->mu_);
-            cancellation_signal->pids_.insert(pid);
-            // Handle cancellation signals sent before the process starts.
-            if (cancellation_signal->is_cancelled_) {
-              int res = kill_(pid, SIGKILL);
-              DCHECK_EQ(res, 0);
-            }
-          },
-      .on_end =
-          [&](pid_t pid) {
-            std::lock_guard<std::mutex> lock(cancellation_signal->mu_);
-            // The pid should no longer receive kill signals sent by `cancellation_signal`.
-            cancellation_signal->pids_.erase(pid);
-          },
-  };
-
   ProcessStat stat;
-  Result<int> result = ExecAndReturnCode(art_exec_args.Get(), kLongTimeoutSec, callbacks, &stat);
+  Result<int> result = ExecAndReturnCode(
+      art_exec_args.Get(), kLongTimeoutSec, cancellation_signal->CreateExecCallbacks(), &stat);
   _aidl_return->wallTimeMs = stat.wall_time_ms;
   _aidl_return->cpuTimeMs = stat.cpu_time_ms;
   if (!result.ok()) {
-    {
-      std::lock_guard<std::mutex> lock(cancellation_signal->mu_);
-      if (cancellation_signal->is_cancelled_) {
-        _aidl_return->cancelled = true;
-        return ScopedAStatus::ok();
-      }
+    if (cancellation_signal->IsCancelled()) {
+      _aidl_return->cancelled = true;
+      return ScopedAStatus::ok();
     }
     return NonFatal("Failed to run dex2oat: " + result.error().message());
   }
@@ -1231,7 +1209,8 @@ ScopedAStatus ArtdCancellationSignal::cancel() {
   std::lock_guard<std::mutex> lock(mu_);
   is_cancelled_ = true;
   for (pid_t pid : pids_) {
-    int res = kill_(pid, SIGKILL);
+    // Kill the whole process group.
+    int res = kill_(-pid, SIGKILL);
     DCHECK_EQ(res, 0);
   }
   return ScopedAStatus::ok();
@@ -1240,6 +1219,32 @@ ScopedAStatus ArtdCancellationSignal::cancel() {
 ScopedAStatus ArtdCancellationSignal::getType(int64_t* _aidl_return) {
   *_aidl_return = reinterpret_cast<intptr_t>(kArtdCancellationSignalType);
   return ScopedAStatus::ok();
+}
+
+ExecCallbacks ArtdCancellationSignal::CreateExecCallbacks() {
+  return {
+      .on_start =
+          [&](pid_t pid) {
+            std::lock_guard<std::mutex> lock(mu_);
+            pids_.insert(pid);
+            // Handle cancellation signals sent before the process starts.
+            if (is_cancelled_) {
+              int res = kill_(-pid, SIGKILL);
+              DCHECK_EQ(res, 0);
+            }
+          },
+      .on_end =
+          [&](pid_t pid) {
+            std::lock_guard<std::mutex> lock(mu_);
+            // The pid should no longer receive kill signals sent by `cancellation_signal`.
+            pids_.erase(pid);
+          },
+  };
+}
+
+bool ArtdCancellationSignal::IsCancelled() {
+  std::lock_guard<std::mutex> lock(mu_);
+  return is_cancelled_;
 }
 
 ScopedAStatus Artd::createCancellationSignal(
@@ -1714,8 +1719,10 @@ Result<int> Artd::ExecAndReturnCode(const std::vector<std::string>& args,
                                     const ExecCallbacks& callbacks,
                                     ProcessStat* stat) const {
   std::string error_msg;
-  ExecResult result =
-      exec_utils_->ExecAndReturnResult(args, timeout_sec, callbacks, stat, &error_msg);
+  // Create a new process group so that we can kill the process subtree at once by killing the
+  // process group.
+  ExecResult result = exec_utils_->ExecAndReturnResult(
+      args, timeout_sec, callbacks, /*new_process_group=*/true, stat, &error_msg);
   if (result.status != ExecResult::kExited) {
     return Error() << error_msg;
   }
@@ -1748,7 +1755,8 @@ Result<void> Artd::BindMount(const std::string& source, const std::string& targe
   return {};
 }
 
-ScopedAStatus Artd::preRebootInit() {
+ScopedAStatus Artd::preRebootInit(
+    const std::shared_ptr<IArtdCancellationSignal>& in_cancellationSignal, bool* _aidl_return) {
   RETURN_FATAL_IF_NOT_PRE_REBOOT(options_);
 
   std::string tmp_dir = pre_reboot_tmp_dir_.value_or(kDefaultPreRebootTmpDir);
@@ -1766,7 +1774,8 @@ ScopedAStatus Artd::preRebootInit() {
       return NonFatal(ART_FORMAT("Failed to check dir '{}': {}", tmp_dir, ec.message()));
     }
     if (!is_empty) {
-      return Fatal("preRebootInit must not be concurrently called or retried after failure");
+      return Fatal(
+          "preRebootInit must not be concurrently called or retried after cancellation or failure");
     }
   }
 
@@ -1780,7 +1789,12 @@ ScopedAStatus Artd::preRebootInit() {
   if (!preparation_done) {
     OR_RETURN_NON_FATAL(BindMountNewDir(art_apex_data_dir, GetArtApexData()));
     OR_RETURN_NON_FATAL(BindMountNewDir(odrefresh_dir, "/data/misc/odrefresh"));
-    OR_RETURN_NON_FATAL(PreRebootInitBootImages());
+    ArtdCancellationSignal* cancellation_signal =
+        OR_RETURN_FATAL(ToArtdCancellationSignal(in_cancellationSignal.get()));
+    if (!OR_RETURN_NON_FATAL(PreRebootInitBootImages(cancellation_signal))) {
+      *_aidl_return = false;
+      return ScopedAStatus::ok();
+    }
   }
 
   if (!preparation_done) {
@@ -1790,6 +1804,7 @@ ScopedAStatus Artd::preRebootInit() {
     }
   }
 
+  *_aidl_return = true;
   return ScopedAStatus::ok();
 }
 
@@ -1863,7 +1878,7 @@ Result<void> Artd::PreRebootInitDeriveClasspath(const std::string& path) {
   return {};
 }
 
-Result<void> Artd::PreRebootInitBootImages() {
+Result<bool> Artd::PreRebootInitBootImages(ArtdCancellationSignal* cancellation_signal) {
   CmdlineBuilder args = OR_RETURN(GetArtExecCmdlineBuilder());
   args.Add("--")
       .Add(OR_RETURN(BuildArtBinPath("odrefresh")))
@@ -1872,8 +1887,12 @@ Result<void> Artd::PreRebootInitBootImages() {
 
   LOG(INFO) << "Running odrefresh: " << Join(args.Get(), /*separator=*/" ");
 
-  Result<int> result = ExecAndReturnCode(args.Get(), kLongTimeoutSec);
+  Result<int> result =
+      ExecAndReturnCode(args.Get(), kLongTimeoutSec, cancellation_signal->CreateExecCallbacks());
   if (!result.ok()) {
+    if (cancellation_signal->IsCancelled()) {
+      return false;
+    }
     return Errorf("Failed to run odrefresh: {}", result.error().message());
   }
 
@@ -1884,7 +1903,7 @@ Result<void> Artd::PreRebootInitBootImages() {
     return Errorf("odrefresh returned an unexpected code: {}", result.value());
   }
 
-  return {};
+  return true;
 }
 
 ScopedAStatus Artd::validateDexPath(const std::string& in_dexFile,
@@ -1916,10 +1935,11 @@ Result<BuildSystemProperties> BuildSystemProperties::Create(const std::string& f
   if (!ReadFileToString(filename, &content)) {
     return ErrnoErrorf("Failed to read '{}'", filename);
   }
+  std::regex import_pattern(R"re(import\s.*)re");
   std::unordered_map<std::string, std::string> system_properties;
   for (const std::string& raw_line : Split(content, "\n")) {
     std::string line = Trim(raw_line);
-    if (line.empty() || StartsWith(line, '#')) {
+    if (line.empty() || line.starts_with('#') || std::regex_match(line, import_pattern)) {
       continue;
     }
     size_t pos = line.find('=');

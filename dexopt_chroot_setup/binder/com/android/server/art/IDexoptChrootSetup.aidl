@@ -27,8 +27,9 @@ interface IDexoptChrootSetup {
      *
      * @param otaSlot The slot that contains the OTA update, "_a" or "_b", or null for a Mainline
      *         update.
+     * @param mapSnapshotsForOta Whether to map/unmap snapshots. Only applicable to an OTA update.
      */
-    void setUp(@nullable @utf8InCpp String otaSlot);
+    void setUp(@nullable @utf8InCpp String otaSlot, boolean mapSnapshotsForOta);
 
     /**
      * Initializes the chroot environment. Can only be called after {@link #setUp}. Apexes and
@@ -37,6 +38,12 @@ interface IDexoptChrootSetup {
      */
     void init();
 
-    /** Tears down the chroot environment. */
-    void tearDown();
+    /**
+     * Tears down the chroot environment.
+     *
+     * @param allowConcurrent If true, allows this method to be called concurrently when another
+     * call to the service is still being processed. Note that the service does not process this
+     * call concurrently but waits until the other call is done.
+     */
+    void tearDown(boolean allowConcurrent);
 }

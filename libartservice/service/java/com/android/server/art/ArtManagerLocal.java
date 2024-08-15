@@ -104,6 +104,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -131,8 +132,14 @@ public final class ArtManagerLocal {
 
     private boolean mShouldCommitPreRebootStagedFiles = false;
 
-    // A temporary object for holding stats while staged files are being committed.
-    @Nullable private PreRebootStatsReporter mPreRebootStatsReporter = null;
+    // A temporary object for holding stats while staged files are being committed, used in two
+    // places: `onBoot` and the `BroadcastReceiver` of `ACTION_BOOT_COMPLETED`.
+    @Nullable private PreRebootStatsReporter.AfterRebootSession mStatsAfterRebootSession = null;
+
+    // A lock that prevents the cleanup from cleaning up dexopt temp files while dexopt is running.
+    // The method that does the cleanup should acquire a write lock; the methods that do dexopt
+    // should acquire a read lock.
+    @NonNull private ReentrantReadWriteLock mCleanupLock = new ReentrantReadWriteLock();
 
     @Deprecated
     public ArtManagerLocal() {
@@ -367,9 +374,12 @@ public final class ArtManagerLocal {
     public DexoptResult dexoptPackage(@NonNull PackageManagerLocal.FilteredSnapshot snapshot,
             @NonNull String packageName, @NonNull DexoptParams params,
             @NonNull CancellationSignal cancellationSignal) {
+        mCleanupLock.readLock().lock();
         try (var pin = mInjector.createArtdPin()) {
             return mInjector.getDexoptHelper().dexopt(
                     snapshot, List.of(packageName), params, cancellationSignal, Runnable::run);
+        } finally {
+            mCleanupLock.readLock().unlock();
         }
     }
 
@@ -479,6 +489,7 @@ public final class ArtManagerLocal {
         ExecutorService dexoptExecutor =
                 Executors.newFixedThreadPool(ReasonMapping.getConcurrencyForReason(reason));
         Map<Integer, DexoptResult> dexoptResults = new HashMap<>();
+        mCleanupLock.readLock().lock();
         try (var pin = mInjector.createArtdPin()) {
             if (reason.equals(ReasonMapping.REASON_BG_DEXOPT)) {
                 DexoptResult downgradeResult = maybeDowngradePackages(snapshot,
@@ -509,6 +520,7 @@ public final class ArtManagerLocal {
             }
             return dexoptResults;
         } finally {
+            mCleanupLock.readLock().unlock();
             dexoptExecutor.shutdown();
         }
     }
@@ -880,7 +892,8 @@ public final class ArtManagerLocal {
                 // to commit files for secondary dex files because they are not decrypted before
                 // then.
                 mShouldCommitPreRebootStagedFiles = true;
-                mPreRebootStatsReporter = mInjector.createPreRebootStatsReporter();
+                mStatsAfterRebootSession =
+                        mInjector.getPreRebootStatsReporter().new AfterRebootSession();
                 commitPreRebootStagedFiles(snapshot, false /* forSecondary */);
             }
             dexoptPackages(snapshot, bootReason, new CancellationSignal(), progressCallbackExecutor,
@@ -908,8 +921,8 @@ public final class ArtManagerLocal {
                     try (var snapshot = mInjector.getPackageManagerLocal().withFilteredSnapshot()) {
                         commitPreRebootStagedFiles(snapshot, true /* forSecondary */);
                     }
-                    mPreRebootStatsReporter.reportAsync();
-                    mPreRebootStatsReporter = null;
+                    mStatsAfterRebootSession.reportAsync();
+                    mStatsAfterRebootSession = null;
                 }
             }, new IntentFilter(Intent.ACTION_BOOT_COMPLETED));
         }
@@ -1053,6 +1066,7 @@ public final class ArtManagerLocal {
      */
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public long cleanup(@NonNull PackageManagerLocal.FilteredSnapshot snapshot) {
+        mCleanupLock.writeLock().lock();
         try (var pin = mInjector.createArtdPin()) {
             mInjector.getDexUseManager().cleanup();
 
@@ -1099,6 +1113,8 @@ public final class ArtManagerLocal {
         } catch (RemoteException e) {
             Utils.logArtdException(e);
             return 0;
+        } finally {
+            mCleanupLock.writeLock().unlock();
         }
     }
 
@@ -1140,7 +1156,7 @@ public final class ArtManagerLocal {
                     // to commit the profile can potentially cause a permanent performance
                     // regression.
                     if (mInjector.getArtd().commitPreRebootStagedFiles(artifacts, profiles)) {
-                        mPreRebootStatsReporter.recordPackageWithArtifacts(
+                        mStatsAfterRebootSession.recordPackageWithArtifacts(
                                 pkgState.getPackageName());
                     }
                 } catch (ServiceSpecificException e) {
@@ -1533,6 +1549,14 @@ public final class ArtManagerLocal {
             getDexUseManager();
             getStorageManager();
             GlobalInjector.getInstance().checkArtModuleServiceManager();
+
+            // `PreRebootDexoptJob` does not depend on external dependencies, so unlike the calls
+            // above, this call is not for checking the dependencies. Rather, we make this call here
+            // to trigger the construction of `PreRebootDexoptJob`, which may clean up leftover
+            // chroot if there is any.
+            if (SdkLevel.isAtLeastV()) {
+                getPreRebootDexoptJob();
+            }
         }
 
         @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
@@ -1657,7 +1681,7 @@ public final class ArtManagerLocal {
 
         @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
         @NonNull
-        public PreRebootStatsReporter createPreRebootStatsReporter() {
+        public PreRebootStatsReporter getPreRebootStatsReporter() {
             return new PreRebootStatsReporter();
         }
     }
