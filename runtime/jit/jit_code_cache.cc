@@ -397,7 +397,7 @@ static void DCheckRootsAreValid(const std::vector<Handle<mirror::Object>>& roots
     }
     // Ensure that we don't put movable objects in the shared region.
     if (is_shared_region) {
-      CHECK(!Runtime::Current()->GetHeap()->IsMovableObject(object.Get()));
+      CHECK(Runtime::Current()->GetHeap()->IsNonMovable(object.Get()));
     }
   }
 }
@@ -1527,7 +1527,8 @@ void JitCodeCache::GetProfiledMethods(const std::set<std::string>& dex_base_loca
   Runtime::Current()->GetClassLinker()->GetClassLoaders(self, &handles);
 
   // Wait for any GC to be complete, to prevent looking at ArtMethods whose
-  // class loader is being deleted.
+  // class loader is being deleted. Since we remain runnable, another new GC
+  // can't get far.
   Runtime::Current()->GetHeap()->WaitForGcToComplete(gc::kGcCauseProfileSaver, self);
 
   // We'll be looking at inline caches, so ensure they are accessible.

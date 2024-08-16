@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Copyright (C) 2021 The Android Open Source Project
+<!-- Copyright (C) 2024 The Android Open Source Project
 
      Licensed under the Apache License, Version 2.0 (the "License");
      you may not use this file except in compliance with the License.
@@ -13,26 +13,20 @@
      See the License for the specific language governing permissions and
      limitations under the License.
 -->
-<configuration description="Runs art_standalone_libprofile_tests.">
+<!-- Note: This test config file for {MODULE} is generated from a template. -->
+<configuration description="Runs {MODULE} in non-multilib mode.">
+    <option name="config-descriptor:metadata" key="parameter" value="not_multi_abi" />
     <option name="config-descriptor:metadata" key="mainline-param" value="com.google.android.art.apex" />
     <option name="config-descriptor:metadata" key="mainline-param" value="com.android.art.apex" />
 
-    <target_preparer class="com.android.compatibility.common.tradefed.targetprep.FilePusher">
+    <target_preparer class="com.android.tradefed.targetprep.PushFilePreparer">
         <option name="cleanup" value="true" />
-        <option name="push" value="art_standalone_libprofile_tests->/data/local/tmp/art_standalone_libprofile_tests/art_standalone_libprofile_tests" />
-        <option name="append-bitness" value="true" />
-    </target_preparer>
-
-    <target_preparer class="com.android.compatibility.common.tradefed.targetprep.FilePusher">
-        <option name="cleanup" value="true" />
-        <option name="push" value="art-gtest-jars-ManyMethods.jar->/data/local/tmp/art_standalone_libprofile_tests/art-gtest-jars-ManyMethods.jar" />
-        <option name="push" value="art-gtest-jars-MultiDex.jar->/data/local/tmp/art_standalone_libprofile_tests/art-gtest-jars-MultiDex.jar" />
-        <option name="push" value="art-gtest-jars-ProfileTestMultiDex.jar->/data/local/tmp/art_standalone_libprofile_tests/art-gtest-jars-ProfileTestMultiDex.jar" />
+        <option name="push" value="{MODULE}->/data/local/tmp/{MODULE}" />
     </target_preparer>
 
     <test class="com.android.tradefed.testtype.GTest" >
-        <option name="native-test-device-path" value="/data/local/tmp/art_standalone_libprofile_tests" />
-        <option name="module-name" value="art_standalone_libprofile_tests" />
+        <option name="native-test-device-path" value="/data/local/tmp" />
+        <option name="module-name" value="{MODULE}" />
     </test>
 
     <!-- When this test is run in a Mainline context (e.g. with `mts-tradefed`), only enable it if

@@ -24,8 +24,7 @@ package {
 }
 
 cc_defaults {
-    name: "libart_verify_dex_fuzzer-defaults",
-    srcs: ["libart_verify_dex_fuzzer.cc"],
+    name: "libart_fuzzer-defaults",
 
     // Build and run on x86 too.
     host_supported: true,
@@ -53,6 +52,45 @@ cc_defaults {
     },
 }
 
+cc_defaults {
+    name: "libart_verify_dex_fuzzer-defaults",
+    srcs: ["libart_verify_dex_fuzzer.cc"],
+
+    defaults: [
+        "libart_fuzzer-defaults",
+    ],
+}
+
+cc_defaults {
+    name: "libart_verify_classes_fuzzer-defaults",
+    srcs: ["libart_verify_classes_fuzzer.cc"],
+
+    defaults: [
+        "art_defaults",
+        "libart_fuzzer-defaults",
+    ],
+
+    target: {
+        android: {
+            shared_libs: [
+                "libdl_android",
+            ],
+        },
+    },
+
+    data: [
+        ":core-oj",
+        ":core-libart",
+        ":okhttp",
+        ":bouncycastle",
+        ":apache-xml",
+        // TODO: Figure out how to enable core-icu4j
+        // ":core-icu4j",
+        // TODO: Figure out how to enable conscrypt
+        // ":conscrypt",
+    ],
+}
+
 cc_fuzz {
     name: "libart_verify_dex_fuzzer",
     defaults: [
@@ -62,7 +100,7 @@ cc_fuzz {
     // Can not be in defaults due to soong limitations.
     corpus: [
         ":art_runtest_corpus",
-        "corpus/*",
+        "dex-verifier-corpus/*",
     ],
 }
 
@@ -75,7 +113,21 @@ cc_fuzz {
     // Can not be in defaults due to soong limitations.
     corpus: [
         ":art_runtest_corpus",
-        "corpus/*",
+        "dex-verifier-corpus/*",
+    ],
+}
+
+cc_fuzz {
+    // TODO Add a debug version
+    name: "libart_verify_classes_fuzzer",
+    defaults: [
+        "libart_verify_classes_fuzzer-defaults",
+        "libart_static_defaults",
+    ],
+    // Can not be in defaults due to soong limitations.
+    corpus: [
+        ":art_runtest_corpus",
+        "class-verifier-corpus/*",
     ],
 }
 
@@ -1267,12 +1319,23 @@ genrule {
 }
 
 genrule {
-    name: "art-gtest-jars-DexFuzzerFolder",
-    // Zip the corpus folder. To get the folder, we grab the first file
+    name: "art-gtest-jars-DexVerificationFuzzerFolder",
+    // Zip the dex-verifier-corpus folder. To get the folder, we grab the first file
     // from `in` and use its directory.
     cmd: "FILES=($(in)) &&" +
         "$(location soong_zip) -j -L 0 -o $(out) -D $$(dirname $${FILES[0]})",
-    srcs: ["corpus/*"],
-    out: ["fuzzer_corpus.zip"],
+    srcs: ["dex-verifier-corpus/*"],
+    out: ["dex_verification_fuzzer_corpus.zip"],
+    tools: ["soong_zip"],
+}
+
+genrule {
+    name: "art-gtest-jars-ClassVerificationFuzzerFolder",
+    // Zip the class-verifier-corpus folder. To get the folder, we grab the first file
+    // from `in` and use its directory.
+    cmd: "FILES=($(in)) &&" +
+        "$(location soong_zip) -j -L 0 -o $(out) -D $$(dirname $${FILES[0]})",
+    srcs: ["class-verifier-corpus/*"],
+    out: ["class_verification_fuzzer_corpus.zip"],
     tools: ["soong_zip"],
 }
