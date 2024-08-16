@@ -488,6 +488,7 @@ class HGraphVisualizerPrinter final : public HGraphDelegateVisitor {
 
   void VisitCompare(HCompare* compare) override {
     StartAttributeStream("bias") << compare->GetBias();
+    StartAttributeStream("comparison_type") << compare->GetComparisonType();
   }
 
   void VisitCondition(HCondition* condition) override {
@@ -628,12 +629,12 @@ class HGraphVisualizerPrinter final : public HGraphDelegateVisitor {
                                     DataType::ToSigned(arg_type));
   }
 
-#if defined(ART_ENABLE_CODEGEN_arm) || defined(ART_ENABLE_CODEGEN_arm64)
-  void VisitMultiplyAccumulate(HMultiplyAccumulate* instruction) override {
+  void VisitBitwiseNegatedRight(HBitwiseNegatedRight* instruction) override {
     StartAttributeStream("kind") << instruction->GetOpKind();
   }
 
-  void VisitBitwiseNegatedRight(HBitwiseNegatedRight* instruction) override {
+#if defined(ART_ENABLE_CODEGEN_arm) || defined(ART_ENABLE_CODEGEN_arm64)
+  void VisitMultiplyAccumulate(HMultiplyAccumulate* instruction) override {
     StartAttributeStream("kind") << instruction->GetOpKind();
   }
 

@@ -112,12 +112,18 @@ implementation_libs=(
   "heapprofd_client_api"
   "libandroid_runtime_lazy"
   "libartpalette-system"
+  "libdebugstore_cxx" # Needed by "libartpalette-system".
   "libbinder"
   "libbinder_ndk"
   "libcutils"
   "libutils"
   "libvndksupport"
 )
+
+# riscv64 has a newer version of libbinder which depends on libapexsupport.
+if [[ $TARGET_ARCH = "riscv64" ]]; then
+    implementation_libs+=("libapexsupport") # Needed by "libbinder".
+fi
 
 if [ -d frameworks/base ]; then
   # In full manifest branches, build the implementation libraries from source

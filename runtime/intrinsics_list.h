@@ -38,6 +38,7 @@
 //
 // Note: adding a new intrinsic requires an art image version change,
 // as the modifiers flag for some ArtMethods will need to be changed.
+// The image version is located in runtime/oat/image.cc
 //
 // Note: j.l.Integer.valueOf says kNoThrow even though it could throw an
 // OOME. The kNoThrow should be renamed to kNoVisibleThrow, as it is ok to
@@ -137,6 +138,7 @@
   V(IntegerReverseBytes, kStatic, kNeedsEnvironment, kNoSideEffects, kNoThrow, "Ljava/lang/Integer;", "reverseBytes", "(I)I") \
   V(IntegerBitCount, kStatic, kNeedsEnvironment, kNoSideEffects, kNoThrow, "Ljava/lang/Integer;", "bitCount", "(I)I") \
   V(IntegerDivideUnsigned, kStatic, kNeedsEnvironment, kNoSideEffects, kCanThrow, "Ljava/lang/Integer;", "divideUnsigned", "(II)I") \
+  V(IntegerRemainderUnsigned, kStatic, kNeedsEnvironment, kNoSideEffects, kCanThrow, "Ljava/lang/Integer;", "remainderUnsigned", "(II)I") \
   V(IntegerHighestOneBit, kStatic, kNeedsEnvironment, kNoSideEffects, kNoThrow, "Ljava/lang/Integer;", "highestOneBit", "(I)I") \
   V(IntegerLowestOneBit, kStatic, kNeedsEnvironment, kNoSideEffects, kNoThrow, "Ljava/lang/Integer;", "lowestOneBit", "(I)I") \
   V(IntegerNumberOfLeadingZeros, kStatic, kNeedsEnvironment, kNoSideEffects, kNoThrow, "Ljava/lang/Integer;", "numberOfLeadingZeros", "(I)I") \
@@ -145,6 +147,7 @@
   V(LongReverseBytes, kStatic, kNeedsEnvironment, kNoSideEffects, kNoThrow, "Ljava/lang/Long;", "reverseBytes", "(J)J") \
   V(LongBitCount, kStatic, kNeedsEnvironment, kNoSideEffects, kNoThrow, "Ljava/lang/Long;", "bitCount", "(J)I") \
   V(LongDivideUnsigned, kStatic, kNeedsEnvironment, kNoSideEffects, kCanThrow, "Ljava/lang/Long;", "divideUnsigned", "(JJ)J") \
+  V(LongRemainderUnsigned, kStatic, kNeedsEnvironment, kNoSideEffects, kCanThrow, "Ljava/lang/Long;", "remainderUnsigned", "(JJ)J") \
   V(LongHighestOneBit, kStatic, kNeedsEnvironment, kNoSideEffects, kNoThrow, "Ljava/lang/Long;", "highestOneBit", "(J)J") \
   V(LongLowestOneBit, kStatic, kNeedsEnvironment, kNoSideEffects, kNoThrow, "Ljava/lang/Long;", "lowestOneBit", "(J)J") \
   V(LongNumberOfLeadingZeros, kStatic, kNeedsEnvironment, kNoSideEffects, kNoThrow, "Ljava/lang/Long;", "numberOfLeadingZeros", "(J)I") \
@@ -177,6 +180,10 @@
   V(MathRoundDouble, kStatic, kNeedsEnvironment, kNoSideEffects, kNoThrow, "Ljava/lang/Math;", "round", "(D)J") \
   V(MathRoundFloat, kStatic, kNeedsEnvironment, kNoSideEffects, kNoThrow, "Ljava/lang/Math;", "round", "(F)I") \
   V(MathMultiplyHigh, kStatic, kNeedsEnvironment, kNoSideEffects, kNoThrow, "Ljava/lang/Math;", "multiplyHigh", "(JJ)J") \
+  V(MathSignumDouble, kStatic, kNeedsEnvironment, kNoSideEffects, kNoThrow, "Ljava/lang/Math;", "signum", "(D)D") \
+  V(MathSignumFloat, kStatic, kNeedsEnvironment, kNoSideEffects, kNoThrow, "Ljava/lang/Math;", "signum", "(F)F") \
+  V(MathCopySignDouble, kStatic, kNeedsEnvironment, kNoSideEffects, kNoThrow, "Ljava/lang/Math;", "copySign", "(DD)D") \
+  V(MathCopySignFloat, kStatic, kNeedsEnvironment, kNoSideEffects, kNoThrow, "Ljava/lang/Math;", "copySign", "(FF)F") \
   V(SystemArrayCopyByte, kStatic, kNeedsEnvironment, kAllSideEffects, kCanThrow, "Ljava/lang/System;", "arraycopy", "([BI[BII)V") \
   V(SystemArrayCopyChar, kStatic, kNeedsEnvironment, kAllSideEffects, kCanThrow, "Ljava/lang/System;", "arraycopy", "([CI[CII)V") \
   V(SystemArrayCopyInt, kStatic, kNeedsEnvironment, kAllSideEffects, kCanThrow, "Ljava/lang/System;", "arraycopy", "([II[III)V") \

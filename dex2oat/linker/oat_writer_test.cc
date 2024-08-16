@@ -109,8 +109,7 @@ class OatTest : public CommonCompilerDriverTest {
     OatWriter oat_writer(*compiler_options_,
                          verification_results_.get(),
                          &timings,
-                         /*profile_compilation_info*/nullptr,
-                         CompactDexLevel::kCompactDexLevelNone);
+                         /*profile_compilation_info*/nullptr);
     for (const DexFile* dex_file : dex_files) {
       if (!oat_writer.AddRawDexFileSource(dex_file->GetContainer(),
                                           dex_file->Begin(),
@@ -135,8 +134,7 @@ class OatTest : public CommonCompilerDriverTest {
     OatWriter oat_writer(*compiler_options_,
                          verification_results_.get(),
                          &timings,
-                         profile_compilation_info,
-                         CompactDexLevel::kCompactDexLevelNone);
+                         profile_compilation_info);
     for (const char* dex_filename : dex_filenames) {
       if (!oat_writer.AddDexFileSource(dex_filename, dex_filename)) {
         return false;
@@ -158,8 +156,7 @@ class OatTest : public CommonCompilerDriverTest {
     OatWriter oat_writer(*compiler_options_,
                          verification_results_.get(),
                          &timings,
-                         profile_compilation_info,
-                         CompactDexLevel::kCompactDexLevelNone);
+                         profile_compilation_info);
     if (!oat_writer.AddDexFileSource(std::move(dex_file_fd), location)) {
       return false;
     }
@@ -505,7 +502,7 @@ TEST_F(OatTest, OatHeaderSizeCheck) {
   EXPECT_EQ(68U, sizeof(OatHeader));
   EXPECT_EQ(4U, sizeof(OatMethodOffsets));
   EXPECT_EQ(4U, sizeof(OatQuickMethodHeader));
-  EXPECT_EQ(170 * static_cast<size_t>(GetInstructionSetPointerSize(kRuntimeISA)),
+  EXPECT_EQ(172 * static_cast<size_t>(GetInstructionSetPointerSize(kRuntimeISA)),
             sizeof(QuickEntryPoints));
 }
 

@@ -45,6 +45,11 @@ cc_defaults {
         "artd-aidl-ndk",
         "libfstab",
     ],
+    target: {
+        android: {
+            compile_multilib: "first",
+        },
+    },
 }
 
 art_cc_binary {
@@ -57,7 +62,7 @@ art_cc_binary {
         "libart",
         "libartbase",
         "libartservice",
-        "libarttools", // Contains "libc++fs".
+        "libarttools",
         "libbase",
         "libdexfile",
     ],

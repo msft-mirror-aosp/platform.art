@@ -16,6 +16,7 @@
 
 #include "code_generator.h"
 #include "base/globals.h"
+#include "mirror/method_type.h"
 
 #ifdef ART_ENABLE_CODEGEN_arm
 #include "code_generator_arm_vixl.h"
@@ -209,11 +210,23 @@ uint64_t CodeGenerator::GetJitClassRootIndex(TypeReference type_reference) {
   return code_generation_data_->GetJitClassRootIndex(type_reference);
 }
 
+void CodeGenerator::ReserveJitMethodTypeRoot(ProtoReference proto_reference,
+                                             Handle<mirror::MethodType> method_type) {
+  DCHECK(code_generation_data_ != nullptr);
+  code_generation_data_->ReserveJitMethodTypeRoot(proto_reference, method_type);
+}
+
+uint64_t CodeGenerator::GetJitMethodTypeRootIndex(ProtoReference proto_reference) {
+  DCHECK(code_generation_data_ != nullptr);
+  return code_generation_data_->GetJitMethodTypeRootIndex(proto_reference);
+}
+
 void CodeGenerator::EmitJitRootPatches([[maybe_unused]] uint8_t* code,
                                        [[maybe_unused]] const uint8_t* roots_data) {
   DCHECK(code_generation_data_ != nullptr);
   DCHECK_EQ(code_generation_data_->GetNumberOfJitStringRoots(), 0u);
   DCHECK_EQ(code_generation_data_->GetNumberOfJitClassRoots(), 0u);
+  DCHECK_EQ(code_generation_data_->GetNumberOfJitMethodTypeRoots(), 0u);
 }
 
 uint32_t CodeGenerator::GetArrayLengthOffset(HArrayLength* array_length) {
@@ -619,11 +632,8 @@ void CodeGenerator::CreateStringBuilderAppendLocations(HStringBuilderAppend* ins
     stack_offset += sizeof(uint32_t);
   }
   DCHECK_EQ(f, 0u);
-
-  size_t param_size = stack_offset - static_cast<size_t>(pointer_size);
-  DCHECK_ALIGNED(param_size, kVRegSize);
-  size_t num_vregs = param_size / kVRegSize;
-  graph_->UpdateMaximumNumberOfOutVRegs(num_vregs);
+  DCHECK_EQ(stack_offset,
+            static_cast<size_t>(pointer_size) + kVRegSize * instruction->GetNumberOfOutVRegs());
 }
 
 void CodeGenerator::CreateUnresolvedFieldLocationSummary(
