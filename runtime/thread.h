@@ -684,20 +684,18 @@ class EXPORT Thread {
   // that needs to be dealt with, false otherwise.
   bool ObserveAsyncException() REQUIRES_SHARED(Locks::mutator_lock_);
 
-  // Find catch block and perform long jump to appropriate exception handle. When
-  // is_method_exit_exception is true, the exception was thrown by the method exit callback and we
-  // should not send method unwind for the method on top of the stack since method exit callback was
-  // already called.
-  NO_RETURN void QuickDeliverException(bool is_method_exit_exception = false)
+  // Find catch block then prepare and return the long jump context to the appropriate exception
+  // handler. When is_method_exit_exception is true, the exception was thrown by the method exit
+  // callback and we should not send method unwind for the method on top of the stack since method
+  // exit callback was already called.
+  std::unique_ptr<Context> QuickDeliverException(bool is_method_exit_exception = false)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
-  Context* GetLongJumpContext();
-  void ReleaseLongJumpContext(Context* context) {
-    if (tlsPtr_.long_jump_context != nullptr) {
-      ReleaseLongJumpContextInternal();
-    }
-    tlsPtr_.long_jump_context = context;
-  }
+  // Perform deoptimization. Return a `Context` prepared for a long jump.
+  std::unique_ptr<Context> Deoptimize(DeoptimizationKind kind,
+                                      bool single_frame,
+                                      bool skip_method_exit_callbacks)
+      REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Get the current method and dex pc. If there are errors in retrieving the dex pc, this will
   // abort the runtime iff abort_on_error is true.
@@ -1099,9 +1097,9 @@ class EXPORT Thread {
   }
 
   template <PointerSize pointer_size>
-  static constexpr ThreadOffset<pointer_size> TraceBufferIndexOffset() {
+  static constexpr ThreadOffset<pointer_size> TraceBufferCurrPtrOffset() {
     return ThreadOffsetFromTlsPtr<pointer_size>(
-        OFFSETOF_MEMBER(tls_ptr_sized_values, method_trace_buffer_index));
+        OFFSETOF_MEMBER(tls_ptr_sized_values, method_trace_buffer_curr_entry));
   }
 
   template <PointerSize pointer_size>
@@ -1364,10 +1362,21 @@ class EXPORT Thread {
 
   uintptr_t* GetMethodTraceBuffer() { return tlsPtr_.method_trace_buffer; }
 
-  size_t* GetMethodTraceIndexPtr() { return &tlsPtr_.method_trace_buffer_index; }
+  uintptr_t** GetTraceBufferCurrEntryPtr() { return &tlsPtr_.method_trace_buffer_curr_entry; }
 
-  uintptr_t* SetMethodTraceBuffer(uintptr_t* buffer) {
-    return tlsPtr_.method_trace_buffer = buffer;
+  void SetMethodTraceBuffer(uintptr_t* buffer, int init_index) {
+    tlsPtr_.method_trace_buffer = buffer;
+    SetTraceBufferCurrentEntry(init_index);
+  }
+
+  void SetTraceBufferCurrentEntry(int index) {
+    uintptr_t* buffer = tlsPtr_.method_trace_buffer;
+    if (buffer == nullptr) {
+      tlsPtr_.method_trace_buffer_curr_entry = nullptr;
+    } else {
+      DCHECK(buffer != nullptr);
+      tlsPtr_.method_trace_buffer_curr_entry = buffer + index;
+    }
   }
 
   uint64_t GetTraceClockBase() const {
@@ -1824,8 +1833,6 @@ class EXPORT Thread {
 
   static bool IsAotCompiler();
 
-  void ReleaseLongJumpContextInternal();
-
   void SetCachedThreadName(const char* name);
 
   // Helper class for manipulating the 32 bits of atomically changed state and flags.
@@ -2130,7 +2137,6 @@ class EXPORT Thread {
                                monitor_enter_object(nullptr),
                                top_handle_scope(nullptr),
                                class_loader_override(nullptr),
-                               long_jump_context(nullptr),
                                stacked_shadow_frame_record(nullptr),
                                deoptimization_context_stack(nullptr),
                                frame_id_to_shadow_frame(nullptr),
@@ -2138,9 +2144,9 @@ class EXPORT Thread {
                                pthread_self(0),
                                active_suspendall_barrier(nullptr),
                                active_suspend1_barriers(nullptr),
-                               thread_local_start(nullptr),
                                thread_local_pos(nullptr),
                                thread_local_end(nullptr),
+                               thread_local_start(nullptr),
                                thread_local_limit(nullptr),
                                thread_local_objects(0),
                                checkpoint_function(nullptr),
@@ -2152,7 +2158,7 @@ class EXPORT Thread {
                                async_exception(nullptr),
                                top_reflective_handle_scope(nullptr),
                                method_trace_buffer(nullptr),
-                               method_trace_buffer_index(0),
+                               method_trace_buffer_curr_entry(nullptr),
                                thread_exit_flags(nullptr),
                                last_no_thread_suspension_cause(nullptr),
                                last_no_transaction_checks_cause(nullptr) {
@@ -2229,9 +2235,6 @@ class EXPORT Thread {
     // useful for testing.
     jobject class_loader_override;
 
-    // Thread local, lazily allocated, long jump context. Used to deliver exceptions.
-    Context* long_jump_context;
-
     // For gc purpose, a shadow frame record stack that keeps track of:
     // 1) shadow frames under construction.
     // 2) deoptimization shadow frames.
@@ -2270,13 +2273,13 @@ class EXPORT Thread {
     // The struct as a whole is still stored on the requesting thread's stack.
     WrappedSuspend1Barrier* active_suspend1_barriers GUARDED_BY(Locks::thread_suspend_count_lock_);
 
-    // Thread-local allocation pointer. Can be moved below the following two to correct alignment.
-    uint8_t* thread_local_start;
-
     // thread_local_pos and thread_local_end must be consecutive for ldrd and are 8 byte aligned for
     // potentially better performance.
     uint8_t* thread_local_pos;
     uint8_t* thread_local_end;
+
+    // Thread-local allocation pointer. Can be moved above the preceding two to correct alignment.
+    uint8_t* thread_local_start;
 
     // Thread local limit is how much we can expand the thread local buffer to, it is greater or
     // equal to thread_local_end.
@@ -2327,8 +2330,8 @@ class EXPORT Thread {
     // Pointer to a thread-local buffer for method tracing.
     uintptr_t* method_trace_buffer;
 
-    // The index of the next free entry in method_trace_buffer.
-    size_t method_trace_buffer_index;
+    // Pointer to the current entry in the buffer.
+    uintptr_t* method_trace_buffer_curr_entry;
 
     // Pointer to the first node of an intrusively doubly-linked list of ThreadExitFlags.
     ThreadExitFlag* thread_exit_flags GUARDED_BY(Locks::thread_list_lock_);
