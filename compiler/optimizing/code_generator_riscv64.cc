@@ -2640,24 +2640,20 @@ void InstructionCodeGeneratorRISCV64::GenerateMethodEntryExitHook(HInstruction* 
   __ Addi(tmp, tmp, -1);
   __ Bnez(tmp, slow_path->GetEntryLabel());
 
-  // Check if there is place in the buffer to store a new entry, if no, take the slow path.
-  int32_t trace_buffer_index_offset =
-      Thread::TraceBufferIndexOffset<kRiscv64PointerSize>().Int32Value();
-  __ Loadd(tmp, TR, trace_buffer_index_offset);
-  __ Addi(tmp, tmp, -dchecked_integral_cast<int32_t>(kNumEntriesForWallClock));
-  __ Bltz(tmp, slow_path->GetEntryLabel());
-
-  // Update the index in the `Thread`.
-  __ Stored(tmp, TR, trace_buffer_index_offset);
-
   // Allocate second core scratch register. We can no longer use `Stored()`
   // and similar macro instructions because there is no core scratch register left.
   XRegister tmp2 = temps.AllocateXRegister();
 
-  // Calculate the entry address in the buffer.
-  // /*addr*/ tmp = TR->GetMethodTraceBuffer() + sizeof(void*) * /*index*/ tmp;
+  // Check if there is place in the buffer to store a new entry, if no, take the slow path.
+  int32_t trace_buffer_curr_entry_offset =
+      Thread::TraceBufferCurrPtrOffset<kRiscv64PointerSize>().Int32Value();
+  __ Loadd(tmp, TR, trace_buffer_curr_entry_offset);
   __ Loadd(tmp2, TR, Thread::TraceBufferPtrOffset<kRiscv64PointerSize>().SizeValue());
-  __ Sh3Add(tmp, tmp, tmp2);
+  __ Addi(tmp, tmp, -dchecked_integral_cast<int32_t>(kNumEntriesForWallClock * sizeof(void*)));
+  __ Blt(tmp, tmp2, slow_path->GetEntryLabel());
+
+  // Update the index in the `Thread`.
+  __ Sd(tmp, TR, trace_buffer_curr_entry_offset);
 
   // Record method pointer and trace action.
   __ Ld(tmp2, SP, 0);
@@ -3474,18 +3470,20 @@ void InstructionCodeGeneratorRISCV64::VisitClinitCheck(HClinitCheck* instruction
 }
 
 void LocationsBuilderRISCV64::VisitCompare(HCompare* instruction) {
-  DataType::Type in_type = instruction->InputAt(0)->GetType();
+  DataType::Type compare_type = instruction->GetComparisonType();
 
   LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(instruction);
 
-  switch (in_type) {
+  switch (compare_type) {
     case DataType::Type::kBool:
     case DataType::Type::kUint8:
     case DataType::Type::kInt8:
     case DataType::Type::kUint16:
     case DataType::Type::kInt16:
     case DataType::Type::kInt32:
+    case DataType::Type::kUint32:
     case DataType::Type::kInt64:
+    case DataType::Type::kUint64:
       locations->SetInAt(0, Location::RequiresRegister());
       locations->SetInAt(1, RegisterOrZeroBitPatternLocation(instruction->InputAt(1)));
       locations->SetOut(Location::RequiresRegister(), Location::kNoOutputOverlap);
@@ -3499,7 +3497,7 @@ void LocationsBuilderRISCV64::VisitCompare(HCompare* instruction) {
       break;
 
     default:
-      LOG(FATAL) << "Unexpected type for compare operation " << in_type;
+      LOG(FATAL) << "Unexpected type for compare operation " << compare_type;
       UNREACHABLE();
   }
 }
@@ -3508,11 +3506,12 @@ void InstructionCodeGeneratorRISCV64::VisitCompare(HCompare* instruction) {
   LocationSummary* locations = instruction->GetLocations();
   XRegister result = locations->Out().AsRegister<XRegister>();
   DataType::Type in_type = instruction->InputAt(0)->GetType();
+  DataType::Type compare_type = instruction->GetComparisonType();
 
   //  0 if: left == right
   //  1 if: left  > right
   // -1 if: left  < right
-  switch (in_type) {
+  switch (compare_type) {
     case DataType::Type::kBool:
     case DataType::Type::kUint8:
     case DataType::Type::kInt8:
@@ -3526,6 +3525,18 @@ void InstructionCodeGeneratorRISCV64::VisitCompare(HCompare* instruction) {
       XRegister tmp = srs.AllocateXRegister();
       __ Slt(tmp, left, right);
       __ Slt(result, right, left);
+      __ Sub(result, result, tmp);
+      break;
+    }
+
+    case DataType::Type::kUint32:
+    case DataType::Type::kUint64: {
+      XRegister left = locations->InAt(0).AsRegister<XRegister>();
+      XRegister right = InputXRegisterOrZero(locations->InAt(1));
+      ScratchRegisterScope srs(GetAssembler());
+      XRegister tmp = srs.AllocateXRegister();
+      __ Sltu(tmp, left, right);
+      __ Sltu(result, right, left);
       __ Sub(result, result, tmp);
       break;
     }
@@ -5437,6 +5448,37 @@ void InstructionCodeGeneratorRISCV64::VisitRiscv64ShiftAdd(HRiscv64ShiftAdd* ins
     default:
       LOG(FATAL) << "Unexpected distance of ShiftAdd: " << instruction->GetDistance();
       UNREACHABLE();
+  }
+}
+
+void LocationsBuilderRISCV64::VisitBitwiseNegatedRight(HBitwiseNegatedRight* instruction) {
+  DCHECK(codegen_->GetInstructionSetFeatures().HasZbb());
+  DCHECK(DataType::IsIntegralType(instruction->GetType())) << instruction->GetType();
+
+  LocationSummary* locations = new (GetGraph()->GetAllocator()) LocationSummary(instruction);
+  locations->SetInAt(0, Location::RequiresRegister());
+  locations->SetInAt(1, Location::RequiresRegister());
+  locations->SetOut(Location::RequiresRegister(), Location::kNoOutputOverlap);
+}
+
+void InstructionCodeGeneratorRISCV64::VisitBitwiseNegatedRight(HBitwiseNegatedRight* instruction) {
+  LocationSummary* locations = instruction->GetLocations();
+  XRegister lhs = locations->InAt(0).AsRegister<XRegister>();
+  XRegister rhs = locations->InAt(1).AsRegister<XRegister>();
+  XRegister dst = locations->Out().AsRegister<XRegister>();
+
+  switch (instruction->GetOpKind()) {
+    case HInstruction::kAnd:
+      __ Andn(dst, lhs, rhs);
+      break;
+    case HInstruction::kOr:
+      __ Orn(dst, lhs, rhs);
+      break;
+    case HInstruction::kXor:
+      __ Xnor(dst, lhs, rhs);
+      break;
+    default:
+      LOG(FATAL) << "Unreachable";
   }
 }
 

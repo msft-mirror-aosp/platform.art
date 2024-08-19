@@ -34,7 +34,6 @@
 #include "base/mem_map.h"
 #include "base/metrics/metrics.h"
 #include "base/os.h"
-#include "base/string_view_cpp20.h"
 #include "base/unix_file/fd_file.h"
 #include "compat_framework.h"
 #include "deoptimization_kind.h"
@@ -632,6 +631,9 @@ class Runtime {
   }
 
   bool IsActiveTransaction() {
+    if (kIsDebugBuild) {
+      DCheckNoTransactionCheckAllowed();
+    }
     return active_transaction_;
   }
 
@@ -1180,6 +1182,8 @@ class Runtime {
 
   void AppendToBootClassPath(const std::string& filename, const std::string& location);
 
+  void DCheckNoTransactionCheckAllowed();
+
   // Don't use EXPORT ("default" visibility), because quick_entrypoints_x86.o
   // refers to this symbol and it can't link with R_386_PC32 relocation.
   // A pointer to the active runtime or null.
@@ -1204,8 +1208,8 @@ class Runtime {
   // for differentiating between unfilled imt slots vs conflict slots in superclasses.
   ArtMethod* imt_unimplemented_method_;
 
-  // Special sentinel object used to invalid conditions in JNI (cleared weak references) and
-  // JDWP (invalid references).
+  // Special sentinel object used to indicate invalid conditions in JNI (cleared weak references)
+  // and JDWP (invalid references).
   GcRoot<mirror::Object> sentinel_;
 
   InstructionSet instruction_set_;
