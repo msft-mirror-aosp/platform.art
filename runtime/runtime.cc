@@ -1278,7 +1278,7 @@ void Runtime::InitNonZygoteOrPostFork(
   heap_->ResetGcPerformanceInfo();
   GetMetrics()->Reset();
 
-  if (metrics_reporter_ != nullptr) {
+  if (AreMetricsInitialized()) {
     // Now that we know if we are an app or system server, reload the metrics reporter config
     // in case there are any difference.
     metrics::ReportingConfig metrics_config =
@@ -1404,7 +1404,8 @@ static size_t OpenBootDexFiles(ArrayRef<const std::string> dex_filenames,
 void Runtime::SetSentinel(ObjPtr<mirror::Object> sentinel) {
   CHECK(sentinel_.Read() == nullptr);
   CHECK(sentinel != nullptr);
-  CHECK(!heap_->IsMovableObject(sentinel));
+  // IsNonMovable(sentinel) doesn't hold if it came from an image.
+  CHECK(!heap_->ObjectMayMove(sentinel));
   sentinel_ = GcRoot<mirror::Object>(sentinel);
 }
 
@@ -2112,7 +2113,12 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
   // Class-roots are setup, we can now finish initializing the JniIdManager.
   GetJniIdManager()->Init(self);
 
-  InitMetrics();
+  // Initialize metrics only for the Zygote process or
+  // if explicitly enabled via command line argument.
+  if (IsZygote() || gFlags.MetricsForceEnable.GetValue()) {
+    LOG(INFO) << "Initializing ART runtime metrics";
+    InitMetrics();
+  }
 
   // Runtime initialization is largely done now.
   // We load plugins first since that can modify the runtime state slightly.
@@ -2213,7 +2219,7 @@ void Runtime::InitMetrics() {
 }
 
 void Runtime::RequestMetricsReport(bool synchronous) {
-  if (metrics_reporter_) {
+  if (AreMetricsInitialized()) {
     metrics_reporter_->RequestMetricsReport(synchronous);
   }
 }
@@ -2871,7 +2877,7 @@ void Runtime::RegisterAppInfo(const std::string& package_name,
       ref_profile_filename,
       AppInfo::FromVMRuntimeConstants(code_type));
 
-  if (metrics_reporter_ != nullptr) {
+  if (AreMetricsInitialized()) {
     metrics_reporter_->NotifyAppInfoUpdated(&app_info_);
   }
 
@@ -3308,14 +3314,14 @@ bool Runtime::NotifyStartupCompleted() {
 
   ProfileSaver::NotifyStartupCompleted();
 
-  if (metrics_reporter_ != nullptr) {
+  if (AreMetricsInitialized()) {
     metrics_reporter_->NotifyStartupCompleted();
   }
   return true;
 }
 
 void Runtime::NotifyDexFileLoaded() {
-  if (metrics_reporter_ != nullptr) {
+  if (AreMetricsInitialized()) {
     metrics_reporter_->NotifyAppInfoUpdated(&app_info_);
   }
 }
