@@ -501,7 +501,6 @@ void HInstructionBuilder::BuildIntrinsic(ArtMethod* method) {
     HInvokeStaticOrDirect* invoke = new (allocator_) HInvokeStaticOrDirect(
         allocator_,
         number_of_arguments,
-        /* number_of_out_vregs= */ in_vregs,
         return_type_,
         kNoDexPc,
         target_method,
@@ -1067,7 +1066,6 @@ bool HInstructionBuilder::BuildInvoke(const Instruction& instruction,
                     MethodCompilationStat::kUnresolvedMethod);
     HInvoke* invoke = new (allocator_) HInvokeUnresolved(allocator_,
                                                          number_of_arguments,
-                                                         operands.GetNumberOfOperands(),
                                                          return_type,
                                                          dex_pc,
                                                          method_reference,
@@ -1088,7 +1086,6 @@ bool HInstructionBuilder::BuildInvoke(const Instruction& instruction,
     HInvoke* invoke = new (allocator_) HInvokeStaticOrDirect(
         allocator_,
         number_of_arguments - 1,
-        operands.GetNumberOfOperands() - 1,
         /* return_type= */ DataType::Type::kReference,
         dex_pc,
         method_reference,
@@ -1154,7 +1151,6 @@ bool HInstructionBuilder::BuildInvoke(const Instruction& instruction,
     }
     invoke = new (allocator_) HInvokeStaticOrDirect(allocator_,
                                                     number_of_arguments,
-                                                    operands.GetNumberOfOperands(),
                                                     return_type,
                                                     dex_pc,
                                                     method_reference,
@@ -1174,7 +1170,6 @@ bool HInstructionBuilder::BuildInvoke(const Instruction& instruction,
   } else if (invoke_type == kVirtual) {
     invoke = new (allocator_) HInvokeVirtual(allocator_,
                                              number_of_arguments,
-                                             operands.GetNumberOfOperands(),
                                              return_type,
                                              dex_pc,
                                              method_reference,
@@ -1196,7 +1191,6 @@ bool HInstructionBuilder::BuildInvoke(const Instruction& instruction,
             .method_load_kind;
     invoke = new (allocator_) HInvokeInterface(allocator_,
                                                number_of_arguments,
-                                               operands.GetNumberOfOperands(),
                                                return_type,
                                                dex_pc,
                                                method_reference,
@@ -1396,9 +1390,24 @@ bool HInstructionBuilder::BuildInvokePolymorphic(uint32_t dex_pc,
                                             &is_string_constructor);
 
   MethodReference method_reference(&graph_->GetDexFile(), method_idx);
+
+  // MethodHandle.invokeExact intrinsic needs to check whether call-site matches with MethodHandle's
+  // type. To do that, MethodType corresponding to the call-site is passed as an extra input.
+  // Other invoke-polymorphic calls do not need it.
+  bool is_invoke_exact =
+      static_cast<Intrinsics>(resolved_method->GetIntrinsic()) ==
+          Intrinsics::kMethodHandleInvokeExact;
+  // Currently intrinsic works for MethodHandle targeting invoke-virtual calls only.
+  bool can_be_virtual = number_of_arguments >= 2 &&
+      DataType::FromShorty(shorty[1]) == DataType::Type::kReference;
+
+  bool can_be_intrinsified = is_invoke_exact && can_be_virtual;
+
+  uint32_t number_of_other_inputs = can_be_intrinsified ? 1u : 0u;
+
   HInvoke* invoke = new (allocator_) HInvokePolymorphic(allocator_,
                                                         number_of_arguments,
-                                                        operands.GetNumberOfOperands(),
+                                                        number_of_other_inputs,
                                                         return_type,
                                                         dex_pc,
                                                         method_reference,
@@ -1408,6 +1417,8 @@ bool HInstructionBuilder::BuildInvokePolymorphic(uint32_t dex_pc,
   if (!HandleInvoke(invoke, operands, shorty, /* is_unresolved= */ false)) {
     return false;
   }
+
+  DCHECK_EQ(invoke->AsInvokePolymorphic()->CanHaveFastPath(), can_be_intrinsified);
 
   if (invoke->GetIntrinsic() != Intrinsics::kNone &&
       invoke->GetIntrinsic() != Intrinsics::kMethodHandleInvoke &&
@@ -1440,7 +1451,6 @@ bool HInstructionBuilder::BuildInvokeCustom(uint32_t dex_pc,
   MethodReference method_reference(&graph_->GetDexFile(), dex::kDexNoIndex);
   HInvoke* invoke = new (allocator_) HInvokeCustom(allocator_,
                                                    number_of_arguments,
-                                                   operands.GetNumberOfOperands(),
                                                    call_site_idx,
                                                    return_type,
                                                    dex_pc,
@@ -1887,6 +1897,26 @@ bool HInstructionBuilder::SetupInvokeArguments(HInstruction* invoke,
                           graph_->GetCurrentMethod());
   }
 
+  if (invoke->IsInvokePolymorphic()) {
+    HInvokePolymorphic* invoke_polymorphic = invoke->AsInvokePolymorphic();
+
+    // MethodHandle.invokeExact intrinsic expects MethodType corresponding to the call-site as an
+    // extra input to determine whether to throw WrongMethodTypeException or execute target method.
+    if (invoke_polymorphic->CanHaveFastPath()) {
+      HLoadMethodType* load_method_type =
+          new (allocator_) HLoadMethodType(graph_->GetCurrentMethod(),
+                                           invoke_polymorphic->GetProtoIndex(),
+                                           graph_->GetDexFile(),
+                                           invoke_polymorphic->GetDexPc());
+      HSharpening::ProcessLoadMethodType(load_method_type,
+                                         code_generator_,
+                                         *dex_compilation_unit_,
+                                         graph_->GetHandleCache()->GetHandles());
+      invoke->SetRawInputAt(invoke_polymorphic->GetNumberOfArguments(), load_method_type);
+      AppendInstruction(load_method_type);
+    }
+  }
+
   return true;
 }
 
@@ -1914,7 +1944,7 @@ bool HInstructionBuilder::BuildSimpleIntrinsic(ArtMethod* method,
                                                uint32_t dex_pc,
                                                const InstructionOperands& operands,
                                                const char* shorty) {
-  Intrinsics intrinsic = static_cast<Intrinsics>(method->GetIntrinsic());
+  Intrinsics intrinsic = method->GetIntrinsic();
   DCHECK_NE(intrinsic, Intrinsics::kNone);
   constexpr DataType::Type kInt32 = DataType::Type::kInt32;
   constexpr DataType::Type kInt64 = DataType::Type::kInt64;
