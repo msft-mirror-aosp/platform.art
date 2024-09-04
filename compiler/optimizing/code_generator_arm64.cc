@@ -27,6 +27,7 @@
 #include "class_root-inl.h"
 #include "class_table.h"
 #include "code_generator_utils.h"
+#include "com_android_art_flags.h"
 #include "entrypoints/quick/quick_entrypoints.h"
 #include "entrypoints/quick/quick_entrypoints_enum.h"
 #include "gc/accounting/card_table.h"
@@ -57,6 +58,8 @@ using namespace vixl::aarch64;  // NOLINT(build/namespaces)
 using vixl::ExactAssemblyScope;
 using vixl::CodeBufferCheckScope;
 using vixl::EmissionCheckScope;
+
+namespace art_flags = com::android::art::flags;
 
 #ifdef __
 #error "ARM64 Codegen VIXL macro-assembler macro already defined."
@@ -826,7 +829,6 @@ class TracingMethodEntryExitHooksSlowPathARM64 : public SlowPathCodeARM64 {
   void EmitNativeCode(CodeGenerator* codegen) override {
     QuickEntrypointEnum entry_point =
         (is_method_entry_) ? kQuickRecordEntryTraceEvent : kQuickRecordExitTraceEvent;
-    CodeGeneratorARM64* arm64_codegen = down_cast<CodeGeneratorARM64*>(codegen);
     vixl::aarch64::Label call;
     __ Bind(GetEntryLabel());
     uint32_t entrypoint_offset = GetThreadOffset<kArm64PointerSize>(entry_point).Int32Value();
@@ -1317,7 +1319,7 @@ void InstructionCodeGeneratorARM64::VisitMethodEntryHook(HMethodEntryHook* instr
 }
 
 void CodeGeneratorARM64::MaybeRecordTraceEvent(bool is_method_entry) {
-  if (!kAlwaysEnableProfileCode) {
+  if (!art_flags::always_enable_profile_code()) {
     return;
   }
 
@@ -3268,16 +3270,18 @@ void InstructionCodeGeneratorARM64::GenerateFcmp(HInstruction* instruction) {
 void LocationsBuilderARM64::VisitCompare(HCompare* compare) {
   LocationSummary* locations =
       new (GetGraph()->GetAllocator()) LocationSummary(compare, LocationSummary::kNoCall);
-  DataType::Type in_type = compare->InputAt(0)->GetType();
+  DataType::Type compare_type = compare->GetComparisonType();
   HInstruction* rhs = compare->InputAt(1);
-  switch (in_type) {
+  switch (compare_type) {
     case DataType::Type::kBool:
     case DataType::Type::kUint8:
     case DataType::Type::kInt8:
     case DataType::Type::kUint16:
     case DataType::Type::kInt16:
     case DataType::Type::kInt32:
-    case DataType::Type::kInt64: {
+    case DataType::Type::kUint32:
+    case DataType::Type::kInt64:
+    case DataType::Type::kUint64: {
       locations->SetInAt(0, Location::RequiresRegister());
       locations->SetInAt(1, ARM64EncodableConstantOrRegister(rhs, compare));
       locations->SetOut(Location::RequiresRegister(), Location::kNoOutputOverlap);
@@ -3294,17 +3298,22 @@ void LocationsBuilderARM64::VisitCompare(HCompare* compare) {
       break;
     }
     default:
-      LOG(FATAL) << "Unexpected type for compare operation " << in_type;
+      LOG(FATAL) << "Unexpected type for compare operation " << compare_type;
   }
 }
 
 void InstructionCodeGeneratorARM64::VisitCompare(HCompare* compare) {
-  DataType::Type in_type = compare->InputAt(0)->GetType();
+  DataType::Type compare_type = compare->GetComparisonType();
 
   //  0 if: left == right
   //  1 if: left  > right
   // -1 if: left  < right
-  switch (in_type) {
+  Condition less_cond = lt;
+  switch (compare_type) {
+    case DataType::Type::kUint32:
+    case DataType::Type::kUint64:
+      less_cond = lo;
+      FALLTHROUGH_INTENDED;
     case DataType::Type::kBool:
     case DataType::Type::kUint8:
     case DataType::Type::kInt8:
@@ -3316,8 +3325,8 @@ void InstructionCodeGeneratorARM64::VisitCompare(HCompare* compare) {
       Register left = InputRegisterAt(compare, 0);
       Operand right = InputOperandAt(compare, 1);
       __ Cmp(left, right);
-      __ Cset(result, ne);          // result == +1 if NE or 0 otherwise
-      __ Cneg(result, result, lt);  // result == -1 if LT or unchanged otherwise
+      __ Cset(result, ne);                 // result == +1 if NE or 0 otherwise
+      __ Cneg(result, result, less_cond);  // result == -1 if LT or unchanged otherwise
       break;
     }
     case DataType::Type::kFloat32:
@@ -3329,7 +3338,7 @@ void InstructionCodeGeneratorARM64::VisitCompare(HCompare* compare) {
       break;
     }
     default:
-      LOG(FATAL) << "Unimplemented compare type " << in_type;
+      LOG(FATAL) << "Unimplemented compare type " << compare_type;
   }
 }
 
