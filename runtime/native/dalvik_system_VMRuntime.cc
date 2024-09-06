@@ -116,11 +116,11 @@ static jobject VMRuntime_newNonMovableArray(JNIEnv* env, jobject, jclass javaEle
     return nullptr;
   }
   gc::AllocatorType allocator = runtime->GetHeap()->GetCurrentNonMovingAllocator();
-  // To keep these allocations distinguishable, do not fall back to LargeObjectsSpace:
-  ObjPtr<mirror::Array> result = mirror::Array::Alloc</* kIsInstrumented= */ true,
-                                                      /* kfillUsable= */ false,
-                                                      /* kCheckLargeObject= */ false>(
-      soa.Self(), array_class, length, array_class->GetComponentSizeShift(), allocator);
+  ObjPtr<mirror::Array> result = mirror::Array::Alloc(soa.Self(),
+                                                      array_class,
+                                                      length,
+                                                      array_class->GetComponentSizeShift(),
+                                                      allocator);
   return soa.AddLocalReference<jobject>(result);
 }
 
@@ -167,11 +167,10 @@ static jlong VMRuntime_addressOf(JNIEnv* env, jobject, jobject javaArray) {
     ThrowIllegalArgumentException("not a primitive array");
     return 0;
   }
-  if (!Runtime::Current()->GetHeap()->IsNonMovable(array)) {
+  if (Runtime::Current()->GetHeap()->IsMovableObject(array)) {
     ThrowRuntimeException("Trying to get address of movable array object");
     return 0;
   }
-  DCHECK(!Runtime::Current()->GetHeap()->ObjectMayMove(array));
   return reinterpret_cast<uintptr_t>(array->GetRawData(array->GetClass()->GetComponentSize(), 0));
 }
 
@@ -341,10 +340,8 @@ static void VMRuntime_requestHeapTrim(JNIEnv* env, jobject) {
 
 static void VMRuntime_requestConcurrentGC(JNIEnv* env, jobject) {
   gc::Heap *heap = Runtime::Current()->GetHeap();
-  heap->RequestConcurrentGC(Thread::ForEnv(env),
-                            gc::kGcCauseBackground,
-                            true,
-                            heap->GetCurrentGcNum());
+  heap->RequestConcurrentGC(
+      Thread::ForEnv(env), gc::kGcCauseExplicitBackground, true, heap->GetCurrentGcNum());
 }
 
 static void VMRuntime_startHeapTaskProcessor(JNIEnv* env, jobject) {
