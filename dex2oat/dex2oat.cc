@@ -379,7 +379,7 @@ class WatchDog {
                                    false);
       runtime->DumpForSigQuit(std::cerr);
     }
-    exit(1);
+    exit(static_cast<int>(dex2oat::ReturnCode::kOther));
   }
 
   void Wait() {
@@ -2540,9 +2540,9 @@ class Dex2Oat final {
         close(fd);
       }
       dirty_image_objects_fds_.clear();
-    } else {
+    } else if (!dirty_image_objects_filenames_.empty()) {
       dirty_image_objects_ = std::make_unique<std::vector<std::string>>();
-      for (const std::string& file : preloaded_classes_files_) {
+      for (const std::string& file : dirty_image_objects_filenames_) {
         if (!ReadCommentedInputFromFile(file.c_str(), nullptr, dirty_image_objects_.get())) {
           LOG(ERROR) << "Failed to create list of dirty objects from '" << file << "'";
           return false;

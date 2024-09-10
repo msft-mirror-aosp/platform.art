@@ -1309,8 +1309,6 @@ class ClassLinker {
       REQUIRES_SHARED(Locks::mutator_lock_);
   bool VerifyRecordClass(Handle<mirror::Class> klass, ObjPtr<mirror::Class> super)
       REQUIRES_SHARED(Locks::mutator_lock_);
-  void CreateReferenceInstanceOffsets(Handle<mirror::Class> klass)
-      REQUIRES_SHARED(Locks::mutator_lock_);
 
   void CheckProxyConstructor(ArtMethod* constructor) const
       REQUIRES_SHARED(Locks::mutator_lock_);
@@ -1466,7 +1464,7 @@ class ClassLinker {
   // A cache of the last FindArrayClass results. The cache serves to avoid creating array class
   // descriptors for the sake of performing FindClass.
   static constexpr size_t kFindArrayCacheSize = 16;
-  GcRoot<mirror::Class> find_array_class_cache_[kFindArrayCacheSize];
+  std::atomic<GcRoot<mirror::Class>> find_array_class_cache_[kFindArrayCacheSize];
   size_t find_array_class_cache_next_victim_;
 
   bool init_done_;
