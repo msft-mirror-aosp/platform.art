@@ -65,7 +65,6 @@
 #include "testing.h"
 #include "tools/binder_utils.h"
 #include "tools/system_properties.h"
-#include "tools/tools.h"
 #include "ziparchive/zip_writer.h"
 
 extern char** environ;
@@ -101,7 +100,6 @@ using ::android::base::Split;
 using ::android::base::WriteStringToFd;
 using ::android::base::WriteStringToFile;
 using ::android::base::testing::HasValue;
-using ::art::tools::GetProcMountsAncestorsOfPath;
 using ::testing::_;
 using ::testing::AllOf;
 using ::testing::AnyNumber;
@@ -2296,10 +2294,6 @@ TEST_F(ArtdCleanupTest, cleanUpPreRebootStagedFiles) {
 TEST_F(ArtdTest, isInDalvikCache) {
   TEST_DISABLED_FOR_HOST();
 
-  if (GetProcMountsAncestorsOfPath("/")->empty()) {
-    GTEST_SKIP() << "Skipped for chroot";
-  }
-
   auto is_in_dalvik_cache = [this](const std::string& dex_file) -> Result<bool> {
     bool result;
     ndk::ScopedAStatus status = artd_->isInDalvikCache(dex_file, &result);
@@ -2652,6 +2646,8 @@ TEST_F(ArtdTest, BuildSystemProperties) {
     property.bar?=000
     property.bar=789
     property.baz?=111
+    import /vendor/my_import.prop ro.*
+    import=222
   )";
 
   CreateFile(scratch_path_ + "/build.prop", kContent);
@@ -2660,6 +2656,7 @@ TEST_F(ArtdTest, BuildSystemProperties) {
   EXPECT_EQ(props.GetOrEmpty("property.foo"), "123");
   EXPECT_EQ(props.GetOrEmpty("property.bar"), "789");
   EXPECT_EQ(props.GetOrEmpty("property.baz"), "111");
+  EXPECT_EQ(props.GetOrEmpty("import"), "222");
 }
 
 class ArtdPreRebootTest : public ArtdTest {
