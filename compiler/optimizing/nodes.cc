@@ -1142,7 +1142,7 @@ void HEnvironment::CopyFrom(ArrayRef<HInstruction* const> locals) {
   }
 }
 
-void HEnvironment::CopyFrom(HEnvironment* env) {
+void HEnvironment::CopyFrom(const HEnvironment* env) {
   for (size_t i = 0; i < env->Size(); i++) {
     HInstruction* instruction = env->GetInstructionAt(i);
     SetRawEnvAt(i, instruction);
@@ -1174,7 +1174,7 @@ void HEnvironment::CopyFromWithLoopPhiAdjustment(HEnvironment* env,
 }
 
 void HEnvironment::RemoveAsUserOfInput(size_t index) const {
-  const HUserRecord<HEnvironment*>& env_use = vregs_[index];
+  const HUserRecord<HEnvironment*>& env_use = GetVRegs()[index];
   HInstruction* user = env_use.GetInstruction();
   auto before_env_use_node = env_use.GetBeforeUseNode();
   user->env_uses_.erase_after(before_env_use_node);
@@ -1182,7 +1182,7 @@ void HEnvironment::RemoveAsUserOfInput(size_t index) const {
 }
 
 void HEnvironment::ReplaceInput(HInstruction* replacement, size_t index) {
-  const HUserRecord<HEnvironment*>& env_use_record = vregs_[index];
+  const HUserRecord<HEnvironment*>& env_use_record = GetVRegs()[index];
   HInstruction* orig_instr = env_use_record.GetInstruction();
 
   DCHECK(orig_instr != replacement);
@@ -1829,7 +1829,7 @@ HConstant* HBinaryOperation::TryStaticEvaluation(HInstruction* left, HInstructio
   } else if (left->IsLongConstant()) {
     if (right->IsIntConstant()) {
       // The binop(long, int) case is only valid for shifts and rotations.
-      DCHECK(IsShl() || IsShr() || IsUShr() || IsRor()) << DebugName();
+      DCHECK(IsShl() || IsShr() || IsUShr() || IsRol() || IsRor()) << DebugName();
       return Evaluate(left->AsLongConstant(), right->AsIntConstant());
     } else if (right->IsLongConstant()) {
       return Evaluate(left->AsLongConstant(), right->AsLongConstant());
@@ -3401,7 +3401,7 @@ std::ostream& operator<<(std::ostream& os, TypeCheckKind rhs) {
 #define CHECK_INTRINSICS_ENUM_VALUES(Name, InvokeType, _, SideEffects, Exceptions, ...) \
   static_assert( \
     static_cast<uint32_t>(Intrinsics::k ## Name) <= (kAccIntrinsicBits >> CTZ(kAccIntrinsicBits)), \
-    "Instrinsics enumeration space overflow.");
+    "Intrinsics enumeration space overflow.");
   ART_INTRINSICS_LIST(CHECK_INTRINSICS_ENUM_VALUES)
 #undef CHECK_INTRINSICS_ENUM_VALUES
 
@@ -3449,7 +3449,7 @@ static inline IntrinsicExceptions GetExceptionsIntrinsic(Intrinsics i) {
 
 void HInvoke::SetResolvedMethod(ArtMethod* method, bool enable_intrinsic_opt) {
   if (method != nullptr && method->IsIntrinsic() && enable_intrinsic_opt) {
-    Intrinsics intrinsic = static_cast<Intrinsics>(method->GetIntrinsic());
+    Intrinsics intrinsic = method->GetIntrinsic();
     SetIntrinsic(intrinsic,
                  NeedsEnvironmentIntrinsic(intrinsic),
                  GetSideEffectsIntrinsic(intrinsic),

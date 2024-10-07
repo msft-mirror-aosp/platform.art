@@ -20,7 +20,6 @@ import static com.android.server.art.ArtFileManager.ProfileLists;
 import static com.android.server.art.ArtFileManager.UsableArtifactLists;
 import static com.android.server.art.ArtFileManager.WritableArtifactLists;
 import static com.android.server.art.DexMetadataHelper.DexMetadataInfo;
-import static com.android.server.art.DexUseManagerLocal.SecondaryDexInfo;
 import static com.android.server.art.PrimaryDexUtils.DetailedPrimaryDexInfo;
 import static com.android.server.art.PrimaryDexUtils.PrimaryDexInfo;
 import static com.android.server.art.ProfilePath.WritableProfilePath;
@@ -36,7 +35,6 @@ import static com.android.server.art.model.DexoptStatus.DexContainerFileDexoptSt
 import android.annotation.CallbackExecutor;
 import android.annotation.NonNull;
 import android.annotation.Nullable;
-import android.annotation.SuppressLint;
 import android.annotation.SystemApi;
 import android.annotation.SystemService;
 import android.app.job.JobInfo;
@@ -103,6 +101,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Consumer;
@@ -881,6 +881,7 @@ public final class ArtManagerLocal {
     public void onBoot(@NonNull @BootReason String bootReason,
             @Nullable @CallbackExecutor Executor progressCallbackExecutor,
             @Nullable Consumer<OperationProgress> progressCallback) {
+        AsLog.d("onBoot: reason=" + bootReason);
         try (var snapshot = mInjector.getPackageManagerLocal().withFilteredSnapshot()) {
             if ((bootReason.equals(ReasonMapping.REASON_BOOT_AFTER_OTA)
                         || bootReason.equals(ReasonMapping.REASON_BOOT_AFTER_MAINLINE_UPDATE))
@@ -910,10 +911,13 @@ public final class ArtManagerLocal {
      */
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     void systemReady() {
+        AsLog.d("systemReady: mShouldCommitPreRebootStagedFiles="
+                + mShouldCommitPreRebootStagedFiles);
         if (mShouldCommitPreRebootStagedFiles) {
             mInjector.getContext().registerReceiver(new BroadcastReceiver() {
                 @Override
                 public void onReceive(Context context, Intent intent) {
+                    AsLog.d("systemReady.onReceive");
                     context.unregisterReceiver(this);
                     if (!SdkLevel.isAtLeastV()) {
                         throw new IllegalStateException("Broadcast receiver unexpectedly called");
@@ -923,6 +927,8 @@ public final class ArtManagerLocal {
                     }
                     mStatsAfterRebootSession.reportAsync();
                     mStatsAfterRebootSession = null;
+                    // OtaPreRebootDexoptTest looks for this log message.
+                    AsLog.d("Pre-reboot staged files committed");
                 }
             }, new IntentFilter(Intent.ACTION_BOOT_COMPLETED));
         }
@@ -940,9 +946,9 @@ public final class ArtManagerLocal {
      *         the directory beneath /apex, e.g., {@code com.android.art} (not the <b>package
      *         names</b>, e.g., {@code com.google.android.art}).
      */
-    @SuppressLint("UnflaggedApi") // Flag support for mainline is not available.
     @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
     public void onApexStaged(@NonNull String[] stagedApexModuleNames) {
+        AsLog.d("onApexStaged");
         mInjector.getPreRebootDexoptJob().onUpdateReady(null /* otaSlot */);
     }
 
@@ -987,7 +993,6 @@ public final class ArtManagerLocal {
      * @throws IllegalStateException if the operation encounters an error that should never happen
      *         (e.g., an internal logic error).
      */
-    @SuppressLint("UnflaggedApi") // Flag support for mainline is not available.
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     @NonNull
     public ArtManagedFileStats getArtManagedFileStats(
@@ -1038,7 +1043,6 @@ public final class ArtManagerLocal {
      * Overrides the compiler filter of a package. The callback is called whenever a package is
      * going to be dexopted. This method is thread-safe.
      */
-    @SuppressLint("UnflaggedApi") // Flag support for mainline is not available.
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public void setAdjustCompilerFilterCallback(@NonNull @CallbackExecutor Executor executor,
             @NonNull AdjustCompilerFilterCallback callback) {
@@ -1050,7 +1054,6 @@ public final class ArtManagerLocal {
      * #setAdjustCompilerFilterCallback(Executor, AdjustCompilerFilterCallback)}. This
      * method is thread-safe.
      */
-    @SuppressLint("UnflaggedApi") // Flag support for mainline is not available.
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public void clearAdjustCompilerFilterCallback() {
         mInjector.getConfig().clearAdjustCompilerFilterCallback();
@@ -1130,6 +1133,10 @@ public final class ArtManagerLocal {
                 if (!Utils.canDexoptPackage(pkgState, null /* appHibernationManager */)) {
                     continue;
                 }
+
+                AsLog.d("commitPreRebootStagedFiles " + (forSecondary ? "secondary" : "primary")
+                        + " for " + pkgState.getPackageName());
+
                 AndroidPackage pkg = Utils.getPackageOrThrow(pkgState);
                 var options = ArtFileManager.Options.builder()
                                       .setForPrimaryDex(!forSecondary)
@@ -1293,6 +1300,13 @@ public final class ArtManagerLocal {
                 packages = filterAndSortByLastActiveTime(
                         packages, false /* keepRecent */, false /* descending */);
                 break;
+            case ReasonMapping.REASON_FIRST_BOOT:
+                // Don't filter the default package list and no need to sort
+                // as in some cases the system time can advance during bootup
+                // after package installation and cause filtering to exclude
+                // all packages when pm.dexopt.downgrade_after_inactive_days
+                // is set. See aosp/3237478 for more details.
+                break;
             default:
                 // Actually, the sorting is only needed for background dexopt, but we do it for all
                 // cases for simplicity.
@@ -1441,7 +1455,6 @@ public final class ArtManagerLocal {
     }
 
     /** @hide */
-    @SuppressLint("UnflaggedApi") // Flag support for mainline is not available.
     @SystemApi(client = SystemApi.Client.SYSTEM_SERVER)
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public interface AdjustCompilerFilterCallback {
@@ -1485,7 +1498,6 @@ public final class ArtManagerLocal {
          * @return the compiler filter after adjustment. This will be the input to step 5 described
          *         above
          */
-        @SuppressLint("UnflaggedApi") // Flag support for mainline is not available.
         @NonNull
         String onAdjustCompilerFilter(@NonNull String packageName,
                 @NonNull String originalCompilerFilter, @NonNull String reason);
@@ -1521,6 +1533,7 @@ public final class ArtManagerLocal {
         @Nullable private final Context mContext;
         @Nullable private final PackageManagerLocal mPackageManagerLocal;
         @Nullable private final Config mConfig;
+        @Nullable private final ThreadPoolExecutor mReporterExecutor;
         @Nullable private BackgroundDexoptJob mBgDexoptJob = null;
         @Nullable private PreRebootDexoptJob mPrDexoptJob = null;
 
@@ -1531,6 +1544,7 @@ public final class ArtManagerLocal {
             mContext = null;
             mPackageManagerLocal = null;
             mConfig = null;
+            mReporterExecutor = null;
         }
 
         @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
@@ -1541,6 +1555,10 @@ public final class ArtManagerLocal {
             mPackageManagerLocal = Objects.requireNonNull(
                     LocalManagerRegistry.getManager(PackageManagerLocal.class));
             mConfig = new Config();
+            mReporterExecutor =
+                    new ThreadPoolExecutor(1 /* corePoolSize */, 1 /* maximumPoolSize */,
+                            60 /* keepTimeAlive */, TimeUnit.SECONDS, new LinkedBlockingQueue<>());
+            mReporterExecutor.allowsCoreThreadTimeOut();
 
             // Call the getters for the dependencies that aren't optional, to ensure correct
             // initialization order.
@@ -1587,13 +1605,19 @@ public final class ArtManagerLocal {
         @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
         @NonNull
         public DexoptHelper getDexoptHelper() {
-            return new DexoptHelper(getContext(), getConfig());
+            return new DexoptHelper(getContext(), getConfig(), getReporterExecutor());
         }
 
         @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
         @NonNull
         public Config getConfig() {
             return mConfig;
+        }
+
+        @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+        @NonNull
+        public Executor getReporterExecutor() {
+            return mReporterExecutor;
         }
 
         /** Returns the registered {@link AppHibernationManager} instance. */

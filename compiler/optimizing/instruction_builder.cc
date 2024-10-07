@@ -26,8 +26,8 @@
 #include "data_type-inl.h"
 #include "dex/bytecode_utils.h"
 #include "dex/dex_instruction-inl.h"
-#include "driver/dex_compilation_unit.h"
 #include "driver/compiler_options.h"
+#include "driver/dex_compilation_unit.h"
 #include "entrypoints/entrypoint_utils-inl.h"
 #include "imtable-inl.h"
 #include "intrinsics.h"
@@ -36,6 +36,7 @@
 #include "jit/profiling_info.h"
 #include "mirror/dex_cache.h"
 #include "oat/oat_file.h"
+#include "optimizing/data_type.h"
 #include "optimizing_compiler_stats.h"
 #include "reflective_handle_scope-inl.h"
 #include "scoped_thread_state_change-inl.h"
@@ -296,7 +297,7 @@ void HInstructionBuilder::InsertInstructionAtTop(HInstruction* instruction) {
 
 void HInstructionBuilder::InitializeInstruction(HInstruction* instruction) {
   if (instruction->NeedsEnvironment()) {
-    HEnvironment* environment = new (allocator_) HEnvironment(
+    HEnvironment* environment = HEnvironment::Create(
         allocator_,
         current_locals_->size(),
         graph_->GetArtMethod(),
@@ -1363,7 +1364,7 @@ static void DecideVarHandleIntrinsic(HInvoke* invoke) {
         optimizations.SetDoNotIntrinsify();
         return;
       }
-      if (value_type != return_type) {
+      if (value_type != return_type && return_type != DataType::Type::kVoid) {
         optimizations.SetDoNotIntrinsify();
         return;
       }
@@ -1396,9 +1397,20 @@ bool HInstructionBuilder::BuildInvokePolymorphic(uint32_t dex_pc,
                                             &is_string_constructor);
 
   MethodReference method_reference(&graph_->GetDexFile(), method_idx);
+
+  // MethodHandle.invokeExact intrinsic needs to check whether call-site matches with MethodHandle's
+  // type. To do that, MethodType corresponding to the call-site is passed as an extra input.
+  // Other invoke-polymorphic calls do not need it.
+  bool can_be_intrinsified =
+      static_cast<Intrinsics>(resolved_method->GetIntrinsic()) ==
+          Intrinsics::kMethodHandleInvokeExact;
+
+  uint32_t number_of_other_inputs = can_be_intrinsified ? 1u : 0u;
+
   HInvoke* invoke = new (allocator_) HInvokePolymorphic(allocator_,
                                                         number_of_arguments,
                                                         operands.GetNumberOfOperands(),
+                                                        number_of_other_inputs,
                                                         return_type,
                                                         dex_pc,
                                                         method_reference,
@@ -1408,6 +1420,8 @@ bool HInstructionBuilder::BuildInvokePolymorphic(uint32_t dex_pc,
   if (!HandleInvoke(invoke, operands, shorty, /* is_unresolved= */ false)) {
     return false;
   }
+
+  DCHECK_EQ(invoke->AsInvokePolymorphic()->IsMethodHandleInvokeExact(), can_be_intrinsified);
 
   if (invoke->GetIntrinsic() != Intrinsics::kNone &&
       invoke->GetIntrinsic() != Intrinsics::kMethodHandleInvoke &&
@@ -1887,6 +1901,26 @@ bool HInstructionBuilder::SetupInvokeArguments(HInstruction* invoke,
                           graph_->GetCurrentMethod());
   }
 
+  if (invoke->IsInvokePolymorphic()) {
+    HInvokePolymorphic* invoke_polymorphic = invoke->AsInvokePolymorphic();
+
+    // MethodHandle.invokeExact intrinsic expects MethodType corresponding to the call-site as an
+    // extra input to determine whether to throw WrongMethodTypeException or execute target method.
+    if (invoke_polymorphic->IsMethodHandleInvokeExact()) {
+      HLoadMethodType* load_method_type =
+          new (allocator_) HLoadMethodType(graph_->GetCurrentMethod(),
+                                           invoke_polymorphic->GetProtoIndex(),
+                                           graph_->GetDexFile(),
+                                           invoke_polymorphic->GetDexPc());
+      HSharpening::ProcessLoadMethodType(load_method_type,
+                                         code_generator_,
+                                         *dex_compilation_unit_,
+                                         graph_->GetHandleCache()->GetHandles());
+      invoke->SetRawInputAt(invoke_polymorphic->GetNumberOfArguments(), load_method_type);
+      AppendInstruction(load_method_type);
+    }
+  }
+
   return true;
 }
 
@@ -1914,7 +1948,7 @@ bool HInstructionBuilder::BuildSimpleIntrinsic(ArtMethod* method,
                                                uint32_t dex_pc,
                                                const InstructionOperands& operands,
                                                const char* shorty) {
-  Intrinsics intrinsic = static_cast<Intrinsics>(method->GetIntrinsic());
+  Intrinsics intrinsic = method->GetIntrinsic();
   DCHECK_NE(intrinsic, Intrinsics::kNone);
   constexpr DataType::Type kInt32 = DataType::Type::kInt32;
   constexpr DataType::Type kInt64 = DataType::Type::kInt64;
@@ -1923,14 +1957,16 @@ bool HInstructionBuilder::BuildSimpleIntrinsic(ArtMethod* method,
   ReceiverArg receiver_arg = method->IsStatic() ? ReceiverArg::kNone : ReceiverArg::kNullCheckedArg;
   HInstruction* instruction = nullptr;
   switch (intrinsic) {
-    case Intrinsics::kIntegerRotateRight:
     case Intrinsics::kIntegerRotateLeft:
-      // For rotate left, we negate the distance below.
+      instruction = new (allocator_) HRol(kInt32, /*value=*/ nullptr, /*distance=*/ nullptr);
+      break;
+    case Intrinsics::kIntegerRotateRight:
       instruction = new (allocator_) HRor(kInt32, /*value=*/ nullptr, /*distance=*/ nullptr);
       break;
-    case Intrinsics::kLongRotateRight:
     case Intrinsics::kLongRotateLeft:
-      // For rotate left, we negate the distance below.
+      instruction = new (allocator_) HRol(kInt64, /*value=*/ nullptr, /*distance=*/ nullptr);
+      break;
+    case Intrinsics::kLongRotateRight:
       instruction = new (allocator_) HRor(kInt64, /*value=*/ nullptr, /*distance=*/ nullptr);
       break;
     case Intrinsics::kIntegerCompare:
@@ -2049,15 +2085,6 @@ bool HInstructionBuilder::BuildSimpleIntrinsic(ArtMethod* method,
   }
 
   switch (intrinsic) {
-    case Intrinsics::kIntegerRotateLeft:
-    case Intrinsics::kLongRotateLeft: {
-      // Negate the distance value for rotate left.
-      DCHECK(instruction->IsRor());
-      HNeg* neg = new (allocator_) HNeg(kInt32, instruction->InputAt(1u));
-      AppendInstruction(neg);
-      instruction->SetRawInputAt(1u, neg);
-      break;
-    }
     case Intrinsics::kFloatIsNaN:
     case Intrinsics::kDoubleIsNaN:
       // Set the second input to be the same as first.

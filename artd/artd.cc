@@ -1171,22 +1171,33 @@ ndk::ScopedAStatus Artd::dexopt(
             << "\nOpened FDs: " << fd_logger;
 
   ProcessStat stat;
-  Result<int> result = ExecAndReturnCode(
-      art_exec_args.Get(), kLongTimeoutSec, cancellation_signal->CreateExecCallbacks(), &stat);
+  std::string error_msg;
+  ExecResult result = exec_utils_->ExecAndReturnResult(art_exec_args.Get(),
+                                                       kLongTimeoutSec,
+                                                       cancellation_signal->CreateExecCallbacks(),
+                                                       /*new_process_group=*/true,
+                                                       &stat,
+                                                       &error_msg);
   _aidl_return->wallTimeMs = stat.wall_time_ms;
   _aidl_return->cpuTimeMs = stat.cpu_time_ms;
-  if (!result.ok()) {
+
+  auto result_info = ART_FORMAT("[status={},exit_code={},signal={}]",
+                                static_cast<int>(result.status),
+                                result.exit_code,
+                                result.signal);
+  if (result.status != ExecResult::kExited) {
     if (cancellation_signal->IsCancelled()) {
       _aidl_return->cancelled = true;
       return ScopedAStatus::ok();
     }
-    return NonFatal("Failed to run dex2oat: " + result.error().message());
+    return NonFatal(ART_FORMAT("Failed to run dex2oat: {} {}", error_msg, result_info));
   }
 
-  LOG(INFO) << ART_FORMAT("dex2oat returned code {}", result.value());
+  LOG(INFO) << ART_FORMAT("dex2oat returned code {}", result.exit_code);
 
-  if (result.value() != 0) {
-    return NonFatal(ART_FORMAT("dex2oat returned an unexpected code: {}", result.value()));
+  if (result.exit_code != 0) {
+    return NonFatal(
+        ART_FORMAT("dex2oat returned an unexpected code: {} {}", result.exit_code, result_info));
   }
 
   int64_t size_bytes = 0;
@@ -1604,8 +1615,17 @@ bool Artd::DenyArtApexDataFilesLocked() {
 Result<std::string> Artd::GetProfman() { return BuildArtBinPath("profman"); }
 
 Result<CmdlineBuilder> Artd::GetArtExecCmdlineBuilder() {
+  std::string art_exec_path = OR_RETURN(BuildArtBinPath("art_exec"));
+  if (options_.is_pre_reboot) {
+    // "/mnt/compat_env" is prepared by dexopt_chroot_setup on Android V.
+    std::string compat_art_exec_path = "/mnt/compat_env" + art_exec_path;
+    if (OS::FileExists(compat_art_exec_path.c_str())) {
+      art_exec_path = std::move(compat_art_exec_path);
+    }
+  }
+
   CmdlineBuilder args;
-  args.Add(OR_RETURN(BuildArtBinPath("art_exec")))
+  args.Add(art_exec_path)
       .Add("--drop-capabilities")
       .AddIf(options_.is_pre_reboot, "--process-name-suffix=Pre-reboot Dexopt chroot");
   return args;
@@ -1616,9 +1636,14 @@ bool Artd::ShouldUseDex2Oat64() {
          props_->GetBool("dalvik.vm.dex2oat64.enabled", /*default_value=*/false);
 }
 
+bool Artd::ShouldUseDebugBinaries() {
+  return props_->GetOrEmpty("persist.sys.dalvik.vm.lib.2") == "libartd.so";
+}
+
 Result<std::string> Artd::GetDex2Oat() {
-  std::string binary_name = ShouldUseDex2Oat64() ? "dex2oat64" : "dex2oat32";
-  // TODO(b/234351700): Should we use the "d" variant?
+  std::string binary_name = ShouldUseDebugBinaries() ?
+                                (ShouldUseDex2Oat64() ? "dex2oatd64" : "dex2oatd32") :
+                                (ShouldUseDex2Oat64() ? "dex2oat64" : "dex2oat32");
   return BuildArtBinPath(binary_name);
 }
 
@@ -1655,9 +1680,8 @@ void Artd::AddCompilerConfigFlags(const std::string& instruction_set,
                      props_->GetOrEmpty("dalvik.vm.dex2oat-max-image-block-size"))
       .AddIfNonEmpty("--very-large-app-threshold=%s",
                      props_->GetOrEmpty("dalvik.vm.dex2oat-very-large"))
-      .AddIfNonEmpty(
-          "--resolve-startup-const-strings=%s",
-          props_->GetOrEmpty("dalvik.vm.dex2oat-resolve-startup-strings"));
+      .AddIfNonEmpty("--resolve-startup-const-strings=%s",
+                     props_->GetOrEmpty("dalvik.vm.dex2oat-resolve-startup-strings"));
 
   args.AddIf(dexopt_options.debuggable, "--debuggable")
       .AddIf(props_->GetBool("debug.generate-debug-info", /*default_value=*/false),

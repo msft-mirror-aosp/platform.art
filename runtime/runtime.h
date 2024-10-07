@@ -1132,6 +1132,8 @@ class Runtime {
     }
   }
 
+  bool AreMetricsInitialized() const { return metrics_reporter_ != nullptr; }
+
  private:
   static void InitPlatformSignalHandlers();
 
@@ -1189,10 +1191,6 @@ class Runtime {
   // A pointer to the active runtime or null.
   LIBART_PROTECTED static Runtime* instance_;
 
-  // NOTE: these must match the gc::ProcessState values as they come directly from the framework.
-  static constexpr int kProfileForground = 0;
-  static constexpr int kProfileBackground = 1;
-
   static constexpr uint32_t kCalleeSaveSize = 6u;
 
   // 64 bit so that we can share the same asm offsets for both 32 and 64 bits.
@@ -1208,8 +1206,8 @@ class Runtime {
   // for differentiating between unfilled imt slots vs conflict slots in superclasses.
   ArtMethod* imt_unimplemented_method_;
 
-  // Special sentinel object used to indicate invalid conditions in JNI (cleared weak references)
-  // and JDWP (invalid references).
+  // Special sentinel object used to invalid conditions in JNI (cleared weak references) and
+  // JDWP (invalid references).
   GcRoot<mirror::Object> sentinel_;
 
   InstructionSet instruction_set_;
