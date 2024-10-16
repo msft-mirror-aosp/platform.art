@@ -39,6 +39,7 @@ public class Main {
     testPutFixedOffset();
     assertEquals(0, testGet());
     assertEquals(42, testGetFar());
+    testGetAndPutAbsoluteAddress();
   }
 
   /// CHECK-START-ARM64: void Main.testPutZero() disassembly (after)
@@ -68,5 +69,30 @@ public class Main {
     int[] object = new int[arraySize];
     unsafe.putInt(object, offset, 42);
     return unsafe.getInt(object, offset);
+  }
+
+  private static void testGetAndPutAbsoluteAddress() {
+    long address = 0;
+    try {
+      address = unsafe.allocateMemory(4);
+      $noinline$unsafePutAbsoluteInt(address, 0xDEADBEEF);
+      assertEquals(0xDEADBEEF, $noinline$unsafeGetAbsoluteInt(address));
+    } finally {
+      if (address != 0) {
+        unsafe.freeMemory(address);
+      }
+    }
+  }
+
+  /// CHECK-START: void Main.$noinline$unsafePutAbsoluteInt(long, int) builder (after)
+  /// CHECK:                  InvokeVirtual intrinsic:UnsafePutAbsolute
+  private static void $noinline$unsafePutAbsoluteInt(long address, int value) {
+    unsafe.putInt(address, value);
+  }
+
+  /// CHECK-START: int Main.$noinline$unsafeGetAbsoluteInt(long) builder (after)
+  /// CHECK:                  InvokeVirtual intrinsic:UnsafeGetAbsolute
+  private static int $noinline$unsafeGetAbsoluteInt(long address) {
+    return unsafe.getInt(address);
   }
 }
