@@ -28,6 +28,7 @@
 #include "dex/inline_method_analyser.h"
 #include "driver/compiler_options.h"
 #include "driver/dex_compilation_unit.h"
+#include "handle_cache-inl.h"
 #include "instruction_simplifier.h"
 #include "intrinsics.h"
 #include "jit/jit.h"
@@ -919,7 +920,7 @@ void HInliner::AddCHAGuard(HInstruction* invoke_instruction,
   // requested we deoptimize before we execute any code and hence we shouldn't
   // see that case here.
   HInstruction* compare = new (graph_->GetAllocator()) HNotEqual(
-      deopt_flag, graph_->GetIntConstant(0, dex_pc));
+      deopt_flag, graph_->GetIntConstant(0));
   HInstruction* deopt = new (graph_->GetAllocator()) HDeoptimize(
       graph_->GetAllocator(), compare, DeoptimizationKind::kCHA, dex_pc);
 
@@ -1277,11 +1278,9 @@ bool HInliner::TryInlinePolymorphicCallToSameTarget(
 
   HConstant* constant;
   if (type == DataType::Type::kInt64) {
-    constant = graph_->GetLongConstant(
-        reinterpret_cast<intptr_t>(actual_method), invoke_instruction->GetDexPc());
+    constant = graph_->GetLongConstant(reinterpret_cast<intptr_t>(actual_method));
   } else {
-    constant = graph_->GetIntConstant(
-        reinterpret_cast<intptr_t>(actual_method), invoke_instruction->GetDexPc());
+    constant = graph_->GetIntConstant(reinterpret_cast<intptr_t>(actual_method));
   }
 
   HNotEqual* compare = new (graph_->GetAllocator()) HNotEqual(class_table_get, constant);
@@ -1385,6 +1384,7 @@ bool HInliner::TryDevirtualize(HInvoke* invoke_instruction,
   HInvokeStaticOrDirect* new_invoke = new (graph_->GetAllocator()) HInvokeStaticOrDirect(
       graph_->GetAllocator(),
       invoke_instruction->GetNumberOfArguments(),
+      invoke_instruction->GetNumberOfOutVRegs(),
       invoke_instruction->GetType(),
       invoke_instruction->GetDexPc(),
       MethodReference(invoke_instruction->GetMethodReference().dex_file, dex_method_index),
@@ -1604,6 +1604,7 @@ bool HInliner::TryBuildAndInline(HInvoke* invoke_instruction,
     HInvokeVirtual* new_invoke = new (graph_->GetAllocator()) HInvokeVirtual(
         graph_->GetAllocator(),
         invoke_instruction->GetNumberOfArguments(),
+        invoke_instruction->GetNumberOfOutVRegs(),
         invoke_instruction->GetType(),
         invoke_instruction->GetDexPc(),
         invoke_instruction->GetMethodReference(),  // Use existing invoke's method's reference.
@@ -1767,17 +1768,14 @@ bool HInliner::TryPatternSubstitution(HInvoke* invoke_instruction,
       uint16_t iput_args[] = { data.iput0_arg, data.iput1_arg, data.iput2_arg };
       static_assert(arraysize(iput_args) == arraysize(iput_field_indexes), "Size mismatch");
       // Count valid field indexes.
-      size_t number_of_iputs = 0u;
-      while (number_of_iputs != arraysize(iput_field_indexes) &&
-          iput_field_indexes[number_of_iputs] != DexFile::kDexNoIndex16) {
+      for (size_t i = 0, end = data.iput_count; i < end; i++) {
         // Check that there are no duplicate valid field indexes.
-        DCHECK_EQ(0, std::count(iput_field_indexes + number_of_iputs + 1,
-                                iput_field_indexes + arraysize(iput_field_indexes),
-                                iput_field_indexes[number_of_iputs]));
-        ++number_of_iputs;
+        DCHECK_EQ(0, std::count(iput_field_indexes + i + 1,
+                                iput_field_indexes + end,
+                                iput_field_indexes[i]));
       }
       // Check that there are no valid field indexes in the rest of the array.
-      DCHECK_EQ(0, std::count_if(iput_field_indexes + number_of_iputs,
+      DCHECK_EQ(0, std::count_if(iput_field_indexes + data.iput_count,
                                  iput_field_indexes + arraysize(iput_field_indexes),
                                  [](uint16_t index) { return index != DexFile::kDexNoIndex16; }));
 
@@ -1785,7 +1783,7 @@ bool HInliner::TryPatternSubstitution(HInvoke* invoke_instruction,
       HInstruction* obj = GetInvokeInputForArgVRegIndex(invoke_instruction,
                                                         /* arg_vreg_index= */ 0u);
       bool needs_constructor_barrier = false;
-      for (size_t i = 0; i != number_of_iputs; ++i) {
+      for (size_t i = 0, end = data.iput_count; i != end; ++i) {
         HInstruction* value = GetInvokeInputForArgVRegIndex(invoke_instruction, iput_args[i]);
         if (!IsZeroBitPattern(value)) {
           uint16_t field_index = iput_field_indexes[i];
@@ -1810,7 +1808,7 @@ bool HInliner::TryPatternSubstitution(HInvoke* invoke_instruction,
                                                                 invoke_instruction);
       }
       *return_replacement = nullptr;
-      number_of_instructions = number_of_iputs + (needs_constructor_barrier ? 1u : 0u);
+      number_of_instructions = data.iput_count + (needs_constructor_barrier ? 1u : 0u);
       break;
     }
   }
