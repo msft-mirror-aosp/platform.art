@@ -127,6 +127,7 @@ class InstructionSimplifierVisitor final : public HGraphDelegateVisitor {
   void SimplifyReturnThis(HInvoke* invoke);
   void SimplifyAllocationIntrinsic(HInvoke* invoke);
   void SimplifyVarHandleIntrinsic(HInvoke* invoke);
+  void SimplifyArrayBaseOffset(HInvoke* invoke);
 
   bool CanUseKnownImageVarHandle(HInvoke* invoke);
   static bool CanEnsureNotNullAt(HInstruction* input, HInstruction* at);
@@ -910,7 +911,7 @@ HInstruction* InstructionSimplifierVisitor::InsertOppositeCondition(HInstruction
     HInstruction* lhs = cond->InputAt(0);
     HInstruction* rhs = cond->InputAt(1);
     HInstruction* replacement =
-        GetGraph()->CreateCondition(cond->AsCondition()->GetOppositeCondition(), lhs, rhs);
+        HCondition::Create(GetGraph(), cond->AsCondition()->GetOppositeCondition(), lhs, rhs);
     cursor->GetBlock()->InsertInstructionBefore(replacement, cursor);
     return replacement;
   } else if (cond->IsIntConstant()) {
@@ -1839,7 +1840,7 @@ static HInstruction* CreateUnsignedConditionReplacement(ArenaAllocator* allocato
       //   unsigned(-1) < 0 -> False
       //   0 < 0 -> False
       //   1 < 0 -> False
-      return block->GetGraph()->GetConstant(DataType::Type::kBool, 0, cond->GetDexPc());
+      return block->GetGraph()->GetConstant(DataType::Type::kBool, 0);
     case HInstruction::kBelowOrEqual:
       // BelowOrEqual(Compare(x, y), 0) transforms into Equal(x, y)
       //    unsigned(-1) <= 0 -> False
@@ -1857,7 +1858,7 @@ static HInstruction* CreateUnsignedConditionReplacement(ArenaAllocator* allocato
       //   unsigned(-1) >= 0 -> True
       //   0 >= 0 -> True
       //   1 >= 0 -> True
-      return block->GetGraph()->GetConstant(DataType::Type::kBool, 1, cond->GetDexPc());
+      return block->GetGraph()->GetConstant(DataType::Type::kBool, 1);
     default:
       LOG(FATAL) << "Unknown ConditionType " << cond->GetKind();
       UNREACHABLE();
@@ -1878,7 +1879,7 @@ void InstructionSimplifierVisitor::VisitCondition(HCondition* condition) {
   HInstruction* right = condition->GetRight();
   if (left->IsConstant() && !right->IsConstant()) {
     IfCondition new_cond = GetOppositeConditionForOperandSwap(condition->GetCondition());
-    HCondition* replacement = GetGraph()->CreateCondition(new_cond, right, left);
+    HCondition* replacement = HCondition::Create(GetGraph(), new_cond, right, left);
     block->ReplaceAndRemoveInstructionWith(condition, replacement);
     // If it is a FP condition, we must set the opposite bias.
     if (condition->IsLtBias()) {
@@ -1960,12 +1961,12 @@ static HInstruction* CheckSignedToUnsignedCompareConversion(HInstruction* operan
       HIntConstant* int_constant = constant->AsIntConstant();
       int32_t old_value = int_constant->GetValue();
       int32_t new_value = old_value - std::numeric_limits<int32_t>::min();
-      return operand->GetBlock()->GetGraph()->GetIntConstant(new_value, constant->GetDexPc());
+      return operand->GetBlock()->GetGraph()->GetIntConstant(new_value);
     } else if (constant->IsLongConstant()) {
       HLongConstant* long_constant = constant->AsLongConstant();
       int64_t old_value = long_constant->GetValue();
       int64_t new_value = old_value - std::numeric_limits<int64_t>::min();
-      return operand->GetBlock()->GetGraph()->GetLongConstant(new_value, constant->GetDexPc());
+      return operand->GetBlock()->GetGraph()->GetLongConstant(new_value);
     } else {
       return nullptr;
     }
@@ -2995,7 +2996,7 @@ static bool NoEscapeForStringBufferReference(HInstruction* reference, HInstructi
   return false;
 }
 
-static bool TryReplaceStringBuilderAppend(HInvoke* invoke) {
+static bool TryReplaceStringBuilderAppend(CodeGenerator* codegen, HInvoke* invoke) {
   DCHECK_EQ(invoke->GetIntrinsic(), Intrinsics::kStringBuilderToString);
   if (invoke->CanThrowIntoCatchBlock()) {
     return false;
@@ -3152,11 +3153,25 @@ static bool TryReplaceStringBuilderAppend(HInvoke* invoke) {
     }
   }
 
+  // Calculate outgoing vregs, including padding for 64-bit arg alignment.
+  const PointerSize pointer_size = InstructionSetPointerSize(codegen->GetInstructionSet());
+  const size_t method_vregs = static_cast<size_t>(pointer_size) / kVRegSize;
+  uint32_t number_of_out_vregs = method_vregs;  // For correct alignment padding; subtracted below.
+  for (uint32_t f = format; f != 0u; f >>= StringBuilderAppend::kBitsPerArg) {
+    auto a = enum_cast<StringBuilderAppend::Argument>(f & StringBuilderAppend::kArgMask);
+    if (a == StringBuilderAppend::Argument::kLong || a == StringBuilderAppend::Argument::kDouble) {
+      number_of_out_vregs += /* alignment */ ((number_of_out_vregs) & 1u) + /* vregs */ 2u;
+    } else {
+      number_of_out_vregs += /* vregs */ 1u;
+    }
+  }
+  number_of_out_vregs -= method_vregs;
+
   // Create replacement instruction.
   HIntConstant* fmt = block->GetGraph()->GetIntConstant(static_cast<int32_t>(format));
   ArenaAllocator* allocator = block->GetGraph()->GetAllocator();
   HStringBuilderAppend* append = new (allocator) HStringBuilderAppend(
-      fmt, num_args, has_fp_args, allocator, invoke->GetDexPc());
+      fmt, num_args, number_of_out_vregs, has_fp_args, allocator, invoke->GetDexPc());
   append->SetReferenceTypeInfoIfValid(invoke->GetReferenceTypeInfo());
   for (size_t i = 0; i != num_args; ++i) {
     append->SetArgumentAt(i, args[num_args - 1u - i]);
@@ -3201,7 +3216,7 @@ void InstructionSimplifierVisitor::SimplifyAllocationIntrinsic(HInvoke* invoke) 
       RecordSimplification();
     }
   } else if (invoke->GetIntrinsic() == Intrinsics::kStringBuilderToString &&
-             TryReplaceStringBuilderAppend(invoke)) {
+             TryReplaceStringBuilderAppend(codegen_, invoke)) {
     RecordSimplification();
   }
 }
@@ -3439,9 +3454,34 @@ void InstructionSimplifierVisitor::VisitInvoke(HInvoke* instruction) {
     case Intrinsics::kVarHandleWeakCompareAndSetRelease:
       SimplifyVarHandleIntrinsic(instruction);
       break;
+    case Intrinsics::kUnsafeArrayBaseOffset:
+    case Intrinsics::kJdkUnsafeArrayBaseOffset:
+      SimplifyArrayBaseOffset(instruction);
+      break;
     default:
       break;
   }
+}
+
+void InstructionSimplifierVisitor::SimplifyArrayBaseOffset(HInvoke* invoke) {
+  if (!invoke->InputAt(1)->IsLoadClass()) {
+    return;
+  }
+  HLoadClass* load_class = invoke->InputAt(1)->AsLoadClass();
+  ReferenceTypeInfo info = load_class->GetLoadedClassRTI();
+  if (!info.IsValid()) {
+    return;
+  }
+  ScopedObjectAccess soa(Thread::Current());
+  ObjPtr<mirror::Class> cls = info.GetTypeHandle()->GetComponentType();
+  if (cls == nullptr) {
+    return;
+  }
+  uint32_t base_offset =
+      mirror::Array::DataOffset(Primitive::ComponentSize(cls->GetPrimitiveType())).Int32Value();
+  invoke->ReplaceWith(GetGraph()->GetIntConstant(base_offset));
+  RecordSimplification();
+  return;
 }
 
 void InstructionSimplifierVisitor::VisitDeoptimize(HDeoptimize* deoptimize) {

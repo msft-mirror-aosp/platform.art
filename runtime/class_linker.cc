@@ -66,12 +66,14 @@
 #include "class_loader_utils.h"
 #include "class_root-inl.h"
 #include "class_table-inl.h"
+#include "common_throws.h"
 #include "compiler_callbacks.h"
 #include "debug_print.h"
 #include "debugger.h"
 #include "dex/class_accessor-inl.h"
 #include "dex/descriptors_names.h"
 #include "dex/dex_file-inl.h"
+#include "dex/dex_file.h"
 #include "dex/dex_file_annotations.h"
 #include "dex/dex_file_exception_helpers.h"
 #include "dex/dex_file_loader.h"
@@ -4136,7 +4138,7 @@ void ClassLinker::LoadMethod(const DexFile& dex_file,
     }
   }
 
-  access_flags |= GetNterpFastPathFlags(shorty, access_flags, kRuntimeISA);
+  access_flags |= GetNterpFastPathFlags(shorty, access_flags, kRuntimeQuickCodeISA);
 
   if (UNLIKELY((access_flags & kAccNative) != 0u)) {
     // Check if the native method is annotated with @FastNative or @CriticalNative.
@@ -5054,7 +5056,7 @@ verifier::FailureKind ClassLinker::VerifyClass(Thread* self,
                      << " in " << klass->GetDexCache()->GetLocation()->ToModifiedUtf8()
                      << ": "
                      << preverified
-                     << "( " << oat_file_class_status << ")";
+                     << " (" << oat_file_class_status << ")";
 
   // If the oat file says the class had an error, re-run the verifier. That way we will either:
   // 1) Be successful at runtime, or
@@ -5163,7 +5165,7 @@ bool ClassLinker::VerifyClassUsingOatFile(Thread* self,
     return true;
   }
   if (oat_file_class_status >= ClassStatus::kVerifiedNeedsAccessChecks) {
-    // We return that the clas has already been verified, and the caller should
+    // We return that the class has already been verified, and the caller should
     // check the class status to ensure we run with access checks.
     return true;
   }
@@ -9602,7 +9604,7 @@ class RecordAnnotationVisitor final : public annotations::AnnotationVisitor {
   RecordAnnotationVisitor() {}
 
   bool ValidateCounts() {
-    if (is_error_) {
+    if (has_error_) {
       return false;
     }
 
@@ -9634,15 +9636,13 @@ class RecordAnnotationVisitor final : public annotations::AnnotationVisitor {
                                names_count_));
     }
 
-    return !is_error_;
+    return !has_error_;
   }
-
-  const std::string& GetErrorMsg() { return error_msg_; }
 
   bool IsRecordAnnotationFound() { return count_ != 0; }
 
   annotations::VisitorStatus VisitAnnotation(const char* descriptor, uint8_t visibility) override {
-    if (is_error_) {
+    if (has_error_) {
       return annotations::VisitorStatus::kVisitBreak;
     }
 
@@ -9664,7 +9664,7 @@ class RecordAnnotationVisitor final : public annotations::AnnotationVisitor {
   annotations::VisitorStatus VisitAnnotationElement(const char* element_name,
                                                     uint8_t type,
                                                     [[maybe_unused]] const JValue& value) override {
-    if (is_error_) {
+    if (has_error_) {
       return annotations::VisitorStatus::kVisitBreak;
     }
 
@@ -9710,7 +9710,7 @@ class RecordAnnotationVisitor final : public annotations::AnnotationVisitor {
                                                uint32_t index,
                                                uint8_t type,
                                                [[maybe_unused]] const JValue& value) override {
-    if (is_error_) {
+    if (has_error_) {
       return annotations::VisitorStatus::kVisitBreak;
     }
     switch (visiting_type_) {
@@ -9794,14 +9794,12 @@ class RecordAnnotationVisitor final : public annotations::AnnotationVisitor {
   }
 
  private:
-  bool is_error_ = false;
   uint32_t count_ = 0;
   uint32_t names_count_ = UINT32_MAX;
   uint32_t types_count_ = UINT32_MAX;
   uint32_t signatures_count_ = UINT32_MAX;
   uint32_t visibilities_count_ = UINT32_MAX;
   uint32_t annotations_count_ = UINT32_MAX;
-  std::string error_msg_;
   RecordElementType visiting_type_;
 
   inline bool ExpectedTypeOrError(uint8_t type,
@@ -9821,11 +9819,6 @@ class RecordAnnotationVisitor final : public annotations::AnnotationVisitor {
         depth,
         kRecordElementNames[static_cast<uint8_t>(visiting_type)]));
     return false;
-  }
-
-  void SetErrorMsg(const std::string& msg) {
-    is_error_ = true;
-    error_msg_ = msg;
   }
 
   DISALLOW_COPY_AND_ASSIGN(RecordAnnotationVisitor);
@@ -9871,6 +9864,11 @@ bool ClassLinker::VerifyRecordClass(Handle<mirror::Class> klass, ObjPtr<mirror::
   // optional, but should have the same size if it exists.
   RecordAnnotationVisitor visitor;
   annotations::VisitClassAnnotations(klass, &visitor);
+  if (UNLIKELY(visitor.HasError())) {
+    ThrowClassFormatError(klass.Get(), "%s", visitor.GetErrorMsg().c_str());
+    return false;
+  }
+
   if (!visitor.IsRecordAnnotationFound()) {
     return true;
   }
@@ -10342,6 +10340,12 @@ ObjPtr<mirror::MethodHandle> ClassLinker::ResolveMethodHandleForField(
       ThrowIllegalAccessErrorField(referring_class, target_field);
       return nullptr;
     }
+    // TODO(b/364876321): ResolveField might return instance field when is_static is true and
+    // vice versa.
+    if (UNLIKELY(is_static != target_field->IsStatic())) {
+      ThrowIncompatibleClassChangeErrorField(target_field, is_static, referrer);
+      return nullptr;
+    }
     if (UNLIKELY(is_put && target_field->IsFinal())) {
       ThrowIllegalAccessErrorField(referring_class, target_field);
       return nullptr;
@@ -10434,19 +10438,21 @@ ObjPtr<mirror::MethodHandle> ClassLinker::ResolveMethodHandleForMethod(
     case DexFile::MethodHandleType::kInvokeStatic: {
       kind = mirror::MethodHandle::Kind::kInvokeStatic;
       receiver_count = 0;
-      target_method = ResolveMethod<ResolveMode::kNoChecks>(self,
-                                                            method_handle.field_or_method_idx_,
-                                                            referrer,
-                                                            InvokeType::kStatic);
+      target_method =
+          ResolveMethod<ResolveMode::kCheckICCEAndIAE>(self,
+                                                       method_handle.field_or_method_idx_,
+                                                       referrer,
+                                                       InvokeType::kStatic);
       break;
     }
     case DexFile::MethodHandleType::kInvokeInstance: {
       kind = mirror::MethodHandle::Kind::kInvokeVirtual;
       receiver_count = 1;
-      target_method = ResolveMethod<ResolveMode::kNoChecks>(self,
-                                                            method_handle.field_or_method_idx_,
-                                                            referrer,
-                                                            InvokeType::kVirtual);
+      target_method =
+          ResolveMethod<ResolveMode::kCheckICCEAndIAE>(self,
+                                                       method_handle.field_or_method_idx_,
+                                                       referrer,
+                                                       InvokeType::kVirtual);
       break;
     }
     case DexFile::MethodHandleType::kInvokeConstructor: {
@@ -10454,10 +10460,11 @@ ObjPtr<mirror::MethodHandle> ClassLinker::ResolveMethodHandleForMethod(
       // are special cased later in this method.
       kind = mirror::MethodHandle::Kind::kInvokeTransform;
       receiver_count = 0;
-      target_method = ResolveMethod<ResolveMode::kNoChecks>(self,
-                                                            method_handle.field_or_method_idx_,
-                                                            referrer,
-                                                            InvokeType::kDirect);
+      target_method =
+          ResolveMethod<ResolveMode::kCheckICCEAndIAE>(self,
+                                                       method_handle.field_or_method_idx_,
+                                                       referrer,
+                                                       InvokeType::kDirect);
       break;
     }
     case DexFile::MethodHandleType::kInvokeDirect: {
@@ -10479,16 +10486,18 @@ ObjPtr<mirror::MethodHandle> ClassLinker::ResolveMethodHandleForMethod(
 
       if (target_method->IsPrivate()) {
         kind = mirror::MethodHandle::Kind::kInvokeDirect;
-        target_method = ResolveMethod<ResolveMode::kNoChecks>(self,
-                                                              method_handle.field_or_method_idx_,
-                                                              referrer,
-                                                              InvokeType::kDirect);
+        target_method =
+            ResolveMethod<ResolveMode::kCheckICCEAndIAE>(self,
+                                                         method_handle.field_or_method_idx_,
+                                                         referrer,
+                                                         InvokeType::kDirect);
       } else {
         kind = mirror::MethodHandle::Kind::kInvokeSuper;
-        target_method = ResolveMethod<ResolveMode::kNoChecks>(self,
-                                                              method_handle.field_or_method_idx_,
-                                                              referrer,
-                                                              InvokeType::kSuper);
+        target_method =
+            ResolveMethod<ResolveMode::kCheckICCEAndIAE>(self,
+                                                         method_handle.field_or_method_idx_,
+                                                         referrer,
+                                                         InvokeType::kSuper);
         if (UNLIKELY(target_method == nullptr)) {
           break;
         }
@@ -10504,16 +10513,24 @@ ObjPtr<mirror::MethodHandle> ClassLinker::ResolveMethodHandleForMethod(
     case DexFile::MethodHandleType::kInvokeInterface: {
       kind = mirror::MethodHandle::Kind::kInvokeInterface;
       receiver_count = 1;
-      target_method = ResolveMethod<ResolveMode::kNoChecks>(self,
-                                                            method_handle.field_or_method_idx_,
-                                                            referrer,
-                                                            InvokeType::kInterface);
+      target_method =
+          ResolveMethod<ResolveMode::kCheckICCEAndIAE>(self,
+                                                       method_handle.field_or_method_idx_,
+                                                       referrer,
+                                                       InvokeType::kInterface);
       break;
     }
   }
 
   if (UNLIKELY(target_method == nullptr)) {
     DCHECK(Thread::Current()->IsExceptionPending());
+    return nullptr;
+  }
+
+  // According to JVMS 4.4.8 none of invoke* MethodHandle-s can target <clinit> methods.
+  if (UNLIKELY(target_method->IsClassInitializer())) {
+    ThrowClassFormatError(referrer->GetDeclaringClass(),
+        "Method handles can't target class initializer method");
     return nullptr;
   }
 
