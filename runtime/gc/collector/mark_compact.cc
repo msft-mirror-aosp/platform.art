@@ -115,7 +115,7 @@ static constexpr uint64_t kUffdFeaturesForMinorFault =
 static constexpr uint64_t kUffdFeaturesForSigbus = UFFD_FEATURE_SIGBUS;
 // A region which is more than kBlackDenseRegionThreshold percent live doesn't
 // need to be compacted as it is too densely packed.
-static constexpr uint kBlackDenseRegionThreshold = 90U;
+static constexpr uint kBlackDenseRegionThreshold = 85U;
 // We consider SIGBUS feature necessary to enable this GC as it's superior than
 // threading-based implementation for janks. We may want minor-fault in future
 // to be available for making jit-code-cache updation concurrent, which uses shmem.
@@ -997,7 +997,7 @@ bool MarkCompact::PrepareForCompaction() {
       auto iter = std::find_if(
           pages_live_bytes.rbegin() + (num_pages - threshold_passing_marker),
           pages_live_bytes.rend(),
-          [](uint32_t bytes) { return bytes * 100U < gPageSize * kBlackDenseRegionThreshold; });
+          [](uint32_t bytes) { return bytes * 100U >= gPageSize * kBlackDenseRegionThreshold; });
       black_dense_idx = (pages_live_bytes.rend() - iter) * chunk_info_per_page;
     }
     black_dense_end_ = moving_space_begin_ + black_dense_idx * kOffsetChunkSize;
