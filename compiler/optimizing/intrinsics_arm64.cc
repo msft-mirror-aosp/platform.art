@@ -56,6 +56,7 @@ using helpers::CPURegisterFrom;
 using helpers::DRegisterFrom;
 using helpers::HeapOperand;
 using helpers::LocationFrom;
+using helpers::Int64FromLocation;
 using helpers::InputCPURegisterAt;
 using helpers::InputCPURegisterOrZeroRegAt;
 using helpers::OperandFrom;
@@ -698,6 +699,12 @@ void IntrinsicCodeGeneratorARM64::VisitThreadCurrentThread(HInvoke* invoke) {
                  MemOperand(tr, Thread::PeerOffset<kArm64PointerSize>().Int32Value()));
 }
 
+static bool ReadBarrierNeedsTemp(bool is_volatile, HInvoke* invoke) {
+  return is_volatile ||
+      !invoke->InputAt(2)->IsLongConstant() ||
+      invoke->InputAt(2)->AsLongConstant()->GetValue() >= kReferenceLoadMinFarOffset;
+}
+
 static void GenUnsafeGet(HInvoke* invoke,
                          DataType::Type type,
                          bool is_volatile,
@@ -710,7 +717,6 @@ static void GenUnsafeGet(HInvoke* invoke,
   Location base_loc = locations->InAt(1);
   Register base = WRegisterFrom(base_loc);      // Object pointer.
   Location offset_loc = locations->InAt(2);
-  Register offset = XRegisterFrom(offset_loc);  // Long offset.
   Location trg_loc = locations->Out();
   Register trg = RegisterFrom(trg_loc, type);
 
@@ -719,16 +725,35 @@ static void GenUnsafeGet(HInvoke* invoke,
     Register temp = WRegisterFrom(locations->GetTemp(0));
     MacroAssembler* masm = codegen->GetVIXLAssembler();
     // Piggy-back on the field load path using introspection for the Baker read barrier.
-    __ Add(temp, base, offset.W());  // Offset should not exceed 32 bits.
-    codegen->GenerateFieldLoadWithBakerReadBarrier(invoke,
-                                                   trg_loc,
-                                                   base,
-                                                   MemOperand(temp.X()),
-                                                   /* needs_null_check= */ false,
-                                                   is_volatile);
+    if (offset_loc.IsConstant()) {
+      uint32_t offset = Int64FromLocation(offset_loc);
+      Location maybe_temp = ReadBarrierNeedsTemp(is_volatile, invoke)
+          ? locations->GetTemp(0) : Location::NoLocation();
+      DCHECK_EQ(locations->GetTempCount(), ReadBarrierNeedsTemp(is_volatile, invoke));
+      codegen->GenerateFieldLoadWithBakerReadBarrier(invoke,
+                                                     trg_loc,
+                                                     base.W(),
+                                                     offset,
+                                                     maybe_temp,
+                                                     /* needs_null_check= */ false,
+                                                     is_volatile);
+    } else {
+      __ Add(temp, base, WRegisterFrom(offset_loc));  // Offset should not exceed 32 bits.
+      codegen->GenerateFieldLoadWithBakerReadBarrier(invoke,
+                                                     trg_loc,
+                                                     base,
+                                                     MemOperand(temp.X()),
+                                                     /* needs_null_check= */ false,
+                                                     is_volatile);
+    }
   } else {
     // Other cases.
-    MemOperand mem_op(base.X(), offset);
+    MemOperand mem_op;
+    if (offset_loc.IsConstant()) {
+      mem_op = MemOperand(base.X(), Int64FromLocation(offset_loc));
+    } else {
+      mem_op = MemOperand(base.X(), XRegisterFrom(offset_loc));
+    }
     if (is_volatile) {
       codegen->LoadAcquire(invoke, type, trg, mem_op, /* needs_null_check= */ true);
     } else {
@@ -742,9 +767,30 @@ static void GenUnsafeGet(HInvoke* invoke,
   }
 }
 
+static void GenUnsafeGetAbsolute(HInvoke* invoke,
+                                 DataType::Type type,
+                                 bool is_volatile,
+                                 CodeGeneratorARM64* codegen) {
+  LocationSummary* locations = invoke->GetLocations();
+  DCHECK((type == DataType::Type::kInt8) ||
+         (type == DataType::Type::kInt32) ||
+         (type == DataType::Type::kInt64));
+  Location address_loc = locations->InAt(1);
+  MemOperand mem_op = MemOperand(XRegisterFrom(address_loc));
+  Location trg_loc = locations->Out();
+  Register trg = RegisterFrom(trg_loc, type);
+
+  if (is_volatile) {
+    codegen->LoadAcquire(invoke, type, trg, mem_op, /* needs_null_check= */ true);
+  } else {
+    codegen->Load(type, trg, mem_op);
+  }
+}
+
 static void CreateUnsafeGetLocations(ArenaAllocator* allocator,
                                      HInvoke* invoke,
-                                     CodeGeneratorARM64* codegen) {
+                                     CodeGeneratorARM64* codegen,
+                                     bool is_volatile = false) {
   bool can_call = codegen->EmitReadBarrier() && IsUnsafeGetReference(invoke);
   LocationSummary* locations =
       new (allocator) LocationSummary(invoke,
@@ -754,19 +800,33 @@ static void CreateUnsafeGetLocations(ArenaAllocator* allocator,
                                       kIntrinsified);
   if (can_call && kUseBakerReadBarrier) {
     locations->SetCustomSlowPathCallerSaves(RegisterSet::Empty());  // No caller-save registers.
-    // We need a temporary register for the read barrier load in order to use
-    // CodeGeneratorARM64::GenerateFieldLoadWithBakerReadBarrier().
-    locations->AddTemp(FixedTempLocation());
+    if (ReadBarrierNeedsTemp(is_volatile, invoke)) {
+      // We need a temporary register for the read barrier load in order to use
+      // CodeGeneratorARM64::GenerateFieldLoadWithBakerReadBarrier().
+      locations->AddTemp(FixedTempLocation());
+    }
   }
   locations->SetInAt(0, Location::NoLocation());        // Unused receiver.
   locations->SetInAt(1, Location::RequiresRegister());
-  locations->SetInAt(2, Location::RequiresRegister());
+  locations->SetInAt(2, Location::RegisterOrConstant(invoke->InputAt(2)));
   locations->SetOut(Location::RequiresRegister(),
                     (can_call ? Location::kOutputOverlap : Location::kNoOutputOverlap));
 }
 
+static void CreateUnsafeGetAbsoluteLocations(ArenaAllocator* allocator,
+                                             HInvoke* invoke) {
+  LocationSummary* locations =
+      new (allocator) LocationSummary(invoke, LocationSummary::kNoCall, kIntrinsified);
+  locations->SetInAt(0, Location::NoLocation());        // Unused receiver.
+  locations->SetInAt(1, Location::RequiresRegister());
+  locations->SetOut(Location::RequiresRegister(), Location::kNoOutputOverlap);
+}
+
 void IntrinsicLocationsBuilderARM64::VisitUnsafeGet(HInvoke* invoke) {
   VisitJdkUnsafeGet(invoke);
+}
+void IntrinsicLocationsBuilderARM64::VisitUnsafeGetAbsolute(HInvoke* invoke) {
+  VisitJdkUnsafeGetAbsolute(invoke);
 }
 void IntrinsicLocationsBuilderARM64::VisitUnsafeGetVolatile(HInvoke* invoke) {
   VisitJdkUnsafeGetVolatile(invoke);
@@ -786,33 +846,35 @@ void IntrinsicLocationsBuilderARM64::VisitUnsafeGetObjectVolatile(HInvoke* invok
 void IntrinsicLocationsBuilderARM64::VisitUnsafeGetByte(HInvoke* invoke) {
   VisitJdkUnsafeGetByte(invoke);
 }
-
 void IntrinsicLocationsBuilderARM64::VisitJdkUnsafeGet(HInvoke* invoke) {
   CreateUnsafeGetLocations(allocator_, invoke, codegen_);
 }
+void IntrinsicLocationsBuilderARM64::VisitJdkUnsafeGetAbsolute(HInvoke* invoke) {
+  CreateUnsafeGetAbsoluteLocations(allocator_, invoke);
+}
 void IntrinsicLocationsBuilderARM64::VisitJdkUnsafeGetVolatile(HInvoke* invoke) {
-  CreateUnsafeGetLocations(allocator_, invoke, codegen_);
+  CreateUnsafeGetLocations(allocator_, invoke, codegen_, /* is_volatile= */ true);
 }
 void IntrinsicLocationsBuilderARM64::VisitJdkUnsafeGetAcquire(HInvoke* invoke) {
-  CreateUnsafeGetLocations(allocator_, invoke, codegen_);
+  CreateUnsafeGetLocations(allocator_, invoke, codegen_, /* is_volatile= */ true);
 }
 void IntrinsicLocationsBuilderARM64::VisitJdkUnsafeGetLong(HInvoke* invoke) {
   CreateUnsafeGetLocations(allocator_, invoke, codegen_);
 }
 void IntrinsicLocationsBuilderARM64::VisitJdkUnsafeGetLongVolatile(HInvoke* invoke) {
-  CreateUnsafeGetLocations(allocator_, invoke, codegen_);
+  CreateUnsafeGetLocations(allocator_, invoke, codegen_, /* is_volatile= */ true);
 }
 void IntrinsicLocationsBuilderARM64::VisitJdkUnsafeGetLongAcquire(HInvoke* invoke) {
-  CreateUnsafeGetLocations(allocator_, invoke, codegen_);
+  CreateUnsafeGetLocations(allocator_, invoke, codegen_, /* is_volatile= */ true);
 }
 void IntrinsicLocationsBuilderARM64::VisitJdkUnsafeGetReference(HInvoke* invoke) {
   CreateUnsafeGetLocations(allocator_, invoke, codegen_);
 }
 void IntrinsicLocationsBuilderARM64::VisitJdkUnsafeGetReferenceVolatile(HInvoke* invoke) {
-  CreateUnsafeGetLocations(allocator_, invoke, codegen_);
+  CreateUnsafeGetLocations(allocator_, invoke, codegen_, /* is_volatile= */ true);
 }
 void IntrinsicLocationsBuilderARM64::VisitJdkUnsafeGetReferenceAcquire(HInvoke* invoke) {
-  CreateUnsafeGetLocations(allocator_, invoke, codegen_);
+  CreateUnsafeGetLocations(allocator_, invoke, codegen_, /* is_volatile= */ true);
 }
 void IntrinsicLocationsBuilderARM64::VisitJdkUnsafeGetByte(HInvoke* invoke) {
   CreateUnsafeGetLocations(allocator_, invoke, codegen_);
@@ -820,6 +882,9 @@ void IntrinsicLocationsBuilderARM64::VisitJdkUnsafeGetByte(HInvoke* invoke) {
 
 void IntrinsicCodeGeneratorARM64::VisitUnsafeGet(HInvoke* invoke) {
   VisitJdkUnsafeGet(invoke);
+}
+void IntrinsicCodeGeneratorARM64::VisitUnsafeGetAbsolute(HInvoke* invoke) {
+  VisitJdkUnsafeGetAbsolute(invoke);
 }
 void IntrinsicCodeGeneratorARM64::VisitUnsafeGetVolatile(HInvoke* invoke) {
   VisitJdkUnsafeGetVolatile(invoke);
@@ -842,6 +907,9 @@ void IntrinsicCodeGeneratorARM64::VisitUnsafeGetByte(HInvoke* invoke) {
 
 void IntrinsicCodeGeneratorARM64::VisitJdkUnsafeGet(HInvoke* invoke) {
   GenUnsafeGet(invoke, DataType::Type::kInt32, /*is_volatile=*/ false, codegen_);
+}
+void IntrinsicCodeGeneratorARM64::VisitJdkUnsafeGetAbsolute(HInvoke* invoke) {
+  GenUnsafeGetAbsolute(invoke, DataType::Type::kInt32, /*is_volatile=*/ false, codegen_);
 }
 void IntrinsicCodeGeneratorARM64::VisitJdkUnsafeGetVolatile(HInvoke* invoke) {
   GenUnsafeGet(invoke, DataType::Type::kInt32, /*is_volatile=*/ true, codegen_);
@@ -874,14 +942,45 @@ void IntrinsicCodeGeneratorARM64::VisitJdkUnsafeGetByte(HInvoke* invoke) {
 static void CreateUnsafePutLocations(ArenaAllocator* allocator, HInvoke* invoke) {
   LocationSummary* locations =
       new (allocator) LocationSummary(invoke, LocationSummary::kNoCall, kIntrinsified);
-  locations->SetInAt(0, Location::NoLocation());        // Unused receiver.
+  static constexpr int kOffsetIndex = 2;
+  static constexpr int kValueIndex = 3;
+  // Unused receiver.
+  locations->SetInAt(0, Location::NoLocation());
+  // The object.
   locations->SetInAt(1, Location::RequiresRegister());
-  locations->SetInAt(2, Location::RequiresRegister());
-  locations->SetInAt(3, Location::RequiresRegister());
+  // The offset.
+  locations->SetInAt(
+      kOffsetIndex, Location::RegisterOrConstant(invoke->InputAt(kOffsetIndex)));
+  // The value.
+  if (IsZeroBitPattern(invoke->InputAt(kValueIndex))) {
+    locations->SetInAt(kValueIndex, Location::ConstantLocation(invoke->InputAt(kValueIndex)));
+  } else {
+    locations->SetInAt(kValueIndex, Location::RequiresRegister());
+  }
+}
+
+static void CreateUnsafePutAbsoluteLocations(ArenaAllocator* allocator, HInvoke* invoke) {
+  LocationSummary* locations =
+      new (allocator) LocationSummary(invoke, LocationSummary::kNoCall, kIntrinsified);
+  static constexpr int kAddressIndex = 1;
+  static constexpr int kValueIndex = 2;
+  // Unused receiver.
+  locations->SetInAt(0, Location::NoLocation());
+  // The address.
+  locations->SetInAt(kAddressIndex, Location::RequiresRegister());
+  // The value.
+  if (IsZeroBitPattern(invoke->InputAt(kValueIndex))) {
+    locations->SetInAt(kValueIndex, Location::ConstantLocation(invoke->InputAt(kValueIndex)));
+  } else {
+    locations->SetInAt(kValueIndex, Location::RequiresRegister());
+  }
 }
 
 void IntrinsicLocationsBuilderARM64::VisitUnsafePut(HInvoke* invoke) {
   VisitJdkUnsafePut(invoke);
+}
+void IntrinsicLocationsBuilderARM64::VisitUnsafePutAbsolute(HInvoke* invoke) {
+  VisitJdkUnsafePutAbsolute(invoke);
 }
 void IntrinsicLocationsBuilderARM64::VisitUnsafePutOrdered(HInvoke* invoke) {
   VisitJdkUnsafePutOrdered(invoke);
@@ -913,6 +1012,9 @@ void IntrinsicLocationsBuilderARM64::VisitUnsafePutByte(HInvoke* invoke) {
 
 void IntrinsicLocationsBuilderARM64::VisitJdkUnsafePut(HInvoke* invoke) {
   CreateUnsafePutLocations(allocator_, invoke);
+}
+void IntrinsicLocationsBuilderARM64::VisitJdkUnsafePutAbsolute(HInvoke* invoke) {
+  CreateUnsafePutAbsoluteLocations(allocator_, invoke);
 }
 void IntrinsicLocationsBuilderARM64::VisitJdkUnsafePutOrdered(HInvoke* invoke) {
   CreateUnsafePutLocations(allocator_, invoke);
@@ -959,18 +1061,27 @@ static void GenUnsafePut(HInvoke* invoke,
   LocationSummary* locations = invoke->GetLocations();
   MacroAssembler* masm = codegen->GetVIXLAssembler();
 
+  static constexpr int kOffsetIndex = 2;
+  static constexpr int kValueIndex = 3;
   Register base = WRegisterFrom(locations->InAt(1));    // Object pointer.
-  Register offset = XRegisterFrom(locations->InAt(2));  // Long offset.
-  Register value = RegisterFrom(locations->InAt(3), type);
-  Register source = value;
-  MemOperand mem_op(base.X(), offset);
+  Location offset = locations->InAt(kOffsetIndex);      // Long offset.
+  CPURegister value = InputCPURegisterOrZeroRegAt(invoke, kValueIndex);
+  CPURegister source = value;
+  MemOperand mem_op;
+  if (offset.IsConstant()) {
+    mem_op = MemOperand(base.X(), Int64FromLocation(offset));
+  } else {
+    mem_op = MemOperand(base.X(), XRegisterFrom(offset));
+  }
 
   {
     // We use a block to end the scratch scope before the write barrier, thus
     // freeing the temporary registers so they can be used in `MarkGCCard`.
     UseScratchRegisterScope temps(masm);
 
-    if (kPoisonHeapReferences && type == DataType::Type::kReference) {
+    if (kPoisonHeapReferences &&
+        type == DataType::Type::kReference &&
+        !IsZeroBitPattern(invoke->InputAt(kValueIndex))) {
       DCHECK(value.IsW());
       Register temp = temps.AcquireW();
       __ Mov(temp.W(), value.W());
@@ -985,14 +1096,38 @@ static void GenUnsafePut(HInvoke* invoke,
     }
   }
 
-  if (type == DataType::Type::kReference) {
+  if (type == DataType::Type::kReference && !IsZeroBitPattern(invoke->InputAt(kValueIndex))) {
     bool value_can_be_null = true;  // TODO: Worth finding out this information?
-    codegen->MaybeMarkGCCard(base, value, value_can_be_null);
+    codegen->MaybeMarkGCCard(base, Register(source), value_can_be_null);
+  }
+}
+
+static void GenUnsafePutAbsolute(HInvoke* invoke,
+                                 DataType::Type type,
+                                 bool is_volatile,
+                                 bool is_ordered,
+                                 CodeGeneratorARM64* codegen) {
+  LocationSummary* locations = invoke->GetLocations();
+  MacroAssembler* masm = codegen->GetVIXLAssembler();
+
+  static constexpr int kAddressIndex = 1;
+  static constexpr int kValueIndex = 2;
+  Location address_loc = locations->InAt(kAddressIndex);
+  MemOperand mem_op = MemOperand(WRegisterFrom(address_loc).X());
+  CPURegister value = InputCPURegisterOrZeroRegAt(invoke, kValueIndex);
+
+  if (is_volatile || is_ordered) {
+    codegen->StoreRelease(invoke, type, value, mem_op, /* needs_null_check= */ false);
+  } else {
+    codegen->Store(type, value, mem_op);
   }
 }
 
 void IntrinsicCodeGeneratorARM64::VisitUnsafePut(HInvoke* invoke) {
   VisitJdkUnsafePut(invoke);
+}
+void IntrinsicCodeGeneratorARM64::VisitUnsafePutAbsolute(HInvoke* invoke) {
+  VisitJdkUnsafePutAbsolute(invoke);
 }
 void IntrinsicCodeGeneratorARM64::VisitUnsafePutOrdered(HInvoke* invoke) {
   VisitJdkUnsafePutOrdered(invoke);
@@ -1028,6 +1163,13 @@ void IntrinsicCodeGeneratorARM64::VisitJdkUnsafePut(HInvoke* invoke) {
                /*is_volatile=*/ false,
                /*is_ordered=*/ false,
                codegen_);
+}
+void IntrinsicCodeGeneratorARM64::VisitJdkUnsafePutAbsolute(HInvoke* invoke) {
+  GenUnsafePutAbsolute(invoke,
+                       DataType::Type::kInt32,
+                       /*is_volatile=*/ false,
+                       /*is_ordered=*/ false,
+                       codegen_);
 }
 void IntrinsicCodeGeneratorARM64::VisitJdkUnsafePutOrdered(HInvoke* invoke) {
   GenUnsafePut(invoke,
