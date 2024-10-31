@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2012 The Android Open Source Project
+ * Copyright (C) 2024 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,16 +14,25 @@
  * limitations under the License.
  */
 
-#ifndef ART_RUNTIME_ENTRYPOINTS_MATH_ENTRYPOINTS_H_
-#define ART_RUNTIME_ENTRYPOINTS_MATH_ENTRYPOINTS_H_
+#ifndef ART_COMPILER_OPTIMIZING_HANDLE_CACHE_INL_H_
+#define ART_COMPILER_OPTIMIZING_HANDLE_CACHE_INL_H_
 
-#include <stdint.h>
+#include "handle_cache.h"
 
-extern "C" double art_l2d(int64_t l);
-extern "C" float art_l2f(int64_t l);
-extern "C" int64_t art_d2l(double d);
-extern "C" int32_t art_d2i(double d);
-extern "C" int64_t art_f2l(float f);
-extern "C" int32_t art_f2i(float f);
+#include "handle_scope-inl.h"
 
-#endif  // ART_RUNTIME_ENTRYPOINTS_MATH_ENTRYPOINTS_H_
+namespace art HIDDEN {
+
+template <typename T>
+MutableHandle<T> HandleCache::NewHandle(T* object) {
+  return handles_->NewHandle(object);
+}
+
+template <typename T>
+MutableHandle<T> HandleCache::NewHandle(ObjPtr<T> object) {
+  return handles_->NewHandle(object);
+}
+
+}  // namespace art
+
+#endif  // ART_COMPILER_OPTIMIZING_HANDLE_CACHE_INL_H_

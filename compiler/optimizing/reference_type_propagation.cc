@@ -24,6 +24,7 @@
 #include "base/scoped_arena_containers.h"
 #include "class_linker-inl.h"
 #include "class_root-inl.h"
+#include "handle_cache-inl.h"
 #include "handle_scope-inl.h"
 #include "mirror/class-inl.h"
 #include "mirror/dex_cache.h"
@@ -749,17 +750,12 @@ void ReferenceTypePropagation::RTPVisitor::VisitPhi(HPhi* phi) {
   }
 }
 
-void ReferenceTypePropagation::FixUpInstructionType(HInstruction* instruction,
-                                                    HandleCache* handle_cache) {
-  if (instruction->IsSelect()) {
-    ScopedObjectAccess soa(Thread::Current());
-    HSelect* select = instruction->AsSelect();
-    ReferenceTypeInfo false_rti = select->GetFalseValue()->GetReferenceTypeInfo();
-    ReferenceTypeInfo true_rti = select->GetTrueValue()->GetReferenceTypeInfo();
-    select->SetReferenceTypeInfo(MergeTypes(false_rti, true_rti, handle_cache));
-  } else {
-    LOG(FATAL) << "Invalid instruction in FixUpInstructionType";
-  }
+void ReferenceTypePropagation::FixUpSelectType(HSelect* select, HandleCache* handle_cache) {
+  ReferenceTypeInfo false_rti = select->GetFalseValue()->GetReferenceTypeInfo();
+  ReferenceTypeInfo true_rti = select->GetTrueValue()->GetReferenceTypeInfo();
+  ReferenceTypeInfo rti = ReferenceTypeInfo::CreateInvalid();
+  ScopedObjectAccess soa(Thread::Current());
+  select->SetReferenceTypeInfo(MergeTypes(false_rti, true_rti, handle_cache));
 }
 
 ReferenceTypeInfo ReferenceTypePropagation::MergeTypes(const ReferenceTypeInfo& a,
