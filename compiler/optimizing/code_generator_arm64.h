@@ -56,6 +56,12 @@ static constexpr size_t kArm64WordSize = static_cast<size_t>(kArm64PointerSize);
 // must be blocked.
 static constexpr int kMaxMacroInstructionSizeInBytes = 15 * vixl::aarch64::kInstructionSize;
 
+// Reference load (except object array loads) is using LDR Wt, [Xn, #offset] which can handle
+// offset < 16KiB. For offsets >= 16KiB, the load shall be emitted as two or more instructions.
+// For the Baker read barrier implementation using link-time generated thunks we need to split
+// the offset explicitly.
+static constexpr uint32_t kReferenceLoadMinFarOffset = 16 * KB;
+
 static const vixl::aarch64::Register kParameterCoreRegisters[] = {
     vixl::aarch64::x1,
     vixl::aarch64::x2,
@@ -124,6 +130,8 @@ const vixl::aarch64::CPURegList callee_saved_fp_registers(vixl::aarch64::CPURegi
                                                           vixl::aarch64::d15.GetCode());
 Location ARM64ReturnLocation(DataType::Type return_type);
 
+vixl::aarch64::Condition ARM64PCondition(HVecPredToBoolean::PCondKind cond);
+
 #define UNIMPLEMENTED_INTRINSIC_LIST_ARM64(V) \
   V(MathSignumFloat)                          \
   V(MathSignumDouble)                         \
@@ -150,9 +158,12 @@ Location ARM64ReturnLocation(DataType::Type return_type);
   V(StringBuilderToString)                    \
   V(SystemArrayCopyByte)                      \
   V(SystemArrayCopyInt)                       \
+  V(UnsafeArrayBaseOffset)                    \
   /* 1.8 */                                   \
   V(MethodHandleInvokeExact)                  \
-  V(MethodHandleInvoke)
+  V(MethodHandleInvoke)                       \
+  /* OpenJDK 11 */                            \
+  V(JdkUnsafeArrayBaseOffset)
 
 class SlowPathCodeARM64 : public SlowPathCode {
  public:
@@ -174,16 +185,34 @@ class SlowPathCodeARM64 : public SlowPathCode {
 
 class JumpTableARM64 : public DeletableArenaObject<kArenaAllocSwitchTable> {
  public:
+  using VIXLInt32Literal = vixl::aarch64::Literal<int32_t>;
+
   explicit JumpTableARM64(HPackedSwitch* switch_instr)
-    : switch_instr_(switch_instr), table_start_() {}
+      : switch_instr_(switch_instr),
+        table_start_(),
+        jump_targets_(switch_instr->GetAllocator()->Adapter(kArenaAllocCodeGenerator)) {
+      uint32_t num_entries = switch_instr_->GetNumEntries();
+      for (uint32_t i = 0; i < num_entries; i++) {
+        VIXLInt32Literal* lit = new VIXLInt32Literal(0);
+        jump_targets_.emplace_back(lit);
+      }
+    }
 
   vixl::aarch64::Label* GetTableStartLabel() { return &table_start_; }
 
+  // Emits the jump table into the code buffer; jump target offsets are not yet known.
   void EmitTable(CodeGeneratorARM64* codegen);
+
+  // Updates the offsets in the jump table, to be used when the jump targets basic blocks
+  // addresses are resolved.
+  void FixTable(CodeGeneratorARM64* codegen);
 
  private:
   HPackedSwitch* const switch_instr_;
   vixl::aarch64::Label table_start_;
+
+  // Contains literals for the switch's jump targets.
+  ArenaVector<std::unique_ptr<VIXLInt32Literal>> jump_targets_;
 
   DISALLOW_COPY_AND_ASSIGN(JumpTableARM64);
 };
@@ -1135,7 +1164,7 @@ class CodeGeneratorARM64 : public CodeGenerator {
                                            vixl::aarch64::Label* adrp_label,
                                            ArenaDeque<PcRelativePatchInfo>* patches);
 
-  void EmitJumpTables();
+  void FixJumpTables();
 
   template <linker::LinkerPatch (*Factory)(size_t, const DexFile*, uint32_t, uint32_t)>
   static void EmitPcRelativeLinkerPatches(const ArenaDeque<PcRelativePatchInfo>& infos,
