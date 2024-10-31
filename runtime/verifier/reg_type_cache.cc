@@ -260,8 +260,7 @@ RegTypeCache::RegTypeCache(Thread* self,
                            const DexFile* dex_file,
                            bool can_load_classes,
                            bool can_suspend)
-    : arena_stack_(arena_pool),
-      allocator_(&arena_stack_),
+    : allocator_(arena_pool),
       entries_(allocator_.Adapter(kArenaAllocVerifier)),
       klass_entries_(allocator_.Adapter(kArenaAllocVerifier)),
       handles_(self),
@@ -275,9 +274,10 @@ RegTypeCache::RegTypeCache(Thread* self,
   if (kIsDebugBuild && can_suspend) {
     Thread::Current()->AssertThreadSuspensionIsAllowable(gAborting == 0);
   }
-  // TODO: Why are we using `ScopedArenaAllocator` here instead of the `ArenaAllocator` which
-  // guarantees zero-initialization? We could avoid this `fill_n()` with the `ArenaAllocator`.
-  std::fill_n(entries_for_type_index_, dex_file->NumTypeIds(), nullptr);
+  // `ArenaAllocator` guarantees zero-initialization.
+  DCHECK(std::all_of(entries_for_type_index_,
+                     entries_for_type_index_ + dex_file->NumTypeIds(),
+                     [](const RegType* reg_type) { return reg_type == nullptr; }));
   // The klass_entries_ array does not have primitives or small constants.
   static constexpr size_t kNumReserveEntries = 32;
   klass_entries_.reserve(kNumReserveEntries);
@@ -392,37 +392,31 @@ const RegType& RegTypeCache::FromUnresolvedSuperClass(const RegType& child) {
       null_handle_, child.GetId(), this, entries_.size()));
 }
 
-const UninitializedType& RegTypeCache::Uninitialized(const RegType& type, uint32_t allocation_pc) {
+const UninitializedType& RegTypeCache::Uninitialized(const RegType& type) {
   UninitializedType* entry = nullptr;
   const std::string_view& descriptor(type.GetDescriptor());
   if (type.IsUnresolvedTypes()) {
     for (size_t i = kNumPrimitivesAndSmallConstants; i < entries_.size(); i++) {
       const RegType* cur_entry = entries_[i];
       if (cur_entry->IsUnresolvedAndUninitializedReference() &&
-          down_cast<const UnresolvedUninitializedRefType*>(cur_entry)->GetAllocationPc()
-              == allocation_pc &&
           (cur_entry->GetDescriptor() == descriptor)) {
         return *down_cast<const UnresolvedUninitializedRefType*>(cur_entry);
       }
     }
     entry = new (&allocator_) UnresolvedUninitializedRefType(null_handle_,
                                                              descriptor,
-                                                             allocation_pc,
                                                              entries_.size());
   } else {
     ObjPtr<mirror::Class> klass = type.GetClass();
     for (size_t i = kNumPrimitivesAndSmallConstants; i < entries_.size(); i++) {
       const RegType* cur_entry = entries_[i];
       if (cur_entry->IsUninitializedReference() &&
-          down_cast<const UninitializedReferenceType*>(cur_entry)
-              ->GetAllocationPc() == allocation_pc &&
           cur_entry->GetClass() == klass) {
         return *down_cast<const UninitializedReferenceType*>(cur_entry);
       }
     }
     entry = new (&allocator_) UninitializedReferenceType(handles_.NewHandle(klass),
                                                          descriptor,
-                                                         allocation_pc,
                                                          entries_.size());
   }
   return AddEntry(entry);
