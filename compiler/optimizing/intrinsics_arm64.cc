@@ -34,6 +34,7 @@
 #include "mirror/reference.h"
 #include "mirror/string-inl.h"
 #include "mirror/var_handle.h"
+#include "optimizing/data_type.h"
 #include "scoped_thread_state_change-inl.h"
 #include "thread-current-inl.h"
 #include "utils/arm64/assembler_arm64.h"
@@ -706,7 +707,6 @@ static bool ReadBarrierNeedsTemp(bool is_volatile, HInvoke* invoke) {
       invoke->InputAt(2)->AsLongConstant()->GetValue() >= kReferenceLoadMinFarOffset;
 }
 
-
 static void GenUnsafeGet(HInvoke* invoke,
                          DataType::Type type,
                          bool is_volatile,
@@ -769,6 +769,26 @@ static void GenUnsafeGet(HInvoke* invoke,
   }
 }
 
+static void GenUnsafeGetAbsolute(HInvoke* invoke,
+                                 DataType::Type type,
+                                 bool is_volatile,
+                                 CodeGeneratorARM64* codegen) {
+  LocationSummary* locations = invoke->GetLocations();
+  DCHECK((type == DataType::Type::kInt8) ||
+         (type == DataType::Type::kInt32) ||
+         (type == DataType::Type::kInt64));
+  Location address_loc = locations->InAt(1);
+  MemOperand mem_op = MemOperand(XRegisterFrom(address_loc));
+  Location trg_loc = locations->Out();
+  Register trg = RegisterFrom(trg_loc, type);
+
+  if (is_volatile) {
+    codegen->LoadAcquire(invoke, type, trg, mem_op, /* needs_null_check= */ true);
+  } else {
+    codegen->Load(type, trg, mem_op);
+  }
+}
+
 static void CreateUnsafeGetLocations(ArenaAllocator* allocator,
                                      HInvoke* invoke,
                                      CodeGeneratorARM64* codegen,
@@ -795,8 +815,20 @@ static void CreateUnsafeGetLocations(ArenaAllocator* allocator,
                     (can_call ? Location::kOutputOverlap : Location::kNoOutputOverlap));
 }
 
+static void CreateUnsafeGetAbsoluteLocations(ArenaAllocator* allocator,
+                                             HInvoke* invoke) {
+  LocationSummary* locations =
+      new (allocator) LocationSummary(invoke, LocationSummary::kNoCall, kIntrinsified);
+  locations->SetInAt(0, Location::NoLocation());        // Unused receiver.
+  locations->SetInAt(1, Location::RequiresRegister());
+  locations->SetOut(Location::RequiresRegister(), Location::kNoOutputOverlap);
+}
+
 void IntrinsicLocationsBuilderARM64::VisitUnsafeGet(HInvoke* invoke) {
   VisitJdkUnsafeGet(invoke);
+}
+void IntrinsicLocationsBuilderARM64::VisitUnsafeGetAbsolute(HInvoke* invoke) {
+  VisitJdkUnsafeGetAbsolute(invoke);
 }
 void IntrinsicLocationsBuilderARM64::VisitUnsafeGetVolatile(HInvoke* invoke) {
   VisitJdkUnsafeGetVolatile(invoke);
@@ -816,9 +848,11 @@ void IntrinsicLocationsBuilderARM64::VisitUnsafeGetObjectVolatile(HInvoke* invok
 void IntrinsicLocationsBuilderARM64::VisitUnsafeGetByte(HInvoke* invoke) {
   VisitJdkUnsafeGetByte(invoke);
 }
-
 void IntrinsicLocationsBuilderARM64::VisitJdkUnsafeGet(HInvoke* invoke) {
   CreateUnsafeGetLocations(allocator_, invoke, codegen_);
+}
+void IntrinsicLocationsBuilderARM64::VisitJdkUnsafeGetAbsolute(HInvoke* invoke) {
+  CreateUnsafeGetAbsoluteLocations(allocator_, invoke);
 }
 void IntrinsicLocationsBuilderARM64::VisitJdkUnsafeGetVolatile(HInvoke* invoke) {
   CreateUnsafeGetLocations(allocator_, invoke, codegen_, /* is_volatile= */ true);
@@ -851,6 +885,9 @@ void IntrinsicLocationsBuilderARM64::VisitJdkUnsafeGetByte(HInvoke* invoke) {
 void IntrinsicCodeGeneratorARM64::VisitUnsafeGet(HInvoke* invoke) {
   VisitJdkUnsafeGet(invoke);
 }
+void IntrinsicCodeGeneratorARM64::VisitUnsafeGetAbsolute(HInvoke* invoke) {
+  VisitJdkUnsafeGetAbsolute(invoke);
+}
 void IntrinsicCodeGeneratorARM64::VisitUnsafeGetVolatile(HInvoke* invoke) {
   VisitJdkUnsafeGetVolatile(invoke);
 }
@@ -872,6 +909,9 @@ void IntrinsicCodeGeneratorARM64::VisitUnsafeGetByte(HInvoke* invoke) {
 
 void IntrinsicCodeGeneratorARM64::VisitJdkUnsafeGet(HInvoke* invoke) {
   GenUnsafeGet(invoke, DataType::Type::kInt32, /*is_volatile=*/ false, codegen_);
+}
+void IntrinsicCodeGeneratorARM64::VisitJdkUnsafeGetAbsolute(HInvoke* invoke) {
+  GenUnsafeGetAbsolute(invoke, DataType::Type::kInt32, /*is_volatile=*/ false, codegen_);
 }
 void IntrinsicCodeGeneratorARM64::VisitJdkUnsafeGetVolatile(HInvoke* invoke) {
   GenUnsafeGet(invoke, DataType::Type::kInt32, /*is_volatile=*/ true, codegen_);
@@ -921,8 +961,28 @@ static void CreateUnsafePutLocations(ArenaAllocator* allocator, HInvoke* invoke)
   }
 }
 
+static void CreateUnsafePutAbsoluteLocations(ArenaAllocator* allocator, HInvoke* invoke) {
+  LocationSummary* locations =
+      new (allocator) LocationSummary(invoke, LocationSummary::kNoCall, kIntrinsified);
+  static constexpr int kAddressIndex = 1;
+  static constexpr int kValueIndex = 2;
+  // Unused receiver.
+  locations->SetInAt(0, Location::NoLocation());
+  // The address.
+  locations->SetInAt(kAddressIndex, Location::RequiresRegister());
+  // The value.
+  if (IsZeroBitPattern(invoke->InputAt(kValueIndex))) {
+    locations->SetInAt(kValueIndex, Location::ConstantLocation(invoke->InputAt(kValueIndex)));
+  } else {
+    locations->SetInAt(kValueIndex, Location::RequiresRegister());
+  }
+}
+
 void IntrinsicLocationsBuilderARM64::VisitUnsafePut(HInvoke* invoke) {
   VisitJdkUnsafePut(invoke);
+}
+void IntrinsicLocationsBuilderARM64::VisitUnsafePutAbsolute(HInvoke* invoke) {
+  VisitJdkUnsafePutAbsolute(invoke);
 }
 void IntrinsicLocationsBuilderARM64::VisitUnsafePutOrdered(HInvoke* invoke) {
   VisitJdkUnsafePutOrdered(invoke);
@@ -954,6 +1014,9 @@ void IntrinsicLocationsBuilderARM64::VisitUnsafePutByte(HInvoke* invoke) {
 
 void IntrinsicLocationsBuilderARM64::VisitJdkUnsafePut(HInvoke* invoke) {
   CreateUnsafePutLocations(allocator_, invoke);
+}
+void IntrinsicLocationsBuilderARM64::VisitJdkUnsafePutAbsolute(HInvoke* invoke) {
+  CreateUnsafePutAbsoluteLocations(allocator_, invoke);
 }
 void IntrinsicLocationsBuilderARM64::VisitJdkUnsafePutOrdered(HInvoke* invoke) {
   CreateUnsafePutLocations(allocator_, invoke);
@@ -1003,7 +1066,7 @@ static void GenUnsafePut(HInvoke* invoke,
   static constexpr int kOffsetIndex = 2;
   static constexpr int kValueIndex = 3;
   Register base = WRegisterFrom(locations->InAt(1));    // Object pointer.
-  Location offset = locations->InAt(kOffsetIndex);       // Long offset.
+  Location offset = locations->InAt(kOffsetIndex);      // Long offset.
   CPURegister value = InputCPURegisterOrZeroRegAt(invoke, kValueIndex);
   CPURegister source = value;
   MemOperand mem_op;
@@ -1041,8 +1104,31 @@ static void GenUnsafePut(HInvoke* invoke,
   }
 }
 
+static void GenUnsafePutAbsolute(HInvoke* invoke,
+                                 DataType::Type type,
+                                 bool is_volatile,
+                                 bool is_ordered,
+                                 CodeGeneratorARM64* codegen) {
+  LocationSummary* locations = invoke->GetLocations();
+
+  static constexpr int kAddressIndex = 1;
+  static constexpr int kValueIndex = 2;
+  Location address_loc = locations->InAt(kAddressIndex);
+  MemOperand mem_op = MemOperand(WRegisterFrom(address_loc).X());
+  CPURegister value = InputCPURegisterOrZeroRegAt(invoke, kValueIndex);
+
+  if (is_volatile || is_ordered) {
+    codegen->StoreRelease(invoke, type, value, mem_op, /* needs_null_check= */ false);
+  } else {
+    codegen->Store(type, value, mem_op);
+  }
+}
+
 void IntrinsicCodeGeneratorARM64::VisitUnsafePut(HInvoke* invoke) {
   VisitJdkUnsafePut(invoke);
+}
+void IntrinsicCodeGeneratorARM64::VisitUnsafePutAbsolute(HInvoke* invoke) {
+  VisitJdkUnsafePutAbsolute(invoke);
 }
 void IntrinsicCodeGeneratorARM64::VisitUnsafePutOrdered(HInvoke* invoke) {
   VisitJdkUnsafePutOrdered(invoke);
@@ -1078,6 +1164,13 @@ void IntrinsicCodeGeneratorARM64::VisitJdkUnsafePut(HInvoke* invoke) {
                /*is_volatile=*/ false,
                /*is_ordered=*/ false,
                codegen_);
+}
+void IntrinsicCodeGeneratorARM64::VisitJdkUnsafePutAbsolute(HInvoke* invoke) {
+  GenUnsafePutAbsolute(invoke,
+                       DataType::Type::kInt32,
+                       /*is_volatile=*/ false,
+                       /*is_ordered=*/ false,
+                       codegen_);
 }
 void IntrinsicCodeGeneratorARM64::VisitJdkUnsafePutOrdered(HInvoke* invoke) {
   GenUnsafePut(invoke,
@@ -1762,17 +1855,33 @@ static void CreateUnsafeGetAndUpdateLocations(ArenaAllocator* allocator,
   locations->SetInAt(3, Location::RequiresRegister());
   locations->AddTemp(Location::RequiresRegister());
 
-  locations->SetOut(Location::RequiresRegister(), Location::kOutputOverlap);
+  // Request another temporary register for methods that don't return a value.
+  DataType::Type return_type = invoke->GetType();
+  const bool is_void = return_type == DataType::Type::kVoid;
+  if (is_void) {
+    locations->AddTemp(Location::RequiresRegister());
+  } else {
+    locations->SetOut(Location::RequiresRegister(), Location::kOutputOverlap);
+  }
 }
 
 static void GenUnsafeGetAndUpdate(HInvoke* invoke,
                                   DataType::Type type,
                                   CodeGeneratorARM64* codegen,
                                   GetAndUpdateOp get_and_update_op) {
+  // Currently only used for these GetAndUpdateOp. Might be fine for other ops but double check
+  // before using.
+  DCHECK(get_and_update_op == GetAndUpdateOp::kAdd || get_and_update_op == GetAndUpdateOp::kSet);
+
   MacroAssembler* masm = codegen->GetVIXLAssembler();
   LocationSummary* locations = invoke->GetLocations();
 
-  Register out = RegisterFrom(locations->Out(), type);            // Result.
+  DataType::Type return_type = invoke->GetType();
+  const bool is_void = return_type == DataType::Type::kVoid;
+  // We use a temporary for void methods, as we don't return the value.
+  Location out_or_temp_loc =
+      is_void ? locations->GetTemp(locations->GetTempCount() - 1u) : locations->Out();
+  Register out_or_temp = RegisterFrom(out_or_temp_loc, type);     // Result.
   Register base = WRegisterFrom(locations->InAt(1));              // Object pointer.
   Register offset = XRegisterFrom(locations->InAt(2));            // Long offset.
   Register arg = RegisterFrom(locations->InAt(3), type);          // New value or addend.
@@ -1793,20 +1902,19 @@ static void GenUnsafeGetAndUpdate(HInvoke* invoke,
                        std::memory_order_seq_cst,
                        tmp_ptr,
                        arg,
-                       /*old_value=*/ out);
+                       /*old_value=*/ out_or_temp);
 
-  if (type == DataType::Type::kReference && codegen->EmitReadBarrier()) {
+  if (!is_void && type == DataType::Type::kReference && codegen->EmitReadBarrier()) {
     DCHECK(get_and_update_op == GetAndUpdateOp::kSet);
     if (kUseBakerReadBarrier) {
-      codegen->GenerateIntrinsicMoveWithBakerReadBarrier(out.W(), out.W());
+      codegen->GenerateIntrinsicMoveWithBakerReadBarrier(out_or_temp.W(), out_or_temp.W());
     } else {
-      codegen->GenerateReadBarrierSlow(
-          invoke,
-          Location::RegisterLocation(out.GetCode()),
-          Location::RegisterLocation(out.GetCode()),
-          Location::RegisterLocation(base.GetCode()),
-          /*offset=*/ 0u,
-          /*index=*/ Location::RegisterLocation(offset.GetCode()));
+      codegen->GenerateReadBarrierSlow(invoke,
+                                       Location::RegisterLocation(out_or_temp.GetCode()),
+                                       Location::RegisterLocation(out_or_temp.GetCode()),
+                                       Location::RegisterLocation(base.GetCode()),
+                                       /*offset=*/ 0u,
+                                       /*index=*/ Location::RegisterLocation(offset.GetCode()));
     }
   }
 }
@@ -5420,7 +5528,10 @@ static void CreateVarHandleGetAndUpdateLocations(HInvoke* invoke,
     return;
   }
 
-  if (invoke->GetType() == DataType::Type::kReference && codegen->EmitNonBakerReadBarrier()) {
+  // Get the type from the shorty as the invokes may not return a value.
+  uint32_t arg_index = invoke->GetNumberOfArguments() - 1;
+  DataType::Type value_type = GetDataTypeFromShorty(invoke, arg_index);
+  if (value_type == DataType::Type::kReference && codegen->EmitNonBakerReadBarrier()) {
     // Unsupported for non-Baker read barrier because the artReadBarrierSlow() ignores
     // the passed reference and reloads it from the field, thus seeing the new value
     // that we have just stored. (And it also gets the memory visibility wrong.) b/173104084
@@ -5428,10 +5539,10 @@ static void CreateVarHandleGetAndUpdateLocations(HInvoke* invoke,
   }
 
   LocationSummary* locations = CreateVarHandleCommonLocations(invoke, codegen);
-
   size_t old_temp_count = locations->GetTempCount();
+
   DCHECK_EQ(old_temp_count, (GetExpectedVarHandleCoordinatesCount(invoke) == 0) ? 2u : 1u);
-  if (DataType::IsFloatingPointType(invoke->GetType())) {
+  if (DataType::IsFloatingPointType(value_type)) {
     if (get_and_update_op == GetAndUpdateOp::kAdd) {
       // For ADD, do not use ZR for zero bit pattern (+0.0f or +0.0).
       locations->SetInAt(invoke->GetNumberOfArguments() - 1u, Location::RequiresFpuRegister());
@@ -5451,9 +5562,20 @@ static void CreateVarHandleGetAndUpdateLocations(HInvoke* invoke,
       (get_and_update_op != GetAndUpdateOp::kSet && get_and_update_op != GetAndUpdateOp::kAdd) &&
       GetExpectedVarHandleCoordinatesCount(invoke) == 2u &&
       !IsZeroBitPattern(invoke->InputAt(invoke->GetNumberOfArguments() - 1u))) {
-    DataType::Type value_type =
-        GetVarHandleExpectedValueType(invoke, /*expected_coordinates_count=*/ 2u);
     if (value_type != DataType::Type::kReference && DataType::Size(value_type) != 1u) {
+      locations->AddTemp(Location::RequiresRegister());
+    }
+  }
+
+  // Request another temporary register for methods that don't return a value.
+  // For the non-void case, we already set `out` in `CreateVarHandleCommonLocations`.
+  DataType::Type return_type = invoke->GetType();
+  const bool is_void = return_type == DataType::Type::kVoid;
+  DCHECK_IMPLIES(!is_void, return_type == value_type);
+  if (is_void) {
+    if (DataType::IsFloatingPointType(value_type)) {
+      locations->AddTemp(Location::RequiresFpuRegister());
+    } else {
       locations->AddTemp(Location::RequiresRegister());
     }
   }
@@ -5464,6 +5586,7 @@ static void GenerateVarHandleGetAndUpdate(HInvoke* invoke,
                                           GetAndUpdateOp get_and_update_op,
                                           std::memory_order order,
                                           bool byte_swap = false) {
+  // Get the type from the shorty as the invokes may not return a value.
   uint32_t arg_index = invoke->GetNumberOfArguments() - 1;
   DataType::Type value_type = GetDataTypeFromShorty(invoke, arg_index);
   bool is_fp = DataType::IsFloatingPointType(value_type);
@@ -5473,7 +5596,13 @@ static void GenerateVarHandleGetAndUpdate(HInvoke* invoke,
   CPURegister arg = (is_fp && get_and_update_op == GetAndUpdateOp::kAdd)
       ? InputCPURegisterAt(invoke, arg_index)
       : InputCPURegisterOrZeroRegAt(invoke, arg_index);
-  CPURegister out = helpers::OutputCPURegister(invoke);
+  DataType::Type return_type = invoke->GetType();
+  const bool is_void = return_type == DataType::Type::kVoid;
+  DCHECK_IMPLIES(!is_void, return_type == value_type);
+  // We use a temporary for void methods, as we don't return the value.
+  CPURegister out_or_temp =
+      is_void ? CPURegisterFrom(locations->GetTemp(locations->GetTempCount() - 1u), value_type) :
+                helpers::OutputCPURegister(invoke);
 
   VarHandleTarget target = GetVarHandleTarget(invoke);
   VarHandleSlowPathARM64* slow_path = nullptr;
@@ -5516,7 +5645,7 @@ static void GenerateVarHandleGetAndUpdate(HInvoke* invoke,
   }
 
   // Prepare register for old value.
-  CPURegister old_value = out;
+  CPURegister old_value = out_or_temp;
   if (get_and_update_op == GetAndUpdateOp::kSet) {
     // For floating point GetAndSet, do the GenerateGetAndUpdate() with core registers,
     // rather than moving between core and FP registers in the loop.
@@ -5554,36 +5683,40 @@ static void GenerateVarHandleGetAndUpdate(HInvoke* invoke,
 
   GenerateGetAndUpdate(codegen, get_and_update_op, load_store_type, order, tmp_ptr, arg, old_value);
 
-  if (get_and_update_op == GetAndUpdateOp::kAddWithByteSwap) {
-    // The only adjustment needed is sign-extension for `kInt16`.
-    // Everything else has been done by the `GenerateGetAndUpdate()`.
-    DCHECK(byte_swap);
-    if (value_type == DataType::Type::kInt16) {
-      DCHECK_EQ(load_store_type, DataType::Type::kUint16);
-      __ Sxth(out.W(), old_value.W());
-    }
-  } else if (byte_swap) {
-    // Also handles moving to FP registers.
-    GenerateReverseBytes(masm, value_type, old_value, out);
-  } else if (get_and_update_op == GetAndUpdateOp::kSet && value_type == DataType::Type::kFloat64) {
-    __ Fmov(out.D(), old_value.X());
-  } else if (get_and_update_op == GetAndUpdateOp::kSet && value_type == DataType::Type::kFloat32) {
-    __ Fmov(out.S(), old_value.W());
-  } else if (value_type == DataType::Type::kInt8) {
-    __ Sxtb(out.W(), old_value.W());
-  } else if (value_type == DataType::Type::kInt16) {
-    __ Sxth(out.W(), old_value.W());
-  } else if (value_type == DataType::Type::kReference && codegen->EmitReadBarrier()) {
-    if (kUseBakerReadBarrier) {
-      codegen->GenerateIntrinsicMoveWithBakerReadBarrier(out.W(), old_value.W());
-    } else {
-      codegen->GenerateReadBarrierSlow(
-          invoke,
-          Location::RegisterLocation(out.GetCode()),
-          Location::RegisterLocation(old_value.GetCode()),
-          Location::RegisterLocation(target.object.GetCode()),
-          /*offset=*/ 0u,
-          /*index=*/ Location::RegisterLocation(target.offset.GetCode()));
+  if (!is_void) {
+    if (get_and_update_op == GetAndUpdateOp::kAddWithByteSwap) {
+      // The only adjustment needed is sign-extension for `kInt16`.
+      // Everything else has been done by the `GenerateGetAndUpdate()`.
+      DCHECK(byte_swap);
+      if (value_type == DataType::Type::kInt16) {
+        DCHECK_EQ(load_store_type, DataType::Type::kUint16);
+        __ Sxth(out_or_temp.W(), old_value.W());
+      }
+    } else if (byte_swap) {
+      // Also handles moving to FP registers.
+      GenerateReverseBytes(masm, value_type, old_value, out_or_temp);
+    } else if (get_and_update_op == GetAndUpdateOp::kSet &&
+               value_type == DataType::Type::kFloat64) {
+      __ Fmov(out_or_temp.D(), old_value.X());
+    } else if (get_and_update_op == GetAndUpdateOp::kSet &&
+               value_type == DataType::Type::kFloat32) {
+      __ Fmov(out_or_temp.S(), old_value.W());
+    } else if (value_type == DataType::Type::kInt8) {
+      __ Sxtb(out_or_temp.W(), old_value.W());
+    } else if (value_type == DataType::Type::kInt16) {
+      __ Sxth(out_or_temp.W(), old_value.W());
+    } else if (value_type == DataType::Type::kReference && codegen->EmitReadBarrier()) {
+      if (kUseBakerReadBarrier) {
+        codegen->GenerateIntrinsicMoveWithBakerReadBarrier(out_or_temp.W(), old_value.W());
+      } else {
+        codegen->GenerateReadBarrierSlow(
+            invoke,
+            Location::RegisterLocation(out_or_temp.GetCode()),
+            Location::RegisterLocation(old_value.GetCode()),
+            Location::RegisterLocation(target.object.GetCode()),
+            /*offset=*/0u,
+            /*index=*/Location::RegisterLocation(target.offset.GetCode()));
+      }
     }
   }
 

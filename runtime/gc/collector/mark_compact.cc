@@ -67,9 +67,6 @@
 #ifndef MREMAP_DONTUNMAP
 #define MREMAP_DONTUNMAP 4
 #endif
-#ifndef MAP_FIXED_NOREPLACE
-#define MAP_FIXED_NOREPLACE 0x100000
-#endif
 #endif  // __BIONIC__
 
 // See aosp/2996596 for where these values came from.
@@ -1000,7 +997,7 @@ bool MarkCompact::PrepareForCompaction() {
       auto iter = std::find_if(
           pages_live_bytes.rbegin() + (num_pages - threshold_passing_marker),
           pages_live_bytes.rend(),
-          [](uint32_t bytes) { return bytes * 100U < gPageSize * kBlackDenseRegionThreshold; });
+          [](uint32_t bytes) { return bytes * 100U >= gPageSize * kBlackDenseRegionThreshold; });
       black_dense_idx = (pages_live_bytes.rend() - iter) * chunk_info_per_page;
     }
     black_dense_end_ = moving_space_begin_ + black_dense_idx * kOffsetChunkSize;
@@ -2172,6 +2169,9 @@ void MarkCompact::CompactMovingSpace(uint8_t* page) {
           [&]() REQUIRES_SHARED(Locks::mutator_lock_) {
             UpdateNonMovingPage(
                 first_obj, to_space_end, from_space_slide_diff_, moving_space_bitmap_);
+            if (kMode == kFallbackMode) {
+              memcpy(to_space_end, to_space_end + from_space_slide_diff_, gPageSize);
+            }
           });
     } else {
       // The page has no reachable object on it. Just declare it mapped.
@@ -2773,9 +2773,11 @@ void MarkCompact::CompactionPause() {
   non_moving_space_bitmap_ = non_moving_space_->GetLiveBitmap();
   if (kIsDebugBuild) {
     DCHECK_EQ(thread_running_gc_, Thread::Current());
-    stack_low_addr_ = thread_running_gc_->GetStackEnd();
-    stack_high_addr_ =
-        reinterpret_cast<char*>(stack_low_addr_) + thread_running_gc_->GetStackSize();
+    // TODO(Simulator): Test that this should not operate on the simulated stack when the simulator
+    // supports mark compact.
+    stack_low_addr_ = thread_running_gc_->GetStackEnd<kNativeStackType>();
+    stack_high_addr_ = reinterpret_cast<char*>(stack_low_addr_)
+                       + thread_running_gc_->GetUsableStackSize<kNativeStackType>();
   }
   {
     TimingLogger::ScopedTiming t2("(Paused)UpdateCompactionDataStructures", GetTimings());
@@ -3008,6 +3010,14 @@ void MarkCompact::KernelPreparation() {
       }
       // Register the moving space with userfaultfd.
       RegisterUffd(moving_space_begin, moving_space_register_sz);
+      // madvise ensures that if any page gets mapped (only possible if some
+      // thread is reading the page(s) without trying to make sense as we hold
+      // mutator-lock exclusively) between mremap and uffd-registration, then
+      // it gets zapped so that the map is empty and ready for userfaults. If
+      // we could mremap after uffd-registration (like in case of linear-alloc
+      // space below) then we wouldn't need it. But since we don't register the
+      // entire space, we can't do that.
+      madvise(moving_space_begin, moving_space_register_sz, MADV_DONTNEED);
     }
     // Prepare linear-alloc for concurrent compaction.
     for (auto& data : linear_alloc_spaces_data_) {

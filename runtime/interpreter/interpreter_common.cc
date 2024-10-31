@@ -62,7 +62,7 @@ bool CheckStackOverflow(Thread* self, size_t frame_size)
   bool implicit_check = Runtime::Current()->GetImplicitStackOverflowChecks();
   uint8_t* stack_end = self->GetStackEndForInterpreter(implicit_check);
   if (UNLIKELY(__builtin_frame_address(0) < stack_end + frame_size)) {
-    ThrowStackOverflowError(self);
+    ThrowStackOverflowError<kNativeStackType>(self);
     return false;
   }
   return true;
@@ -439,7 +439,7 @@ static bool DoVarHandleInvokeCommon(Thread* self,
   bool is_var_args = inst->HasVarArgs();
   const uint32_t vRegC = is_var_args ? inst->VRegC_45cc() : inst->VRegC_4rcc();
   const uint16_t vRegH = is_var_args ? inst->VRegH_45cc() : inst->VRegH_4rcc();
-  StackHandleScope<3> hs(self);
+  StackHandleScope<1> hs(self);
   Handle<mirror::VarHandle> var_handle = hs.NewHandle(
       ObjPtr<mirror::VarHandle>::DownCast(shadow_frame.GetVRegReference(vRegC)));
   ArtMethod* method = shadow_frame.GetMethod();
@@ -459,8 +459,8 @@ static bool DoVarHandleInvokeCommon(Thread* self,
 
   return VarHandleInvokeAccessor(self,
                                  shadow_frame,
-                                 method,
                                  var_handle,
+                                 method,
                                  dex::ProtoIndex(vRegH),
                                  access_mode,
                                  &operands,

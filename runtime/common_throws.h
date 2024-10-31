@@ -34,6 +34,7 @@ class ArtMethod;
 class DexFile;
 enum InvokeType : uint32_t;
 class Signature;
+enum class StackType;
 
 // The descriptor of the transaction abort exception.
 constexpr const char kTransactionAbortErrorDescriptor[] = "Ldalvik/system/TransactionAbortError;";
@@ -253,6 +254,7 @@ void ThrowSecurityException(const char* fmt, ...)
 
 // Stack overflow.
 
+template <StackType stack_type>
 void ThrowStackOverflowError(Thread* self) REQUIRES_SHARED(Locks::mutator_lock_) COLD_ATTR;
 
 // StringIndexOutOfBoundsException

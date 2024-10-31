@@ -32,7 +32,6 @@
 #include "base/os.h"
 #include "base/unix_file/fd_file.h"
 #include "dex/art_dex_file_loader.h"
-#include "dex/compact_dex_level.h"
 // TODO: Add inl file and avoid including inl.
 #include "obj_ptr-inl.h"
 #include "runtime_globals.h"
@@ -307,6 +306,11 @@ class CheckJniAbortCatcher {
 #define TEST_DISABLED_FOR_KERNELS_WITH_CACHE_SEGFAULT()                                   \
   if (CacheOperationsMaySegFault()) {                                                     \
     GTEST_SKIP() << "WARNING: TEST DISABLED ON KERNEL THAT SEGFAULT ON CACHE OPERATIONS"; \
+  }
+
+#define TEST_DISABLED_ON_VM() \
+  if (RunningOnVM()) {        \
+    GTEST_SKIP();             \
   }
 
 }  // namespace art
