@@ -103,12 +103,6 @@ uint16_t SYS_CNTVCT_EL0 = SystemRegisterEncoder<1, 3, 14, 0, 2>::value;
 // generates less code/data with a small num_entries.
 static constexpr uint32_t kPackedSwitchCompareJumpThreshold = 7;
 
-// Reference load (except object array loads) is using LDR Wt, [Xn, #offset] which can handle
-// offset < 16KiB. For offsets >= 16KiB, the load shall be emitted as two or more instructions.
-// For the Baker read barrier implementation using link-time generated thunks we need to split
-// the offset explicitly.
-constexpr uint32_t kReferenceLoadMinFarOffset = 16 * KB;
-
 inline Condition ARM64Condition(IfCondition cond) {
   switch (cond) {
     case kCondEQ: return eq;
@@ -140,6 +134,16 @@ inline Condition ARM64FPCondition(IfCondition cond, bool gt_bias) {
     case kCondGE: return gt_bias ? cs /* unordered */ : ge;
     default:
       LOG(FATAL) << "UNREACHABLE";
+      UNREACHABLE();
+  }
+}
+
+Condition ARM64PCondition(HVecPredToBoolean::PCondKind cond) {
+  switch (cond) {
+    case HVecPredToBoolean::PCondKind::kFirst: return mi;
+    case HVecPredToBoolean::PCondKind::kNFirst: return pl;
+    default:
+      LOG(FATAL) << "Unsupported condition type: " << enum_cast<uint32_t>(cond);
       UNREACHABLE();
   }
 }
@@ -560,11 +564,19 @@ void JumpTableARM64::EmitTable(CodeGeneratorARM64* codegen) {
 
   // We are about to use the assembler to place literals directly. Make sure we have enough
   // underlying code buffer and we have generated the jump table with right size.
-  EmissionCheckScope scope(codegen->GetVIXLAssembler(),
+  ExactAssemblyScope scope(codegen->GetVIXLAssembler(),
                            num_entries * sizeof(int32_t),
                            CodeBufferCheckScope::kExactSize);
+  codegen->GetVIXLAssembler()->bind(&table_start_);
+  for (uint32_t i = 0; i < num_entries; i++) {
+    codegen->GetVIXLAssembler()->place(jump_targets_[i].get());
+  }
+}
 
-  __ Bind(&table_start_);
+void JumpTableARM64::FixTable(CodeGeneratorARM64* codegen) {
+  uint32_t num_entries = switch_instr_->GetNumEntries();
+  DCHECK_GE(num_entries, kPackedSwitchCompareJumpThreshold);
+
   const ArenaVector<HBasicBlock*>& successors = switch_instr_->GetBlock()->GetSuccessors();
   for (uint32_t i = 0; i < num_entries; i++) {
     vixl::aarch64::Label* target_label = codegen->GetLabelOf(successors[i]);
@@ -572,8 +584,7 @@ void JumpTableARM64::EmitTable(CodeGeneratorARM64* codegen) {
     ptrdiff_t jump_offset = target_label->GetLocation() - table_start_.GetLocation();
     DCHECK_GT(jump_offset, std::numeric_limits<int32_t>::min());
     DCHECK_LE(jump_offset, std::numeric_limits<int32_t>::max());
-    Literal<int32_t> literal(jump_offset);
-    __ place(&literal);
+    jump_targets_[i].get()->UpdateValue(jump_offset, codegen->GetVIXLAssembler());
   }
 }
 
@@ -1078,14 +1089,14 @@ size_t CodeGeneratorARM64::GetSIMDRegisterWidth() const {
 
 #define __ GetVIXLAssembler()->
 
-void CodeGeneratorARM64::EmitJumpTables() {
+void CodeGeneratorARM64::FixJumpTables() {
   for (auto&& jump_table : jump_tables_) {
-    jump_table->EmitTable(this);
+    jump_table->FixTable(this);
   }
 }
 
 void CodeGeneratorARM64::Finalize() {
-  EmitJumpTables();
+  FixJumpTables();
 
   // Emit JIT baker read barrier slow paths.
   DCHECK(GetCompilerOptions().IsJitCompiler() || jit_baker_read_barrier_slow_paths_.empty());
@@ -2436,6 +2447,22 @@ void InstructionCodeGeneratorARM64::HandleBinaryOp(HBinaryOperation* instr) {
         __ Orr(dst, lhs, rhs);
       } else if (instr->IsSub()) {
         __ Sub(dst, lhs, rhs);
+      } else if (instr->IsRol()) {
+        if (rhs.IsImmediate()) {
+          uint32_t shift = (-rhs.GetImmediate()) & (lhs.GetSizeInBits() - 1);
+          __ Ror(dst, lhs, shift);
+        } else {
+          UseScratchRegisterScope temps(GetVIXLAssembler());
+
+          // Ensure shift distance is in the same size register as the result. If
+          // we are rotating a long and the shift comes in a w register originally,
+          // we don't need to sxtw for use as an x since the shift distances are
+          // all & reg_bits - 1.
+          Register right = RegisterFrom(instr->GetLocations()->InAt(1), type);
+          Register negated = (type == DataType::Type::kInt32) ? temps.AcquireW() : temps.AcquireX();
+          __ Neg(negated, right);
+          __ Ror(dst, lhs, negated);
+        }
       } else if (instr->IsRor()) {
         if (rhs.IsImmediate()) {
           uint32_t shift = rhs.GetImmediate() & (lhs.GetSizeInBits() - 1);
@@ -6417,6 +6444,14 @@ void InstructionCodeGeneratorARM64::VisitReturnVoid([[maybe_unused]] HReturnVoid
   codegen_->GenerateFrameExit();
 }
 
+void LocationsBuilderARM64::VisitRol(HRol* rol) {
+  HandleBinaryOp(rol);
+}
+
+void InstructionCodeGeneratorARM64::VisitRol(HRol* rol) {
+  HandleBinaryOp(rol);
+}
+
 void LocationsBuilderARM64::VisitRor(HRor* ror) {
   HandleBinaryOp(ror);
 }
@@ -6691,17 +6726,7 @@ void InstructionCodeGeneratorARM64::VisitPackedSwitch(HPackedSwitch* switch_inst
   Register value_reg = InputRegisterAt(switch_instr, 0);
   HBasicBlock* default_block = switch_instr->GetDefaultBlock();
 
-  // Roughly set 16 as max average assemblies generated per HIR in a graph.
-  static constexpr int32_t kMaxExpectedSizePerHInstruction = 16 * kInstructionSize;
-  // ADR has a limited range(+/-1MB), so we set a threshold for the number of HIRs in the graph to
-  // make sure we don't emit it if the target may run out of range.
-  // TODO: Instead of emitting all jump tables at the end of the code, we could keep track of ADR
-  // ranges and emit the tables only as required.
-  static constexpr int32_t kJumpTableInstructionThreshold = 1* MB / kMaxExpectedSizePerHInstruction;
-
-  if (num_entries <= kPackedSwitchCompareJumpThreshold ||
-      // Current instruction id is an upper bound of the number of HIRs in the graph.
-      GetGraph()->GetCurrentInstructionId() > kJumpTableInstructionThreshold) {
+  if (num_entries <= kPackedSwitchCompareJumpThreshold) {
     // Create a series of compare/jumps.
     UseScratchRegisterScope temps(codegen_->GetVIXLAssembler());
     Register temp = temps.AcquireW();
@@ -6753,15 +6778,25 @@ void InstructionCodeGeneratorARM64::VisitPackedSwitch(HPackedSwitch* switch_inst
     // immediate value for Adr. So we are free to use both VIXL blocked registers to reduce the
     // register pressure.
     Register table_base = temps.AcquireX();
+
+    const size_t jump_size = switch_instr->GetNumEntries() * sizeof(int32_t);
+    ExactAssemblyScope scope(codegen_->GetVIXLAssembler(),
+                             kInstructionSize * 4 + jump_size,
+                             CodeBufferCheckScope::kExactSize);
+
     // Load jump offset from the table.
-    __ Adr(table_base, jump_table->GetTableStartLabel());
+    // Note: the table start address is always in range as the table is emitted immediately
+    // after these 4 instructions.
+    __ adr(table_base, jump_table->GetTableStartLabel());
     Register jump_offset = temp_w;
-    __ Ldr(jump_offset, MemOperand(table_base, index, UXTW, 2));
+    __ ldr(jump_offset, MemOperand(table_base, index, UXTW, 2));
 
     // Jump to target block by branching to table_base(pc related) + offset.
     Register target_address = table_base;
-    __ Add(target_address, table_base, Operand(jump_offset, SXTW));
-    __ Br(target_address);
+    __ add(target_address, table_base, Operand(jump_offset, SXTW));
+    __ br(target_address);
+
+    jump_table->EmitTable(codegen_);
   }
 }
 
