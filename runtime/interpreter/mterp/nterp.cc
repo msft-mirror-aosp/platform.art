@@ -35,7 +35,7 @@ namespace art HIDDEN {
 namespace interpreter {
 
 bool IsNterpSupported() {
-  switch (kRuntimeISA) {
+  switch (kRuntimeQuickCodeISA) {
     case InstructionSet::kArm:
     case InstructionSet::kThumb2:
     case InstructionSet::kArm64:
@@ -106,10 +106,11 @@ void CheckNterpAsmConstants() {
    * which one did, but if any one is too big the total size will
    * overflow.
    */
-  const int width = kNterpHandlerSize;
+  constexpr size_t width = kNterpHandlerSize;
   ptrdiff_t interp_size = reinterpret_cast<uintptr_t>(artNterpAsmInstructionEnd) -
                           reinterpret_cast<uintptr_t>(artNterpAsmInstructionStart);
-  if ((interp_size == 0) || (interp_size != (art::kNumPackedOpcodes * width))) {
+  static_assert(kNumPackedOpcodes * width != 0);
+  if (interp_size != kNumPackedOpcodes * width) {
     LOG(FATAL) << "ERROR: unexpected asm interp size " << interp_size
                << "(did an instruction handler exceed " << width << " bytes?)";
   }

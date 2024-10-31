@@ -380,6 +380,7 @@ art_cc_binary {
         "libcrypto_for_art",
         "libdex2oat_static",
     ],
+    visibility: ["//tools/vendor/google_prebuilts/arc"],
 }
 
 art_cc_binary {
@@ -482,7 +483,10 @@ art_cc_defaults {
     ],
     target: {
         host: {
-            required: ["dex2oatd"],
+            required: [
+                "dex2oatd",
+                "art_boot_images",
+            ],
         },
     },
 
