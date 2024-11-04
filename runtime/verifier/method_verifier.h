@@ -32,7 +32,6 @@
 #include "dex/method_reference.h"
 #include "handle.h"
 #include "instruction_flags.h"
-#include "reg_type_cache.h"
 #include "register_line.h"
 #include "verifier_enums.h"
 
@@ -51,15 +50,15 @@ struct CodeItem;
 }  // namespace dex
 
 namespace mirror {
+class ClassLoader;
 class DexCache;
 }  // namespace mirror
 
 namespace verifier {
 
 class MethodVerifier;
-class RegisterLine;
-using RegisterLineArenaUniquePtr = std::unique_ptr<RegisterLine, RegisterLineArenaDelete>;
 class RegType;
+class RegTypeCache;
 struct ScopedNewLine;
 class VerifierDeps;
 
@@ -97,24 +96,24 @@ class PcToRegisterLineTable {
 // The verifier
 class MethodVerifier {
  public:
-  EXPORT static MethodVerifier* VerifyMethodAndDump(Thread* self,
-                                                    VariableIndentationOutputStream* vios,
-                                                    uint32_t method_idx,
-                                                    const DexFile* dex_file,
-                                                    Handle<mirror::DexCache> dex_cache,
-                                                    Handle<mirror::ClassLoader> class_loader,
-                                                    const dex::ClassDef& class_def,
-                                                    const dex::CodeItem* code_item,
-                                                    uint32_t method_access_flags,
-                                                    uint32_t api_level)
+  EXPORT static void VerifyMethodAndDump(Thread* self,
+                                         VariableIndentationOutputStream* vios,
+                                         uint32_t method_idx,
+                                         const DexFile* dex_file,
+                                         Handle<mirror::DexCache> dex_cache,
+                                         Handle<mirror::ClassLoader> class_loader,
+                                         const dex::ClassDef& class_def,
+                                         const dex::CodeItem* code_item,
+                                         uint32_t method_access_flags,
+                                         uint32_t api_level)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   // Calculates the type information at the given `dex_pc`.
   // No classes will be loaded.
   EXPORT static MethodVerifier* CalculateVerificationInfo(Thread* self,
+                                                          RegTypeCache* reg_types,
                                                           ArtMethod* method,
                                                           Handle<mirror::DexCache> dex_cache,
-                                                          Handle<mirror::ClassLoader> class_loader,
                                                           uint32_t dex_pc)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -171,16 +170,11 @@ class MethodVerifier {
     return (encountered_failure_types_ & VERIFY_ERROR_RUNTIME_THROW) != 0;
   }
 
-  virtual const RegType& ResolveCheckedClass(dex::TypeIndex class_idx)
-      REQUIRES_SHARED(Locks::mutator_lock_) = 0;
-
   uint32_t GetEncounteredFailureTypes() const {
     return encountered_failure_types_;
   }
 
-  ClassLinker* GetClassLinker() const {
-    return reg_types_.GetClassLinker();
-  }
+  ClassLinker* GetClassLinker() const;
 
   bool IsAotMode() const {
     return const_flags_.aot_mode_;
@@ -196,15 +190,12 @@ class MethodVerifier {
 
  protected:
   MethodVerifier(Thread* self,
-                 ClassLinker* class_linker,
                  ArenaPool* arena_pool,
+                 RegTypeCache* reg_types,
                  VerifierDeps* verifier_deps,
-                 const DexFile* dex_file,
                  const dex::ClassDef& class_def,
                  const dex::CodeItem* code_item,
                  uint32_t dex_method_idx,
-                 bool can_load_classes,
-                 bool allow_thread_suspension,
                  bool aot_mode)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -230,13 +221,11 @@ class MethodVerifier {
    *      for code flow problems.
    */
   static FailureData VerifyMethod(Thread* self,
-                                  ClassLinker* class_linker,
                                   ArenaPool* arena_pool,
+                                  RegTypeCache* reg_types,
                                   VerifierDeps* verifier_deps,
                                   uint32_t method_idx,
-                                  const DexFile* dex_file,
                                   Handle<mirror::DexCache> dex_cache,
-                                  Handle<mirror::ClassLoader> class_loader,
                                   const dex::ClassDef& class_def_idx,
                                   const dex::CodeItem* code_item,
                                   uint32_t method_access_flags,
@@ -248,13 +237,11 @@ class MethodVerifier {
 
   template <bool kVerifierDebug>
   static FailureData VerifyMethod(Thread* self,
-                                  ClassLinker* class_linker,
                                   ArenaPool* arena_pool,
+                                  RegTypeCache* reg_types,
                                   VerifierDeps* verifier_deps,
                                   uint32_t method_idx,
-                                  const DexFile* dex_file,
                                   Handle<mirror::DexCache> dex_cache,
-                                  Handle<mirror::ClassLoader> class_loader,
                                   const dex::ClassDef& class_def_idx,
                                   const dex::CodeItem* code_item,
                                   uint32_t method_access_flags,
@@ -264,23 +251,30 @@ class MethodVerifier {
                                   std::string* hard_failure_msg)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
+  /*
+   * Get the "this" pointer from a non-static method invocation. This returns the RegType so the
+   * caller can decide whether it needs the reference to be initialized or not.
+   *
+   * The argument count is in vA, and the first argument is in vC, for both "simple" and "range"
+   * versions. We just need to make sure vA is >= 1 and then return vC.
+   */
+  const RegType& GetInvocationThis(const Instruction* inst)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
   // For VerifierDepsTest. TODO: Refactor.
 
   // Run verification on the method. Returns true if verification completes and false if the input
   // has an irrecoverable corruption.
   virtual bool Verify() REQUIRES_SHARED(Locks::mutator_lock_) = 0;
   static MethodVerifier* CreateVerifier(Thread* self,
+                                        RegTypeCache* reg_types,
                                         VerifierDeps* verifier_deps,
-                                        const DexFile* dex_file,
                                         Handle<mirror::DexCache> dex_cache,
-                                        Handle<mirror::ClassLoader> class_loader,
                                         const dex::ClassDef& class_def,
                                         const dex::CodeItem* code_item,
                                         uint32_t method_idx,
                                         uint32_t access_flags,
-                                        bool can_load_classes,
                                         bool verify_to_dump,
-                                        bool allow_thread_suspension,
                                         uint32_t api_level)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -293,7 +287,7 @@ class MethodVerifier {
   ArenaStack arena_stack_;
   ScopedArenaAllocator allocator_;
 
-  RegTypeCache reg_types_;
+  RegTypeCache& reg_types_;  // TODO: Change to a pointer in a separate CL.
 
   PcToRegisterLineTable reg_table_;
 
@@ -356,6 +350,7 @@ class MethodVerifier {
 
   friend class art::Thread;
   friend class ClassVerifier;
+  friend class RegisterLineTest;
   friend class VerifierDepsTest;
 
   DISALLOW_COPY_AND_ASSIGN(MethodVerifier);

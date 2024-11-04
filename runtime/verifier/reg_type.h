@@ -39,8 +39,8 @@ class Class;
 class ClassLoader;
 }  // namespace mirror
 
+class ArenaAllocator;
 class ArenaBitVector;
-class ScopedArenaAllocator;
 
 namespace verifier {
 
@@ -75,7 +75,6 @@ class RegType {
   virtual bool IsUnresolvedMergedReference() const { return false; }
   virtual bool IsUnresolvedSuperClass() const { return false; }
   virtual bool IsReference() const { return false; }
-  virtual bool IsPreciseReference() const { return false; }
   virtual bool IsPreciseConstant() const { return false; }
   virtual bool IsPreciseConstantLo() const { return false; }
   virtual bool IsPreciseConstantHi() const { return false; }
@@ -258,8 +257,8 @@ class RegType {
     return ::operator new(size);
   }
 
-  static void* operator new(size_t size, ArenaAllocator* allocator) = delete;
-  static void* operator new(size_t size, ScopedArenaAllocator* allocator);
+  static void* operator new(size_t size, ArenaAllocator* allocator);
+  static void* operator new(size_t size, ScopedArenaAllocator* allocator) = delete;
 
   enum class AssignmentType {
     kBoolean,
@@ -768,24 +767,15 @@ class UninitializedType : public RegType {
  public:
   UninitializedType(Handle<mirror::Class> klass,
                     const std::string_view& descriptor,
-                    uint32_t allocation_pc,
                     uint16_t cache_id)
-      : RegType(klass, descriptor, cache_id), allocation_pc_(allocation_pc) {}
+      : RegType(klass, descriptor, cache_id) {}
 
   bool IsUninitializedTypes() const override;
   bool IsNonZeroReferenceTypes() const override;
 
-  uint32_t GetAllocationPc() const {
-    DCHECK(IsUninitializedTypes());
-    return allocation_pc_;
-  }
-
   AssignmentType GetAssignmentTypeImpl() const override {
     return AssignmentType::kReference;
   }
-
- private:
-  const uint32_t allocation_pc_;
 };
 
 // Similar to ReferenceType but not yet having been passed to a constructor.
@@ -793,10 +783,9 @@ class UninitializedReferenceType final : public UninitializedType {
  public:
   UninitializedReferenceType(Handle<mirror::Class> klass,
                              const std::string_view& descriptor,
-                             uint32_t allocation_pc,
                              uint16_t cache_id)
       REQUIRES_SHARED(Locks::mutator_lock_)
-      : UninitializedType(klass, descriptor, allocation_pc, cache_id) {
+      : UninitializedType(klass, descriptor, cache_id) {
     CheckConstructorInvariants(this);
   }
 
@@ -813,10 +802,9 @@ class UnresolvedUninitializedRefType final : public UninitializedType {
  public:
   UnresolvedUninitializedRefType(Handle<mirror::Class> klass,
                                  const std::string_view& descriptor,
-                                 uint32_t allocation_pc,
                                  uint16_t cache_id)
       REQUIRES_SHARED(Locks::mutator_lock_)
-      : UninitializedType(klass, descriptor, allocation_pc, cache_id) {
+      : UninitializedType(klass, descriptor, cache_id) {
     CheckConstructorInvariants(this);
   }
 
@@ -838,7 +826,7 @@ class UninitializedThisReferenceType final : public UninitializedType {
                                  const std::string_view& descriptor,
                                  uint16_t cache_id)
       REQUIRES_SHARED(Locks::mutator_lock_)
-      : UninitializedType(klass, descriptor, 0, cache_id) {
+      : UninitializedType(klass, descriptor, cache_id) {
     CheckConstructorInvariants(this);
   }
 
@@ -858,7 +846,7 @@ class UnresolvedUninitializedThisRefType final : public UninitializedType {
                                      const std::string_view& descriptor,
                                      uint16_t cache_id)
       REQUIRES_SHARED(Locks::mutator_lock_)
-      : UninitializedType(klass, descriptor, 0, cache_id) {
+      : UninitializedType(klass, descriptor, cache_id) {
     CheckConstructorInvariants(this);
   }
 
@@ -884,29 +872,6 @@ class ReferenceType final : public RegType {
   }
 
   bool IsReference() const override { return true; }
-
-  bool IsNonZeroReferenceTypes() const override { return true; }
-
-  bool HasClassVirtual() const override { return true; }
-
-  std::string Dump() const override REQUIRES_SHARED(Locks::mutator_lock_);
-
-  AssignmentType GetAssignmentTypeImpl() const override {
-    return AssignmentType::kReference;
-  }
-};
-
-// A type of register holding a reference to an Object of type GetClass and only
-// an object of that
-// type.
-class PreciseReferenceType final : public RegType {
- public:
-  PreciseReferenceType(Handle<mirror::Class> klass,
-                       const std::string_view& descriptor,
-                       uint16_t cache_id)
-      REQUIRES_SHARED(Locks::mutator_lock_);
-
-  bool IsPreciseReference() const override { return true; }
 
   bool IsNonZeroReferenceTypes() const override { return true; }
 

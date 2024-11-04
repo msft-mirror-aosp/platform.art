@@ -92,7 +92,7 @@ public class TestRotate {
   /// CHECK:                           ror {{w\d+}}, {{w\d+}}, {{w\d+}}
 
   /// CHECK-START-RISCV64: int TestRotate.$noinline$rotateLeftInt(int, int) disassembly (after)
-  /// CHECK:                           rol {{a\d+}}, {{a\d+}}, {{a\d+}}
+  /// CHECK:                           rolw {{a\d+}}, {{a\d+}}, {{a\d+}}
 
   private static int $noinline$rotateLeftInt(int value, int distance) {
     return Integer.rotateLeft(value, distance);
