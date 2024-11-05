@@ -997,7 +997,7 @@ bool MarkCompact::PrepareForCompaction() {
       auto iter = std::find_if(
           pages_live_bytes.rbegin() + (num_pages - threshold_passing_marker),
           pages_live_bytes.rend(),
-          [](uint32_t bytes) { return bytes * 100U < gPageSize * kBlackDenseRegionThreshold; });
+          [](uint32_t bytes) { return bytes * 100U >= gPageSize * kBlackDenseRegionThreshold; });
       black_dense_idx = (pages_live_bytes.rend() - iter) * chunk_info_per_page;
     }
     black_dense_end_ = moving_space_begin_ + black_dense_idx * kOffsetChunkSize;
@@ -2169,6 +2169,9 @@ void MarkCompact::CompactMovingSpace(uint8_t* page) {
           [&]() REQUIRES_SHARED(Locks::mutator_lock_) {
             UpdateNonMovingPage(
                 first_obj, to_space_end, from_space_slide_diff_, moving_space_bitmap_);
+            if (kMode == kFallbackMode) {
+              memcpy(to_space_end, to_space_end + from_space_slide_diff_, gPageSize);
+            }
           });
     } else {
       // The page has no reachable object on it. Just declare it mapped.
@@ -4010,6 +4013,33 @@ void MarkCompact::UpdateLivenessInfo(mirror::Object* obj, size_t obj_size) {
 
 template <bool kUpdateLiveWords>
 void MarkCompact::ScanObject(mirror::Object* obj) {
+  mirror::Class* klass = obj->GetClass<kVerifyNone, kWithoutReadBarrier>();
+  // TODO(lokeshgidra): Remove the following condition once b/373609505 is fixed.
+  if (UNLIKELY(klass == nullptr)) {
+    // It was seen in ConcurrentCopying GC that after a small wait when we reload
+    // the class pointer, it turns out to be a valid class object. So as a workaround,
+    // we can continue execution and log an error that this happened.
+    for (size_t i = 0; i < 1000; i++) {
+      // Wait for 1ms at a time. Don't wait for more than 1 second in total.
+      usleep(1000);
+      klass = obj->GetClass<kVerifyNone, kWithoutReadBarrier>();
+      if (klass != nullptr) {
+        std::ostringstream oss;
+        klass->DumpClass(oss, mirror::Class::kDumpClassFullDetail);
+        LOG(FATAL_WITHOUT_ABORT) << "klass pointer for obj: " << obj
+                                 << " found to be null first. Reloading after " << i
+                                 << " iterations of 1ms sleep fetched klass: " << oss.str();
+        break;
+      }
+    }
+
+    if (UNLIKELY(klass == nullptr)) {
+      // It must be heap corruption.
+      LOG(FATAL_WITHOUT_ABORT) << "klass pointer for obj: " << obj << " found to be null.";
+    }
+    heap_->GetVerification()->LogHeapCorruption(
+        obj, mirror::Object::ClassOffset(), klass, /*fatal=*/true);
+  }
   // The size of `obj` is used both here (to update `bytes_scanned_`) and in
   // `UpdateLivenessInfo`. As fetching this value can be expensive, do it once
   // here and pass that information to `UpdateLivenessInfo`.

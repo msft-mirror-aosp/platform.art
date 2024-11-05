@@ -67,8 +67,8 @@
 namespace art HIDDEN {
 
 // Visits the arguments as saved to the stack by a CalleeSaveType::kRefAndArgs callee save frame.
-template <typename Derived>
-class QuickArgumentVisitorBase {
+template <typename FrameInfo>
+class QuickArgumentVisitorImpl {
   // Number of bytes for each out register in the caller method's frame.
   static constexpr size_t kBytesStackArgLocation = 4;
   // Frame size in bytes of a callee-save frame for RefsAndArgs.
@@ -85,23 +85,23 @@ class QuickArgumentVisitorBase {
       RuntimeCalleeSaveFrame::GetReturnPcOffset(CalleeSaveType::kSaveRefsAndArgs);
 
   static size_t GprIndexToGprOffset(uint32_t gpr_index) {
-    return Derived::GprIndexToGprOffsetImpl(gpr_index);
+    return FrameInfo::GprIndexToGprOffsetImpl(gpr_index);
   }
 
   static constexpr bool kSplitPairAcrossRegisterAndStack =
-      Derived::kSplitPairAcrossRegisterAndStack;
-  static constexpr bool kAlignPairRegister = Derived::kAlignPairRegister;
-  static constexpr bool kQuickSoftFloatAbi = Derived::kQuickSoftFloatAbi;
+      FrameInfo::kSplitPairAcrossRegisterAndStack;
+  static constexpr bool kAlignPairRegister = FrameInfo::kAlignPairRegister;
+  static constexpr bool kQuickSoftFloatAbi = FrameInfo::kQuickSoftFloatAbi;
   static constexpr bool kQuickDoubleRegAlignedFloatBackFilled =
-      Derived::kQuickDoubleRegAlignedFloatBackFilled;
-  static constexpr bool kQuickSkipOddFpRegisters = Derived::kQuickSkipOddFpRegisters;
-  static constexpr size_t kNumQuickGprArgs = Derived::kNumQuickGprArgs;
-  static constexpr size_t kNumQuickFprArgs = Derived::kNumQuickFprArgs;
-  static constexpr bool kGprFprLockstep = Derived::kGprFprLockstep;
-  static constexpr bool kNaNBoxing = Derived::kNanBoxing;
+      FrameInfo::kQuickDoubleRegAlignedFloatBackFilled;
+  static constexpr bool kQuickSkipOddFpRegisters = FrameInfo::kQuickSkipOddFpRegisters;
+  static constexpr size_t kNumQuickGprArgs = FrameInfo::kNumQuickGprArgs;
+  static constexpr size_t kNumQuickFprArgs = FrameInfo::kNumQuickFprArgs;
+  static constexpr bool kGprFprLockstep = FrameInfo::kGprFprLockstep;
+  static constexpr bool kNaNBoxing = FrameInfo::kNanBoxing;
 
  public:
-  static constexpr bool NaNBoxing() { return Derived::kNaNBoxing; }
+  static constexpr bool NaNBoxing() { return FrameInfo::kNaNBoxing; }
 
   static StackReference<mirror::Object>* GetThisObjectReference(ArtMethod** sp)
       REQUIRES_SHARED(Locks::mutator_lock_) {
@@ -143,7 +143,7 @@ class QuickArgumentVisitorBase {
     return *reinterpret_cast<uintptr_t*>(GetCallingPcAddr(sp));
   }
 
-  QuickArgumentVisitorBase(ArtMethod** sp, bool is_static, std::string_view shorty)
+  QuickArgumentVisitorImpl(ArtMethod** sp, bool is_static, std::string_view shorty)
       REQUIRES_SHARED(Locks::mutator_lock_)
       : is_static_(is_static),
         shorty_(shorty),
@@ -168,7 +168,7 @@ class QuickArgumentVisitorBase {
     DCHECK_EQ(Runtime::Current()->GetClassLinker()->GetImagePointerSize(), kRuntimePointerSize);
   }
 
-  virtual ~QuickArgumentVisitorBase() {}
+  virtual ~QuickArgumentVisitorImpl() {}
 
   virtual void Visit() = 0;
 
@@ -182,10 +182,11 @@ class QuickArgumentVisitorBase {
       if (UNLIKELY((type == Primitive::kPrimDouble) || (type == Primitive::kPrimFloat))) {
         if (type == Primitive::kPrimDouble && kQuickDoubleRegAlignedFloatBackFilled) {
           if (fpr_double_index_ + 2 < kNumQuickFprArgs + 1) {
-            return fpr_args_ + (fpr_double_index_ * GetBytesPerFprSpillLocation(kRuntimeISA));
+            return fpr_args_ +
+                   (fpr_double_index_ * GetBytesPerFprSpillLocation(kRuntimeQuickCodeISA));
           }
         } else if (fpr_index_ + 1 < kNumQuickFprArgs + 1) {
-          return fpr_args_ + (fpr_index_ * GetBytesPerFprSpillLocation(kRuntimeISA));
+          return fpr_args_ + (fpr_index_ * GetBytesPerFprSpillLocation(kRuntimeQuickCodeISA));
         }
         return stack_args_ + (stack_index_ * kBytesStackArgLocation);
       }
@@ -197,8 +198,8 @@ class QuickArgumentVisitorBase {
   }
 
   bool IsSplitLongOrDouble() const {
-    if ((GetBytesPerGprSpillLocation(kRuntimeISA) == 4) ||
-        (GetBytesPerFprSpillLocation(kRuntimeISA) == 4)) {
+    if ((GetBytesPerGprSpillLocation(kRuntimeQuickCodeISA) == 4) ||
+        (GetBytesPerFprSpillLocation(kRuntimeQuickCodeISA) == 4)) {
       return is_split_long_or_double_;
     } else {
       return false;  // An optimization for when GPR and FPRs are 64bit.
@@ -304,7 +305,7 @@ class QuickArgumentVisitorBase {
               // even-numbered registers by skipping R1 and using R2 instead.
               IncGprIndex();
             }
-            is_split_long_or_double_ = (GetBytesPerGprSpillLocation(kRuntimeISA) == 4) &&
+            is_split_long_or_double_ = (GetBytesPerGprSpillLocation(kRuntimeQuickCodeISA) == 4) &&
                 ((gpr_index_ + 1) == kNumQuickGprArgs);
             if (!kSplitPairAcrossRegisterAndStack && is_split_long_or_double_) {
               // We don't want to split this. Pass over this register.
@@ -320,14 +321,14 @@ class QuickArgumentVisitorBase {
             }
             if (gpr_index_ < kNumQuickGprArgs) {
               IncGprIndex();
-              if (GetBytesPerGprSpillLocation(kRuntimeISA) == 4) {
+              if (GetBytesPerGprSpillLocation(kRuntimeQuickCodeISA) == 4) {
                 if (gpr_index_ < kNumQuickGprArgs) {
                   IncGprIndex();
                 }
               }
             }
           } else {
-            is_split_long_or_double_ = (GetBytesPerFprSpillLocation(kRuntimeISA) == 4) &&
+            is_split_long_or_double_ = (GetBytesPerFprSpillLocation(kRuntimeQuickCodeISA) == 4) &&
                 ((fpr_index_ + 1) == kNumQuickFprArgs) && !kQuickDoubleRegAlignedFloatBackFilled;
             Visit();
             if (kBytesStackArgLocation == 4) {
@@ -346,7 +347,7 @@ class QuickArgumentVisitorBase {
               }
             } else if (fpr_index_ + 1 < kNumQuickFprArgs + 1) {
               IncFprIndex();
-              if (GetBytesPerFprSpillLocation(kRuntimeISA) == 4) {
+              if (GetBytesPerFprSpillLocation(kRuntimeQuickCodeISA) == 4) {
                 if (fpr_index_ + 1 < kNumQuickFprArgs + 1) {
                   IncFprIndex();
                 }
@@ -384,7 +385,7 @@ class QuickArgumentVisitorBase {
   bool is_split_long_or_double_;
 };
 
-class QuickArgumentFrameInfoARM : public QuickArgumentVisitorBase<QuickArgumentFrameInfoARM> {
+class QuickArgumentFrameInfoARM {
  public:
   // The callee save frame is pointed to by SP.
   // | argN       |  |
@@ -414,16 +415,11 @@ class QuickArgumentFrameInfoARM : public QuickArgumentVisitorBase<QuickArgumentF
   static constexpr bool kGprFprLockstep = false;
   static constexpr bool kNaNBoxing = false;
   static size_t GprIndexToGprOffsetImpl(uint32_t gpr_index) {
-    return gpr_index * GetBytesPerGprSpillLocation(kRuntimeISA);
+    return gpr_index * GetBytesPerGprSpillLocation(InstructionSet::kArm);
   }
-
-  QuickArgumentFrameInfoARM(ArtMethod** sp,
-                            bool is_static,
-                            std::string_view shorty) REQUIRES_SHARED(Locks::mutator_lock_)
-      : QuickArgumentVisitorBase(sp, is_static, shorty) {}
 };
 
-class QuickArgumentFrameInfoARM64 : public QuickArgumentVisitorBase<QuickArgumentFrameInfoARM64> {
+class QuickArgumentFrameInfoARM64 {
  public:
   // The callee save frame is pointed to by SP.
   // | argN       |  |
@@ -455,17 +451,11 @@ class QuickArgumentFrameInfoARM64 : public QuickArgumentVisitorBase<QuickArgumen
   static constexpr bool kGprFprLockstep = false;
   static constexpr bool kNaNBoxing = false;
   static size_t GprIndexToGprOffsetImpl(uint32_t gpr_index) {
-    return gpr_index * GetBytesPerGprSpillLocation(kRuntimeISA);
+    return gpr_index * GetBytesPerGprSpillLocation(InstructionSet::kArm64);
   }
-
-  QuickArgumentFrameInfoARM64(ArtMethod** sp,
-                              bool is_static,
-                              std::string_view shorty) REQUIRES_SHARED(Locks::mutator_lock_)
-      : QuickArgumentVisitorBase(sp, is_static, shorty) {}
 };
 
-class QuickArgumentFrameInfoRISCV64 :
-    public QuickArgumentVisitorBase<QuickArgumentFrameInfoRISCV64> {
+class QuickArgumentFrameInfoRISCV64 {
  public:
   // The callee save frame is pointed to by SP.
   // | argN            |  |
@@ -510,16 +500,12 @@ class QuickArgumentFrameInfoRISCV64 :
   static constexpr bool kGprFprLockstep = false;
   static constexpr bool kNaNBoxing = true;
   static size_t GprIndexToGprOffsetImpl(uint32_t gpr_index) {
-    return (gpr_index + 1) * GetBytesPerGprSpillLocation(kRuntimeISA);  // skip S0/X8/FP
+    // skip S0/X8/FP
+    return (gpr_index + 1) * GetBytesPerGprSpillLocation(InstructionSet::kRiscv64);
   }
-
-  QuickArgumentFrameInfoRISCV64(ArtMethod** sp,
-                                bool is_static,
-                                std::string_view shorty) REQUIRES_SHARED(Locks::mutator_lock_)
-      : QuickArgumentVisitorBase(sp, is_static, shorty) {}
 };
 
-class QuickArgumentFrameInfoX86 : public QuickArgumentVisitorBase<QuickArgumentFrameInfoX86> {
+class QuickArgumentFrameInfoX86 {
  public:
   // The callee save frame is pointed to by SP.
   // | argN        |  |
@@ -549,17 +535,11 @@ class QuickArgumentFrameInfoX86 : public QuickArgumentVisitorBase<QuickArgumentF
   static constexpr bool kGprFprLockstep = false;
   static constexpr bool kNaNBoxing = false;
   static size_t GprIndexToGprOffsetImpl(uint32_t gpr_index) {
-    return gpr_index * GetBytesPerGprSpillLocation(kRuntimeISA);
+    return gpr_index * GetBytesPerGprSpillLocation(InstructionSet::kX86);
   }
-
-  QuickArgumentFrameInfoX86(ArtMethod** sp,
-                            bool is_static,
-                            std::string_view shorty) REQUIRES_SHARED(Locks::mutator_lock_)
-      : QuickArgumentVisitorBase(sp, is_static, shorty) {}
 };
 
-class QuickArgumentFrameInfoX86_64 :
-    public QuickArgumentVisitorBase<QuickArgumentFrameInfoX86_64> {
+class QuickArgumentFrameInfoX86_64 {
  public:
   // The callee save frame is pointed to by SP.
   // | argN            |  |
@@ -602,44 +582,40 @@ class QuickArgumentFrameInfoX86_64 :
   static constexpr bool kGprFprLockstep = false;
   static constexpr bool kNaNBoxing = false;
   static size_t GprIndexToGprOffsetImpl(uint32_t gpr_index) {
+    static constexpr size_t kBytesPerSpill = GetBytesPerGprSpillLocation(InstructionSet::kX86_64);
     switch (gpr_index) {
-      case 0: return (4 * GetBytesPerGprSpillLocation(kRuntimeISA));
-      case 1: return (1 * GetBytesPerGprSpillLocation(kRuntimeISA));
-      case 2: return (0 * GetBytesPerGprSpillLocation(kRuntimeISA));
-      case 3: return (5 * GetBytesPerGprSpillLocation(kRuntimeISA));
-      case 4: return (6 * GetBytesPerGprSpillLocation(kRuntimeISA));
+      case 0: return (4 * kBytesPerSpill);
+      case 1: return (1 * kBytesPerSpill);
+      case 2: return (0 * kBytesPerSpill);
+      case 3: return (5 * kBytesPerSpill);
+      case 4: return (6 * kBytesPerSpill);
       default:
       LOG(FATAL) << "Unexpected GPR index: " << gpr_index;
       UNREACHABLE();
     }
   }
-
-  QuickArgumentFrameInfoX86_64(ArtMethod** sp,
-                               bool is_static,
-                               std::string_view shorty) REQUIRES_SHARED(Locks::mutator_lock_)
-      : QuickArgumentVisitorBase(sp, is_static, shorty) {}
 };
 
 namespace detail {
 
 template <InstructionSet>
-struct QAVSelector;
+struct QAFISelector;
 
 template <>
-struct QAVSelector<InstructionSet::kArm> { using type = QuickArgumentFrameInfoARM; };
+struct QAFISelector<InstructionSet::kArm> { using type = QuickArgumentFrameInfoARM; };
 template <>
-struct QAVSelector<InstructionSet::kArm64> { using type = QuickArgumentFrameInfoARM64; };
+struct QAFISelector<InstructionSet::kArm64> { using type = QuickArgumentFrameInfoARM64; };
 template <>
-struct QAVSelector<InstructionSet::kRiscv64> { using type = QuickArgumentFrameInfoRISCV64; };
+struct QAFISelector<InstructionSet::kRiscv64> { using type = QuickArgumentFrameInfoRISCV64; };
 template <>
-struct QAVSelector<InstructionSet::kX86> { using type = QuickArgumentFrameInfoX86; };
+struct QAFISelector<InstructionSet::kX86> { using type = QuickArgumentFrameInfoX86; };
 template <>
-struct QAVSelector<InstructionSet::kX86_64> { using type = QuickArgumentFrameInfoX86_64; };
+struct QAFISelector<InstructionSet::kX86_64> { using type = QuickArgumentFrameInfoX86_64; };
 
 }  // namespace detail
 
-// TODO(Simulator): Use the quick code ISA instead of kRuntimeISA.
-using QuickArgumentVisitor = detail::QAVSelector<kRuntimeISA>::type;
+using QuickArgumentVisitor =
+    QuickArgumentVisitorImpl<detail::QAFISelector<kRuntimeQuickCodeISA>::type>;
 
 // Returns the 'this' object of a proxy method. This function is only used by StackVisitor. It
 // allows to use the QuickArgumentVisitor constants without moving all the code in its own module.
