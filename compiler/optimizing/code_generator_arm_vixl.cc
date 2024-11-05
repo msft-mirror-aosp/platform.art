@@ -1944,6 +1944,7 @@ CodeGeneratorARMVIXL::CodeGeneratorARMVIXL(HGraph* graph,
       move_resolver_(graph->GetAllocator(), this),
       assembler_(graph->GetAllocator()),
       boot_image_method_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
+      app_image_method_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       method_bss_entry_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       boot_image_type_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       app_image_type_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
@@ -5280,17 +5281,22 @@ void InstructionCodeGeneratorARMVIXL::VisitDivZeroCheck(HDivZeroCheck* instructi
   }
 }
 
-void InstructionCodeGeneratorARMVIXL::HandleIntegerRotate(HRor* ror) {
-  LocationSummary* locations = ror->GetLocations();
-  vixl32::Register in = InputRegisterAt(ror, 0);
+void InstructionCodeGeneratorARMVIXL::HandleIntegerRotate(HBinaryOperation* rotate) {
+  LocationSummary* locations = rotate->GetLocations();
+  vixl32::Register in = InputRegisterAt(rotate, 0);
   Location rhs = locations->InAt(1);
-  vixl32::Register out = OutputRegister(ror);
+  vixl32::Register out = OutputRegister(rotate);
 
   if (rhs.IsConstant()) {
     // Arm32 and Thumb2 assemblers require a rotation on the interval [1,31],
     // so map all rotations to a +ve. equivalent in that range.
     // (e.g. left *or* right by -2 bits == 30 bits in the same direction.)
     uint32_t rot = CodeGenerator::GetInt32ValueOf(rhs.GetConstant()) & 0x1F;
+
+    if (rotate->IsRol()) {
+      rot = -rot;
+    }
+
     if (rot) {
       // Rotate, mapping left rotations to right equivalents if necessary.
       // (e.g. left by 2 bits == right by 30.)
@@ -5299,7 +5305,16 @@ void InstructionCodeGeneratorARMVIXL::HandleIntegerRotate(HRor* ror) {
       __ Mov(out, in);
     }
   } else {
-    __ Ror(out, in, RegisterFrom(rhs));
+    if (rotate->IsRol()) {
+      UseScratchRegisterScope temps(GetVIXLAssembler());
+
+      vixl32::Register negated = temps.Acquire();
+      __ Rsb(negated, RegisterFrom(rhs), 0);
+      __ Ror(out, in, negated);
+    } else {
+      DCHECK(rotate->IsRor());
+      __ Ror(out, in, RegisterFrom(rhs));
+    }
   }
 }
 
@@ -5307,8 +5322,8 @@ void InstructionCodeGeneratorARMVIXL::HandleIntegerRotate(HRor* ror) {
 // rotates by swapping input regs (effectively rotating by the first 32-bits of
 // a larger rotation) or flipping direction (thus treating larger right/left
 // rotations as sub-word sized rotations in the other direction) as appropriate.
-void InstructionCodeGeneratorARMVIXL::HandleLongRotate(HRor* ror) {
-  LocationSummary* locations = ror->GetLocations();
+void InstructionCodeGeneratorARMVIXL::HandleLongRotate(HBinaryOperation* rotate) {
+  LocationSummary* locations = rotate->GetLocations();
   vixl32::Register in_reg_lo = LowRegisterFrom(locations->InAt(0));
   vixl32::Register in_reg_hi = HighRegisterFrom(locations->InAt(0));
   Location rhs = locations->InAt(1);
@@ -5317,6 +5332,11 @@ void InstructionCodeGeneratorARMVIXL::HandleLongRotate(HRor* ror) {
 
   if (rhs.IsConstant()) {
     uint64_t rot = CodeGenerator::GetInt64ValueOf(rhs.GetConstant());
+
+    if (rotate->IsRol()) {
+      rot = -rot;
+    }
+
     // Map all rotations to +ve. equivalents on the interval [0,63].
     rot &= kMaxLongShiftDistance;
     // For rotates over a word in size, 'pre-rotate' by 32-bits to keep rotate
@@ -5341,7 +5361,17 @@ void InstructionCodeGeneratorARMVIXL::HandleLongRotate(HRor* ror) {
     vixl32::Register shift_left = RegisterFrom(locations->GetTemp(1));
     vixl32::Label end;
     vixl32::Label shift_by_32_plus_shift_right;
-    vixl32::Label* final_label = codegen_->GetFinalLabel(ror, &end);
+    vixl32::Label* final_label = codegen_->GetFinalLabel(rotate, &end);
+
+    // Negate rhs, taken from VisitNeg
+    if (rotate->IsRol()) {
+      Location negated = locations->GetTemp(2);
+      Location in = rhs;
+
+      __ Rsb(RegisterFrom(negated), RegisterFrom(in), 0);
+
+      rhs = negated;
+    }
 
     __ And(shift_right, RegisterFrom(rhs), 0x1F);
     __ Lsrs(shift_left, RegisterFrom(rhs), 6);
@@ -5374,11 +5404,11 @@ void InstructionCodeGeneratorARMVIXL::HandleLongRotate(HRor* ror) {
   }
 }
 
-void LocationsBuilderARMVIXL::VisitRor(HRor* ror) {
+void LocationsBuilderARMVIXL::HandleRotate(HBinaryOperation* rotate) {
   LocationSummary* locations =
-      new (GetGraph()->GetAllocator()) LocationSummary(ror, LocationSummary::kNoCall);
-  HInstruction* shift = ror->InputAt(1);
-  switch (ror->GetResultType()) {
+      new (GetGraph()->GetAllocator()) LocationSummary(rotate, LocationSummary::kNoCall);
+  HInstruction* shift = rotate->InputAt(1);
+  switch (rotate->GetResultType()) {
     case DataType::Type::kInt32: {
       locations->SetInAt(0, Location::RequiresRegister());
       locations->SetInAt(1, Location::RegisterOrConstant(shift));
@@ -5391,31 +5421,53 @@ void LocationsBuilderARMVIXL::VisitRor(HRor* ror) {
         locations->SetInAt(1, Location::ConstantLocation(shift));
       } else {
         locations->SetInAt(1, Location::RequiresRegister());
-        locations->AddRegisterTemps(2);
+
+        if (rotate->IsRor()) {
+          locations->AddRegisterTemps(2);
+        } else {
+          DCHECK(rotate->IsRol());
+          locations->AddRegisterTemps(3);
+        }
       }
       locations->SetOut(Location::RequiresRegister(), Location::kOutputOverlap);
       break;
     }
     default:
-      LOG(FATAL) << "Unexpected operation type " << ror->GetResultType();
+      LOG(FATAL) << "Unexpected operation type " << rotate->GetResultType();
   }
 }
 
-void InstructionCodeGeneratorARMVIXL::VisitRor(HRor* ror) {
-  DataType::Type type = ror->GetResultType();
+void LocationsBuilderARMVIXL::VisitRol(HRol* rol) {
+  HandleRotate(rol);
+}
+
+void LocationsBuilderARMVIXL::VisitRor(HRor* ror) {
+  HandleRotate(ror);
+}
+
+void InstructionCodeGeneratorARMVIXL::HandleRotate(HBinaryOperation* rotate) {
+  DataType::Type type = rotate->GetResultType();
   switch (type) {
     case DataType::Type::kInt32: {
-      HandleIntegerRotate(ror);
+      HandleIntegerRotate(rotate);
       break;
     }
     case DataType::Type::kInt64: {
-      HandleLongRotate(ror);
+      HandleLongRotate(rotate);
       break;
     }
     default:
       LOG(FATAL) << "Unexpected operation type " << type;
       UNREACHABLE();
   }
+}
+
+void InstructionCodeGeneratorARMVIXL::VisitRol(HRol* rol) {
+  HandleRotate(rol);
+}
+
+void InstructionCodeGeneratorARMVIXL::VisitRor(HRor* ror) {
+  HandleRotate(ror);
 }
 
 void LocationsBuilderARMVIXL::HandleShift(HBinaryOperation* op) {
@@ -9506,6 +9558,14 @@ void CodeGeneratorARMVIXL::LoadMethod(MethodLoadKind load_kind, Location temp, H
       LoadBootImageRelRoEntry(RegisterFrom(temp), boot_image_offset);
       break;
     }
+    case MethodLoadKind::kAppImageRelRo: {
+      DCHECK(GetCompilerOptions().IsAppImage());
+      PcRelativePatchInfo* labels = NewAppImageMethodPatch(invoke->GetResolvedMethodReference());
+      vixl32::Register temp_reg = RegisterFrom(temp);
+      EmitMovwMovtPlaceholder(labels, temp_reg);
+      __ Ldr(temp_reg, MemOperand(temp_reg, /*offset=*/ 0));
+      break;
+    }
     case MethodLoadKind::kBssEntry: {
       PcRelativePatchInfo* labels = NewMethodBssEntryPatch(invoke->GetMethodReference());
       vixl32::Register temp_reg = RegisterFrom(temp);
@@ -9693,6 +9753,12 @@ CodeGeneratorARMVIXL::PcRelativePatchInfo* CodeGeneratorARMVIXL::NewBootImageMet
     MethodReference target_method) {
   return NewPcRelativePatch(
       target_method.dex_file, target_method.index, &boot_image_method_patches_);
+}
+
+CodeGeneratorARMVIXL::PcRelativePatchInfo* CodeGeneratorARMVIXL::NewAppImageMethodPatch(
+    MethodReference target_method) {
+  return NewPcRelativePatch(
+      target_method.dex_file, target_method.index, &app_image_method_patches_);
 }
 
 CodeGeneratorARMVIXL::PcRelativePatchInfo* CodeGeneratorARMVIXL::NewMethodBssEntryPatch(
@@ -9895,6 +9961,7 @@ void CodeGeneratorARMVIXL::EmitLinkerPatches(ArenaVector<linker::LinkerPatch>* l
   DCHECK(linker_patches->empty());
   size_t size =
       /* MOVW+MOVT for each entry */ 2u * boot_image_method_patches_.size() +
+      /* MOVW+MOVT for each entry */ 2u * app_image_method_patches_.size() +
       /* MOVW+MOVT for each entry */ 2u * method_bss_entry_patches_.size() +
       /* MOVW+MOVT for each entry */ 2u * boot_image_type_patches_.size() +
       /* MOVW+MOVT for each entry */ 2u * app_image_type_patches_.size() +
@@ -9919,6 +9986,7 @@ void CodeGeneratorARMVIXL::EmitLinkerPatches(ArenaVector<linker::LinkerPatch>* l
     DCHECK(boot_image_type_patches_.empty());
     DCHECK(boot_image_string_patches_.empty());
   }
+  DCHECK_IMPLIES(!GetCompilerOptions().IsAppImage(), app_image_method_patches_.empty());
   DCHECK_IMPLIES(!GetCompilerOptions().IsAppImage(), app_image_type_patches_.empty());
   if (GetCompilerOptions().IsBootImage()) {
     EmitPcRelativeLinkerPatches<NoDexFileAdapter<linker::LinkerPatch::IntrinsicReferencePatch>>(
@@ -9926,6 +9994,8 @@ void CodeGeneratorARMVIXL::EmitLinkerPatches(ArenaVector<linker::LinkerPatch>* l
   } else {
     EmitPcRelativeLinkerPatches<NoDexFileAdapter<linker::LinkerPatch::BootImageRelRoPatch>>(
         boot_image_other_patches_, linker_patches);
+    EmitPcRelativeLinkerPatches<linker::LinkerPatch::MethodAppImageRelRoPatch>(
+        app_image_method_patches_, linker_patches);
     EmitPcRelativeLinkerPatches<linker::LinkerPatch::TypeAppImageRelRoPatch>(
         app_image_type_patches_, linker_patches);
   }

@@ -498,10 +498,12 @@ class ReleaseChecker:
     self._checker.check_file('etc/init.rc')
     self._checker.check_file('etc/linker.config.pb')
     self._checker.check_file('etc/sdkinfo.pb')
+    self._checker.check_file('etc/dirty-image-objects')
 
     # Check flagging files that don't get added in builds on master-art.
     # TODO(b/345713436): Make flags work on master-art.
     self._checker.check_optional_file('etc/aconfig_flags.pb')
+    self._checker.check_optional_file('etc/flag.info')
     self._checker.check_optional_file('etc/flag.map')
     self._checker.check_optional_file('etc/flag.val')
     self._checker.check_optional_file('etc/package.map')

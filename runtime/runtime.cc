@@ -1870,7 +1870,7 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
   InitPlatformSignalHandlers();
 
   // Change the implicit checks flags based on runtime architecture.
-  switch (kRuntimeISA) {
+  switch (kRuntimeQuickCodeISA) {
     case InstructionSet::kArm64:
       implicit_suspend_checks_ = true;
       FALLTHROUGH_INTENDED;
@@ -2049,9 +2049,6 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
                                            TraceOutputMode::kFile;
     trace_config_->clock_source = runtime_options.GetOrDefault(Opt::MethodTraceClock);
   }
-
-  // TODO: Remove this in a follow up CL. This isn't used anywhere.
-  Trace::SetDefaultClockSource(runtime_options.GetOrDefault(Opt::ProfileClock));
 
   if (GetHeap()->HasBootImageSpace()) {
     const ImageHeader& image_header = GetHeap()->GetBootImageSpaces()[0]->GetImageHeader();
@@ -2960,7 +2957,8 @@ void Runtime::AddCurrentRuntimeFeaturesAsDex2OatArguments(std::vector<std::strin
   // architecture support, dex2oat may be compiled as a different instruction-set than that
   // currently being executed.
   std::string instruction_set("--instruction-set=");
-  instruction_set += GetInstructionSetString(kRuntimeISA);
+  // The dex2oat instruction set should match the runtime's target ISA.
+  instruction_set += GetInstructionSetString(kRuntimeQuickCodeISA);
   argv->push_back(instruction_set);
 
   if (InstructionSetFeatures::IsRuntimeDetectionSupported()) {

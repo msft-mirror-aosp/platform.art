@@ -143,6 +143,9 @@
       "name": "art-run-test-055-enum-performance"
     },
     {
+      "name": "art-run-test-057-math-intrinsics"
+    },
+    {
       "name": "art-run-test-058-enum-order"
     },
     {
@@ -1379,6 +1382,12 @@
       "name": "art-run-test-857-default-access"
     },
     {
+      "name": "art-run-test-858-checker-unsafe"
+    },
+    {
+      "name": "art-run-test-859-checker-var-handles-intrinsics"
+    },
+    {
       "name": "art-run-test-963-default-range-smali"
     },
     {
@@ -1403,6 +1412,9 @@
           "exclude-filter": "JniCompilerTest*"
         }
       ]
+    },
+    {
+      "name": "art_standalone_dex2oat_cts_tests"
     },
     {
       "name": "art_standalone_dex2oat_tests"
@@ -1459,6 +1471,9 @@
     },
     {
       "name": "art_standalone_sigchain_tests"
+    },
+    {
+      "name": "libnativebridge-lazy-tests"
     },
     {
       "name": "libnativebridge-tests"
@@ -1611,6 +1626,9 @@
     },
     {
       "name": "art-run-test-055-enum-performance[com.google.android.art.apex]"
+    },
+    {
+      "name": "art-run-test-057-math-intrinsics[com.google.android.art.apex]"
     },
     {
       "name": "art-run-test-058-enum-order[com.google.android.art.apex]"
@@ -2849,6 +2867,12 @@
       "name": "art-run-test-857-default-access[com.google.android.art.apex]"
     },
     {
+      "name": "art-run-test-858-checker-unsafe[com.google.android.art.apex]"
+    },
+    {
+      "name": "art-run-test-859-checker-var-handles-intrinsics[com.google.android.art.apex]"
+    },
+    {
       "name": "art-run-test-963-default-range-smali[com.google.android.art.apex]"
     },
     {
@@ -2873,6 +2897,9 @@
           "exclude-filter": "JniCompilerTest*"
         }
       ]
+    },
+    {
+      "name": "art_standalone_dex2oat_cts_tests[com.google.android.art.apex]"
     },
     {
       "name": "art_standalone_dex2oat_tests[com.google.android.art.apex]"
@@ -2929,6 +2956,9 @@
     },
     {
       "name": "art_standalone_sigchain_tests[com.google.android.art.apex]"
+    },
+    {
+      "name": "libnativebridge-lazy-tests[com.google.android.art.apex]"
     },
     {
       "name": "libnativebridge-tests[com.google.android.art.apex]"
@@ -3098,6 +3128,9 @@
       "name": "art-run-test-055-enum-performance"
     },
     {
+      "name": "art-run-test-057-math-intrinsics"
+    },
+    {
       "name": "art-run-test-058-enum-order"
     },
     {
@@ -4334,6 +4367,12 @@
       "name": "art-run-test-857-default-access"
     },
     {
+      "name": "art-run-test-858-checker-unsafe"
+    },
+    {
+      "name": "art-run-test-859-checker-var-handles-intrinsics"
+    },
+    {
       "name": "art-run-test-963-default-range-smali"
     },
     {
@@ -4353,6 +4392,9 @@
     },
     {
       "name": "art_standalone_compiler_tests"
+    },
+    {
+      "name": "art_standalone_dex2oat_cts_tests"
     },
     {
       "name": "art_standalone_dex2oat_tests"
@@ -4404,6 +4446,9 @@
     },
     {
       "name": "art_standalone_sigchain_tests"
+    },
+    {
+      "name": "libnativebridge-lazy-tests"
     },
     {
       "name": "libnativebridge-tests"
@@ -4570,6 +4615,9 @@
       "name": "art-run-test-055-enum-performance"
     },
     {
+      "name": "art-run-test-057-math-intrinsics"
+    },
+    {
       "name": "art-run-test-058-enum-order"
     },
     {
@@ -5806,6 +5854,12 @@
       "name": "art-run-test-857-default-access"
     },
     {
+      "name": "art-run-test-858-checker-unsafe"
+    },
+    {
+      "name": "art-run-test-859-checker-var-handles-intrinsics"
+    },
+    {
       "name": "art-run-test-963-default-range-smali"
     },
     {
@@ -5825,6 +5879,9 @@
     },
     {
       "name": "art_standalone_compiler_tests"
+    },
+    {
+      "name": "art_standalone_dex2oat_cts_tests"
     },
     {
       "name": "art_standalone_dex2oat_tests"
@@ -5875,6 +5932,9 @@
       "name": "art_standalone_sigchain_tests"
     },
     {
+      "name": "libnativebridge-lazy-tests"
+    },
+    {
       "name": "libnativebridge-tests"
     },
     {
@@ -5891,10 +5951,10 @@
   ],
   "postsubmit": [
     {
-      "name": "art-run-test-057-math-intrinsics"
+      "name": "art-run-test-2282-checker-always-throws-try-catch"
     },
     {
-      "name": "art_standalone_dex2oat_cts_tests"
+      "name": "art-run-test-2283-checker-remove-null-check"
     }
   ]
 }

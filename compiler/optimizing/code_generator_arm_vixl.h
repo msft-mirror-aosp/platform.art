@@ -390,13 +390,12 @@ class LocationsBuilderARMVIXL : public HGraphVisitor {
   void HandleInvoke(HInvoke* invoke);
   void HandleBitwiseOperation(HBinaryOperation* operation, Opcode opcode);
   void HandleCondition(HCondition* condition);
-  void HandleIntegerRotate(LocationSummary* locations);
-  void HandleLongRotate(LocationSummary* locations);
   void HandleShift(HBinaryOperation* operation);
   void HandleFieldSet(HInstruction* instruction,
                       const FieldInfo& field_info,
                       WriteBarrierKind write_barrier_kind);
   void HandleFieldGet(HInstruction* instruction, const FieldInfo& field_info);
+  void HandleRotate(HBinaryOperation* rotate);
 
   Location ArithmeticZeroOrFpuRegister(HInstruction* input);
   Location ArmEncodableConstantOrRegister(HInstruction* constant, Opcode opcode);
@@ -446,8 +445,9 @@ class InstructionCodeGeneratorARMVIXL : public InstructionCodeGenerator {
   void GenerateAddLongConst(Location out, Location first, uint64_t value);
   void HandleBitwiseOperation(HBinaryOperation* operation);
   void HandleCondition(HCondition* condition);
-  void HandleIntegerRotate(HRor* ror);
-  void HandleLongRotate(HRor* ror);
+  void HandleIntegerRotate(HBinaryOperation* rotate);
+  void HandleLongRotate(HBinaryOperation* rotate);
+  void HandleRotate(HBinaryOperation* rotate);
   void HandleShift(HBinaryOperation* operation);
 
   void GenerateWideAtomicStore(vixl::aarch32::Register addr,
@@ -716,6 +716,7 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
   PcRelativePatchInfo* NewBootImageIntrinsicPatch(uint32_t intrinsic_data);
   PcRelativePatchInfo* NewBootImageRelRoPatch(uint32_t boot_image_offset);
   PcRelativePatchInfo* NewBootImageMethodPatch(MethodReference target_method);
+  PcRelativePatchInfo* NewAppImageMethodPatch(MethodReference target_method);
   PcRelativePatchInfo* NewMethodBssEntryPatch(MethodReference target_method);
   PcRelativePatchInfo* NewBootImageTypePatch(const DexFile& dex_file, dex::TypeIndex type_index);
   PcRelativePatchInfo* NewAppImageTypePatch(const DexFile& dex_file, dex::TypeIndex type_index);
@@ -1035,6 +1036,8 @@ class CodeGeneratorARMVIXL : public CodeGenerator {
 
   // PC-relative method patch info for kBootImageLinkTimePcRelative.
   ArenaDeque<PcRelativePatchInfo> boot_image_method_patches_;
+  // PC-relative method patch info for kAppImageRelRo.
+  ArenaDeque<PcRelativePatchInfo> app_image_method_patches_;
   // PC-relative method patch info for kBssEntry.
   ArenaDeque<PcRelativePatchInfo> method_bss_entry_patches_;
   // PC-relative type patch info for kBootImageLinkTimePcRelative.

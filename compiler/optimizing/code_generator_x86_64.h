@@ -247,6 +247,7 @@ class LocationsBuilderX86_64 : public HGraphVisitor {
   void HandleBitwiseOperation(HBinaryOperation* operation);
   void HandleCondition(HCondition* condition);
   void HandleShift(HBinaryOperation* operation);
+  void HandleRotate(HBinaryOperation* rotate);
   void HandleFieldSet(HInstruction* instruction,
                       const FieldInfo& field_info,
                       WriteBarrierKind write_barrier_kind);
@@ -320,6 +321,7 @@ class InstructionCodeGeneratorX86_64 : public InstructionCodeGenerator {
   void GenerateDivRemIntegral(HBinaryOperation* instruction);
   void HandleCondition(HCondition* condition);
   void HandleShift(HBinaryOperation* operation);
+  void HandleRotate(HBinaryOperation* rotate);
 
   void HandleFieldSet(HInstruction* instruction,
                       const FieldInfo& field_info,
@@ -540,6 +542,7 @@ class CodeGeneratorX86_64 : public CodeGenerator {
   void RecordBootImageIntrinsicPatch(uint32_t intrinsic_data);
   void RecordBootImageRelRoPatch(uint32_t boot_image_offset);
   void RecordBootImageMethodPatch(HInvoke* invoke);
+  void RecordAppImageMethodPatch(HInvoke* invoke);
   void RecordMethodBssEntryPatch(HInvoke* invoke);
   void RecordBootImageTypePatch(const DexFile& dex_file, dex::TypeIndex type_index);
   void RecordAppImageTypePatch(const DexFile& dex_file, dex::TypeIndex type_index);
@@ -748,6 +751,8 @@ class CodeGeneratorX86_64 : public CodeGenerator {
 
   // PC-relative method patch info for kBootImageLinkTimePcRelative.
   ArenaDeque<PatchInfo<Label>> boot_image_method_patches_;
+  // PC-relative method patch info for kAppImageRelRo.
+  ArenaDeque<PatchInfo<Label>> app_image_method_patches_;
   // PC-relative method patch info for kBssEntry.
   ArenaDeque<PatchInfo<Label>> method_bss_entry_patches_;
   // PC-relative type patch info for kBootImageLinkTimePcRelative.
