@@ -4827,47 +4827,6 @@ void ClassLinker::MoveClassTableToPreZygote() {
   VisitClassLoaders(&visitor);
 }
 
-// Look up classes by hash and descriptor and put all matching ones in the result array.
-class LookupClassesVisitor : public ClassLoaderVisitor {
- public:
-  LookupClassesVisitor(const char* descriptor,
-                       size_t hash,
-                       std::vector<ObjPtr<mirror::Class>>* result)
-     : descriptor_(descriptor),
-       hash_(hash),
-       result_(result) {}
-
-  void Visit(ObjPtr<mirror::ClassLoader> class_loader)
-      REQUIRES_SHARED(Locks::classlinker_classes_lock_, Locks::mutator_lock_) override {
-    ClassTable* const class_table = class_loader->GetClassTable();
-    ObjPtr<mirror::Class> klass = class_table->Lookup(descriptor_, hash_);
-    // Add `klass` only if `class_loader` is its defining (not just initiating) class loader.
-    if (klass != nullptr && klass->GetClassLoader() == class_loader) {
-      result_->push_back(klass);
-    }
-  }
-
- private:
-  const char* const descriptor_;
-  const size_t hash_;
-  std::vector<ObjPtr<mirror::Class>>* const result_;
-};
-
-void ClassLinker::LookupClasses(const char* descriptor,
-                                std::vector<ObjPtr<mirror::Class>>& result) {
-  result.clear();
-  Thread* const self = Thread::Current();
-  ReaderMutexLock mu(self, *Locks::classlinker_classes_lock_);
-  const size_t hash = ComputeModifiedUtf8Hash(descriptor);
-  ObjPtr<mirror::Class> klass = boot_class_table_->Lookup(descriptor, hash);
-  if (klass != nullptr) {
-    DCHECK(klass->GetClassLoader() == nullptr);
-    result.push_back(klass);
-  }
-  LookupClassesVisitor visitor(descriptor, hash, &result);
-  VisitClassLoaders(&visitor);
-}
-
 bool ClassLinker::AttemptSupertypeVerification(Thread* self,
                                                verifier::VerifierDeps* verifier_deps,
                                                Handle<mirror::Class> klass,
@@ -10094,9 +10053,9 @@ ArtMethod* ClassLinker::FindIncompatibleMethod(ObjPtr<mirror::Class> klass,
   }
 }
 
-ArtMethod* ClassLinker::ResolveMethodWithoutInvokeType(uint32_t method_idx,
-                                                       Handle<mirror::DexCache> dex_cache,
-                                                       Handle<mirror::ClassLoader> class_loader) {
+ArtMethod* ClassLinker::ResolveMethodId(uint32_t method_idx,
+                                        Handle<mirror::DexCache> dex_cache,
+                                        Handle<mirror::ClassLoader> class_loader) {
   DCHECK(dex_cache->GetClassLoader() == class_loader.Get());
   ArtMethod* resolved = dex_cache->GetResolvedMethod(method_idx);
   Thread::PoisonObjectPointersIfDebug();
@@ -10477,9 +10436,9 @@ ObjPtr<mirror::MethodHandle> ClassLinker::ResolveMethodHandleForMethod(
       // the invocation type to determine if the method is private. We
       // then resolve again specifying the intended invocation type to
       // force the appropriate checks.
-      target_method = ResolveMethodWithoutInvokeType(method_handle.field_or_method_idx_,
-                                                     hs.NewHandle(referrer->GetDexCache()),
-                                                     hs.NewHandle(referrer->GetClassLoader()));
+      target_method = ResolveMethodId(method_handle.field_or_method_idx_,
+                                      hs.NewHandle(referrer->GetDexCache()),
+                                      hs.NewHandle(referrer->GetClassLoader()));
       if (UNLIKELY(target_method == nullptr)) {
         break;
       }
