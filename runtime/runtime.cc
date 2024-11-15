@@ -3492,4 +3492,10 @@ void Runtime::AddExtraBootDexFiles(const std::string& filename,
   GetClassLinker()->AddExtraBootDexFiles(Thread::Current(), std::move(dex_files));
 }
 
+NO_INLINE void Runtime::AllowPageSizeAccess() {
+#ifdef ART_PAGE_SIZE_AGNOSTIC
+  gPageSize.AllowAccess();
+#endif
+}
+
 }  // namespace art
