@@ -1129,6 +1129,9 @@ class Runtime {
     }
   }
 
+  // For `artd` only.
+  EXPORT static void AllowPageSizeAccess();
+
  private:
   static void InitPlatformSignalHandlers();
 
