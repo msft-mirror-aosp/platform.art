@@ -782,9 +782,10 @@ HInliner::InlineCacheType HInliner::GetInlineCacheAOT(
   Thread* self = Thread::Current();
   for (const dex::TypeIndex& type_index : dex_pc_data.classes) {
     const DexFile* dex_file = caller_compilation_unit_.GetDexFile();
-    const char* descriptor = pci->GetTypeDescriptor(dex_file, type_index);
-    ObjPtr<mirror::Class> clazz =
-        class_linker->FindClass(self, descriptor, caller_compilation_unit_.GetClassLoader());
+    size_t descriptor_length;
+    const char* descriptor = pci->GetTypeDescriptor(dex_file, type_index, &descriptor_length);
+    ObjPtr<mirror::Class> clazz = class_linker->FindClass(
+        self, descriptor, descriptor_length, caller_compilation_unit_.GetClassLoader());
     if (clazz == nullptr) {
       self->ClearException();  // Clean up the exception left by type resolution.
       VLOG(compiler) << "Could not find class from inline cache in AOT mode "
@@ -1338,13 +1339,6 @@ bool HInliner::TryDevirtualize(HInvoke* invoke_instruction,
                                HInvoke** replacement) {
   DCHECK(invoke_instruction != *replacement);
   if (!invoke_instruction->IsInvokeInterface() && !invoke_instruction->IsInvokeVirtual()) {
-    return false;
-  }
-
-  // Don't try to devirtualize intrinsics as it breaks pattern matching from later phases.
-  // TODO(solanes): This `if` could be removed if we update optimizations like
-  // TryReplaceStringBuilderAppend.
-  if (invoke_instruction->IsIntrinsic()) {
     return false;
   }
 
@@ -2451,7 +2445,7 @@ bool HInliner::ReturnTypeMoreSpecific(HInstruction* return_replacement,
       ReferenceTypeInfo invoke_rti = invoke_instruction->GetReferenceTypeInfo();
       if (IsReferenceTypeRefinement(invoke_rti.GetTypeHandle().Get(),
                                     invoke_rti.IsExact(),
-                                    /*declared_can_be_null=*/ true,
+                                    invoke_instruction->CanBeNull(),
                                     return_replacement)) {
         return true;
       } else if (return_replacement->IsInstanceFieldGet()) {
