@@ -115,7 +115,7 @@ static constexpr uint64_t kUffdFeaturesForMinorFault =
 static constexpr uint64_t kUffdFeaturesForSigbus = UFFD_FEATURE_SIGBUS;
 // A region which is more than kBlackDenseRegionThreshold percent live doesn't
 // need to be compacted as it is too densely packed.
-static constexpr uint kBlackDenseRegionThreshold = 90U;
+static constexpr uint kBlackDenseRegionThreshold = 95U;
 // We consider SIGBUS feature necessary to enable this GC as it's superior than
 // threading-based implementation for janks. We may want minor-fault in future
 // to be available for making jit-code-cache updation concurrent, which uses shmem.
@@ -971,7 +971,7 @@ bool MarkCompact::PrepareForCompaction() {
   GcCause gc_cause = GetCurrentIteration()->GetGcCause();
   if (gc_cause != kGcCauseExplicit && gc_cause != kGcCauseCollectorTransition &&
       !GetCurrentIteration()->GetClearSoftReferences()) {
-    size_t live_bytes = 0, total_bytes = 0;
+    uint64_t live_bytes = 0, total_bytes = 0;
     size_t aligned_vec_len = RoundUp(vector_len, chunk_info_per_page);
     size_t num_pages = aligned_vec_len / chunk_info_per_page;
     size_t threshold_passing_marker = 0;  // In number of pages
@@ -997,7 +997,7 @@ bool MarkCompact::PrepareForCompaction() {
       auto iter = std::find_if(
           pages_live_bytes.rbegin() + (num_pages - threshold_passing_marker),
           pages_live_bytes.rend(),
-          [](uint32_t bytes) { return bytes * 100U < gPageSize * kBlackDenseRegionThreshold; });
+          [](uint32_t bytes) { return bytes * 100U >= gPageSize * kBlackDenseRegionThreshold; });
       black_dense_idx = (pages_live_bytes.rend() - iter) * chunk_info_per_page;
     }
     black_dense_end_ = moving_space_begin_ + black_dense_idx * kOffsetChunkSize;
@@ -4013,6 +4013,33 @@ void MarkCompact::UpdateLivenessInfo(mirror::Object* obj, size_t obj_size) {
 
 template <bool kUpdateLiveWords>
 void MarkCompact::ScanObject(mirror::Object* obj) {
+  mirror::Class* klass = obj->GetClass<kVerifyNone, kWithoutReadBarrier>();
+  // TODO(lokeshgidra): Remove the following condition once b/373609505 is fixed.
+  if (UNLIKELY(klass == nullptr)) {
+    // It was seen in ConcurrentCopying GC that after a small wait when we reload
+    // the class pointer, it turns out to be a valid class object. So as a workaround,
+    // we can continue execution and log an error that this happened.
+    for (size_t i = 0; i < 1000; i++) {
+      // Wait for 1ms at a time. Don't wait for more than 1 second in total.
+      usleep(1000);
+      klass = obj->GetClass<kVerifyNone, kWithoutReadBarrier>();
+      if (klass != nullptr) {
+        std::ostringstream oss;
+        klass->DumpClass(oss, mirror::Class::kDumpClassFullDetail);
+        LOG(FATAL_WITHOUT_ABORT) << "klass pointer for obj: " << obj
+                                 << " found to be null first. Reloading after " << i
+                                 << " iterations of 1ms sleep fetched klass: " << oss.str();
+        break;
+      }
+    }
+
+    if (UNLIKELY(klass == nullptr)) {
+      // It must be heap corruption.
+      LOG(FATAL_WITHOUT_ABORT) << "klass pointer for obj: " << obj << " found to be null.";
+    }
+    heap_->GetVerification()->LogHeapCorruption(
+        obj, mirror::Object::ClassOffset(), klass, /*fatal=*/true);
+  }
   // The size of `obj` is used both here (to update `bytes_scanned_`) and in
   // `UpdateLivenessInfo`. As fetching this value can be expensive, do it once
   // here and pass that information to `UpdateLivenessInfo`.

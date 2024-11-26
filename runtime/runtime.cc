@@ -2050,9 +2050,6 @@ bool Runtime::Init(RuntimeArgumentMap&& runtime_options_in) {
     trace_config_->clock_source = runtime_options.GetOrDefault(Opt::MethodTraceClock);
   }
 
-  // TODO: Remove this in a follow up CL. This isn't used anywhere.
-  Trace::SetDefaultClockSource(runtime_options.GetOrDefault(Opt::ProfileClock));
-
   if (GetHeap()->HasBootImageSpace()) {
     const ImageHeader& image_header = GetHeap()->GetBootImageSpaces()[0]->GetImageHeader();
     ObjPtr<mirror::ObjectArray<mirror::Object>> boot_image_live_objects =
@@ -2923,7 +2920,10 @@ void Runtime::RegisterAppInfo(const std::string& package_name,
     return;
   }
 
-  jit_->StartProfileSaver(profile_output_filename, code_paths, ref_profile_filename);
+  jit_->StartProfileSaver(profile_output_filename,
+                          code_paths,
+                          ref_profile_filename,
+                          AppInfo::FromVMRuntimeConstants(code_type));
 }
 
 void Runtime::SetFaultMessage(const std::string& message) {
@@ -3502,6 +3502,12 @@ void Runtime::DCheckNoTransactionCheckAllowed() {
       self->AssertNoTransactionCheckAllowed();
     }
   }
+}
+
+NO_INLINE void Runtime::AllowPageSizeAccess() {
+#ifdef ART_PAGE_SIZE_AGNOSTIC
+  gPageSize.AllowAccess();
+#endif
 }
 
 }  // namespace art

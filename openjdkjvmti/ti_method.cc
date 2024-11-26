@@ -642,15 +642,19 @@ class CommonLocalVariableClosure : public art::Closure {
     art::Runtime* runtime = art::Runtime::Current();
     art::ClassLinker* class_linker = runtime->GetClassLinker();
     art::ArenaPool* arena_pool = runtime->GetArenaPool();
-    art::verifier::RegTypeCache reg_types(
-        self, class_linker, arena_pool, /* can_load_classes= */ false, /* can_suspend= */ false);
+    art::verifier::RegTypeCache reg_types(self,
+                                          class_linker,
+                                          arena_pool,
+                                          class_loader,
+                                          dex_cache->GetDexFile(),
+                                          /* can_load_classes= */ false,
+                                          /* can_suspend= */ false);
     std::unique_ptr<art::verifier::MethodVerifier> verifier(
         art::verifier::MethodVerifier::CalculateVerificationInfo(
             self,
             &reg_types,
             method,
             dex_cache,
-            class_loader,
             dex_pc));
     if (verifier == nullptr) {
       JVMTI_LOG(WARNING, jvmti_) << "Unable to extract verification information from "
@@ -1062,8 +1066,7 @@ class SetLocalVariableClosure : public CommonLocalVariableClosure {
           art::ObjPtr<art::mirror::Class> set_class = caller_->DecodeJObject(val_.l)->GetClass();
           art::ObjPtr<art::mirror::ClassLoader> loader =
               method->GetDeclaringClass()->GetClassLoader();
-          art::ObjPtr<art::mirror::Class> slot_class =
-              cl->LookupClass(caller_, descriptor.c_str(), loader);
+          art::ObjPtr<art::mirror::Class> slot_class = cl->LookupClass(caller_, descriptor, loader);
           DCHECK(!slot_class.IsNull()) << descriptor << " slot: " << slot_type;
           return slot_class->IsAssignableFrom(set_class) ? OK : ERR(TYPE_MISMATCH);
         }

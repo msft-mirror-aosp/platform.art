@@ -422,7 +422,13 @@ static bool AlwaysThrows(ArtMethod* method)
   if (!method->IsCompilable() || !IsMethodVerified(method)) {
     return false;
   }
+
   // Skip native methods, methods with try blocks, and methods that are too large.
+  // TODO(solanes): We could correctly mark methods with try/catch blocks as always throwing as long
+  // as we can get rid of the infinite loop cases. These cases (e.g. `void foo() {while (true) {}}`)
+  // are the only ones that can have no return instruction and still not be an "always throwing
+  // method". Unfortunately, we need to construct the graph to know there's an infinite loop and
+  // therefore not worth the trouble.
   CodeItemDataAccessor accessor(method->DexInstructionData());
   if (!accessor.HasCodeItem() ||
       accessor.TriesSize() != 0 ||
@@ -776,9 +782,10 @@ HInliner::InlineCacheType HInliner::GetInlineCacheAOT(
   Thread* self = Thread::Current();
   for (const dex::TypeIndex& type_index : dex_pc_data.classes) {
     const DexFile* dex_file = caller_compilation_unit_.GetDexFile();
-    const char* descriptor = pci->GetTypeDescriptor(dex_file, type_index);
-    ObjPtr<mirror::Class> clazz =
-        class_linker->FindClass(self, descriptor, caller_compilation_unit_.GetClassLoader());
+    size_t descriptor_length;
+    const char* descriptor = pci->GetTypeDescriptor(dex_file, type_index, &descriptor_length);
+    ObjPtr<mirror::Class> clazz = class_linker->FindClass(
+        self, descriptor, descriptor_length, caller_compilation_unit_.GetClassLoader());
     if (clazz == nullptr) {
       self->ClearException();  // Clean up the exception left by type resolution.
       VLOG(compiler) << "Could not find class from inline cache in AOT mode "
@@ -1993,11 +2000,13 @@ bool HInliner::CanInlineBody(const HGraph* callee_graph,
   }
 
   bool has_one_return = false;
+  bool has_try_catch = false;
   for (HBasicBlock* predecessor : exit_block->GetPredecessors()) {
     const HInstruction* last_instruction = predecessor->GetLastInstruction();
     // On inlinees, we can have Return/ReturnVoid/Throw -> TryBoundary -> Exit. To check for the
     // actual last instruction, we have to skip the TryBoundary instruction.
     if (last_instruction->IsTryBoundary()) {
+      has_try_catch = true;
       predecessor = predecessor->GetSinglePredecessor();
       last_instruction = predecessor->GetLastInstruction();
 
@@ -2039,7 +2048,9 @@ bool HInliner::CanInlineBody(const HGraph* callee_graph,
   }
 
   if (!has_one_return) {
-    if (!is_speculative) {
+    // If a method has a try catch, all throws are potentially caught. We are conservative and
+    // don't assume a method always throws unless we can guarantee that.
+    if (!is_speculative && !has_try_catch) {
       // If we know that the method always throws with the particular parameters, set it as such.
       // This is better than using the dex instructions as we have more information about this
       // particular call. We don't mark speculative inlines (e.g. the ones from the inline cache) as
@@ -2048,6 +2059,13 @@ bool HInliner::CanInlineBody(const HGraph* callee_graph,
       graph_->SetHasAlwaysThrowingInvokes(/* value= */ true);
     }
 
+    // Methods that contain infinite loops with try catches fall into this line too as we construct
+    // an Exit block for them. This will mean that the stat `kNotInlinedAlwaysThrows` might not be
+    // 100% correct but:
+    // 1) This is a very small fraction of methods, and
+    // 2) It is not easy to disambiguate between those.
+    // Since we want to avoid inlining methods with infinite loops anyway, we return false for these
+    // cases too.
     LOG_FAIL(stats_, MethodCompilationStat::kNotInlinedAlwaysThrows)
         << "Method " << resolved_method->PrettyMethod()
         << " could not be inlined because it always throws";

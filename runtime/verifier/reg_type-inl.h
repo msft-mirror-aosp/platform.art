@@ -19,8 +19,8 @@
 
 #include "reg_type.h"
 
+#include "base/arena_allocator.h"
 #include "base/casts.h"
-#include "base/scoped_arena_allocator.h"
 #include "method_verifier.h"
 #include "mirror/class.h"
 #include "verifier_deps.h"
@@ -55,15 +55,6 @@ inline bool RegType::CanAccessMember(ObjPtr<mirror::Class> klass, uint32_t acces
     return GetClass()->CanAccessMember(klass, access_flags);
   } else {
     return false;  // More complicated test not possible on unresolved types, be conservative.
-  }
-}
-
-inline bool RegType::IsConstantBoolean() const {
-  if (!IsConstant()) {
-    return false;
-  } else {
-    const ConstantType* const_val = down_cast<const ConstantType*>(this);
-    return const_val->ConstantValue() >= 0 && const_val->ConstantValue() <= 1;
   }
 }
 
@@ -158,7 +149,7 @@ inline bool RegType::IsStrictlyAssignableFrom(const RegType& src, MethodVerifier
   return AssignableFrom(*this, src, true, verifier);
 }
 
-inline void* RegType::operator new(size_t size, ScopedArenaAllocator* allocator) {
+inline void* RegType::operator new(size_t size, ArenaAllocator* allocator) {
   return allocator->Alloc(size, kArenaAllocMisc);
 }
 
