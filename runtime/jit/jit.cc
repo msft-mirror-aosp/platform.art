@@ -19,6 +19,7 @@
 #include <dlfcn.h>
 #include <sys/resource.h>
 
+#include "app_info.h"
 #include "art_method-inl.h"
 #include "base/file_utils.h"
 #include "base/logging.h"  // For VLOG.
@@ -276,13 +277,15 @@ void Jit::DeleteThreadPool() {
 
 void Jit::StartProfileSaver(const std::string& profile_filename,
                             const std::vector<std::string>& code_paths,
-                            const std::string& ref_profile_filename) {
+                            const std::string& ref_profile_filename,
+                            AppInfo::CodeType code_type) {
   if (options_->GetSaveProfilingInfo()) {
     ProfileSaver::Start(options_->GetProfileSaverOptions(),
                         profile_filename,
                         code_cache_,
                         code_paths,
-                        ref_profile_filename);
+                        ref_profile_filename,
+                        code_type);
   }
 }
 
@@ -803,15 +806,17 @@ class ZygoteVerificationTask final : public Task {
     const std::vector<const DexFile*>& boot_class_path =
         runtime->GetClassLinker()->GetBootClassPath();
     ScopedObjectAccess soa(self);
-    StackHandleScope<1> hs(self);
+    StackHandleScope<2> hs(self);
+    MutableHandle<mirror::DexCache> dex_cache = hs.NewHandle<mirror::DexCache>(nullptr);
     MutableHandle<mirror::Class> klass = hs.NewHandle<mirror::Class>(nullptr);
     uint64_t start_ns = ThreadCpuNanoTime();
     uint64_t number_of_classes = 0;
     for (const DexFile* dex_file : boot_class_path) {
+      dex_cache.Assign(linker->FindDexCache(self, *dex_file));
       for (uint32_t i = 0; i < dex_file->NumClassDefs(); ++i) {
         const dex::ClassDef& class_def = dex_file->GetClassDef(i);
-        const char* descriptor = dex_file->GetClassDescriptor(class_def);
-        klass.Assign(linker->LookupResolvedType(descriptor, /* class_loader= */ nullptr));
+        klass.Assign(linker->LookupResolvedType(
+            class_def.class_idx_, dex_cache.Get(), /* class_loader= */ nullptr));
         if (klass == nullptr) {
           // Class not loaded yet.
           DCHECK(!self->IsExceptionPending());
@@ -1685,7 +1690,8 @@ void Jit::MaybeEnqueueCompilation(ArtMethod* method, Thread* self) {
   }
 
   static constexpr size_t kIndividualSharedMethodHotnessThreshold = 0x3f;
-  if (method->IsMemorySharedMethod()) {
+  // Intrinsics are always in the boot image and considered hot.
+  if (method->IsMemorySharedMethod() && !method->IsIntrinsic()) {
     MutexLock mu(self, lock_);
     auto it = shared_method_counters_.find(method);
     if (it == shared_method_counters_.end()) {

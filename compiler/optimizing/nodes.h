@@ -76,6 +76,7 @@ class HParameterValue;
 class HPhi;
 class HSuspendCheck;
 class HTryBoundary;
+class HVecCondition;
 class FieldInfo;
 class LiveInterval;
 class LocationSummary;
@@ -1423,8 +1424,17 @@ class HLoopInformationOutwardIterator : public ValueObject {
   M(VecPredSetAll, VecPredSetOperation)                                 \
   M(VecPredWhile, VecPredSetOperation)                                  \
   M(VecPredToBoolean, VecOperation)                                     \
-  M(VecCondition, VecPredSetOperation)                                  \
-  M(VecPredNot, VecPredSetOperation)                                    \
+  M(VecEqual, VecCondition)                                             \
+  M(VecNotEqual, VecCondition)                                          \
+  M(VecLessThan, VecCondition)                                          \
+  M(VecLessThanOrEqual, VecCondition)                                   \
+  M(VecGreaterThan, VecCondition)                                       \
+  M(VecGreaterThanOrEqual, VecCondition)                                \
+  M(VecBelow, VecCondition)                                             \
+  M(VecBelowOrEqual, VecCondition)                                      \
+  M(VecAbove, VecCondition)                                             \
+  M(VecAboveOrEqual, VecCondition)                                      \
+  M(VecPredNot, VecPredSetOperation)
 
 #define FOR_EACH_CONCRETE_INSTRUCTION_COMMON(M)                         \
   FOR_EACH_CONCRETE_INSTRUCTION_SCALAR_COMMON(M)                        \
@@ -1492,7 +1502,8 @@ class HLoopInformationOutwardIterator : public ValueObject {
   M(VecUnaryOperation, VecOperation)                                    \
   M(VecBinaryOperation, VecOperation)                                   \
   M(VecMemoryOperation, VecOperation)                                   \
-  M(VecPredSetOperation, VecOperation)
+  M(VecPredSetOperation, VecOperation)                                  \
+  M(VecCondition, VecPredSetOperation)
 
 #define FOR_EACH_INSTRUCTION(M)                                         \
   FOR_EACH_CONCRETE_INSTRUCTION(M)                                      \
@@ -4621,6 +4632,8 @@ class HInvoke : public HVariableInputSizeInstruction {
 
   bool CanBeMoved() const override { return IsIntrinsic() && !DoesAnyWrite(); }
 
+  bool CanBeNull() const override;
+
   bool InstructionDataEquals(const HInstruction* other) const override {
     return intrinsic_ != Intrinsics::kNone && intrinsic_ == other->AsInvoke()->intrinsic_;
   }
@@ -5098,28 +5111,6 @@ class HInvokeVirtual final : public HInvoke {
   }
 
   bool IsClonable() const override { return true; }
-
-  bool CanBeNull() const override {
-    switch (GetIntrinsic()) {
-      case Intrinsics::kThreadCurrentThread:
-      case Intrinsics::kStringBufferAppend:
-      case Intrinsics::kStringBufferToString:
-      case Intrinsics::kStringBuilderAppendObject:
-      case Intrinsics::kStringBuilderAppendString:
-      case Intrinsics::kStringBuilderAppendCharSequence:
-      case Intrinsics::kStringBuilderAppendCharArray:
-      case Intrinsics::kStringBuilderAppendBoolean:
-      case Intrinsics::kStringBuilderAppendChar:
-      case Intrinsics::kStringBuilderAppendInt:
-      case Intrinsics::kStringBuilderAppendLong:
-      case Intrinsics::kStringBuilderAppendFloat:
-      case Intrinsics::kStringBuilderAppendDouble:
-      case Intrinsics::kStringBuilderToString:
-        return false;
-      default:
-        return HInvoke::CanBeNull();
-    }
-  }
 
   bool CanDoImplicitNullCheckOn(HInstruction* obj) const override;
 

@@ -37,6 +37,7 @@
 #include "mirror/string.h"
 #include "optimizing/code_generator.h"
 #include "optimizing/data_type.h"
+#include "optimizing/locations.h"
 #include "scoped_thread_state_change-inl.h"
 #include "thread-current-inl.h"
 #include "utils/x86_64/assembler_x86_64.h"
@@ -163,7 +164,7 @@ class InvokePolymorphicSlowPathX86_64 : public SlowPathCode {
     SaveLiveRegisters(codegen, instruction_->GetLocations());
 
     // Passing `MethodHandle` object as hidden argument.
-    __ movq(CpuRegister(RDI), method_handle_);
+    __ movl(CpuRegister(RDI), method_handle_);
     x86_64_codegen->InvokeRuntime(QuickEntrypointEnum::kQuickInvokePolymorphicWithHiddenReceiver,
                                   instruction_,
                                   instruction_->GetDexPc());
@@ -329,7 +330,7 @@ static void CreateFPToFPLocations(ArenaAllocator* allocator, HInvoke* invoke) {
   LocationSummary* locations =
       new (allocator) LocationSummary(invoke, LocationSummary::kNoCall, kIntrinsified);
   locations->SetInAt(0, Location::RequiresFpuRegister());
-  locations->SetOut(Location::RequiresFpuRegister());
+  locations->SetOut(Location::RequiresFpuRegister(), Location::kNoOutputOverlap);
 }
 
 void IntrinsicLocationsBuilderX86_64::VisitMathSqrt(HInvoke* invoke) {
@@ -4279,10 +4280,17 @@ void IntrinsicCodeGeneratorX86_64::VisitMethodHandleInvokeExact(HInvoke* invoke)
     __ testl(Address(method, ArtMethod::AccessFlagsOffset()), Immediate(kAccPrivate));
     __ j(kNotZero, &execute_target_method);
 
-    CpuRegister vtable_index = locations->GetTemp(0).AsRegister<CpuRegister>();
+    Label do_virtual_dispatch;
+    CpuRegister temp = locations->GetTemp(0).AsRegister<CpuRegister>();
 
+    __ movl(temp, Address(method, ArtMethod::DeclaringClassOffset()));
+    __ cmpl(temp, Address(receiver, mirror::Object::ClassOffset()));
+    // If method is defined in the receiver's class, execute it as it is.
+    __ j(kEqual, &execute_target_method);
+
+    __ Bind(&do_virtual_dispatch);
     // MethodIndex is uint16_t.
-    __ movzxw(vtable_index, Address(method, ArtMethod::MethodIndexOffset()));
+    __ movzxw(temp, Address(method, ArtMethod::MethodIndexOffset()));
 
     constexpr uint32_t class_offset = mirror::Object::ClassOffset().Int32Value();
     // Re-using method register for receiver class.
@@ -4290,7 +4298,7 @@ void IntrinsicCodeGeneratorX86_64::VisitMethodHandleInvokeExact(HInvoke* invoke)
 
     constexpr uint32_t vtable_offset =
         mirror::Class::EmbeddedVTableOffset(art::PointerSize::k64).Int32Value();
-    __ movq(method, Address(method, vtable_index, TIMES_8, vtable_offset));
+    __ movq(method, Address(method, temp, TIMES_8, vtable_offset));
     __ Jump(&execute_target_method);
   }
   __ Bind(&static_dispatch);
