@@ -249,7 +249,6 @@ class MethodVerifier final : public ::art::verifier::MethodVerifier {
    *
    * Walks through instructions in a method calling VerifyInstruction on each.
    */
-  template <bool kAllowRuntimeOnlyInstructions>
   bool VerifyInstructions();
 
   /*
@@ -285,7 +284,6 @@ class MethodVerifier final : public ::art::verifier::MethodVerifier {
    * - (earlier) for each exception handler, the handler must start at a valid
    *   instruction
    */
-  template <bool kAllowRuntimeOnlyInstructions>
   bool VerifyInstruction(const Instruction* inst, uint32_t code_offset);
 
   /* Ensure that the register index is valid for this code item. */
@@ -1021,9 +1019,30 @@ class MethodVerifier final : public ::art::verifier::MethodVerifier {
   }
 
   // Returns the method index of an invoke instruction.
-  uint16_t GetMethodIdxOfInvoke(const Instruction* inst)
+  static uint16_t GetMethodIdxOfInvoke(const Instruction* inst)
       REQUIRES_SHARED(Locks::mutator_lock_) {
-    return inst->VRegB();
+    // Note: This is compiled to a single load in release mode.
+    Instruction::Code opcode = inst->Opcode();
+    if (opcode == Instruction::INVOKE_VIRTUAL ||
+        opcode == Instruction::INVOKE_SUPER ||
+        opcode == Instruction::INVOKE_DIRECT ||
+        opcode == Instruction::INVOKE_STATIC ||
+        opcode == Instruction::INVOKE_INTERFACE ||
+        opcode == Instruction::INVOKE_CUSTOM) {
+      return inst->VRegB_35c();
+    } else if (opcode == Instruction::INVOKE_VIRTUAL_RANGE ||
+               opcode == Instruction::INVOKE_SUPER_RANGE ||
+               opcode == Instruction::INVOKE_DIRECT_RANGE ||
+               opcode == Instruction::INVOKE_STATIC_RANGE ||
+               opcode == Instruction::INVOKE_INTERFACE_RANGE ||
+               opcode == Instruction::INVOKE_CUSTOM_RANGE) {
+      return inst->VRegB_3rc();
+    } else if (opcode == Instruction::INVOKE_POLYMORPHIC) {
+      return inst->VRegB_45cc();
+    } else {
+      DCHECK_EQ(opcode, Instruction::INVOKE_POLYMORPHIC_RANGE);
+      return inst->VRegB_4rcc();
+    }
   }
   // Returns the field index of a field access instruction.
   uint16_t GetFieldIdxOfFieldAccess(const Instruction* inst, bool is_static)
@@ -1352,13 +1371,10 @@ bool MethodVerifier<kVerifierDebug>::Verify() {
                             InstructionFlags());
   // Run through the instructions and see if the width checks out.
   bool result = ComputeWidthsAndCountOps();
-  bool allow_runtime_only_instructions = !IsAotMode() || verify_to_dump_;
   // Flag instructions guarded by a "try" block and check exception handlers.
   result = result && ScanTryCatchBlocks();
   // Perform static instruction verification.
-  result = result && (allow_runtime_only_instructions
-                          ? VerifyInstructions<true>()
-                          : VerifyInstructions<false>());
+  result = result && VerifyInstructions();
   // Perform code-flow analysis and return.
   result = result && VerifyCodeFlow();
 
@@ -1456,13 +1472,12 @@ bool MethodVerifier<kVerifierDebug>::ScanTryCatchBlocks() {
 }
 
 template <bool kVerifierDebug>
-template <bool kAllowRuntimeOnlyInstructions>
 bool MethodVerifier<kVerifierDebug>::VerifyInstructions() {
   // Flag the start of the method as a branch target.
   GetModifiableInstructionFlags(0).SetBranchTarget();
   for (const DexInstructionPcPair& inst : code_item_accessor_) {
     const uint32_t dex_pc = inst.DexPc();
-    if (!VerifyInstruction<kAllowRuntimeOnlyInstructions>(&inst.Inst(), dex_pc)) {
+    if (!VerifyInstruction(&inst.Inst(), dex_pc)) {
       DCHECK_NE(failures_.size(), 0U);
       return false;
     }
@@ -1478,7 +1493,6 @@ bool MethodVerifier<kVerifierDebug>::VerifyInstructions() {
 }
 
 template <bool kVerifierDebug>
-template <bool kAllowRuntimeOnlyInstructions>
 bool MethodVerifier<kVerifierDebug>::VerifyInstruction(const Instruction* inst,
                                                        uint32_t code_offset) {
   bool result = true;
@@ -1586,10 +1600,6 @@ bool MethodVerifier<kVerifierDebug>::VerifyInstruction(const Instruction* inst,
       Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "unexpected opcode " << inst->Name();
       result = false;
       break;
-  }
-  if (!kAllowRuntimeOnlyInstructions && inst->GetVerifyIsRuntimeOnly()) {
-    Fail(VERIFY_ERROR_BAD_CLASS_HARD) << "opcode only expected at runtime " << inst->Name();
-    result = false;
   }
   return result;
 }
