@@ -24,8 +24,8 @@
 #include <android-base/logging.h>
 
 #include "base/arena_allocator.h"
+#include "base/arena_containers.h"
 #include "base/macros.h"
-#include "base/scoped_arena_containers.h"
 #include "base/value_object.h"
 #include "dex/code_item_accessors.h"
 #include "dex/dex_file_types.h"
@@ -57,8 +57,6 @@ class DexCache;
 namespace verifier {
 
 class MethodVerifier;
-class RegisterLine;
-using RegisterLineArenaUniquePtr = std::unique_ptr<RegisterLine, RegisterLineArenaDelete>;
 class RegType;
 class RegTypeCache;
 struct ScopedNewLine;
@@ -68,7 +66,7 @@ class VerifierDeps;
 // execution of that instruction.
 class PcToRegisterLineTable {
  public:
-  explicit PcToRegisterLineTable(ScopedArenaAllocator& allocator);
+  explicit PcToRegisterLineTable(ArenaAllocator& allocator);
   ~PcToRegisterLineTable();
 
   // Initialize the RegisterTable. Every instruction address can have a different set of information
@@ -77,7 +75,7 @@ class PcToRegisterLineTable {
   void Init(InstructionFlags* flags,
             uint32_t insns_size,
             uint16_t registers_size,
-            ScopedArenaAllocator& allocator,
+            ArenaAllocator& allocator,
             RegTypeCache* reg_types,
             uint32_t interesting_dex_pc);
 
@@ -90,7 +88,7 @@ class PcToRegisterLineTable {
   }
 
  private:
-  ScopedArenaVector<RegisterLineArenaUniquePtr> register_lines_;
+  ArenaVector<RegisterLineArenaUniquePtr> register_lines_;
 
   DISALLOW_COPY_AND_ASSIGN(PcToRegisterLineTable);
 };
@@ -253,6 +251,16 @@ class MethodVerifier {
                                   std::string* hard_failure_msg)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
+  /*
+   * Get the "this" pointer from a non-static method invocation. This returns the RegType so the
+   * caller can decide whether it needs the reference to be initialized or not.
+   *
+   * The argument count is in vA, and the first argument is in vC, for both "simple" and "range"
+   * versions. We just need to make sure vA is >= 1 and then return vC.
+   */
+  const RegType& GetInvocationThis(const Instruction* inst)
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
   // For VerifierDepsTest. TODO: Refactor.
 
   // Run verification on the method. Returns true if verification completes and false if the input
@@ -272,12 +280,18 @@ class MethodVerifier {
 
   virtual bool PotentiallyMarkRuntimeThrow() = 0;
 
+  std::ostringstream& InfoMessages() {
+    if (!info_messages_.has_value()) {
+      info_messages_.emplace();
+    }
+    return info_messages_.value();
+  }
+
   // The thread we're verifying on.
   Thread* const self_;
 
   // Arena allocator.
-  ArenaStack arena_stack_;
-  ScopedArenaAllocator allocator_;
+  ArenaAllocator allocator_;
 
   RegTypeCache& reg_types_;  // TODO: Change to a pointer in a separate CL.
 
@@ -331,7 +345,7 @@ class MethodVerifier {
   uint32_t encountered_failure_types_;
 
   // Info message log use primarily for verifier diagnostics.
-  std::ostringstream info_messages_;
+  std::optional<std::ostringstream> info_messages_;
 
   // The verifier deps object we are going to report type assigability
   // constraints to. Can be null for runtime verification.
@@ -342,6 +356,7 @@ class MethodVerifier {
 
   friend class art::Thread;
   friend class ClassVerifier;
+  friend class RegisterLineTest;
   friend class VerifierDepsTest;
 
   DISALLOW_COPY_AND_ASSIGN(MethodVerifier);
