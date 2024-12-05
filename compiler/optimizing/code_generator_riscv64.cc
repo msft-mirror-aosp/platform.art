@@ -2666,8 +2666,10 @@ void InstructionCodeGeneratorRISCV64::GenerateMethodEntryExitHook(HInstruction* 
   __ Addi(tmp, tmp, -dchecked_integral_cast<int32_t>(kNumEntriesForWallClock * sizeof(void*)));
   __ Blt(tmp, tmp2, slow_path->GetEntryLabel());
 
-  // Update the index in the `Thread`.
-  __ Sd(tmp, TR, trace_buffer_curr_entry_offset);
+  // Update the index in the `Thread`. Temporarily free `tmp2` to be used by `Stored()`.
+  temps.FreeXRegister(tmp2);
+  __ Stored(tmp, TR, trace_buffer_curr_entry_offset);
+  tmp2 = temps.AllocateXRegister();
 
   // Record method pointer and trace action.
   __ Ld(tmp2, SP, 0);
@@ -5825,12 +5827,103 @@ void InstructionCodeGeneratorRISCV64::VisitVecPredToBoolean(HVecPredToBoolean* i
   LOG(FATAL) << "Unimplemented";
 }
 
-void LocationsBuilderRISCV64::VisitVecCondition(HVecCondition* instruction) {
+void LocationsBuilderRISCV64::VisitVecEqual(HVecEqual* instruction) {
   UNUSED(instruction);
   LOG(FATAL) << "Unimplemented";
 }
 
-void InstructionCodeGeneratorRISCV64::VisitVecCondition(HVecCondition* instruction) {
+void InstructionCodeGeneratorRISCV64::VisitVecEqual(HVecEqual* instruction) {
+  UNUSED(instruction);
+  LOG(FATAL) << "Unimplemented";
+}
+
+void LocationsBuilderRISCV64::VisitVecNotEqual(HVecNotEqual* instruction) {
+  UNUSED(instruction);
+  LOG(FATAL) << "Unimplemented";
+}
+
+void InstructionCodeGeneratorRISCV64::VisitVecNotEqual(HVecNotEqual* instruction) {
+  UNUSED(instruction);
+  LOG(FATAL) << "Unimplemented";
+}
+
+void LocationsBuilderRISCV64::VisitVecLessThan(HVecLessThan* instruction) {
+  UNUSED(instruction);
+  LOG(FATAL) << "Unimplemented";
+}
+
+void InstructionCodeGeneratorRISCV64::VisitVecLessThan(HVecLessThan* instruction) {
+  UNUSED(instruction);
+  LOG(FATAL) << "Unimplemented";
+}
+
+void LocationsBuilderRISCV64::VisitVecLessThanOrEqual(HVecLessThanOrEqual* instruction) {
+  UNUSED(instruction);
+  LOG(FATAL) << "Unimplemented";
+}
+
+void InstructionCodeGeneratorRISCV64::VisitVecLessThanOrEqual(HVecLessThanOrEqual* instruction) {
+  UNUSED(instruction);
+  LOG(FATAL) << "Unimplemented";
+}
+
+void LocationsBuilderRISCV64::VisitVecGreaterThan(HVecGreaterThan* instruction) {
+  UNUSED(instruction);
+  LOG(FATAL) << "Unimplemented";
+}
+
+void InstructionCodeGeneratorRISCV64::VisitVecGreaterThan(HVecGreaterThan* instruction) {
+  UNUSED(instruction);
+  LOG(FATAL) << "Unimplemented";
+}
+
+void LocationsBuilderRISCV64::VisitVecGreaterThanOrEqual(HVecGreaterThanOrEqual* instruction) {
+  UNUSED(instruction);
+  LOG(FATAL) << "Unimplemented";
+}
+
+void InstructionCodeGeneratorRISCV64::VisitVecGreaterThanOrEqual(
+    HVecGreaterThanOrEqual* instruction) {
+  UNUSED(instruction);
+  LOG(FATAL) << "Unimplemented";
+}
+
+void LocationsBuilderRISCV64::VisitVecBelow(HVecBelow* instruction) {
+  UNUSED(instruction);
+  LOG(FATAL) << "Unimplemented";
+}
+
+void InstructionCodeGeneratorRISCV64::VisitVecBelow(HVecBelow* instruction) {
+  UNUSED(instruction);
+  LOG(FATAL) << "Unimplemented";
+}
+
+void LocationsBuilderRISCV64::VisitVecBelowOrEqual(HVecBelowOrEqual* instruction) {
+  UNUSED(instruction);
+  LOG(FATAL) << "Unimplemented";
+}
+
+void InstructionCodeGeneratorRISCV64::VisitVecBelowOrEqual(HVecBelowOrEqual* instruction) {
+  UNUSED(instruction);
+  LOG(FATAL) << "Unimplemented";
+}
+
+void LocationsBuilderRISCV64::VisitVecAbove(HVecAbove* instruction) {
+  UNUSED(instruction);
+  LOG(FATAL) << "Unimplemented";
+}
+
+void InstructionCodeGeneratorRISCV64::VisitVecAbove(HVecAbove* instruction) {
+  UNUSED(instruction);
+  LOG(FATAL) << "Unimplemented";
+}
+
+void LocationsBuilderRISCV64::VisitVecAboveOrEqual(HVecAboveOrEqual* instruction) {
+  UNUSED(instruction);
+  LOG(FATAL) << "Unimplemented";
+}
+
+void InstructionCodeGeneratorRISCV64::VisitVecAboveOrEqual(HVecAboveOrEqual* instruction) {
   UNUSED(instruction);
   LOG(FATAL) << "Unimplemented";
 }
