@@ -471,6 +471,17 @@ public final class ArtManagerLocal {
             @NonNull CancellationSignal cancellationSignal,
             @Nullable @CallbackExecutor Executor progressCallbackExecutor,
             @Nullable Map<Integer, Consumer<OperationProgress>> progressCallbacks) {
+        return dexoptPackagesWithParams(snapshot, reason, cancellationSignal,
+                progressCallbackExecutor, progressCallbacks, null /* params */);
+    }
+
+    /** @hide */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    @NonNull
+    public BatchDexoptParams getBatchDexoptParams(
+            @NonNull PackageManagerLocal.FilteredSnapshot snapshot,
+            @NonNull @BatchDexoptReason String reason,
+            @NonNull CancellationSignal cancellationSignal) {
         List<String> defaultPackages =
                 Collections.unmodifiableList(getDefaultPackages(snapshot, reason));
         DexoptParams defaultDexoptParams = new DexoptParams.Builder(reason).build();
@@ -484,8 +495,30 @@ public final class ArtManagerLocal {
             });
         }
         BatchDexoptParams params = builder.build();
-        Utils.check(params.getDexoptParams().getReason().equals(reason));
+        DexoptParams dexoptParams = params.getDexoptParams();
+        Utils.check(dexoptParams.getReason().equals(reason));
+        if (dexoptParams.getSplitName() != null) {
+            AsLog.w("`setSplitName` is not supported in `BatchDexoptStartCallback`. The value is "
+                    + "ignored");
+            params = builder.setDexoptParams(dexoptParams.toBuilder().setSplitName(null).build())
+                             .build();
+        }
+        return params;
+    }
 
+    /** @hide */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    @NonNull
+    public Map<Integer, DexoptResult> dexoptPackagesWithParams(
+            @NonNull PackageManagerLocal.FilteredSnapshot snapshot,
+            @NonNull @BatchDexoptReason String reason,
+            @NonNull CancellationSignal cancellationSignal,
+            @Nullable @CallbackExecutor Executor progressCallbackExecutor,
+            @Nullable Map<Integer, Consumer<OperationProgress>> progressCallbacks,
+            @Nullable BatchDexoptParams params) {
+        if (params == null) {
+            params = getBatchDexoptParams(snapshot, reason, cancellationSignal);
+        }
         ExecutorService dexoptExecutor =
                 Executors.newFixedThreadPool(ReasonMapping.getConcurrencyForReason(reason));
         Map<Integer, DexoptResult> dexoptResults = new HashMap<>();
@@ -963,8 +996,19 @@ public final class ArtManagerLocal {
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public void dump(
             @NonNull PrintWriter pw, @NonNull PackageManagerLocal.FilteredSnapshot snapshot) {
+        dump(pw, snapshot, false /* verifySdmSignatures */);
+    }
+
+    /**
+     * Same as above, but allows to specify options.
+     *
+     * @hide
+     */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    public void dump(@NonNull PrintWriter pw,
+            @NonNull PackageManagerLocal.FilteredSnapshot snapshot, boolean verifySdmSignatures) {
         try (var pin = mInjector.createArtdPin()) {
-            new DumpHelper(this).dump(pw, snapshot);
+            new DumpHelper(this).dump(pw, snapshot, verifySdmSignatures);
         }
     }
 
@@ -980,9 +1024,21 @@ public final class ArtManagerLocal {
     @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
     public void dumpPackage(@NonNull PrintWriter pw,
             @NonNull PackageManagerLocal.FilteredSnapshot snapshot, @NonNull String packageName) {
+        dumpPackage(pw, snapshot, packageName, false /* verifySdmSignatures */);
+    }
+
+    /**
+     * Same as above, but allows to specify options.
+     *
+     * @hide
+     */
+    @RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+    public void dumpPackage(@NonNull PrintWriter pw,
+            @NonNull PackageManagerLocal.FilteredSnapshot snapshot, @NonNull String packageName,
+            boolean verifySdmSignatures) {
         try (var pin = mInjector.createArtdPin()) {
-            new DumpHelper(this).dumpPackage(
-                    pw, snapshot, Utils.getPackageStateOrThrow(snapshot, packageName));
+            new DumpHelper(this).dumpPackage(pw, snapshot,
+                    Utils.getPackageStateOrThrow(snapshot, packageName), verifySdmSignatures);
         }
     }
 
@@ -1646,7 +1702,7 @@ public final class ArtManagerLocal {
         @NonNull
         public synchronized PreRebootDexoptJob getPreRebootDexoptJob() {
             if (mPrDexoptJob == null) {
-                mPrDexoptJob = new PreRebootDexoptJob(mContext);
+                mPrDexoptJob = new PreRebootDexoptJob(mContext, mArtManagerLocal);
             }
             return mPrDexoptJob;
         }

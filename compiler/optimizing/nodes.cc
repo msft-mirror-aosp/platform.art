@@ -2476,7 +2476,6 @@ void HBasicBlock::DisconnectAndDelete() {
 
   // (7) Delete from the graph, update reverse post order.
   graph_->DeleteDeadEmptyBlock(this);
-  SetGraph(nullptr);
 }
 
 void HBasicBlock::DisconnectFromSuccessors(const ArenaBitVector* visited) {
@@ -2593,7 +2592,6 @@ void HBasicBlock::MergeWith(HBasicBlock* other) {
 
   // Delete `other` from the graph. The function updates reverse post order.
   graph_->DeleteDeadEmptyBlock(other);
-  other->SetGraph(nullptr);
 }
 
 void HBasicBlock::MergeWithInlined(HBasicBlock* other) {
@@ -3263,17 +3261,35 @@ std::ostream& operator<<(std::ostream& os, HInvokeStaticOrDirect::ClinitCheckReq
 }
 
 bool HInvokeStaticOrDirect::CanBeNull() const {
-  if (GetType() != DataType::Type::kReference || IsStringInit()) {
+  if (IsStringInit()) {
     return false;
   }
+  return HInvoke::CanBeNull();
+}
+
+bool HInvoke::CanBeNull() const {
   switch (GetIntrinsic()) {
+    case Intrinsics::kThreadCurrentThread:
+    case Intrinsics::kStringBufferAppend:
+    case Intrinsics::kStringBufferToString:
+    case Intrinsics::kStringBuilderAppendObject:
+    case Intrinsics::kStringBuilderAppendString:
+    case Intrinsics::kStringBuilderAppendCharSequence:
+    case Intrinsics::kStringBuilderAppendCharArray:
+    case Intrinsics::kStringBuilderAppendBoolean:
+    case Intrinsics::kStringBuilderAppendChar:
+    case Intrinsics::kStringBuilderAppendInt:
+    case Intrinsics::kStringBuilderAppendLong:
+    case Intrinsics::kStringBuilderAppendFloat:
+    case Intrinsics::kStringBuilderAppendDouble:
+    case Intrinsics::kStringBuilderToString:
 #define DEFINE_BOXED_CASE(name, unused1, unused2, unused3, unused4) \
-    case Intrinsics::k##name##ValueOf: \
-      return false;
+    case Intrinsics::k##name##ValueOf:
     BOXED_TYPES(DEFINE_BOXED_CASE)
 #undef DEFINE_BOXED_CASE
+      return false;
     default:
-      return true;
+      return GetType() == DataType::Type::kReference;
   }
 }
 
