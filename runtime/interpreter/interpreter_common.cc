@@ -189,14 +189,7 @@ bool MoveToExceptionHandler(Thread* self,
   } else {
     shadow_frame.SetDexPC(found_dex_pc);
     if (!skip_listeners && instrumentation->HasExceptionHandledListeners()) {
-      self->ClearException();
-      instrumentation->ExceptionHandledEvent(self, exception.Get());
-      if (UNLIKELY(self->IsExceptionPending())) {
-        // Exception handled event threw an exception. Try to find the handler for this one.
-        return MoveToExceptionHandler(self, shadow_frame, skip_listeners, skip_throw_listener);
-      } else if (!clear_exception) {
-        self->SetException(exception.Get());
-      }
+      shadow_frame.SetNotifyExceptionHandledEvent(/*enable=*/ true);
     } else if (clear_exception) {
       self->ClearException();
     }
@@ -520,8 +513,8 @@ bool DoInvokePolymorphic(Thread* self,
   const int invoke_method_idx = inst->VRegB();
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
   ArtMethod* invoke_method =
-      class_linker->ResolveMethod<ClassLinker::ResolveMode::kCheckICCEAndIAE>(
-          self, invoke_method_idx, shadow_frame.GetMethod(), kPolymorphic);
+      class_linker->ResolveMethodWithChecks(
+          invoke_method_idx, shadow_frame.GetMethod(), kPolymorphic);
 
   // Ensure intrinsic identifiers are initialized.
   DCHECK(invoke_method->IsIntrinsic());
