@@ -106,7 +106,23 @@ inline void BumpPointerSpace::Walk(Visitor&& visitor) {
   }
   // Walk the other blocks (currently only TLABs).
   if (block_sizes_copy != nullptr) {
-    for (size_t block_size : *block_sizes_copy) {
+    size_t iter = 0;
+    size_t num_blks = block_sizes_copy->size();
+    // Skip blocks which are already visited above as part of black-dense region.
+    for (uint8_t* ptr = main_end; iter < num_blks; iter++) {
+      size_t block_size = (*block_sizes_copy)[iter];
+      ptr += block_size;
+      if (ptr > pos) {
+        // Adjust block-size in case 'pos' is in the middle of the block.
+        if (static_cast<ssize_t>(block_size) > ptr - pos) {
+          (*block_sizes_copy)[iter] -= ptr - pos;
+        }
+        break;
+      }
+    }
+
+    for (; iter < num_blks; iter++) {
+      size_t block_size = (*block_sizes_copy)[iter];
       mirror::Object* obj = reinterpret_cast<mirror::Object*>(pos);
       const mirror::Object* end_obj = reinterpret_cast<const mirror::Object*>(pos + block_size);
       CHECK_LE(reinterpret_cast<const uint8_t*>(end_obj), End());

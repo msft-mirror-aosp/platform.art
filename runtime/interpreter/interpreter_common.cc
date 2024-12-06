@@ -62,7 +62,7 @@ bool CheckStackOverflow(Thread* self, size_t frame_size)
   bool implicit_check = Runtime::Current()->GetImplicitStackOverflowChecks();
   uint8_t* stack_end = self->GetStackEndForInterpreter(implicit_check);
   if (UNLIKELY(__builtin_frame_address(0) < stack_end + frame_size)) {
-    ThrowStackOverflowError(self);
+    ThrowStackOverflowError<kNativeStackType>(self);
     return false;
   }
   return true;
@@ -189,14 +189,7 @@ bool MoveToExceptionHandler(Thread* self,
   } else {
     shadow_frame.SetDexPC(found_dex_pc);
     if (!skip_listeners && instrumentation->HasExceptionHandledListeners()) {
-      self->ClearException();
-      instrumentation->ExceptionHandledEvent(self, exception.Get());
-      if (UNLIKELY(self->IsExceptionPending())) {
-        // Exception handled event threw an exception. Try to find the handler for this one.
-        return MoveToExceptionHandler(self, shadow_frame, skip_listeners, skip_throw_listener);
-      } else if (!clear_exception) {
-        self->SetException(exception.Get());
-      }
+      shadow_frame.SetNotifyExceptionHandledEvent(/*enable=*/ true);
     } else if (clear_exception) {
       self->ClearException();
     }
@@ -439,7 +432,7 @@ static bool DoVarHandleInvokeCommon(Thread* self,
   bool is_var_args = inst->HasVarArgs();
   const uint32_t vRegC = is_var_args ? inst->VRegC_45cc() : inst->VRegC_4rcc();
   const uint16_t vRegH = is_var_args ? inst->VRegH_45cc() : inst->VRegH_4rcc();
-  StackHandleScope<3> hs(self);
+  StackHandleScope<1> hs(self);
   Handle<mirror::VarHandle> var_handle = hs.NewHandle(
       ObjPtr<mirror::VarHandle>::DownCast(shadow_frame.GetVRegReference(vRegC)));
   ArtMethod* method = shadow_frame.GetMethod();
@@ -459,8 +452,8 @@ static bool DoVarHandleInvokeCommon(Thread* self,
 
   return VarHandleInvokeAccessor(self,
                                  shadow_frame,
-                                 method,
                                  var_handle,
+                                 method,
                                  dex::ProtoIndex(vRegH),
                                  access_mode,
                                  &operands,
@@ -520,8 +513,8 @@ bool DoInvokePolymorphic(Thread* self,
   const int invoke_method_idx = inst->VRegB();
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
   ArtMethod* invoke_method =
-      class_linker->ResolveMethod<ClassLinker::ResolveMode::kCheckICCEAndIAE>(
-          self, invoke_method_idx, shadow_frame.GetMethod(), kPolymorphic);
+      class_linker->ResolveMethodWithChecks(
+          invoke_method_idx, shadow_frame.GetMethod(), kPolymorphic);
 
   // Ensure intrinsic identifiers are initialized.
   DCHECK(invoke_method->IsIntrinsic());

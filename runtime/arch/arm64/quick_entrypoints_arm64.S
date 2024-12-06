@@ -32,20 +32,6 @@
     .cfi_adjust_cfa_offset -(\frame_adjustment)
 .endm
 
-.macro SAVE_TWO_REGS_INCREASE_FRAME reg1, reg2, frame_adjustment
-    stp \reg1, \reg2, [sp, #-(\frame_adjustment)]!
-    .cfi_adjust_cfa_offset (\frame_adjustment)
-    .cfi_rel_offset \reg1, 0
-    .cfi_rel_offset \reg2, 8
-.endm
-
-.macro RESTORE_TWO_REGS_DECREASE_FRAME reg1, reg2, frame_adjustment
-    ldp \reg1, \reg2, [sp], #(\frame_adjustment)
-    .cfi_restore \reg1
-    .cfi_restore \reg2
-    .cfi_adjust_cfa_offset -(\frame_adjustment)
-.endm
-
 .macro POP_SAVE_REFS_ONLY_FRAME
     DECREASE_FRAME 96
 .endm
@@ -2467,19 +2453,6 @@ ENTRY art_quick_invoke_custom
     RETURN_OR_DELIVER_PENDING_EXCEPTION
 END  art_quick_invoke_custom
 
-// Wrap ExecuteSwitchImpl in assembly method which specifies DEX PC for unwinding.
-//  Argument 0: x0: The context pointer for ExecuteSwitchImpl.
-//  Argument 1: x1: Pointer to the templated ExecuteSwitchImpl to call.
-//  Argument 2: x2: The value of DEX PC (memory address of the methods bytecode).
-ENTRY ExecuteSwitchImplAsm
-    SAVE_TWO_REGS_INCREASE_FRAME x19, xLR, 16
-    mov x19, x2                                   // x19 = DEX PC
-    CFI_DEFINE_DEX_PC_WITH_OFFSET(0 /* x0 */, 19 /* x19 */, 0)
-    blr x1                                        // Call the wrapped method.
-    RESTORE_TWO_REGS_DECREASE_FRAME x19, xLR, 16
-    ret
-END ExecuteSwitchImplAsm
-
 // x0 contains the class, x8 contains the inline cache. x9-x15 can be used.
 ENTRY art_quick_update_inline_cache
 #if (INLINE_CACHE_SIZE != 5)
@@ -2561,8 +2534,8 @@ ENTRY art_quick_record_entry_trace_event
     mov xIP1, #TRACE_BUFFER_SIZE
     add xIP1, xIP0, xIP1
 .Lupdate_entry:
-    str x0, [xIP1]
     sub xIP1, xIP1, 8
+    str x0, [xIP1]
     str xIP1, [xSELF, #TRACE_BUFFER_CURRENT_OFFSET]
     ret
 END art_quick_record_entry_trace_event
@@ -2576,9 +2549,9 @@ ENTRY art_quick_record_exit_trace_event
     mov xIP1, #TRACE_BUFFER_SIZE
     add xIP1, xIP0, xIP1
 .Lupdate_entry_exit:
+    sub xIP1, xIP1, 8
     mov xIP0, #1
     str xIP0, [xIP1]
-    sub xIP1, xIP1, 8
     str xIP1, [xSELF, #TRACE_BUFFER_CURRENT_OFFSET]
     ret
 END art_quick_record_exit_trace_event

@@ -67,9 +67,6 @@
 #ifndef MREMAP_DONTUNMAP
 #define MREMAP_DONTUNMAP 4
 #endif
-#ifndef MAP_FIXED_NOREPLACE
-#define MAP_FIXED_NOREPLACE 0x100000
-#endif
 #endif  // __BIONIC__
 
 // See aosp/2996596 for where these values came from.
@@ -118,7 +115,7 @@ static constexpr uint64_t kUffdFeaturesForMinorFault =
 static constexpr uint64_t kUffdFeaturesForSigbus = UFFD_FEATURE_SIGBUS;
 // A region which is more than kBlackDenseRegionThreshold percent live doesn't
 // need to be compacted as it is too densely packed.
-static constexpr uint kBlackDenseRegionThreshold = 85U;
+static constexpr uint kBlackDenseRegionThreshold = 95U;
 // We consider SIGBUS feature necessary to enable this GC as it's superior than
 // threading-based implementation for janks. We may want minor-fault in future
 // to be available for making jit-code-cache updation concurrent, which uses shmem.
@@ -974,7 +971,7 @@ bool MarkCompact::PrepareForCompaction() {
   GcCause gc_cause = GetCurrentIteration()->GetGcCause();
   if (gc_cause != kGcCauseExplicit && gc_cause != kGcCauseCollectorTransition &&
       !GetCurrentIteration()->GetClearSoftReferences()) {
-    size_t live_bytes = 0, total_bytes = 0;
+    uint64_t live_bytes = 0, total_bytes = 0;
     size_t aligned_vec_len = RoundUp(vector_len, chunk_info_per_page);
     size_t num_pages = aligned_vec_len / chunk_info_per_page;
     size_t threshold_passing_marker = 0;  // In number of pages
@@ -1000,7 +997,7 @@ bool MarkCompact::PrepareForCompaction() {
       auto iter = std::find_if(
           pages_live_bytes.rbegin() + (num_pages - threshold_passing_marker),
           pages_live_bytes.rend(),
-          [](uint32_t bytes) { return bytes * 100U < gPageSize * kBlackDenseRegionThreshold; });
+          [](uint32_t bytes) { return bytes * 100U >= gPageSize * kBlackDenseRegionThreshold; });
       black_dense_idx = (pages_live_bytes.rend() - iter) * chunk_info_per_page;
     }
     black_dense_end_ = moving_space_begin_ + black_dense_idx * kOffsetChunkSize;
@@ -2172,6 +2169,9 @@ void MarkCompact::CompactMovingSpace(uint8_t* page) {
           [&]() REQUIRES_SHARED(Locks::mutator_lock_) {
             UpdateNonMovingPage(
                 first_obj, to_space_end, from_space_slide_diff_, moving_space_bitmap_);
+            if (kMode == kFallbackMode) {
+              memcpy(to_space_end, to_space_end + from_space_slide_diff_, gPageSize);
+            }
           });
     } else {
       // The page has no reachable object on it. Just declare it mapped.
@@ -2773,9 +2773,11 @@ void MarkCompact::CompactionPause() {
   non_moving_space_bitmap_ = non_moving_space_->GetLiveBitmap();
   if (kIsDebugBuild) {
     DCHECK_EQ(thread_running_gc_, Thread::Current());
-    stack_low_addr_ = thread_running_gc_->GetStackEnd();
-    stack_high_addr_ =
-        reinterpret_cast<char*>(stack_low_addr_) + thread_running_gc_->GetStackSize();
+    // TODO(Simulator): Test that this should not operate on the simulated stack when the simulator
+    // supports mark compact.
+    stack_low_addr_ = thread_running_gc_->GetStackEnd<kNativeStackType>();
+    stack_high_addr_ = reinterpret_cast<char*>(stack_low_addr_)
+                       + thread_running_gc_->GetUsableStackSize<kNativeStackType>();
   }
   {
     TimingLogger::ScopedTiming t2("(Paused)UpdateCompactionDataStructures", GetTimings());
@@ -3008,6 +3010,14 @@ void MarkCompact::KernelPreparation() {
       }
       // Register the moving space with userfaultfd.
       RegisterUffd(moving_space_begin, moving_space_register_sz);
+      // madvise ensures that if any page gets mapped (only possible if some
+      // thread is reading the page(s) without trying to make sense as we hold
+      // mutator-lock exclusively) between mremap and uffd-registration, then
+      // it gets zapped so that the map is empty and ready for userfaults. If
+      // we could mremap after uffd-registration (like in case of linear-alloc
+      // space below) then we wouldn't need it. But since we don't register the
+      // entire space, we can't do that.
+      madvise(moving_space_begin, moving_space_register_sz, MADV_DONTNEED);
     }
     // Prepare linear-alloc for concurrent compaction.
     for (auto& data : linear_alloc_spaces_data_) {
@@ -4003,6 +4013,33 @@ void MarkCompact::UpdateLivenessInfo(mirror::Object* obj, size_t obj_size) {
 
 template <bool kUpdateLiveWords>
 void MarkCompact::ScanObject(mirror::Object* obj) {
+  mirror::Class* klass = obj->GetClass<kVerifyNone, kWithoutReadBarrier>();
+  // TODO(lokeshgidra): Remove the following condition once b/373609505 is fixed.
+  if (UNLIKELY(klass == nullptr)) {
+    // It was seen in ConcurrentCopying GC that after a small wait when we reload
+    // the class pointer, it turns out to be a valid class object. So as a workaround,
+    // we can continue execution and log an error that this happened.
+    for (size_t i = 0; i < 1000; i++) {
+      // Wait for 1ms at a time. Don't wait for more than 1 second in total.
+      usleep(1000);
+      klass = obj->GetClass<kVerifyNone, kWithoutReadBarrier>();
+      if (klass != nullptr) {
+        std::ostringstream oss;
+        klass->DumpClass(oss, mirror::Class::kDumpClassFullDetail);
+        LOG(FATAL_WITHOUT_ABORT) << "klass pointer for obj: " << obj
+                                 << " found to be null first. Reloading after " << i
+                                 << " iterations of 1ms sleep fetched klass: " << oss.str();
+        break;
+      }
+    }
+
+    if (UNLIKELY(klass == nullptr)) {
+      // It must be heap corruption.
+      LOG(FATAL_WITHOUT_ABORT) << "klass pointer for obj: " << obj << " found to be null.";
+    }
+    heap_->GetVerification()->LogHeapCorruption(
+        obj, mirror::Object::ClassOffset(), klass, /*fatal=*/true);
+  }
   // The size of `obj` is used both here (to update `bytes_scanned_`) and in
   // `UpdateLivenessInfo`. As fetching this value can be expensive, do it once
   // here and pass that information to `UpdateLivenessInfo`.
