@@ -459,7 +459,6 @@ class Instruction {
   // VRegH
   bool HasVRegH() const;
   int32_t VRegH() const;
-  ALWAYS_INLINE int32_t VRegH(Format format) const;
   uint16_t VRegH_45cc() const;
   uint16_t VRegH_4rcc() const;
 
@@ -571,11 +570,8 @@ class Instruction {
   }
 
   // Determine if the instruction is any of 'return' instructions.
-  static constexpr bool IsReturn(Code opcode) {
-    return (InstructionDescriptorOf(opcode).flags & kReturn) != 0;
-  }
   bool IsReturn() const {
-    return IsReturn(Opcode());
+    return (InstructionDescriptorOf(Opcode()).flags & kReturn) != 0;
   }
 
   // Determine if this instruction ends execution of its basic block.
@@ -674,12 +670,12 @@ class Instruction {
     return insns[offset];
   }
 
-  size_t SizeInCodeUnitsComplexOpcode() const;
-
  private:
   static constexpr const InstructionDescriptor& InstructionDescriptorOf(Code opcode) {
     return kInstructionDescriptors[opcode];
   }
+
+  size_t SizeInCodeUnitsComplexOpcode() const;
 
   // Return how many code unit words are required to compute the size of the opcode.
   size_t CodeUnitsRequiredForSizeOfComplexOpcode() const;

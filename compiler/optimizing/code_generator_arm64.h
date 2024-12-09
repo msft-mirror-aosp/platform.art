@@ -160,6 +160,7 @@ vixl::aarch64::Condition ARM64PCondition(HVecPredToBoolean::PCondKind cond);
   V(SystemArrayCopyInt)                       \
   V(UnsafeArrayBaseOffset)                    \
   /* 1.8 */                                   \
+  V(MethodHandleInvokeExact)                  \
   V(MethodHandleInvoke)                       \
   /* OpenJDK 11 */                            \
   V(JdkUnsafeArrayBaseOffset)
