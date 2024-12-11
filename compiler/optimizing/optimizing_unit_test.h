@@ -382,7 +382,7 @@ class OptimizingUnitTestHelper {
 
     pre_header->AddSuccessor(loop);
     loop->AddSuccessor(loop_exit);  // true successor
-    loop->AddSuccessor(loop);  // fakse successor
+    loop->AddSuccessor(loop);  // false successor
 
     MakeGoto(pre_header);
 
@@ -404,8 +404,8 @@ class OptimizingUnitTestHelper {
 
   HEnvironment* ManuallyBuildEnvFor(HInstruction* instruction,
                                     ArenaVector<HInstruction*>* current_locals) {
-    HEnvironment* environment = new (GetAllocator()) HEnvironment(
-        (GetAllocator()),
+    HEnvironment* environment = HEnvironment::Create(
+        GetAllocator(),
         current_locals->size(),
         graph_->GetArtMethod(),
         instruction->GetDexPc(),
@@ -472,6 +472,7 @@ class OptimizingUnitTestHelper {
   HLoadClass* MakeLoadClass(HBasicBlock* block,
                             std::optional<dex::TypeIndex> ti = std::nullopt,
                             std::optional<Handle<mirror::Class>> klass = std::nullopt,
+                            std::initializer_list<HInstruction*> env = {},
                             uint32_t dex_pc = kNoDexPc) {
     HLoadClass* load_class = new (GetAllocator()) HLoadClass(
         graph_->GetCurrentMethod(),
@@ -482,10 +483,14 @@ class OptimizingUnitTestHelper {
         dex_pc,
         /* needs_access_check= */ false);
     AddOrInsertInstruction(block, load_class);
+    ManuallyBuildEnvFor(load_class, env);
     return load_class;
   }
 
-  HNewInstance* MakeNewInstance(HBasicBlock* block, HInstruction* cls, uint32_t dex_pc = kNoDexPc) {
+  HNewInstance* MakeNewInstance(HBasicBlock* block,
+                                HInstruction* cls,
+                                std::initializer_list<HInstruction*> env = {},
+                                uint32_t dex_pc = kNoDexPc) {
     EXPECT_TRUE(cls->IsLoadClass() || cls->IsClinitCheck()) << *cls;
     HLoadClass* load =
         cls->IsLoadClass() ? cls->AsLoadClass() : cls->AsClinitCheck()->GetLoadClass();
@@ -497,26 +502,27 @@ class OptimizingUnitTestHelper {
         /* finalizable= */ false,
         QuickEntrypointEnum::kQuickAllocObjectInitialized);
     AddOrInsertInstruction(block, new_instance);
+    ManuallyBuildEnvFor(new_instance, env);
     return new_instance;
   }
 
   HInstanceFieldSet* MakeIFieldSet(HBasicBlock* block,
-                                   HInstruction* inst,
+                                   HInstruction* object,
                                    HInstruction* data,
                                    MemberOffset off,
                                    uint32_t dex_pc = kNoDexPc) {
     CHECK(data != nullptr);
-    return MakeIFieldSet(block, inst, data, data->GetType(), off, dex_pc);
+    return MakeIFieldSet(block, object, data, data->GetType(), off, dex_pc);
   }
 
   HInstanceFieldSet* MakeIFieldSet(HBasicBlock* block,
-                                   HInstruction* inst,
+                                   HInstruction* object,
                                    HInstruction* data,
                                    DataType::Type field_type,
                                    MemberOffset off,
                                    uint32_t dex_pc = kNoDexPc) {
     HInstanceFieldSet* ifield_set = new (GetAllocator()) HInstanceFieldSet(
-        inst,
+        object,
         data,
         /* field= */ nullptr,
         field_type,
@@ -531,12 +537,12 @@ class OptimizingUnitTestHelper {
   }
 
   HInstanceFieldGet* MakeIFieldGet(HBasicBlock* block,
-                                   HInstruction* inst,
+                                   HInstruction* object,
                                    DataType::Type type,
                                    MemberOffset off,
                                    uint32_t dex_pc = kNoDexPc) {
     HInstanceFieldGet* ifield_get = new (GetAllocator()) HInstanceFieldGet(
-        inst,
+        object,
         /* field= */ nullptr,
         /* field_type= */ type,
         /* field_offset= */ off,
@@ -553,11 +559,22 @@ class OptimizingUnitTestHelper {
                           HInstruction* cls,
                           HInstruction* length,
                           size_t component_size_shift = DataType::SizeShift(DataType::Type::kInt32),
+                          std::initializer_list<HInstruction*> env = {},
                           uint32_t dex_pc = kNoDexPc) {
     HNewArray* new_array =
         new (GetAllocator()) HNewArray(cls, length, dex_pc, component_size_shift);
     AddOrInsertInstruction(block, new_array);
+    ManuallyBuildEnvFor(new_array, env);
     return new_array;
+  }
+
+  HArraySet* MakeArraySet(HBasicBlock* block,
+                          HInstruction* array,
+                          HInstruction* index,
+                          HInstruction* value,
+                          uint32_t dex_pc = kNoDexPc) {
+    CHECK(value != nullptr);
+    return MakeArraySet(block, array, index, value, value->GetType(), dex_pc);
   }
 
   HArraySet* MakeArraySet(HBasicBlock* block,
@@ -591,18 +608,22 @@ class OptimizingUnitTestHelper {
 
   HNullCheck* MakeNullCheck(HBasicBlock* block,
                             HInstruction* value,
+                            std::initializer_list<HInstruction*> env = {},
                             uint32_t dex_pc = kNoDexPc) {
     HNullCheck* null_check = new (GetAllocator()) HNullCheck(value, dex_pc);
     AddOrInsertInstruction(block, null_check);
+    ManuallyBuildEnvFor(null_check, env);
     return null_check;
   }
 
   HBoundsCheck* MakeBoundsCheck(HBasicBlock* block,
                                 HInstruction* index,
                                 HInstruction* length,
+                                std::initializer_list<HInstruction*> env = {},
                                 uint32_t dex_pc = kNoDexPc) {
     HBoundsCheck* bounds_check = new (GetAllocator()) HBoundsCheck(index, length, dex_pc);
     AddOrInsertInstruction(block, bounds_check);
+    ManuallyBuildEnvFor(bounds_check, env);
     return bounds_check;
   }
 
@@ -611,23 +632,97 @@ class OptimizingUnitTestHelper {
                           HInstruction* index,
                           HInstruction* value,
                           DataType::Type packed_type,
-                          size_t vector_length = 4,
+                          size_t vector_size_in_bytes = kDefaultTestVectorSizeInBytes,
                           uint32_t dex_pc = kNoDexPc) {
+    size_t num_of_elements = GetNumberOfElementsInVector(vector_size_in_bytes, packed_type);
     SideEffects side_effects = SideEffects::ArrayWriteOfType(packed_type);
     HVecStore* vec_store = new (GetAllocator()) HVecStore(
-        GetAllocator(), base, index, value, packed_type, side_effects, vector_length, dex_pc);
+        GetAllocator(), base, index, value, packed_type, side_effects, num_of_elements, dex_pc);
     AddOrInsertInstruction(block, vec_store);
     return vec_store;
+  }
+
+  HVecPredSetAll* MakeVecPredSetAll(HBasicBlock* block,
+                                    HInstruction* input,
+                                    DataType::Type packed_type,
+                                    size_t vector_size_in_bytes = kDefaultTestVectorSizeInBytes,
+                                    uint32_t dex_pc = kNoDexPc) {
+    size_t num_of_elements = GetNumberOfElementsInVector(vector_size_in_bytes, packed_type);
+    HVecPredSetAll* predicate = new (GetAllocator()) HVecPredSetAll(
+        GetAllocator(), input, packed_type, num_of_elements, dex_pc);
+    AddOrInsertInstruction(block, predicate);
+    return predicate;
+  }
+
+  HVecReplicateScalar* MakeVecReplicateScalar(
+      HBasicBlock* block,
+      HInstruction* scalar,
+      DataType::Type packed_type,
+      size_t vector_size_in_bytes = kDefaultTestVectorSizeInBytes,
+      HVecPredSetOperation* predicate = nullptr,
+      uint32_t dex_pc = kNoDexPc) {
+    size_t num_of_elements = GetNumberOfElementsInVector(vector_size_in_bytes, packed_type);
+    HVecReplicateScalar* vec_replicate_scalar = new (GetAllocator()) HVecReplicateScalar(
+        GetAllocator(), scalar, packed_type, num_of_elements, dex_pc);
+    AddOrInsertInstruction(block, vec_replicate_scalar);
+    if (predicate != nullptr) {
+      vec_replicate_scalar->SetMergingGoverningPredicate(predicate);
+    }
+    return vec_replicate_scalar;
+  }
+
+  HVecPredToBoolean* MakeVecPredToBoolean(
+      HBasicBlock* block,
+      HInstruction* input,
+      HVecPredToBoolean::PCondKind pred_cond,
+      DataType::Type packed_type,
+      size_t vector_size_in_bytes = kDefaultTestVectorSizeInBytes,
+      uint32_t dex_pc = kNoDexPc) {
+    size_t num_of_elements = GetNumberOfElementsInVector(vector_size_in_bytes, packed_type);
+    HVecPredToBoolean* vec_pred_to_boolean = new (GetAllocator()) HVecPredToBoolean(
+        GetAllocator(),
+        input,
+        pred_cond,
+        packed_type,
+        num_of_elements,
+        dex_pc);
+    AddOrInsertInstruction(block, vec_pred_to_boolean);
+    return vec_pred_to_boolean;
+  }
+
+  HVecPredWhile* MakeVecPredWhile(HBasicBlock* block,
+                                  HInstruction* left,
+                                  HInstruction* right,
+                                  HVecPredWhile::CondKind cond,
+                                  DataType::Type packed_type,
+                                  size_t vector_size_in_bytes = kDefaultTestVectorSizeInBytes,
+                                  uint32_t dex_pc = kNoDexPc) {
+    size_t num_of_elements = GetNumberOfElementsInVector(vector_size_in_bytes, packed_type);
+    HVecPredWhile* vec_pred_while = new (GetAllocator()) HVecPredWhile(
+        GetAllocator(),
+        left,
+        right,
+        cond,
+        packed_type,
+        num_of_elements,
+        dex_pc);
+    AddOrInsertInstruction(block, vec_pred_while);
+    return vec_pred_while;
   }
 
   HInvokeStaticOrDirect* MakeInvokeStatic(HBasicBlock* block,
                                           DataType::Type return_type,
                                           const std::vector<HInstruction*>& args,
+                                          std::initializer_list<HInstruction*> env = {},
                                           uint32_t dex_pc = kNoDexPc) {
     MethodReference method_reference{/* file= */ &graph_->GetDexFile(), /* index= */ method_idx_++};
+    size_t num_64bit_args = std::count_if(args.begin(), args.end(), [](HInstruction* insn) {
+      return DataType::Is64BitType(insn->GetType());
+    });
     HInvokeStaticOrDirect* invoke = new (GetAllocator())
         HInvokeStaticOrDirect(GetAllocator(),
                               args.size(),
+                              /* number_of_out_vregs= */ args.size() + num_64bit_args,
                               return_type,
                               dex_pc,
                               method_reference,
@@ -641,6 +736,7 @@ class OptimizingUnitTestHelper {
       invoke->SetRawInputAt(idx, ins);
     }
     AddOrInsertInstruction(block, invoke);
+    ManuallyBuildEnvFor(invoke, env);
     return invoke;
   }
 
@@ -661,8 +757,31 @@ class OptimizingUnitTestHelper {
                             HInstruction* first,
                             HInstruction* second,
                             uint32_t dex_pc = kNoDexPc) {
-    HCondition* condition = graph_->CreateCondition(cond, first, second, dex_pc);
+    HCondition* condition = HCondition::Create(graph_, cond, first, second, dex_pc);
     AddOrInsertInstruction(block, condition);
+    return condition;
+  }
+
+  HVecCondition* MakeVecCondition(HBasicBlock* block,
+                                  IfCondition cond,
+                                  HInstruction* first,
+                                  HInstruction* second,
+                                  DataType::Type packed_type,
+                                  size_t vector_size_in_bytes = kDefaultTestVectorSizeInBytes,
+                                  HVecPredSetOperation* predicate = nullptr,
+                                  uint32_t dex_pc = kNoDexPc) {
+    size_t num_of_elements = GetNumberOfElementsInVector(vector_size_in_bytes, packed_type);
+    HVecCondition* condition = HVecCondition::Create(graph_,
+                                                     cond,
+                                                     first,
+                                                     second,
+                                                     packed_type,
+                                                     num_of_elements,
+                                                     dex_pc);
+    AddOrInsertInstruction(block, condition);
+    if (predicate != nullptr) {
+      condition->SetMergingGoverningPredicate(predicate);
+    }
     return condition;
   }
 
@@ -676,9 +795,12 @@ class OptimizingUnitTestHelper {
     return select;
   }
 
-  HSuspendCheck* MakeSuspendCheck(HBasicBlock* block, uint32_t dex_pc = kNoDexPc) {
+  HSuspendCheck* MakeSuspendCheck(HBasicBlock* block,
+                                  std::initializer_list<HInstruction*> env = {},
+                                  uint32_t dex_pc = kNoDexPc) {
     HSuspendCheck* suspend_check = new (GetAllocator()) HSuspendCheck(dex_pc);
     AddOrInsertInstruction(block, suspend_check);
+    ManuallyBuildEnvFor(suspend_check, env);
     return suspend_check;
   }
 
@@ -805,6 +927,10 @@ class OptimizingUnitTestHelper {
   size_t param_count_ = 0;
   size_t class_idx_ = 42;
   uint32_t method_idx_ = 100;
+
+  // The default size of vectors to use for tests, in bytes. 16 bytes (128 bits) is used as it is
+  // commonly the smallest size of vector used in vector extensions.
+  static constexpr size_t kDefaultTestVectorSizeInBytes = 16;
 
   ScopedNullHandle<mirror::Class> null_klass_;
 };

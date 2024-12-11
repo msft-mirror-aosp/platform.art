@@ -51,10 +51,15 @@ public class DumpedStuff extends SuperDumpedStuff {
       bigArray[i] = (byte)((i * i) & 0xFF);
     }
 
-    // 0x12345, 50000, and 0xABCDABCD are arbitrary values.
-    NativeAllocationRegistry registry = new NativeAllocationRegistry(
-        Main.class.getClassLoader(), 0x12345, 50000);
+    // 50000, 0xABCDABCD, and 0xBCDABCDA are arbitrary values.
+    NativeAllocationRegistry registry =
+        new NativeAllocationRegistry(Main.class.getClassLoader(), getNoopFreeFunction(), 50000);
     registry.registerNativeAllocation(anObject, 0xABCDABCD);
+
+    {
+      aCleanerThunk = registry.registerNativeAllocation(aCleanedObject, 0xBCDABCDA);
+      aCleanerThunk.run();
+    }
 
     {
       Object object = new Object();
@@ -173,8 +178,13 @@ public class DumpedStuff extends SuperDumpedStuff {
   public String nonAscii = "Sigma (Ʃ) is not ASCII";
   public String embeddedZero = "embedded\0...";  // Non-ASCII for string compression purposes.
   public char[] charArray = "char thing".toCharArray();
+  public byte[] byteString = new byte[] {'h', 'i', '.', '\n', '\0', '\0', '\0'};
+  public byte[] byteNotString = new byte[] {0, 1, 2, 3, 4, 5};
+  public byte[] byteEmpty = new byte[] {};
   public String nullString = null;
   public Object anObject = new Object();
+  public Object aCleanedObject = new Object();
+  public Runnable aCleanerThunk;
   public Reference aReference = new Reference(anObject);
   public ReferenceQueue<Object> referenceQueue = new ReferenceQueue<Object>();
   public PhantomReference aPhantomReference = new PhantomReference(anObject, referenceQueue);
@@ -227,4 +237,10 @@ public class DumpedStuff extends SuperDumpedStuff {
         new SoftReference(
         new PhantomReference(new Object(), referenceQueue))))));
   }
+
+  static {
+    System.loadLibrary("ahat-test-jni");
+  }
+
+  private static native long getNoopFreeFunction();
 }
