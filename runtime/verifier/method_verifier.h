@@ -261,6 +261,21 @@ class MethodVerifier {
   const RegType& GetInvocationThis(const Instruction* inst)
       REQUIRES_SHARED(Locks::mutator_lock_);
 
+  // Can a variable with type `lhs` be assigned a value with type `rhs`?
+  // Note: Object and interface types may always be assigned to one another, see
+  // comment on `ClassJoin()`.
+  bool IsAssignableFrom(const RegType& lhs, const RegType& rhs) const
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // Can a variable with type `lhs` be assigned a value with type `rhs`?
+  // Variant of IsAssignableFrom that doesn't allow assignment to an interface from an Object.
+  bool IsStrictlyAssignableFrom(const RegType& lhs, const RegType& rhs) const
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // Implementation helper for `IsAssignableFrom()` and `IsStrictlyAssignableFrom()`.
+  bool AssignableFrom(const RegType& lhs, const RegType& rhs, bool strict) const
+      REQUIRES_SHARED(Locks::mutator_lock_);
+
   // For VerifierDepsTest. TODO: Refactor.
 
   // Run verification on the method. Returns true if verification completes and false if the input
@@ -279,6 +294,13 @@ class MethodVerifier {
       REQUIRES_SHARED(Locks::mutator_lock_);
 
   virtual bool PotentiallyMarkRuntimeThrow() = 0;
+
+  std::ostringstream& InfoMessages() {
+    if (!info_messages_.has_value()) {
+      info_messages_.emplace();
+    }
+    return info_messages_.value();
+  }
 
   // The thread we're verifying on.
   Thread* const self_;
@@ -338,7 +360,7 @@ class MethodVerifier {
   uint32_t encountered_failure_types_;
 
   // Info message log use primarily for verifier diagnostics.
-  std::ostringstream info_messages_;
+  std::optional<std::ostringstream> info_messages_;
 
   // The verifier deps object we are going to report type assigability
   // constraints to. Can be null for runtime verification.
