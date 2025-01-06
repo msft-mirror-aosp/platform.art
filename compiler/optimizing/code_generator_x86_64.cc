@@ -1142,6 +1142,13 @@ void CodeGeneratorX86_64::LoadMethod(MethodLoadKind load_kind, Location temp, HI
       RecordBootImageRelRoPatch(GetBootImageOffset(invoke));
       break;
     }
+    case MethodLoadKind::kAppImageRelRo: {
+      DCHECK(GetCompilerOptions().IsAppImage());
+      __ movl(temp.AsRegister<CpuRegister>(),
+              Address::Absolute(CodeGeneratorX86_64::kPlaceholder32BitOffset, /* no_rip= */ false));
+      RecordAppImageMethodPatch(invoke);
+      break;
+    }
     case MethodLoadKind::kBssEntry: {
       __ movq(temp.AsRegister<CpuRegister>(),
               Address::Absolute(kPlaceholder32BitOffset, /* no_rip= */ false));
@@ -1312,6 +1319,12 @@ void CodeGeneratorX86_64::RecordBootImageMethodPatch(HInvoke* invoke) {
   __ Bind(&boot_image_method_patches_.back().label);
 }
 
+void CodeGeneratorX86_64::RecordAppImageMethodPatch(HInvoke* invoke) {
+  app_image_method_patches_.emplace_back(invoke->GetResolvedMethodReference().dex_file,
+                                         invoke->GetResolvedMethodReference().index);
+  __ Bind(&app_image_method_patches_.back().label);
+}
+
 void CodeGeneratorX86_64::RecordMethodBssEntryPatch(HInvoke* invoke) {
   DCHECK(IsSameDexFile(GetGraph()->GetDexFile(), *invoke->GetMethodReference().dex_file) ||
          GetCompilerOptions().WithinOatFile(invoke->GetMethodReference().dex_file) ||
@@ -1452,6 +1465,7 @@ void CodeGeneratorX86_64::EmitLinkerPatches(ArenaVector<linker::LinkerPatch>* li
   DCHECK(linker_patches->empty());
   size_t size =
       boot_image_method_patches_.size() +
+      app_image_method_patches_.size() +
       method_bss_entry_patches_.size() +
       boot_image_type_patches_.size() +
       app_image_type_patches_.size() +
@@ -1476,6 +1490,7 @@ void CodeGeneratorX86_64::EmitLinkerPatches(ArenaVector<linker::LinkerPatch>* li
     DCHECK(boot_image_type_patches_.empty());
     DCHECK(boot_image_string_patches_.empty());
   }
+  DCHECK_IMPLIES(!GetCompilerOptions().IsAppImage(), app_image_method_patches_.empty());
   DCHECK_IMPLIES(!GetCompilerOptions().IsAppImage(), app_image_type_patches_.empty());
   if (GetCompilerOptions().IsBootImage()) {
     EmitPcRelativeLinkerPatches<NoDexFileAdapter<linker::LinkerPatch::IntrinsicReferencePatch>>(
@@ -1483,6 +1498,8 @@ void CodeGeneratorX86_64::EmitLinkerPatches(ArenaVector<linker::LinkerPatch>* li
   } else {
     EmitPcRelativeLinkerPatches<NoDexFileAdapter<linker::LinkerPatch::BootImageRelRoPatch>>(
         boot_image_other_patches_, linker_patches);
+    EmitPcRelativeLinkerPatches<linker::LinkerPatch::MethodAppImageRelRoPatch>(
+        app_image_method_patches_, linker_patches);
     EmitPcRelativeLinkerPatches<linker::LinkerPatch::TypeAppImageRelRoPatch>(
         app_image_type_patches_, linker_patches);
   }
@@ -1615,6 +1632,7 @@ CodeGeneratorX86_64::CodeGeneratorX86_64(HGraph* graph,
                  compiler_options.GetInstructionSetFeatures()->AsX86_64InstructionSetFeatures()),
       constant_area_start_(0),
       boot_image_method_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
+      app_image_method_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       method_bss_entry_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       boot_image_type_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
       app_image_type_patches_(graph->GetAllocator()->Adapter(kArenaAllocCodeGenerator)),
@@ -1965,7 +1983,7 @@ void CodeGeneratorX86_64::Move(Location destination, Location source) {
     if (source.IsRegister()) {
       __ movq(dest, source.AsRegister<CpuRegister>());
     } else if (source.IsFpuRegister()) {
-      __ movd(dest, source.AsFpuRegister<XmmRegister>());
+      __ movq(dest, source.AsFpuRegister<XmmRegister>());
     } else if (source.IsStackSlot()) {
       __ movl(dest, Address(CpuRegister(RSP), source.GetStackIndex()));
     } else if (source.IsConstant()) {
@@ -1984,7 +2002,7 @@ void CodeGeneratorX86_64::Move(Location destination, Location source) {
   } else if (destination.IsFpuRegister()) {
     XmmRegister dest = destination.AsFpuRegister<XmmRegister>();
     if (source.IsRegister()) {
-      __ movd(dest, source.AsRegister<CpuRegister>());
+      __ movq(dest, source.AsRegister<CpuRegister>());
     } else if (source.IsFpuRegister()) {
       __ movaps(dest, source.AsFpuRegister<XmmRegister>());
     } else if (source.IsConstant()) {
@@ -2930,7 +2948,7 @@ void InstructionCodeGeneratorX86_64::VisitReturn(HReturn* ret) {
       // To simplify callers of an OSR method, we put the return value in both
       // floating point and core register.
       if (GetGraph()->IsCompilingOsr()) {
-        __ movd(CpuRegister(RAX), XmmRegister(XMM0), /* is64bit= */ false);
+        __ movd(CpuRegister(RAX), XmmRegister(XMM0));
       }
       break;
     }
@@ -2940,7 +2958,7 @@ void InstructionCodeGeneratorX86_64::VisitReturn(HReturn* ret) {
       // To simplify callers of an OSR method, we put the return value in both
       // floating point and core register.
       if (GetGraph()->IsCompilingOsr()) {
-        __ movd(CpuRegister(RAX), XmmRegister(XMM0), /* is64bit= */ true);
+        __ movq(CpuRegister(RAX), XmmRegister(XMM0));
       }
       break;
     }
@@ -5104,11 +5122,11 @@ void InstructionCodeGeneratorX86_64::HandleRotate(HBinaryOperation* rotate) {
   }
 }
 
-void InstructionCodeGeneratorX86_64::VisitRor(HRor* ror) {
-  HandleRotate(ror);
+void LocationsBuilderX86_64::VisitRol(HRol* rol) {
+  HandleRotate(rol);
 }
 
-void LocationsBuilderX86_64::VisitRol(HRol* rol) {
+void InstructionCodeGeneratorX86_64::VisitRol(HRol* rol) {
   HandleRotate(rol);
 }
 
@@ -5116,8 +5134,8 @@ void LocationsBuilderX86_64::VisitRor(HRor* ror) {
   HandleRotate(ror);
 }
 
-void InstructionCodeGeneratorX86_64::VisitRol(HRol* rol) {
-  HandleRotate(rol);
+void InstructionCodeGeneratorX86_64::VisitRor(HRor* ror) {
+  HandleRotate(ror);
 }
 
 void LocationsBuilderX86_64::VisitShl(HShl* shl) {
@@ -5442,16 +5460,16 @@ void InstructionCodeGeneratorX86_64::Bswap(Location value,
       break;
     case DataType::Type::kFloat32: {
       DCHECK_NE(temp, nullptr);
-      __ movd(*temp, value.AsFpuRegister<XmmRegister>(), /*is64bit=*/ false);
+      __ movd(*temp, value.AsFpuRegister<XmmRegister>());
       __ bswapl(*temp);
-      __ movd(value.AsFpuRegister<XmmRegister>(), *temp, /*is64bit=*/ false);
+      __ movd(value.AsFpuRegister<XmmRegister>(), *temp);
       break;
     }
     case DataType::Type::kFloat64: {
       DCHECK_NE(temp, nullptr);
-      __ movd(*temp, value.AsFpuRegister<XmmRegister>(), /*is64bit=*/ true);
+      __ movq(*temp, value.AsFpuRegister<XmmRegister>());
       __ bswapq(*temp);
-      __ movd(value.AsFpuRegister<XmmRegister>(), *temp, /*is64bit=*/ true);
+      __ movq(value.AsFpuRegister<XmmRegister>(), *temp);
       break;
     }
     default:
@@ -6543,7 +6561,7 @@ void ParallelMoveResolverX86_64::Exchange32(XmmRegister reg, int mem) {
 void ParallelMoveResolverX86_64::Exchange64(XmmRegister reg, int mem) {
   __ movq(CpuRegister(TMP), Address(CpuRegister(RSP), mem));
   __ movsd(Address(CpuRegister(RSP), mem), reg);
-  __ movd(reg, CpuRegister(TMP));
+  __ movq(reg, CpuRegister(TMP));
 }
 
 void ParallelMoveResolverX86_64::Exchange128(XmmRegister reg, int mem) {
@@ -6608,9 +6626,9 @@ void ParallelMoveResolverX86_64::EmitSwap(size_t index) {
   } else if (source.IsDoubleStackSlot() && destination.IsDoubleStackSlot()) {
     ExchangeMemory64(destination.GetStackIndex(), source.GetStackIndex(), 1);
   } else if (source.IsFpuRegister() && destination.IsFpuRegister()) {
-    __ movd(CpuRegister(TMP), source.AsFpuRegister<XmmRegister>());
+    __ movq(CpuRegister(TMP), source.AsFpuRegister<XmmRegister>());
     __ movaps(source.AsFpuRegister<XmmRegister>(), destination.AsFpuRegister<XmmRegister>());
-    __ movd(destination.AsFpuRegister<XmmRegister>(), CpuRegister(TMP));
+    __ movq(destination.AsFpuRegister<XmmRegister>(), CpuRegister(TMP));
   } else if (source.IsFpuRegister() && destination.IsStackSlot()) {
     Exchange32(source.AsFpuRegister<XmmRegister>(), destination.GetStackIndex());
   } else if (source.IsStackSlot() && destination.IsFpuRegister()) {

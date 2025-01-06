@@ -115,7 +115,7 @@ static constexpr uint64_t kUffdFeaturesForMinorFault =
 static constexpr uint64_t kUffdFeaturesForSigbus = UFFD_FEATURE_SIGBUS;
 // A region which is more than kBlackDenseRegionThreshold percent live doesn't
 // need to be compacted as it is too densely packed.
-static constexpr uint kBlackDenseRegionThreshold = 85U;
+static constexpr uint kBlackDenseRegionThreshold = 95U;
 // We consider SIGBUS feature necessary to enable this GC as it's superior than
 // threading-based implementation for janks. We may want minor-fault in future
 // to be available for making jit-code-cache updation concurrent, which uses shmem.
@@ -787,6 +787,7 @@ void MarkCompact::RunPhases() {
     }
   }
   FinishPhase();
+  GetHeap()->PostGcVerification(this);
   thread_running_gc_ = nullptr;
 }
 
@@ -971,7 +972,7 @@ bool MarkCompact::PrepareForCompaction() {
   GcCause gc_cause = GetCurrentIteration()->GetGcCause();
   if (gc_cause != kGcCauseExplicit && gc_cause != kGcCauseCollectorTransition &&
       !GetCurrentIteration()->GetClearSoftReferences()) {
-    size_t live_bytes = 0, total_bytes = 0;
+    uint64_t live_bytes = 0, total_bytes = 0;
     size_t aligned_vec_len = RoundUp(vector_len, chunk_info_per_page);
     size_t num_pages = aligned_vec_len / chunk_info_per_page;
     size_t threshold_passing_marker = 0;  // In number of pages
@@ -1061,6 +1062,7 @@ bool MarkCompact::PrepareForCompaction() {
   // We shouldn't be consuming more space after compaction than pre-compaction.
   CHECK_GE(black_objs_slide_diff_, 0);
   if (black_objs_slide_diff_ == 0) {
+    black_dense_end_ = black_allocations_begin_;
     return false;
   }
   for (size_t i = vector_len; i < vector_length_; i++) {
