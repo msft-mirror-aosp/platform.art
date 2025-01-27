@@ -1064,7 +1064,8 @@
           "2264-throwing-systemcleaner",
           "2267-class-implements-itself",
           "2276-const-method-type-gc-cleanup",
-          "2281-method-handle-invoke-static-class-unload"
+          "2281-method-handle-invoke-static-class-unload",
+          "2286-invokevirtual-invokeexact"
         ],
         "variant": "jvm",
         "bug": "b/73888836",
@@ -1140,6 +1141,9 @@
                   "692-vdex-inmem-loader",
                   "693-vdex-inmem-loader-evict",
                   "723-string-init-range",
+                  "734-duplicate-fields",
+                  "735-interface-clone",
+                  "736-interface-super-Object",
                   "808-checker-invoke-super",
                   "809-checker-invoke-super-bss",
                   "810-checker-invoke-super-default",
@@ -1224,7 +1228,8 @@
                   "2263-method-trace-jit",
                   "2270-mh-internal-hiddenapi-use",
                   "2271-profile-inline-cache",
-                  "2279-aconfig-flags"],
+                  "2279-aconfig-flags",
+                  "2286-method-tracing-aot-code"],
         "variant": "jvm",
         "description": ["Doesn't run on RI."]
     },
@@ -1439,7 +1444,6 @@
         "tests": ["150-loadlibrary",
                   "656-annotation-lookup-generic-jni",
                   "674-hiddenapi",
-                  "817-hiddenapi",
                   "900-hello-plugin"],
         "variant": "target",
         "bug": "b/186654484",
