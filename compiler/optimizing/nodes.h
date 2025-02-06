@@ -1733,26 +1733,26 @@ class SideEffects : public ValueObject {
   }
 
   bool HasSideEffects() const {
-    return (flags_ & kAllChangeBits);
+    return (flags_ & kAllChangeBits) != 0u;
   }
 
   bool HasDependencies() const {
-    return (flags_ & kAllDependOnBits);
+    return (flags_ & kAllDependOnBits) != 0u;
   }
 
   // Returns true if there are no side effects or dependencies.
   bool DoesNothing() const {
-    return flags_ == 0;
+    return flags_ == 0u;
   }
 
   // Returns true if something is written.
   bool DoesAnyWrite() const {
-    return (flags_ & kAllWrites);
+    return (flags_ & kAllWrites) != 0u;
   }
 
   // Returns true if something is read.
   bool DoesAnyRead() const {
-    return (flags_ & kAllReads);
+    return (flags_ & kAllReads) != 0u;
   }
 
   // Returns true if potentially everything is written and read
@@ -1768,7 +1768,7 @@ class SideEffects : public ValueObject {
   // Returns true if `this` may read something written by `other`.
   bool MayDependOn(SideEffects other) const {
     const uint64_t depends_on_flags = (flags_ & kAllDependOnBits) >> kChangeBits;
-    return (other.flags_ & depends_on_flags);
+    return (other.flags_ & depends_on_flags) != 0u;
   }
 
   // Returns string representation of flags (for debugging only).
@@ -3179,12 +3179,6 @@ class HIntConstant final : public HConstant {
   bool IsTrue() const { return GetValue() == 1; }
   bool IsFalse() const { return GetValue() == 0; }
 
-  DECLARE_INSTRUCTION(IntConstant);
-
- protected:
-  DEFAULT_COPY_CONSTRUCTOR(IntConstant);
-
- private:
   explicit HIntConstant(int32_t value)
       : HConstant(kIntConstant, DataType::Type::kInt32), value_(value) {
   }
@@ -3193,6 +3187,12 @@ class HIntConstant final : public HConstant {
         value_(value ? 1 : 0) {
   }
 
+  DECLARE_INSTRUCTION(IntConstant);
+
+ protected:
+  DEFAULT_COPY_CONSTRUCTOR(IntConstant);
+
+ private:
   const int32_t value_;
 
   friend class HGraph;
@@ -3697,7 +3697,7 @@ class HUnaryOperation : public HExpression<1> {
   HInstruction* GetInput() const { return InputAt(0); }
   DataType::Type GetResultType() const { return GetType(); }
 
-  bool CanBeMoved() const override { return true; }
+  bool CanBeMoved() const final { return true; }
   bool InstructionDataEquals([[maybe_unused]] const HInstruction* other) const override {
     return true;
   }
@@ -3788,7 +3788,7 @@ class HBinaryOperation : public HExpression<2> {
     }
   }
 
-  bool CanBeMoved() const override { return true; }
+  bool CanBeMoved() const final { return true; }
   bool InstructionDataEquals([[maybe_unused]] const HInstruction* other) const override {
     return true;
   }
@@ -5872,7 +5872,6 @@ class HNot final : public HUnaryOperation {
       : HUnaryOperation(kNot, result_type, input, dex_pc) {
   }
 
-  bool CanBeMoved() const override { return true; }
   bool InstructionDataEquals([[maybe_unused]] const HInstruction* other) const override {
     return true;
   }
@@ -5898,7 +5897,6 @@ class HBooleanNot final : public HUnaryOperation {
       : HUnaryOperation(kBooleanNot, DataType::Type::kBool, input, dex_pc) {
   }
 
-  bool CanBeMoved() const override { return true; }
   bool InstructionDataEquals([[maybe_unused]] const HInstruction* other) const override {
     return true;
   }
@@ -6148,7 +6146,10 @@ class HInstanceFieldSet final : public HExpression<2> {
                     declaring_class_def_index,
                     dex_file) {
     SetPackedFlag<kFlagValueCanBeNull>(true);
-    SetPackedField<WriteBarrierKindField>(WriteBarrierKind::kEmitNotBeingReliedOn);
+    SetPackedField<WriteBarrierKindField>(
+        field_type == DataType::Type::kReference
+            ? WriteBarrierKind::kEmitNotBeingReliedOn
+            : WriteBarrierKind::kDontEmit);
     SetRawInputAt(0, object);
     SetRawInputAt(1, value);
   }
@@ -6315,7 +6316,10 @@ class HArraySet final : public HExpression<3> {
     SetPackedFlag<kFlagNeedsTypeCheck>(value->GetType() == DataType::Type::kReference);
     SetPackedFlag<kFlagValueCanBeNull>(true);
     SetPackedFlag<kFlagStaticTypeOfArrayIsObjectArray>(false);
-    SetPackedField<WriteBarrierKindField>(WriteBarrierKind::kEmitNotBeingReliedOn);
+    SetPackedField<WriteBarrierKindField>(
+        value->GetType() == DataType::Type::kReference
+            ? WriteBarrierKind::kEmitNotBeingReliedOn
+            : WriteBarrierKind::kDontEmit);
     SetRawInputAt(0, array);
     SetRawInputAt(1, index);
     SetRawInputAt(2, value);
@@ -7274,7 +7278,10 @@ class HStaticFieldSet final : public HExpression<2> {
                     declaring_class_def_index,
                     dex_file) {
     SetPackedFlag<kFlagValueCanBeNull>(true);
-    SetPackedField<WriteBarrierKindField>(WriteBarrierKind::kEmitNotBeingReliedOn);
+    SetPackedField<WriteBarrierKindField>(
+        field_type == DataType::Type::kReference
+            ? WriteBarrierKind::kEmitNotBeingReliedOn
+            : WriteBarrierKind::kDontEmit);
     SetRawInputAt(0, cls);
     SetRawInputAt(1, value);
   }
