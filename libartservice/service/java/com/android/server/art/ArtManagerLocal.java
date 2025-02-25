@@ -190,7 +190,7 @@ public final class ArtManagerLocal {
     public int handleShellCommand(@NonNull Binder target, @NonNull ParcelFileDescriptor in,
             @NonNull ParcelFileDescriptor out, @NonNull ParcelFileDescriptor err,
             @NonNull String[] args) {
-        return new ArtShellCommand(this, mInjector.getPackageManagerLocal(), mInjector.getContext())
+        return new ArtShellCommand(this, mInjector.getPackageManagerLocal())
                 .exec(target, in.getFileDescriptor(), out.getFileDescriptor(),
                         err.getFileDescriptor(), args);
     }
@@ -1014,7 +1014,7 @@ public final class ArtManagerLocal {
     public void dump(@NonNull PrintWriter pw,
             @NonNull PackageManagerLocal.FilteredSnapshot snapshot, boolean verifySdmSignatures) {
         try (var pin = mInjector.createArtdPin()) {
-            new DumpHelper(this).dump(pw, snapshot, verifySdmSignatures);
+            new DumpHelper(this, verifySdmSignatures).dump(pw, snapshot);
         }
     }
 
@@ -1043,8 +1043,8 @@ public final class ArtManagerLocal {
             @NonNull PackageManagerLocal.FilteredSnapshot snapshot, @NonNull String packageName,
             boolean verifySdmSignatures) {
         try (var pin = mInjector.createArtdPin()) {
-            new DumpHelper(this).dumpPackage(pw, snapshot,
-                    Utils.getPackageStateOrThrow(snapshot, packageName), verifySdmSignatures);
+            new DumpHelper(this, verifySdmSignatures)
+                    .dumpPackage(pw, snapshot, Utils.getPackageStateOrThrow(snapshot, packageName));
         }
     }
 

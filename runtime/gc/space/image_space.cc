@@ -65,7 +65,6 @@
 #include "oat/oat_file.h"
 #include "profile/profile_compilation_info.h"
 #include "runtime.h"
-#include "runtime_globals.h"
 #include "space-inl.h"
 
 namespace art HIDDEN {
@@ -564,11 +563,6 @@ class ImageSpace::Loader {
                                                   /*out*/std::string* error_msg)
         REQUIRES(!Locks::mutator_lock_) {
     TimingLogger logger(__PRETTY_FUNCTION__, /*precise=*/ true, VLOG_IS_ON(image));
-
-    if (gPageSize != kMinPageSize) {
-      *error_msg = "Loading app image is only supported on devices with 4K page size";
-      return nullptr;
-    }
 
     std::unique_ptr<ImageSpace> space = Init(image_filename,
                                              image_location,
@@ -2878,14 +2872,12 @@ class ImageSpace::BootImageLoader {
       TimingLogger::ScopedTiming timing("OpenOatFile", logger);
       std::string oat_filename =
           ImageHeader::GetOatLocationFromImageLocation(space->GetImageFilename());
-      std::string oat_location =
-          ImageHeader::GetOatLocationFromImageLocation(space->GetImageLocation());
 
       DCHECK_EQ(vdex_fd.get() != -1, oat_fd.get() != -1);
       if (vdex_fd.get() == -1) {
         oat_file.reset(OatFile::Open(/*zip_fd=*/-1,
                                      oat_filename,
-                                     oat_location,
+                                     oat_filename,
                                      executable_,
                                      /*low_4gb=*/false,
                                      dex_filenames,
@@ -2896,7 +2888,7 @@ class ImageSpace::BootImageLoader {
         oat_file.reset(OatFile::Open(/*zip_fd=*/-1,
                                      vdex_fd.get(),
                                      oat_fd.get(),
-                                     oat_location,
+                                     oat_filename,
                                      executable_,
                                      /*low_4gb=*/false,
                                      dex_filenames,
@@ -3248,11 +3240,6 @@ bool ImageSpace::BootImageLoader::LoadFromSystem(
     /*out*/MemMap* extra_reservation,
     /*out*/std::string* error_msg) {
   TimingLogger logger(__PRETTY_FUNCTION__, /*precise=*/ true, VLOG_IS_ON(image));
-
-  if (gPageSize != kMinPageSize) {
-    *error_msg = "Loading boot image is only supported on devices with 4K page size";
-    return false;
-  }
 
   BootImageLayout layout(image_locations_,
                          boot_class_path_,

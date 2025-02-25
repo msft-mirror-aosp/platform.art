@@ -31,7 +31,6 @@ import static com.android.server.art.model.DexoptStatus.DexContainerFileDexoptSt
 
 import android.annotation.NonNull;
 import android.annotation.Nullable;
-import android.content.Context;
 import android.os.Binder;
 import android.os.Build;
 import android.os.CancellationSignal;
@@ -44,6 +43,7 @@ import android.system.StructStat;
 import androidx.annotation.RequiresApi;
 
 import com.android.internal.annotations.GuardedBy;
+import com.android.internal.annotations.VisibleForTesting;
 import com.android.modules.utils.BasicShellCommandHandler;
 import com.android.modules.utils.build.SdkLevel;
 import com.android.server.art.model.ArtFlags;
@@ -93,19 +93,20 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
     /** The default location for profile dumps. */
     private final static String PROFILE_DEBUG_LOCATION = "/data/misc/profman";
 
-    private final ArtManagerLocal mArtManagerLocal;
-    private final PackageManagerLocal mPackageManagerLocal;
-    private final Context mContext;
+    @NonNull private final Injector mInjector;
 
     @GuardedBy("sCancellationSignalMap")
     @NonNull
     private static final Map<String, CancellationSignal> sCancellationSignalMap = new HashMap<>();
 
     public ArtShellCommand(@NonNull ArtManagerLocal artManagerLocal,
-            @NonNull PackageManagerLocal packageManagerLocal, @NonNull Context context) {
-        mArtManagerLocal = artManagerLocal;
-        mPackageManagerLocal = packageManagerLocal;
-        mContext = context;
+            @NonNull PackageManagerLocal packageManagerLocal) {
+        this(new Injector(artManagerLocal, packageManagerLocal));
+    }
+
+    @VisibleForTesting
+    public ArtShellCommand(@NonNull Injector injector) {
+        mInjector = injector;
     }
 
     @Override
@@ -113,7 +114,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
         // Apps shouldn't call ART Service shell commands, not even for dexopting themselves.
         enforceRootOrShell();
         PrintWriter pw = getOutPrintWriter();
-        try (var snapshot = mPackageManagerLocal.withFilteredSnapshot()) {
+        try (var snapshot = mInjector.getPackageManagerLocal().withFilteredSnapshot()) {
             switch (cmd) {
                 case "compile":
                     return handleCompile(pw, snapshot);
@@ -183,9 +184,10 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
 
                 String packageName = getNextArg();
                 if (packageName != null) {
-                    mArtManagerLocal.dumpPackage(pw, snapshot, packageName, verifySdmSignatures);
+                    mInjector.getArtManagerLocal().dumpPackage(
+                            pw, snapshot, packageName, verifySdmSignatures);
                 } else {
-                    mArtManagerLocal.dump(pw, snapshot, verifySdmSignatures);
+                    mInjector.getArtManagerLocal().dump(pw, snapshot, verifySdmSignatures);
                 }
                 return 0;
             }
@@ -193,7 +195,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
                 return handleCleanup(pw, snapshot);
             }
             case "clear-app-profiles": {
-                mArtManagerLocal.clearAppProfiles(snapshot, getNextArgRequired());
+                mInjector.getArtManagerLocal().clearAppProfiles(snapshot, getNextArgRequired());
                 pw.println("Profiles cleared");
                 return 0;
             }
@@ -371,7 +373,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
                 // For compat only. Combining this with dexopt usually produces in undesired
                 // results.
                 for (String packageName : packageNames) {
-                    mArtManagerLocal.clearAppProfiles(snapshot, packageName);
+                    mInjector.getArtManagerLocal().clearAppProfiles(snapshot, packageName);
                 }
             }
             return dexoptPackages(pw, snapshot, packageNames, paramsBuilder.build(), verbose);
@@ -411,7 +413,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
             }
 
             CompletableFuture<BackgroundDexoptJob.Result> runningJob =
-                    mArtManagerLocal.getRunningBackgroundDexoptJob();
+                    mInjector.getArtManagerLocal().getRunningBackgroundDexoptJob();
             if (runningJob != null) {
                 pw.println("Another job already running. Waiting for it to finish... To cancel it, "
                         + "run 'pm bg-dexopt-job --cancel'. in a separate shell.");
@@ -419,7 +421,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
                 Utils.getFuture(runningJob);
             }
             CompletableFuture<BackgroundDexoptJob.Result> future =
-                    mArtManagerLocal.startBackgroundDexoptJobAndReturnFuture();
+                    mInjector.getArtManagerLocal().startBackgroundDexoptJobAndReturnFuture();
             pw.println("Job running...  To cancel it, run 'pm bg-dexopt-job --cancel'. in a "
                     + "separate shell.");
             pw.flush();
@@ -445,7 +447,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
                 // This operation requires the uid to be "system" (1000).
                 long identityToken = Binder.clearCallingIdentity();
                 try {
-                    mArtManagerLocal.scheduleBackgroundDexoptJob();
+                    mInjector.getArtManagerLocal().scheduleBackgroundDexoptJob();
                 } finally {
                     Binder.restoreCallingIdentity(identityToken);
                 }
@@ -456,7 +458,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
                 // This operation requires the uid to be "system" (1000).
                 long identityToken = Binder.clearCallingIdentity();
                 try {
-                    mArtManagerLocal.unscheduleBackgroundDexoptJob();
+                    mInjector.getArtManagerLocal().unscheduleBackgroundDexoptJob();
                 } finally {
                     Binder.restoreCallingIdentity(identityToken);
                 }
@@ -470,22 +472,22 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
     }
 
     private int handleCancelBgDexoptJob(@NonNull PrintWriter pw) {
-        mArtManagerLocal.cancelBackgroundDexoptJob();
+        mInjector.getArtManagerLocal().cancelBackgroundDexoptJob();
         pw.println("Background dexopt job cancelled");
         return 0;
     }
 
     private int handleCleanup(
             @NonNull PrintWriter pw, @NonNull PackageManagerLocal.FilteredSnapshot snapshot) {
-        long freedBytes = mArtManagerLocal.cleanup(snapshot);
+        long freedBytes = mInjector.getArtManagerLocal().cleanup(snapshot);
         pw.printf("Freed %d bytes\n", freedBytes);
         return 0;
     }
 
     private int handleDeleteDexopt(
             @NonNull PrintWriter pw, @NonNull PackageManagerLocal.FilteredSnapshot snapshot) {
-        DeleteResult result =
-                mArtManagerLocal.deleteDexoptArtifacts(snapshot, getNextArgRequired());
+        DeleteResult result = mInjector.getArtManagerLocal().deleteDexoptArtifacts(
+                snapshot, getNextArgRequired());
         pw.printf("Freed %d bytes\n", result.getFreedBytes());
         return 0;
     }
@@ -548,7 +550,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
             @NonNull PrintWriter pw, @NonNull PackageManagerLocal.FilteredSnapshot snapshot)
             throws SnapshotProfileException {
         String outputRelativePath = "android.prof";
-        ParcelFileDescriptor fd = mArtManagerLocal.snapshotBootImageProfile(snapshot);
+        ParcelFileDescriptor fd = mInjector.getArtManagerLocal().snapshotBootImageProfile(snapshot);
         writeProfileFdContentsToFile(pw, fd, outputRelativePath);
         return 0;
     }
@@ -559,7 +561,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
         String outputRelativePath = String.format("%s%s.prof", packageName,
                 splitName != null ? String.format("-split_%s.apk", splitName) : "");
         ParcelFileDescriptor fd =
-                mArtManagerLocal.snapshotAppProfile(snapshot, packageName, splitName);
+                mInjector.getArtManagerLocal().snapshotAppProfile(snapshot, packageName, splitName);
         writeProfileFdContentsToFile(pw, fd, outputRelativePath);
         return 0;
     }
@@ -594,7 +596,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
             pw.println("Waiting for app processes to flush profiles...");
             pw.flush();
             long startTimeMs = System.currentTimeMillis();
-            if (mArtManagerLocal.flushProfiles(snapshot, packageName)) {
+            if (mInjector.getArtManagerLocal().flushProfiles(snapshot, packageName)) {
                 pw.printf("App processes flushed profiles in %dms\n",
                         System.currentTimeMillis() - startTimeMs);
             } else {
@@ -607,7 +609,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
                 // is to match the behavior of the legacy PM shell command.
                 String outputRelativePath =
                         String.format("%s-%s.prof.txt", packageName, profileName);
-                ParcelFileDescriptor fd = mArtManagerLocal.dumpAppProfile(
+                ParcelFileDescriptor fd = mInjector.getArtManagerLocal().dumpAppProfile(
                         snapshot, packageName, dexInfo.splitName(), dumpClassesAndMethods);
                 writeProfileFdContentsToFile(pw, fd, outputRelativePath);
             }
@@ -654,8 +656,9 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
 
         ExecutorService progressCallbackExecutor = Executors.newSingleThreadExecutor();
         try (var signal = new WithCancellationSignal(pw, true /* verbose */)) {
-            Map<Integer, DexoptResult> results = mArtManagerLocal.dexoptPackages(snapshot,
-                    finalReason, signal.get(), progressCallbackExecutor, progressCallbacks);
+            Map<Integer, DexoptResult> results =
+                    mInjector.getArtManagerLocal().dexoptPackages(snapshot, finalReason,
+                            signal.get(), progressCallbackExecutor, progressCallbacks);
 
             Utils.executeAndWait(progressCallbackExecutor, () -> {
                 for (@BatchDexoptPass int pass : ArtFlags.BATCH_DEXOPT_PASSES) {
@@ -682,11 +685,12 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
             return 1;
         }
 
-        int uid = Binder.getCallingUid();
+        int uid = mInjector.getCallingUid();
         if (uid != Process.ROOT_UID) {
             throw new SecurityException("Only root can call 'on-ota-staged'");
         }
 
+        String mode = null;
         String otaSlot = null;
 
         String opt;
@@ -695,23 +699,33 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
                 case "--slot":
                     otaSlot = getNextArgRequired();
                     break;
+                case "--start":
+                    mode = opt;
+                    break;
                 default:
                     pw.println("Error: Unknown option: " + opt);
                     return 1;
             }
         }
 
-        if (otaSlot == null) {
-            pw.println("Error: '--slot' must be specified");
-            return 1;
-        }
-
-        if (mArtManagerLocal.getPreRebootDexoptJob().isAsyncForOta()) {
-            return handleSchedulePrDexoptJob(pw, otaSlot);
+        if ("--start".equals(mode)) {
+            if (otaSlot != null) {
+                pw.println("Error: '--slot' cannot be specified together with '--start'");
+                return 1;
+            }
+            return handleOnOtaStagedStart(pw);
         } else {
-            // Don't map snapshots when running synchronously. `update_engine` maps snapshots for
-            // us.
-            return handleRunPrDexoptJob(pw, otaSlot, false /* mapSnapshotsForOta */);
+            if (otaSlot == null) {
+                pw.println("Error: '--slot' must be specified");
+                return 1;
+            }
+
+            if (mInjector.getArtManagerLocal().getPreRebootDexoptJob().isAsyncForOta()) {
+                return handleSchedulePrDexoptJob(pw, otaSlot);
+            } else {
+                // In the synchronous case, `update_engine` has already mapped snapshots for us.
+                return handleRunPrDexoptJob(pw, otaSlot, true /* isUpdateEngineReady */);
+            }
         }
     }
 
@@ -752,7 +766,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
             return 1;
         }
 
-        if (otaSlot != null && Binder.getCallingUid() != Process.ROOT_UID) {
+        if (otaSlot != null && mInjector.getCallingUid() != Process.ROOT_UID) {
             throw new SecurityException("Only root can specify '--slot'");
         }
 
@@ -763,7 +777,11 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
             case "--test":
                 return handleTestPrDexoptJob(pw);
             case "--run":
-                return handleRunPrDexoptJob(pw, otaSlot, true /* mapSnapshotsForOta */);
+                // Passing isUpdateEngineReady=false will make the job call update_engine's
+                // triggerPostinstall to map the snapshot devices if the API is available.
+                // It's always safe to do so because triggerPostinstall can be called at any time
+                // any number of times to map the snapshots if any are available.
+                return handleRunPrDexoptJob(pw, otaSlot, false /* isUpdateEngineReady */);
             case "--schedule":
                 return handleSchedulePrDexoptJob(pw, otaSlot);
             case "--cancel":
@@ -777,7 +795,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
     @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
     private int handleTestPrDexoptJob(@NonNull PrintWriter pw) {
         try {
-            mArtManagerLocal.getPreRebootDexoptJob().test();
+            mInjector.getArtManagerLocal().getPreRebootDexoptJob().test();
             pw.println("Success");
             return 0;
         } catch (Exception e) {
@@ -789,15 +807,41 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
 
     @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
     private int handleRunPrDexoptJob(
-            @NonNull PrintWriter pw, @Nullable String otaSlot, boolean mapSnapshotsForOta) {
-        PreRebootDexoptJob job = mArtManagerLocal.getPreRebootDexoptJob();
+            @NonNull PrintWriter pw, @Nullable String otaSlot, boolean isUpdateEngineReady) {
+        PreRebootDexoptJob job = mInjector.getArtManagerLocal().getPreRebootDexoptJob();
 
-        CompletableFuture<Void> future = job.onUpdateReadyStartNow(otaSlot, mapSnapshotsForOta);
+        CompletableFuture<Void> future = job.onUpdateReadyStartNow(otaSlot, isUpdateEngineReady);
         if (future == null) {
             pw.println("Job disabled by system property");
             return 1;
         }
 
+        return handlePrDexoptJobRunning(pw, future);
+    }
+
+    @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    private int handleOnOtaStagedStart(@NonNull PrintWriter pw) {
+        PreRebootDexoptJob job = mInjector.getArtManagerLocal().getPreRebootDexoptJob();
+
+        // We assume we're being invoked from within `UpdateEngine.triggerPostinstall` in
+        // `PreRebootDexoptJob.triggerUpdateEnginePostinstallAndWait`, so a Pre-reboot Dexopt job is
+        // waiting.
+        CompletableFuture<Void> future = job.notifyUpdateEngineReady();
+        if (future == null) {
+            pw.println("No waiting job found");
+            return 1;
+        }
+
+        return handlePrDexoptJobRunning(pw, future);
+    }
+
+    @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
+    private int handlePrDexoptJobRunning(
+            @NonNull PrintWriter pw, @NonNull CompletableFuture<Void> future) {
+        PreRebootDexoptJob job = mInjector.getArtManagerLocal().getPreRebootDexoptJob();
+
+        // Read stdin and cancel on broken pipe, to detect if the caller (e.g. update_engine) has
+        // killed the postinstall script.
         // Put the read in a separate thread because there isn't an easy way in Java to wait for
         // both the `Future` and the read.
         var readThread = new Thread(() -> {
@@ -844,7 +888,8 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
 
     @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
     private int handleSchedulePrDexoptJob(@NonNull PrintWriter pw, @Nullable String otaSlot) {
-        int code = mArtManagerLocal.getPreRebootDexoptJob().onUpdateReadyImpl(otaSlot);
+        int code =
+                mInjector.getArtManagerLocal().getPreRebootDexoptJob().onUpdateReadyImpl(otaSlot);
         switch (code) {
             case ArtFlags.SCHEDULE_SUCCESS:
                 pw.println("Pre-reboot Dexopt job scheduled");
@@ -863,7 +908,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
 
     @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
     private int handleCancelPrDexoptJob(@NonNull PrintWriter pw) {
-        mArtManagerLocal.getPreRebootDexoptJob().cancelAny();
+        mInjector.getArtManagerLocal().getPreRebootDexoptJob().cancelAny();
         pw.println("Pre-reboot Dexopt job cancelled");
         return 0;
     }
@@ -889,7 +934,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
 
         // Variables used in lambda needs to be effectively final.
         String finalInputReason = inputReason;
-        mArtManagerLocal.setBatchDexoptStartCallback(
+        mInjector.getArtManagerLocal().setBatchDexoptStartCallback(
                 Runnable::run, (snapshot, reason, defaultPackages, builder, cancellationSignal) -> {
                     if (reason.equals(finalInputReason)) {
                         if (!packages.isEmpty()) {
@@ -935,10 +980,11 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
         pw.println("       better than that of the current dexopt artifacts for a package.");
         pw.println("    --reset Reset the dexopt state of the package as if the package is newly");
         pw.println("       installed.");
-        pw.println("       More specifically, it clears reference profiles, current profiles, and");
-        pw.println("       any code compiled from those local profiles. If there is an external");
-        pw.println("       profile (e.g., a cloud profile), the code compiled from that profile");
-        pw.println("       will be kept.");
+        pw.println("       More specifically, it clears current profiles, reference profiles");
+        pw.println("       from local profiles, and any code compiled from those local profiles.");
+        pw.println("       If there is an external profile (e.g., a cloud profile), the reference");
+        pw.println("       profile from that profile and the code compiled from that profile will");
+        pw.println("       be kept.");
         pw.println("       For secondary dex files, it also clears all dexopt artifacts.");
         pw.println("       When this flag is set, all the other flags are ignored.");
         pw.println("    -v Verbose mode. This mode prints detailed results.");
@@ -1054,7 +1100,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
         pw.println("    only dexopts a subset of apps, and it runs dexopt in parallel. See the");
         pw.println("    API documentation for 'ArtManagerLocal.dexoptPackages' for details.");
         pw.println();
-        pw.println("  on-ota-staged --slot SLOT");
+        pw.println("  on-ota-staged [--slot SLOT | --start]");
         pw.println("    Notify ART Service that an OTA update is staged. ART Service decides what");
         pw.println("    to do with this notification:");
         pw.println("    - If Pre-reboot Dexopt is disabled or unsupported, the command returns");
@@ -1067,6 +1113,9 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
         pw.println("      then run by the job scheduler when the device is idle and charging.");
         pw.println("    Options:");
         pw.println("      --slot SLOT The slot that contains the OTA update, '_a' or '_b'.");
+        pw.println("      --start Notify the asynchronous job that the snapshot devices are");
+        pw.println("        ready. The command blocks until the job finishes, and returns zero no");
+        pw.println("        matter it succeeds or not.");
         pw.println("    Note: This command is only supposed to be used by the system. To manually");
         pw.println("    control the Pre-reboot Dexopt job, use 'pr-dexopt-job' instead.");
         pw.println();
@@ -1109,7 +1158,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
     }
 
     private void enforceRootOrShell() {
-        final int uid = Binder.getCallingUid();
+        final int uid = mInjector.getCallingUid();
         if (uid != Process.ROOT_UID && uid != Process.SHELL_UID) {
             throw new SecurityException("ART service shell commands need root or shell access");
         }
@@ -1175,8 +1224,8 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
             @NonNull List<String> packageNames, boolean verbose) {
         try (var signal = new WithCancellationSignal(pw, verbose)) {
             for (String packageName : packageNames) {
-                DexoptResult result =
-                        mArtManagerLocal.resetDexoptStatus(snapshot, packageName, signal.get());
+                DexoptResult result = mInjector.getArtManagerLocal().resetDexoptStatus(
+                        snapshot, packageName, signal.get());
                 printDexoptResult(pw, result, verbose, packageNames.size() > 1);
             }
         }
@@ -1188,8 +1237,8 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
             @NonNull List<String> packageNames, @NonNull DexoptParams params, boolean verbose) {
         try (var signal = new WithCancellationSignal(pw, verbose)) {
             for (String packageName : packageNames) {
-                DexoptResult result =
-                        mArtManagerLocal.dexoptPackage(snapshot, packageName, params, signal.get());
+                DexoptResult result = mInjector.getArtManagerLocal().dexoptPackage(
+                        snapshot, packageName, params, signal.get());
                 printDexoptResult(pw, result, verbose, packageNames.size() > 1);
             }
         }
@@ -1300,6 +1349,33 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
             synchronized (sCancellationSignalMap) {
                 sCancellationSignalMap.remove(mJobId);
             }
+        }
+    }
+
+    /** Injector pattern for testing purpose. */
+    @VisibleForTesting
+    public static class Injector {
+        @NonNull private final ArtManagerLocal mArtManagerLocal;
+        @NonNull private final PackageManagerLocal mPackageManagerLocal;
+
+        public Injector(@NonNull ArtManagerLocal artManagerLocal,
+                @NonNull PackageManagerLocal packageManagerLocal) {
+            mArtManagerLocal = artManagerLocal;
+            mPackageManagerLocal = packageManagerLocal;
+        }
+
+        @NonNull
+        public ArtManagerLocal getArtManagerLocal() {
+            return mArtManagerLocal;
+        }
+
+        @NonNull
+        public PackageManagerLocal getPackageManagerLocal() {
+            return mPackageManagerLocal;
+        }
+
+        public int getCallingUid() {
+            return Binder.getCallingUid();
         }
     }
 }

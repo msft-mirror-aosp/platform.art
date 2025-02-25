@@ -261,7 +261,6 @@ class OatWriter {
   // to actually write it.
   class DexMethodVisitor;
   class OatDexMethodVisitor;
-  class InitBssLayoutMethodVisitor;
   class InitOatClassesMethodVisitor;
   class LayoutCodeMethodVisitor;
   class LayoutReserveOffsetCodeMethodVisitor;
@@ -302,7 +301,11 @@ class OatWriter {
   size_t InitOatCode(size_t offset);
   size_t InitOatCodeDexFiles(size_t offset);
   size_t InitDataImgRelRoLayout(size_t offset);
+  void InitBssAndRelRoData();
   void InitBssLayout(InstructionSet instruction_set);
+  void AddBssReference(const DexFileReference& ref,
+                       size_t number_of_indexes,
+                       /*inout*/ SafeMap<const DexFile*, BitVector>* references);
 
   size_t WriteClassOffsets(OutputStream* out, size_t file_offset, size_t relative_offset);
   size_t WriteClasses(OutputStream* out, size_t file_offset, size_t relative_offset);
@@ -353,6 +356,18 @@ class OatWriter {
 
   bool VdexWillContainDexFiles() const {
     return dex_files_ != nullptr && extract_dex_files_into_vdex_;
+  }
+
+  // Return the file offset that corresponds to `offset_from_oat_data`.
+  size_t GetFileOffset(size_t offset_from_oat_data) const {
+    DCHECK_NE(oat_data_offset_, 0u);
+    return offset_from_oat_data + oat_data_offset_;
+  }
+
+  // Return the next offset (relative to the oat data) that is on or after `offset_from_oat_data`,
+  // that is aligned by `alignment` to the beginning of the file.
+  size_t GetOffsetFromOatDataAlignedToFile(size_t offset_from_oat_data, size_t alignment) const {
+    return RoundUp(GetFileOffset(offset_from_oat_data), alignment) - oat_data_offset_;
   }
 
   enum class WriteState {
@@ -505,7 +520,7 @@ class OatWriter {
   std::vector<std::unique_ptr<art::OatDexFile>> type_lookup_table_oat_dex_files_;
 
   // data to write
-  std::unique_ptr<OatHeader> oat_header_;
+  OatHeader* oat_header_;
   dchecked_vector<OatDexFile> oat_dex_files_;
   dchecked_vector<OatClassHeader> oat_class_headers_;
   dchecked_vector<OatClass> oat_classes_;

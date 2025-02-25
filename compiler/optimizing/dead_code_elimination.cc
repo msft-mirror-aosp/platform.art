@@ -29,21 +29,21 @@
 
 namespace art HIDDEN {
 
-static void MarkReachableBlocks(HGraph* graph, ArenaBitVector* visited) {
+static void MarkReachableBlocks(HGraph* graph, BitVectorView<size_t> visited) {
   // Use local allocator for allocating memory.
   ScopedArenaAllocator allocator(graph->GetArenaStack());
 
   ScopedArenaVector<HBasicBlock*> worklist(allocator.Adapter(kArenaAllocDCE));
   constexpr size_t kDefaultWorlistSize = 8;
   worklist.reserve(kDefaultWorlistSize);
-  visited->SetBit(graph->GetEntryBlock()->GetBlockId());
+  visited.SetBit(graph->GetEntryBlock()->GetBlockId());
   worklist.push_back(graph->GetEntryBlock());
 
   while (!worklist.empty()) {
     HBasicBlock* block = worklist.back();
     worklist.pop_back();
     int block_id = block->GetBlockId();
-    DCHECK(visited->IsBitSet(block_id));
+    DCHECK(visited.IsBitSet(block_id));
 
     ArrayRef<HBasicBlock* const> live_successors(block->GetSuccessors());
     HInstruction* last_instruction = block->GetLastInstruction();
@@ -83,8 +83,8 @@ static void MarkReachableBlocks(HGraph* graph, ArenaBitVector* visited) {
 
     for (HBasicBlock* successor : live_successors) {
       // Add only those successors that have not been visited yet.
-      if (!visited->IsBitSet(successor->GetBlockId())) {
-        visited->SetBit(successor->GetBlockId());
+      if (!visited.IsBitSet(successor->GetBlockId())) {
+        visited.SetBit(successor->GetBlockId());
         worklist.push_back(successor);
       }
     }
@@ -488,7 +488,8 @@ void HDeadCodeElimination::MaybeAddPhi(HBasicBlock* block) {
 
     if (block_cond->GetLeft() != dominator_cond->GetLeft() ||
         block_cond->GetRight() != dominator_cond->GetRight() ||
-        block_cond->GetOppositeCondition() != dominator_cond->GetCondition()) {
+        block_cond->GetOppositeCondition() != dominator_cond->GetCondition() ||
+        block_cond->GetBias() != dominator_cond->GetBias()) {
       return;
     }
   }
@@ -526,10 +527,10 @@ void HDeadCodeElimination::MaybeAddPhi(HBasicBlock* block) {
       //         |
       //         8
       // `7` (which would be `block` in this example), and `6` will come from both the true path and
-      // the false path of `1`. We bumped into something similar in `HCodeFlowSimplifier`. See
-      // `HCodeFlowSimplifier::TryFixupDoubleDiamondPattern()`.
+      // the false path of `1`. We bumped into something similar in `HControlFlowSimplifier`. See
+      // `HControlFlowSimplifier::TryFixupDoubleDiamondPattern()`.
       // TODO(solanes): Figure out if we can fix up the graph into a double diamond in a generic way
-      // so that `HDeadCodeElimination` and `HCodeFlowSimplifier` can take advantage of it.
+      // so that `HDeadCodeElimination` and `HControlFlowSimplifier` can take advantage of it.
 
       if (!same_input) {
         // `1` and `7` having the opposite condition is a case we are missing. We could potentially
@@ -798,8 +799,8 @@ bool HDeadCodeElimination::RemoveEmptyIfs() {
     //   5
     // where 2, 3, and 4 are single HGoto blocks, and block 5 has Phis.
     ScopedArenaAllocator allocator(graph_->GetArenaStack());
-    ArenaBitVector visited_blocks(
-        &allocator, graph_->GetBlocks().size(), /*expandable=*/ false, kArenaAllocDCE);
+    BitVectorView<size_t> visited_blocks =
+        ArenaBitVector::CreateFixedSize(&allocator, graph_->GetBlocks().size(), kArenaAllocDCE);
     HBasicBlock* merge_true = true_block;
     visited_blocks.SetBit(merge_true->GetBlockId());
     while (merge_true->IsSingleGoto()) {
@@ -821,8 +822,8 @@ bool HDeadCodeElimination::RemoveEmptyIfs() {
 
     // Data structures to help remove now-dead instructions.
     ScopedArenaQueue<HInstruction*> maybe_remove(allocator.Adapter(kArenaAllocDCE));
-    ArenaBitVector visited(
-        &allocator, graph_->GetCurrentInstructionId(), /*expandable=*/ false, kArenaAllocDCE);
+    BitVectorView<size_t> visited = ArenaBitVector::CreateFixedSize(
+        &allocator, graph_->GetCurrentInstructionId(), kArenaAllocDCE);
     maybe_remove.push(if_instr->InputAt(0));
     visited.SetBit(if_instr->GetId());
 
@@ -873,9 +874,10 @@ bool HDeadCodeElimination::RemoveDeadBlocks(bool force_recomputation,
   ScopedArenaAllocator allocator(graph_->GetArenaStack());
 
   // Classify blocks as reachable/unreachable.
-  ArenaBitVector live_blocks(&allocator, graph_->GetBlocks().size(), false, kArenaAllocDCE);
+  BitVectorView<size_t> live_blocks =
+      ArenaBitVector::CreateFixedSize(&allocator, graph_->GetBlocks().size(), kArenaAllocDCE);
 
-  MarkReachableBlocks(graph_, &live_blocks);
+  MarkReachableBlocks(graph_, live_blocks);
   bool removed_one_or_more_blocks = false;
   bool rerun_dominance_and_loop_analysis = false;
 

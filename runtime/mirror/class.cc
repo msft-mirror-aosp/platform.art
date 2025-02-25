@@ -1454,7 +1454,7 @@ const char* Class::GetDescriptor(std::string* storage) {
     // the contents of the String are also constant. See ReadBarrierOption.
     ObjPtr<mirror::String> name = klass->GetName<kVerifyNone, kWithoutReadBarrier>();
     DCHECK(name != nullptr);
-    *storage = DotToDescriptor(name->ToModifiedUtf8().c_str());
+    *storage = DotToDescriptor(name->ToModifiedUtf8());
   } else {
     const char* descriptor;
     if (klass->IsPrimitive()) {
@@ -1829,7 +1829,7 @@ bool Class::ProxyDescriptorEquals(ObjPtr<mirror::Class> match) {
   }
 
   // Note: Proxy descriptor should never match a non-proxy descriptor but ART does not enforce that.
-  std::string descriptor = DotToDescriptor(name->ToModifiedUtf8().c_str());
+  std::string descriptor = DotToDescriptor(name->ToModifiedUtf8());
   std::string_view match_descriptor =
       match->GetDexFile().GetTypeDescriptorView(match->GetDexTypeIndex());
   return descriptor == match_descriptor;
@@ -1962,7 +1962,7 @@ ObjPtr<Method> Class::GetDeclaredMethodInternal(
   }
   auto h_args = hs.NewHandle(args);
   Handle<Class> h_klass = hs.NewHandle(klass);
-  constexpr hiddenapi::AccessMethod access_method = hiddenapi::AccessMethod::kNone;
+  constexpr hiddenapi::AccessMethod access_method = hiddenapi::AccessMethod::kCheckWithPolicy;
   ArtMethod* result = nullptr;
   bool result_hidden = false;
   for (auto& m : h_klass->GetDeclaredVirtualMethods(kPointerSize)) {
@@ -2298,7 +2298,8 @@ static bool IsInterfaceMethodAccessible(ArtMethod* interface_method)
     REQUIRES_SHARED(Locks::mutator_lock_) {
   // If the interface method is part of the public SDK, return it.
   if ((hiddenapi::GetRuntimeFlags(interface_method) & kAccPublicApi) != 0) {
-    hiddenapi::ApiList api_list(hiddenapi::detail::GetDexFlags(interface_method));
+    hiddenapi::ApiList api_list =
+        hiddenapi::ApiList::FromDexFlags(hiddenapi::detail::GetDexFlags(interface_method));
     // The kAccPublicApi flag is also used as an optimization to avoid
     // other hiddenapi checks to always go on the slow path. Therefore, we
     // need to check here if the method is in the SDK list.

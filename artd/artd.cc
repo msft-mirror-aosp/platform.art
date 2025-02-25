@@ -424,14 +424,11 @@ Result<File> ExtractEmbeddedProfileToFd(const std::string& dex_path) {
     return Error() << error_msg;
   }
   constexpr const char* kEmbeddedProfileEntry = "assets/art-profile/baseline.prof";
-  std::unique_ptr<ZipEntry> zip_entry(zip_archive->Find(kEmbeddedProfileEntry, &error_msg));
+  std::unique_ptr<ZipEntry> zip_entry(zip_archive->FindOrNull(kEmbeddedProfileEntry, &error_msg));
   size_t size;
   if (zip_entry == nullptr || (size = zip_entry->GetUncompressedLength()) == 0) {
-    // From system/libziparchive/zip_error.cpp.
-    constexpr const char* kEntryNotFound = "Entry not found";
-    if (error_msg != kEntryNotFound) {
-      LOG(WARNING) << ART_FORMAT(
-          "Failed to find zip entry '{}' in '{}': {}", kEmbeddedProfileEntry, dex_path, error_msg);
+    if (!error_msg.empty()) {
+      LOG(WARNING) << error_msg;
     }
     // The dex file doesn't necessarily contain a profile. This is expected.
     return File();
@@ -1172,8 +1169,7 @@ ndk::ScopedAStatus Artd::dexopt(
   }
 
   AddBootImageFlags(args);
-  AddCompilerConfigFlags(
-      in_instructionSet, in_compilerFilter, in_priorityClass, in_dexoptOptions, args);
+  AddCompilerConfigFlags(in_instructionSet, in_compilerFilter, in_dexoptOptions, args);
   AddPerfConfigFlags(in_priorityClass, art_exec_args, args);
 
   // For being surfaced in crash reports on crashes.
@@ -1629,7 +1625,6 @@ ScopedAStatus Artd::checkPreRebootSystemRequirements(const std::string& in_chroo
 Result<void> Artd::Start() {
   OR_RETURN(SetLogVerbosity());
   MemMap::Init();
-  Runtime::AllowPageSizeAccess();
 
   ScopedAStatus status = ScopedAStatus::fromStatus(AServiceManager_registerLazyService(
       this->asBinder().get(), options_.is_pre_reboot ? kPreRebootServiceName : kServiceName));
@@ -1795,7 +1790,6 @@ void Artd::AddBootImageFlags(/*out*/ CmdlineBuilder& args) {
 
 void Artd::AddCompilerConfigFlags(const std::string& instruction_set,
                                   const std::string& compiler_filter,
-                                  PriorityClass priority_class,
                                   const DexoptOptions& dexopt_options,
                                   /*out*/ CmdlineBuilder& args) {
   args.Add("--instruction-set=%s", instruction_set);
@@ -1806,8 +1800,6 @@ void Artd::AddCompilerConfigFlags(const std::string& instruction_set,
 
   args.Add("--compiler-filter=%s", compiler_filter)
       .Add("--compilation-reason=%s", dexopt_options.compilationReason);
-
-  args.AddIf(priority_class >= PriorityClass::INTERACTIVE, "--compact-dex-level=none");
 
   args.AddIfNonEmpty("--max-image-block-size=%s",
                      props_->GetOrEmpty("dalvik.vm.dex2oat-max-image-block-size"))

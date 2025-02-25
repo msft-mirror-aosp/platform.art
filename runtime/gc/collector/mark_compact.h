@@ -330,7 +330,8 @@ class MarkCompact final : public GarbageCollector {
   // mirror::Class.
   bool IsValidObject(mirror::Object* obj) const REQUIRES_SHARED(Locks::mutator_lock_);
   void InitializePhase();
-  void FinishPhase() REQUIRES(!Locks::mutator_lock_, !Locks::heap_bitmap_lock_, !lock_);
+  void FinishPhase(bool performed_compaction)
+      REQUIRES(!Locks::mutator_lock_, !Locks::heap_bitmap_lock_, !lock_);
   void MarkingPhase() REQUIRES_SHARED(Locks::mutator_lock_) REQUIRES(!Locks::heap_bitmap_lock_);
   void CompactionPhase() REQUIRES_SHARED(Locks::mutator_lock_);
 
@@ -930,6 +931,12 @@ class MarkCompact final : public GarbageCollector {
   // is incorporated.
   void* stack_high_addr_;
   void* stack_low_addr_;
+  // Following values for logging purposes
+  void* prev_post_compact_end_;
+  void* prev_black_dense_end_;
+  void* prev_black_allocations_begin_;
+  bool prev_gc_young_;
+  bool prev_gc_performed_compaction_;
 
   class FlipCallback;
   class ThreadFlipVisitor;
@@ -945,6 +952,7 @@ class MarkCompact final : public GarbageCollector {
   class ClassLoaderRootsUpdater;
   class LinearAllocPageUpdater;
   class ImmuneSpaceUpdateObjVisitor;
+  class DetectOldToMidRefVisitor;
 
   DISALLOW_IMPLICIT_CONSTRUCTORS(MarkCompact);
 };
