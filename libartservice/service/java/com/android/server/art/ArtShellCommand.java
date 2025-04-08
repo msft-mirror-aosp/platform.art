@@ -171,23 +171,11 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
                 return 0;
             }
             case "dump": {
-                boolean verifySdmSignatures = false;
-
-                String opt;
-                while ((opt = getNextOption()) != null) {
-                    switch (opt) {
-                        case "--verify-sdm-signatures":
-                            verifySdmSignatures = true;
-                            break;
-                    }
-                }
-
                 String packageName = getNextArg();
                 if (packageName != null) {
-                    mInjector.getArtManagerLocal().dumpPackage(
-                            pw, snapshot, packageName, verifySdmSignatures);
+                    mInjector.getArtManagerLocal().dumpPackage(pw, snapshot, packageName);
                 } else {
-                    mInjector.getArtManagerLocal().dump(pw, snapshot, verifySdmSignatures);
+                    mInjector.getArtManagerLocal().dump(pw, snapshot);
                 }
                 return 0;
             }
@@ -979,13 +967,16 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
         pw.println("    -f Force dexopt, also when the compiler filter being applied is not");
         pw.println("       better than that of the current dexopt artifacts for a package.");
         pw.println("    --reset Reset the dexopt state of the package as if the package is newly");
-        pw.println("       installed.");
-        pw.println("       More specifically, it clears current profiles, reference profiles");
-        pw.println("       from local profiles, and any code compiled from those local profiles.");
-        pw.println("       If there is an external profile (e.g., a cloud profile), the reference");
-        pw.println("       profile from that profile and the code compiled from that profile will");
-        pw.println("       be kept.");
-        pw.println("       For secondary dex files, it also clears all dexopt artifacts.");
+        pw.println("       installed without cloud dexopt artifacts (SDM files).");
+        pw.println("       More specifically,");
+        pw.println("       - It clears current profiles, reference profiles, and all dexopt");
+        pw.println("         artifacts (including cloud dexopt artifacts).");
+        pw.println("       - If there is an external profile (e.g., a cloud profile), the");
+        pw.println("         reference profile will be re-created from that profile, and dexopt");
+        pw.println("         artifacts will be regenerated for that profile.");
+        pw.println("       For secondary dex files, it clears all profiles and dexopt artifacts");
+        pw.println("       without regeneration because secondary dex files are supposed to be");
+        pw.println("       unknown at install time.");
         pw.println("       When this flag is set, all the other flags are ignored.");
         pw.println("    -v Verbose mode. This mode prints detailed results.");
         pw.println("    --force-merge-profile Force merge profiles even if the difference between");
@@ -1012,7 +1003,7 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
         pw.println();
         pw.println("delete-dexopt PACKAGE_NAME");
         pw.println("  Delete the dexopt artifacts of both primary dex files and secondary dex");
-        pw.println("  files of a package.");
+        pw.println("  files of a package, including cloud dexopt artifacts (SDM files).");
         pw.println();
         pw.println("bg-dexopt-job [--cancel | --disable | --enable]");
         pw.println("  Control the background dexopt job.");
@@ -1084,13 +1075,10 @@ public final class ArtShellCommand extends BasicShellCommandHandler {
         pw.println("    Cleanup obsolete files, such as dexopt artifacts that are outdated or");
         pw.println("    correspond to dex container files that no longer exist.");
         pw.println();
-        pw.println("  dump [--verify-sdm-signatures] [PACKAGE_NAME]");
+        pw.println("  dump [PACKAGE_NAME]");
         pw.println("    Dump the dexopt state in text format to stdout.");
         pw.println("    If PACKAGE_NAME is empty, the command is for all packages. Otherwise, it");
         pw.println("    is for the given package.");
-        pw.println("    Options:");
-        pw.println("      --verify-sdm-signatures Also verify SDM file signatures and include");
-        pw.println("        their statuses.");
         pw.println();
         pw.println("  dexopt-packages -r REASON");
         pw.println("    Run batch dexopt for the given reason.");

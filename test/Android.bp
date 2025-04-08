@@ -363,6 +363,10 @@ art_cc_defaults {
         },
     },
     static_libs: [
+        // This dependency links the whole runtime statically into the test. Note that the boot
+        // classpath is not (normally) bundled with the test, so if the runtime is used to actually
+        // start a VM it may load the boot classpath from the device. Depending on the test
+        // configuration, that may not be in sync with the statically linked runtime.
         "libart-gtest",
     ],
     version_script: ":art-standalone-gtest-version",
@@ -725,7 +729,6 @@ art_cc_defaults {
         "1959-redefine-object-instrument/fake_redef_object.cc",
         "1960-obsolete-jit-multithread-native/native_say_hi.cc",
         "1964-add-to-dex-classloader-file/add_to_loader.cc",
-        "1963-add-to-dex-classloader-in-memory/check_memfd_create.cc",
         "2012-structural-redefinition-failures-jni-id/set-jni-id-used.cc",
         "2031-zygote-compiled-frame-deopt/native-wait.cc",
         "2038-hiddenapi-jvmti-ext/hiddenapi_ext.cc",
@@ -1387,6 +1390,18 @@ art_cc_test {
     ],
     test_suites: ["general-tests"],
     test_config: "art-gtests-target-chroot.xml",
+}
+
+art_cc_test {
+    name: "ArtTest",
+    data: [
+        // We need the ART testing apex, which contains debug binaries and other utilities.
+        ":com.android.art.testing",
+        // Archive which contains all run-test data and test-specific bash scripts to run them.
+        ":art-test-target-fg",
+    ],
+    test_suites: ["general-tests"],
+    test_config: "ArtTest.xml",
 }
 
 csuite_test {

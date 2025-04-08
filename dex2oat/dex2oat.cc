@@ -33,10 +33,6 @@
 
 #if defined(__linux__)
 #include <sched.h>
-#if defined(__arm__)
-#include <sys/personality.h>
-#include <sys/utsname.h>
-#endif  // __arm__
 #endif
 
 #include <android-base/parseint.h>
@@ -500,15 +496,6 @@ class ThreadLocalHashOverride {
   Handle<mirror::Object> old_field_value_;
 };
 
-class OatKeyValueStore : public SafeMap<std::string, std::string> {
- public:
-  using SafeMap::Put;
-
-  iterator Put(const std::string& k, bool v) {
-    return SafeMap::Put(k, v ? OatHeader::kTrueValue : OatHeader::kFalseValue);
-  }
-};
-
 class Dex2Oat final {
  public:
   explicit Dex2Oat(TimingLogger* timings)
@@ -893,7 +880,7 @@ class Dex2Oat final {
     }
 
     // Fill some values into the key-value store for the oat header.
-    key_value_store_.reset(new OatKeyValueStore());
+    key_value_store_.reset(new linker::OatKeyValueStore());
 
     // Automatically force determinism for the boot image and boot image extensions in a host build.
     if (!kIsTargetBuild && (IsBootImage() || IsBootImageExtension())) {
@@ -978,7 +965,8 @@ class Dex2Oat final {
         }
         oss << argv[i];
       }
-      key_value_store_->Put(OatHeader::kDex2OatCmdLineKey, oss.str());
+      key_value_store_->PutNonDeterministic(
+          OatHeader::kDex2OatCmdLineKey, oss.str(), /*allow_truncation=*/true);
     }
     key_value_store_->Put(OatHeader::kDebuggableKey, compiler_options_->debuggable_);
     key_value_store_->Put(OatHeader::kNativeDebuggableKey,
@@ -1696,7 +1684,10 @@ class Dex2Oat final {
         CompilerFilter::DependsOnImageChecksum(original_compiler_filter)) {
       std::string versions =
           apex_versions_argument_.empty() ? runtime->GetApexVersions() : apex_versions_argument_;
-      key_value_store_->Put(OatHeader::kApexVersionsKey, versions);
+      if (!key_value_store_->PutNonDeterministic(OatHeader::kApexVersionsKey, versions)) {
+        LOG(ERROR) << "Cannot store apex versions string because it's too long";
+        return dex2oat::ReturnCode::kOther;
+      }
     }
 
     // Now that we have adjusted whether we generate an image, encode it in the
@@ -2915,7 +2906,7 @@ class Dex2Oat final {
 
   std::unique_ptr<CompilerOptions> compiler_options_;
 
-  std::unique_ptr<OatKeyValueStore> key_value_store_;
+  std::unique_ptr<linker::OatKeyValueStore> key_value_store_;
 
   std::unique_ptr<VerificationResults> verification_results_;
 
@@ -3045,26 +3036,6 @@ class Dex2Oat final {
   DISALLOW_IMPLICIT_CONSTRUCTORS(Dex2Oat);
 };
 
-static void b13564922() {
-#if defined(__linux__) && defined(__arm__)
-  int major, minor;
-  struct utsname uts;
-  if (uname(&uts) != -1 &&
-      sscanf(uts.release, "%d.%d", &major, &minor) == 2 &&
-      ((major < 3) || ((major == 3) && (minor < 4)))) {
-    // Kernels before 3.4 don't handle the ASLR well and we can run out of address
-    // space (http://b/13564922). Work around the issue by inhibiting further mmap() randomization.
-    int old_personality = personality(0xffffffff);
-    if ((old_personality & ADDR_NO_RANDOMIZE) == 0) {
-      int new_personality = personality(old_personality | ADDR_NO_RANDOMIZE);
-      if (new_personality == -1) {
-        LOG(WARNING) << "personality(. | ADDR_NO_RANDOMIZE) failed.";
-      }
-    }
-  }
-#endif
-}
-
 class ScopedGlobalRef {
  public:
   explicit ScopedGlobalRef(jobject obj) : obj_(obj) {}
@@ -3128,8 +3099,6 @@ static dex2oat::ReturnCode DoCompilation(Dex2Oat& dex2oat) REQUIRES(!Locks::muta
 }
 
 static dex2oat::ReturnCode Dex2oat(int argc, char** argv) {
-  b13564922();
-
   TimingLogger timings("compiler", false, false);
 
   // Allocate `dex2oat` on the heap instead of on the stack, as Clang

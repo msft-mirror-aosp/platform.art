@@ -1173,14 +1173,7 @@ ArtField* Class::FindDeclaredStaticField(std::string_view name, std::string_view
 }
 
 ArtField* Class::FindDeclaredField(ObjPtr<DexCache> dex_cache, uint32_t dex_field_idx) {
-  if (dex_cache == GetDexCache()) {
-    for (ArtField& field : GetFields()) {
-      if (field.GetDexFieldIndex() == dex_field_idx) {
-        return &field;
-      }
-    }
-  }
-  return nullptr;
+  return (dex_cache == GetDexCache()) ? FindDeclaredField(dex_field_idx) : nullptr;
 }
 
 ArtField* Class::FindDeclaredStaticField(ObjPtr<DexCache> dex_cache, uint32_t dex_field_idx) {
