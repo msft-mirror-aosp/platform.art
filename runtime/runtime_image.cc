@@ -18,6 +18,7 @@
 
 #include <lz4.h>
 #include <sstream>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "android-base/file.h"
@@ -1872,6 +1873,14 @@ bool RuntimeImage::WriteImageToDisk(std::string* error_msg) {
 
   if (image_file == nullptr) {
     *error_msg = "Could not open " + temp_path + " for writing";
+    return false;
+  }
+
+  // Make the file read-only immediately after creation to prevent tampering
+  // during the generation window. Writes to the open file descriptor will
+  // still succeed.
+  if (fchmod(image_file->Fd(), S_IRUSR | S_IRGRP | S_IROTH) != 0) {
+    *error_msg = "Failed to make runtime image read-only: " + std::string(strerror(errno));
     return false;
   }
 
